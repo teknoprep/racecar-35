@@ -1,0 +1,31 @@
+# PlatformIO build artifacts (all levels — keeps nested .pio/ out too)
+.pio/
+**/.pio/
+
+# Arduino IDE build outputs
+build/
+*.elf
+*.hex
+*.bin
+*.map
+
+# Claude Code local config / per-machine state
+.claude/
+
+# Elecrow CrowPanel-ESP32-Display-Course-File — nested clone of upstream.
+# Re-clone from the Elecrow github if you need the reference material:
+#   git clone https://github.com/Elecrow-RD/CrowPanel-ESP32-Display-Course-File _vendor/CrowPanel-ESP32-Display-Course-File
+_vendor/
+
+# VSCode C/C++ extension auto-generates absolute paths in this file
+.vscode/c_cpp_properties.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup / temp files
+*~
+*.swp
+*.bak
