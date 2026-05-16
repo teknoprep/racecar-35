@@ -1,0 +1,38 @@
+# racecar-35 cloud receiver
+#
+# Behind nginx. nginx terminates TLS, proxies plain HTTP to this service on
+# port 8089. For initial LAN testing the dash points directly at this port
+# over plain HTTP and skips nginx entirely.
+#
+# Bring up:   docker compose up -d --build
+# Logs:       docker compose logs -f
+# Tear down:  docker compose down
+services:
+  cloud:
+    build: .
+    container_name: racecar35-cloud
+    restart: unless-stopped
+    ports:
+      # Host:container. Change the host side if 8089 is already taken.
+      - "8089:8089"
+    environment:
+      # If set, requests must send X-API-Key: <this value>. Leave empty during
+      # initial bring-up so a fresh dash without credentials can still upload.
+      RACECAR_API_KEY: "${RACECAR_API_KEY:-}"
+      RACECAR_DATA_DIR: "/data"
+      RACECAR_SERVICE_NAME: "racecar-35 cloud"
+      # Reject any body larger than this many bytes. 64 MB is generous for an
+      # hour of 25 Hz NDJSON. Increase if you record longer sessions.
+      RACECAR_MAX_BODY_BYTES: "67108864"
+    volumes:
+      # Persistent on-disk storage for uploaded sessions. Survives container
+      # rebuilds. Map to wherever you keep server data on the host.
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request, sys; \
+              sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8089/health').status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3

@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.22"
+#define FIRMWARE_VERSION "0.1.23"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -1911,8 +1911,14 @@ void loop() {
     // Emit on every fresh PVT (== 25 Hz when GPS is reporting) plus a 1 Hz
     // heartbeat fallback so the dash's LINK indicator stays green even
     // without a GPS fix.
+    // Emit cadence:
+    //   - Real GPS:  every fresh PVT (== 25 Hz when locked), with a 1 Hz
+    //                heartbeat fallback when PVT is stale or absent.
+    //   - Test mode: synthetic data at a fixed 25 Hz so the dash UI animates
+    //                smoothly and the SD/cloud pipeline sees realistic load.
     static unsigned long lastEmit = 0;
-    if (freshThisCall || millis() - lastEmit >= 1000) {
+    const unsigned long emit_interval_ms = test_mode_active ? 40UL : 1000UL;
+    if (freshThisCall || millis() - lastEmit >= emit_interval_ms) {
         lastEmit = millis();
         emitToDash();
     }
