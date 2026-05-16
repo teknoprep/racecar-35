@@ -804,6 +804,7 @@ enum Page : uint8_t {
     PAGE_CONFIG_PICKER = 5,
     PAGE_STATUS        = 6,
     PAGE_TIME_SET      = 7,
+    PAGE_WIFI_SCAN     = 8,
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -1161,6 +1162,8 @@ static void handleTimeSetTap(int x, int y);
 static void openTrackPicker(bool for_recording = false);
 static void openConfigPicker(int track_idx, bool from_auto, bool for_recording = false);
 static void handleConfigPickerTap(int x, int y);
+static void handleWifiScannerTap(int x, int y);
+static void drawWifiScannerPage();
 
 static void handleTouch() {
     int32_t x, y;
@@ -1169,7 +1172,8 @@ static void handleTouch() {
     // Keyboard + track picker pages use a tap-only model (with vertical
     // drag for picker scrolling). No swipe-back; CANCEL is the way out.
     if (currentPage == PAGE_NUM_KB || currentPage == PAGE_TEXT_KB ||
-        currentPage == PAGE_CONFIG_PICKER || currentPage == PAGE_TIME_SET) {
+        currentPage == PAGE_CONFIG_PICKER || currentPage == PAGE_TIME_SET ||
+        currentPage == PAGE_WIFI_SCAN) {
         if (now && !tt.active) {
             tt.startX = x; tt.startY = y;
             tt.lastX  = x; tt.lastY  = y;
@@ -1178,6 +1182,7 @@ static void handleTouch() {
         } else if (!now && tt.active) {
             if      (currentPage == PAGE_CONFIG_PICKER) handleConfigPickerTap(tt.startX, tt.startY);
             else if (currentPage == PAGE_TIME_SET)      handleTimeSetTap(tt.startX, tt.startY);
+            else if (currentPage == PAGE_WIFI_SCAN)     handleWifiScannerTap(tt.startX, tt.startY);
             else                                        handleKeyboardTap(tt.startX, tt.startY);
             tt.active = false;
         } else if (now && tt.active) {
@@ -2175,6 +2180,55 @@ static void wifiTick() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WiFi scanner — PAGE_WIFI_SCAN. Tap WiFi SSID row in settings to open.
+// Lists nearby networks (sorted by RSSI — strongest first), tap one to
+// select. Open networks save immediately; secured networks then open the
+// password keyboard.
+// ---------------------------------------------------------------------------
+enum WifiScanState : uint8_t { WSC_IDLE = 0, WSC_RUNNING, WSC_DONE };
+struct WifiScanItem {
+    char    ssid[33];
+    int8_t  rssi;
+    bool    secured;
+};
+static WifiScanItem  wifi_scan_list[16];
+static uint8_t       wifi_scan_count = 0;
+static WifiScanState wifi_scan_state = WSC_IDLE;
+static bool          wifi_scan_dirty = false;
+
+static void startWifiScan() {
+    wifi_scan_count = 0;
+    wifi_scan_state = WSC_RUNNING;
+    wifi_scan_dirty = true;
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_STA);
+    delay(50);
+    WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+}
+
+static void openWifiScanner() {
+    currentPage     = PAGE_WIFI_SCAN;
+    pageJustEntered = true;
+    startWifiScan();
+}
+
+static void pollWifiScanner() {
+    if (wifi_scan_state != WSC_RUNNING) return;
+    const int n = WiFi.scanComplete();
+    if (n < 0) return;   // -1 = still running, -2 = not started
+
+    wifi_scan_count = (n > 16) ? 16 : (uint8_t)n;
+    for (int i = 0; i < wifi_scan_count; i++) {
+        WiFi.SSID(i).toCharArray(wifi_scan_list[i].ssid, sizeof(wifi_scan_list[i].ssid));
+        wifi_scan_list[i].rssi    = (int8_t)WiFi.RSSI(i);
+        wifi_scan_list[i].secured = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+    }
+    WiFi.scanDelete();
+    wifi_scan_state = WSC_DONE;
+    wifi_scan_dirty = true;
+}
+
 static void wifiForceReconfigure() {
     WiFi.disconnect(true, false);
     wifi_ip[0]    = '\0';
@@ -2555,6 +2609,8 @@ static void handleSettingsTap(int x, int y) {
             constexpr int TEXT_X = 410, TEXT_W = 360;
             if (inRect(x, y, TEXT_X, ry, TEXT_W, SETTINGS_ROW_HEIGHT)) {
                 if (r.id == ST_CL_PORT)              openNumericKeyboard(r.id);
+                else if (r.id == ST_WIFI_SSID)       openWifiScanner();
+                else if (r.id == ST_WIFI_PASS)       openTextKeyboard(r.id);
                 else if (r.id == ST_CL_HOST    ||
                          r.id == ST_CL_AUTH_USER ||
                          r.id == ST_CL_AUTH_PASS)    openTextKeyboard(r.id);
@@ -3140,6 +3196,148 @@ static void drawConfigPicker() {
     tft.setTextDatum(textdatum_t::top_left);
 }
 
+// ---------------------------------------------------------------------------
+// WiFi scanner page rendering + tap dispatch.
+// Layout:
+//   y 0-40    : navy title bar
+//   y 50-400  : scrollable-free list (cap 16 networks, fits in 350 px @ ~22 px/row)
+//   y 410-470 : action row — RESCAN / TYPE SSID / CANCEL
+// ---------------------------------------------------------------------------
+namespace {
+    constexpr int WSC_LIST_Y    = 50;
+    constexpr int WSC_ROW_H     = 22;
+    constexpr int WSC_LIST_BOT  = 400;
+    constexpr int WSC_BTN_Y     = 410;
+    constexpr int WSC_BTN_H     = 55;
+    constexpr int WSC_BTN1_X    =  20, WSC_BTN1_W = 230;   // RESCAN
+    constexpr int WSC_BTN2_X    = 285, WSC_BTN2_W = 230;   // TYPE SSID
+    constexpr int WSC_BTN3_X    = 550, WSC_BTN3_W = 230;   // CANCEL
+}
+
+static void drawWifiScannerPage() {
+    if (pageJustEntered) {
+        tft.fillScreen(TFT_BLACK);
+        pageJustEntered = false;
+        wifi_scan_dirty = true;
+        // Title bar (drawn once — doesn't change while scanner is open)
+        tft.fillRect(0, 0, 800, 40, TFT_NAVY);
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.setTextDatum(textdatum_t::middle_left);
+        tft.drawString("WiFi networks", 10, 20);
+        // Static action buttons
+        tft.fillRect(WSC_BTN1_X, WSC_BTN_Y, WSC_BTN1_W, WSC_BTN_H, TFT_NAVY);
+        tft.drawRect(WSC_BTN1_X, WSC_BTN_Y, WSC_BTN1_W, WSC_BTN_H, TFT_WHITE);
+        tft.fillRect(WSC_BTN2_X, WSC_BTN_Y, WSC_BTN2_W, WSC_BTN_H, TFT_DARKGREY);
+        tft.drawRect(WSC_BTN2_X, WSC_BTN_Y, WSC_BTN2_W, WSC_BTN_H, TFT_WHITE);
+        tft.fillRect(WSC_BTN3_X, WSC_BTN_Y, WSC_BTN3_W, WSC_BTN_H, TFT_MAROON);
+        tft.drawRect(WSC_BTN3_X, WSC_BTN_Y, WSC_BTN3_W, WSC_BTN_H, TFT_WHITE);
+        tft.setTextDatum(textdatum_t::middle_center);
+        const int byc = WSC_BTN_Y + WSC_BTN_H / 2;
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);     tft.drawString("RESCAN",   WSC_BTN1_X + WSC_BTN1_W/2, byc);
+        tft.setTextColor(TFT_WHITE, TFT_DARKGREY); tft.drawString("TYPE SSID",WSC_BTN2_X + WSC_BTN2_W/2, byc);
+        tft.setTextColor(TFT_WHITE, TFT_MAROON);   tft.drawString("CANCEL",   WSC_BTN3_X + WSC_BTN3_W/2, byc);
+        tft.setTextDatum(textdatum_t::top_left);
+    }
+    if (!wifi_scan_dirty) return;
+    wifi_scan_dirty = false;
+
+    // Clear body band
+    tft.fillRect(0, 50, 800, WSC_LIST_BOT - 50, TFT_BLACK);
+
+    tft.setFont(&fonts::Font2);
+    tft.setTextSize(1);
+    if (wifi_scan_state == WSC_RUNNING) {
+        tft.setFont(&fonts::Font4);
+        tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("Scanning for networks...", 400, (50 + WSC_LIST_BOT)/2);
+        tft.setTextDatum(textdatum_t::top_left);
+        return;
+    }
+    if (wifi_scan_count == 0) {
+        tft.setFont(&fonts::Font4);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("No networks found.", 400, (50 + WSC_LIST_BOT)/2);
+        tft.setTextDatum(textdatum_t::top_left);
+        return;
+    }
+
+    // List — strongest first (ESP32 returns in RSSI order).
+    for (uint8_t i = 0; i < wifi_scan_count; i++) {
+        const int y = WSC_LIST_Y + i * (WSC_ROW_H + 2);
+        if (y + WSC_ROW_H > WSC_LIST_BOT) break;
+        // Row background + border
+        tft.fillRect(10, y, 780, WSC_ROW_H, TFT_BLACK);
+        tft.drawRect(10, y, 780, WSC_ROW_H, TFT_DARKGREY);
+        // SSID left
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextDatum(textdatum_t::middle_left);
+        tft.drawString(wifi_scan_list[i].ssid, 20, y + WSC_ROW_H/2);
+        // Right: WPA/OPN  + RSSI dBm
+        char info[24];
+        snprintf(info, sizeof(info), "%s  %ddBm",
+                 wifi_scan_list[i].secured ? "WPA" : "OPN",
+                 (int)wifi_scan_list[i].rssi);
+        tft.setTextColor(wifi_scan_list[i].secured ? TFT_LIGHTGREY : TFT_CYAN, TFT_BLACK);
+        tft.setTextDatum(textdatum_t::middle_right);
+        tft.drawString(info, 770, y + WSC_ROW_H/2);
+    }
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleWifiScannerTap(int x, int y) {
+    // Action row first (fixed positions).
+    if (y >= WSC_BTN_Y && y <= WSC_BTN_Y + WSC_BTN_H) {
+        if (x >= WSC_BTN1_X && x <= WSC_BTN1_X + WSC_BTN1_W) {
+            startWifiScan();   // RESCAN
+            return;
+        }
+        if (x >= WSC_BTN2_X && x <= WSC_BTN2_X + WSC_BTN2_W) {
+            // TYPE SSID — open the existing text keyboard for manual entry.
+            wifi_scan_state = WSC_IDLE;
+            openTextKeyboard(ST_WIFI_SSID);
+            return;
+        }
+        if (x >= WSC_BTN3_X && x <= WSC_BTN3_X + WSC_BTN3_W) {
+            // CANCEL — back to settings; restart whatever WiFi connection.
+            wifi_scan_state = WSC_IDLE;
+            currentPage = PAGE_SETTINGS;
+            pageJustEntered = true;
+            settingsDirty   = true;
+            wifiForceReconfigure();
+            return;
+        }
+    }
+    // List rows — only tappable once scan completed.
+    if (wifi_scan_state != WSC_DONE) return;
+    for (uint8_t i = 0; i < wifi_scan_count; i++) {
+        const int ry = WSC_LIST_Y + i * (WSC_ROW_H + 2);
+        if (ry + WSC_ROW_H > WSC_LIST_BOT) break;
+        if (y >= ry && y <= ry + WSC_ROW_H) {
+            // Selected this network.
+            strncpy(s.wifi_ssid, wifi_scan_list[i].ssid, sizeof(s.wifi_ssid) - 1);
+            s.wifi_ssid[sizeof(s.wifi_ssid) - 1] = '\0';
+            wifi_scan_state = WSC_IDLE;
+            if (!wifi_scan_list[i].secured) {
+                // Open network — no password needed.
+                s.wifi_pass[0] = '\0';
+                wifiForceReconfigure();
+                currentPage = PAGE_SETTINGS;
+                pageJustEntered = true;
+                settingsDirty   = true;
+            } else {
+                // Secured — prompt for password via keyboard.
+                openTextKeyboard(ST_WIFI_PASS);
+            }
+            return;
+        }
+    }
+}
+
 static void handleConfigPickerTap(int x, int y) {
     const TrackInfo& t = TRACKS[cp.track_idx];
     const int n = (int)t.n_configs;
@@ -3693,5 +3891,11 @@ void loop() {
         if (pageJustEntered || now - lastDraw >= 200) { lastDraw = now; drawStatusPage(); }
     } else if (currentPage == PAGE_TIME_SET) {
         if (pageJustEntered || ts_dirty) { ts_dirty = false; lastDraw = now; drawTimeSetPage(); }
+    } else if (currentPage == PAGE_WIFI_SCAN) {
+        pollWifiScanner();   // checks WiFi.scanComplete(), flips state when done
+        if (pageJustEntered || wifi_scan_dirty || now - lastDraw >= 250) {
+            lastDraw = now;
+            drawWifiScannerPage();
+        }
     }
 }
