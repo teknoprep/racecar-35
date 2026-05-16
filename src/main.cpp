@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.8"
+#define FIRMWARE_VERSION "0.1.9"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -263,8 +263,14 @@ static void handleDashCommand(const String& line) {
         Serial.printf("[fwupdate] buffer @ 0x%08lX, size=%lu\n",
                       (unsigned long)buffer_addr, (unsigned long)buffer_size);
         DASH_SERIAL.printf("FW,READY,%lu\n", (unsigned long)buffer_size);
-        // Diagnostic output via USB serial; UART is busy receiving hex lines.
-        update_firmware_noprompt(&DASH_SERIAL, &Serial, buffer_addr, buffer_size);
+        // Per-line ACK protocol. Each Intel HEX line is parsed, written to
+        // the flash buffer, then we send 'A\n' on DASH_SERIAL. The dash waits
+        // for that ACK before sending the next line, which gives us reliable
+        // flow control across arbitrary flash erase stalls (~100 ms each) at
+        // 921 600 baud. The earlier byte-streaming version saw mid-stream
+        // byte loss — with ACKs, that's structurally impossible.
+        update_firmware_acked(&DASH_SERIAL, &Serial, &DASH_SERIAL,
+                              buffer_addr, buffer_size);
         // If we get here, the update failed. Free the buffer and report.
         firmware_buffer_free(buffer_addr, buffer_size);
         DASH_SERIAL.println(F("FW,ERR,update_failed"));

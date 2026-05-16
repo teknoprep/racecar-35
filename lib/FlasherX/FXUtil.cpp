@@ -354,3 +354,76 @@ void update_firmware_noprompt( Stream *in, Stream *out,
   flash_move( FLASH_BASE_ADDR, buffer_addr, hex.max - hex.min );
   REBOOT;
 }
+
+//******************************************************************************
+// update_firmware_acked() — per-line ACK protocol. After each successful hex
+// line, emits 'A\n' on `ack`. The dash uses this for flow control: send one
+// line, wait for ACK, send next. Survives arbitrary flash-stall delays
+// (sector erases can take 100+ ms on Teensy 4.x) because the dash simply
+// waits longer for that line's ACK. No byte loss possible \u2014 we don't move
+// to the next line until the previous one is fully digested.
+//******************************************************************************
+void update_firmware_acked( Stream *in, Stream *out, Stream *ack,
+                            uint32_t buffer_addr, uint32_t buffer_size )
+{
+  static char line[96];
+  static char data[32] __attribute__ ((aligned (8)));
+  hex_info_t hex = { data, 0, 0, 0,  0, 0xFFFFFFFF, 0,  0, 0 };
+
+  out->printf( "FX: reading hex lines (acked mode)...\n" );
+
+  while (!hex.eof)  {
+    read_ascii_line( in, line, sizeof(line) );
+    if (parse_hex_line( (const char*)line, hex.data, &hex.addr, &hex.num, &hex.code ) == 0) {
+      out->printf( "FX: abort - bad hex line @%d: '%s'\n", hex.lines, line );
+      ack->printf( "FW,ERR,bad_hex_line@%d\n", hex.lines );
+      return;
+    }
+    if (process_hex_record( &hex ) != 0) {
+      out->printf( "FX: abort - invalid hex code %d\n", hex.code );
+      ack->printf( "FW,ERR,bad_hex_code,%d\n", hex.code );
+      return;
+    }
+    if (hex.code == 0) {   // data record
+      uint32_t addr = buffer_addr + hex.base + hex.addr - FLASH_BASE_ADDR;
+      if (hex.max > (FLASH_BASE_ADDR + buffer_size)) {
+        out->printf( "FX: abort - max address %08lX too large\n", hex.max );
+        ack->printf( "FW,ERR,addr_too_large\n" );
+        return;
+      }
+      if (!IN_FLASH(buffer_addr)) {
+        memcpy( (void*)addr, (void*)hex.data, hex.num );
+      }
+      else if (IN_FLASH(buffer_addr)) {
+        int error = flash_write_block( addr, hex.data, hex.num );
+        if (error) {
+          out->printf( "FX: abort - flash_write error %d\n", error );
+          ack->printf( "FW,ERR,flash_write,%d\n", error );
+          return;
+        }
+      }
+    }
+    hex.lines++;
+    // Per-line ACK. Single byte + newline; minimal latency.
+    ack->println( "A" );
+    ack->flush();
+  }
+
+  out->printf( "FX: %d records, hex.min=%08lX, hex.max=%08lX\n",
+               hex.lines, hex.min, hex.max );
+
+  if (!check_flash_id( buffer_addr, hex.max - hex.min )) {
+    out->printf( "FX: abort - new code missing string %s\n", FLASH_ID );
+    ack->printf( "FW,ERR,no_flash_id\n" );
+    return;
+  }
+
+  // Commit. flash_move() doesn't return; the dash should see no further
+  // output until the new firmware boots up.
+  ack->printf( "FW,COMMITTING\n" );
+  ack->flush();
+  out->printf( "FX: committing flash_move()...\n" );
+  out->flush();
+  flash_move( FLASH_BASE_ADDR, buffer_addr, hex.max - hex.min );
+  REBOOT;
+}

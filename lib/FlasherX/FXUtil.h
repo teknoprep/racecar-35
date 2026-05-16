@@ -15,4 +15,13 @@ void update_firmware( Stream *in, Stream *out,
 void update_firmware_noprompt( Stream *in, Stream *out,
 			uint32_t buffer_addr, uint32_t buffer_size );
 
+// Per-line ACK variant. After successfully processing each Intel HEX line,
+// emits 'A\n' on `ack`. The sender (dash) waits for the ACK before sending
+// the next line, providing reliable flow control regardless of how long
+// flash sector erases stall the read loop. On any parse/write error, emits
+// 'FW,ERR,<reason>\n' on `ack` and returns without committing. On success,
+// emits 'FW,COMMITTING\n' just before flash_move() (which doesn't return).
+void update_firmware_acked( Stream *in, Stream *out, Stream *ack,
+			uint32_t buffer_addr, uint32_t buffer_size );
+
 #endif
