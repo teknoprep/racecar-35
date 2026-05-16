@@ -157,6 +157,15 @@ static struct {
     uint8_t  inet       = 0;     // 0=Ethernet, 1=WiFi (mirror of dash setting)
 } g_cfg;
 
+// Set when the dash sends UPLOAD,CANCEL. Volatile across reboot — deliberately
+// in-RAM only so a reboot is the only way to re-enable uploads.
+static volatile bool uploads_disabled = false;
+// Set true while httpPost() is actively pushing a file; checked from
+// pumpDashCommands -> handleDashCommand so a CANCEL during the loop aborts
+// the current connection on the next chunk boundary.
+static volatile bool upload_in_progress = false;
+static volatile bool upload_cancel_pending = false;
+
 static uint8_t  live_buf[2048];
 static size_t   live_buf_n          = 0;
 static uint32_t live_last_flush_ms  = 0;
@@ -222,6 +231,13 @@ static void handleDashCommand(const String& line) {
         Serial.printf("[teensy] timezone set to \"%s\"\n", current_tz);
     } else if (line.startsWith("CFG,")) {
         handleCfgLine(line);   // defined in cloud section below
+    } else if (line == "UPLOAD,CANCEL") {
+        // Dash requested cancel-all. Latch the disabled flag (clears only
+        // on reboot) and signal the in-progress upload loop to bail out at
+        // the next chunk boundary.
+        uploads_disabled = true;
+        if (upload_in_progress) upload_cancel_pending = true;
+        Serial.println(F("[cloud] UPLOAD,CANCEL received — uploads disabled until reboot"));
     } else if (line.length() > 0) {
         Serial.printf("[teensy] unknown dash cmd: %s\n", line.c_str());
     }
@@ -847,11 +863,15 @@ static void openSession() {
 }
 
 // Forward decl — cloud helpers live below this block but closeSession() uses them.
+static constexpr int HTTP_STATUS_CANCELLED = -1;
 static int  httpPost(const char* path, const uint8_t* body, size_t body_len, File32* file_body);
 static bool moveToQueue(const char* src_path);
 static void scanQueue();
 static void emitCloudStatus();
 static void liveStreamAppend(const char* line, size_t n);
+static void emitUploadStart(const char* filename, uint32_t total);
+static void emitUploadProg(uint32_t done);
+static void emitUploadDone(const char* status);
 
 static void closeSession() {
     if (session_file_open) {
@@ -867,21 +887,29 @@ static void closeSession() {
     if (have_file && g_cfg.rec_cl) {
         bool tried_now    = false;
         bool upload_ok    = false;
-        if (g_cfg.stream == 1 && !live_failed_session) {
+        if (g_cfg.stream == 1 && !live_failed_session && !uploads_disabled) {
             // AfterRace mode: try to POST the whole file now.
             File32 f;
             if (f.open(session_path, O_READ)) {
                 const uint32_t sz = f.fileSize();
                 Serial.printf("[cloud] after-race POST %s (%lu bytes)...\n",
                               session_path, (unsigned long)sz);
+                // Filename only — don't ship the full SD path to the dash UI.
+                const char* base = strrchr(session_path, '/');
+                emitUploadStart(base ? base + 1 : session_path, sz);
                 const int status = httpPost("/upload", nullptr, sz, &f);
                 f.close();
                 tried_now = true;
                 upload_ok = (status >= 200 && status < 300);
-                if (upload_ok) {
+                if (status == HTTP_STATUS_CANCELLED) {
+                    emitUploadDone("CANCELLED");
+                    Serial.println(F("[cloud] after-race cancelled by dash"));
+                } else if (upload_ok) {
+                    emitUploadDone("OK");
                     sdFat.remove(session_path);
                     Serial.println(F("[cloud] after-race OK — file deleted"));
                 } else {
+                    emitUploadDone("FAIL");
                     Serial.printf("[cloud] after-race failed (status=%d)\n", status);
                 }
             }
@@ -1052,12 +1080,29 @@ static void urlEncode(const char* in, char* out, size_t outsize) {
     out[o] = '\0';
 }
 
+// Emit upload progress to the dash. file_body==nullptr means live-stream
+// (no modal); otherwise it's a real session/queue file and the dash should
+// show the blocking progress modal.
+// (HTTP_STATUS_CANCELLED + these three forward-decls live up top so closeSession()
+//  in the SD section can call them — main.cpp is plain C++, no auto-prototyper.)
+static void emitUploadStart(const char* filename, uint32_t total) {
+    DASH_SERIAL.printf("UPLOAD,START,%s,%lu\n", filename, (unsigned long)total);
+}
+static void emitUploadProg(uint32_t done) {
+    DASH_SERIAL.printf("UPLOAD,PROG,%lu\n", (unsigned long)done);
+}
+static void emitUploadDone(const char* status) {
+    DASH_SERIAL.printf("UPLOAD,DONE,%s\n", status);
+}
+
 // Single POST primitive. body may be a contiguous buffer (live stream) or a
 // file streamed in fixed-size chunks (after-race / queue). For the file path
 // the caller passes body=nullptr + body_len=total + file=open File32. Returns
-// HTTP status code, or 0 on connect/transport failure.
+// HTTP status code, HTTP_STATUS_CANCELLED on user cancel, or 0 on connect/
+// transport failure.
 static int httpPost(const char* path, const uint8_t* body, size_t body_len,
                     File32* file_body) {
+    if (uploads_disabled)                                   return 0;
     if (!eth_hw_present)                                    return 0;
     if (Ethernet.linkStatus() != LinkON)                    return 0;
     if (g_cfg.host[0] == '\0' || g_cfg.port == 0)           return 0;
@@ -1097,16 +1142,37 @@ static int httpPost(const char* path, const uint8_t* body, size_t body_len,
     if (file_body) {
         // Stream the file in 1 KB chunks. Rewinds the file to the start first.
         if (!file_body->seek(0)) { c.stop(); return 0; }
+
+        upload_in_progress    = true;
+        upload_cancel_pending = false;
         uint8_t chunk[1024];
-        size_t remaining = body_len;
+        size_t  remaining     = body_len;
+        uint32_t done         = 0;
+        uint32_t last_prog_ms = 0;
+        emitUploadProg(0);
         while (remaining > 0 && c.connected()) {
+            // Pump dash commands so an in-flight UPLOAD,CANCEL is observed
+            // without waiting for the post-POST loop tick.
+            pumpDashCommands();
+            if (upload_cancel_pending) {
+                c.stop();
+                upload_in_progress = false;
+                return HTTP_STATUS_CANCELLED;
+            }
             size_t want = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
             const int got = file_body->read(chunk, want);
             if (got <= 0) break;
             const int w   = c.write(chunk, (size_t)got);
-            if (w != got) { c.stop(); return 0; }
+            if (w != got) { c.stop(); upload_in_progress = false; return 0; }
             remaining -= (size_t)got;
+            done      += (size_t)got;
+            if (millis() - last_prog_ms >= 250) {
+                last_prog_ms = millis();
+                emitUploadProg(done);
+            }
         }
+        emitUploadProg(done);
+        upload_in_progress = false;
     } else if (body && body_len > 0) {
         c.write(body, body_len);
     }
@@ -1150,6 +1216,7 @@ static void liveStreamAppend(const char* line, size_t n) {
 }
 
 static void liveStreamMaybeFlush() {
+    if (uploads_disabled) { live_buf_n = 0; return; }
     if (live_buf_n == 0) return;
     if (millis() - live_last_flush_ms < 200) return;
     live_last_flush_ms = millis();
@@ -1233,19 +1300,29 @@ static bool drainOneQueued() {
     const uint32_t sz = f.fileSize();
     Serial.printf("[queue] uploading %s (%lu bytes)...\n",
                   chosen_path, (unsigned long)sz);
+    const char* base = strrchr(chosen_path, '/');
+    emitUploadStart(base ? base + 1 : chosen_path, sz);
     const int status = httpPost("/upload", nullptr, sz, &f);
     f.close();
+    if (status == HTTP_STATUS_CANCELLED) {
+        emitUploadDone("CANCELLED");
+        Serial.printf("[queue] %s cancelled by dash — uploads disabled until reboot\n", chosen_path);
+        return false;
+    }
     if (status >= 200 && status < 300) {
+        emitUploadDone("OK");
         sdFat.remove(chosen_path);
         Serial.printf("[queue] OK — %s deleted\n", chosen_path);
         return true;
     }
+    emitUploadDone("FAIL");
     Serial.printf("[queue] %s POST failed (status=%d) — leaving for next pass\n",
                   chosen_path, status);
     return false;
 }
 
 static void cloudTick() {
+    if (uploads_disabled) return;   // cancel-latched until reboot
     if (recording_active) {
         // Only the live streamer runs during a session — queue walking is
         // strictly between sessions to avoid contending with live POSTs.

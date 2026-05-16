@@ -234,6 +234,22 @@ static bool     sd_session_active  = false;
 static char     sd_session_file[80] = "";
 static uint32_t sd_session_samples = 0;
 
+// Upload modal state — driven by UPLOAD,START/PROG/DONE lines from Teensy.
+// While upload_active, the dash forces PAGE_UPLOAD on top of whatever was
+// showing, and ignores all input except the CANCEL button. CANCEL latches
+// upload_locally_cancelled = true so the dash can show a small reminder that
+// uploads are disabled until the system reboots.
+static bool     upload_active            = false;
+static char     upload_file[64]          = "";
+static uint32_t upload_total             = 0;
+static uint32_t upload_done              = 0;
+static uint8_t  upload_return_page       = 0;        // PAGE_DASH; uint8_t because
+                                                     // enum Page isn't visible up here
+static bool     upload_locally_cancelled = false;   // cleared only on reboot
+static bool     upload_modal_dirty       = false;
+static uint32_t upload_last_draw_ms      = 0;
+static char     upload_result_msg[32]    = "";       // brief banner after DONE
+
 // Cloud state — updated from CLD,<live_ok>,<queue_depth> lines.
 static bool     cloud_live_ok      = false;
 static uint32_t cloud_queue_depth  = 0;
@@ -805,6 +821,7 @@ enum Page : uint8_t {
     PAGE_STATUS        = 6,
     PAGE_TIME_SET      = 7,
     PAGE_WIFI_SCAN     = 8,
+    PAGE_UPLOAD        = 9,   // full-screen modal during file upload; blocks all other input
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -1085,6 +1102,66 @@ static bool parseSdLine(const String& line) {
     return true;
 }
 
+// Pop the modal full-screen, save the current page so we can restore it after.
+static void openUploadModal(const char* filename, uint32_t total) {
+    strncpy(upload_file, filename, sizeof(upload_file) - 1);
+    upload_file[sizeof(upload_file) - 1] = '\0';
+    upload_total       = total;
+    upload_done        = 0;
+    upload_active      = true;
+    upload_modal_dirty = true;
+    upload_result_msg[0] = '\0';
+    // Only remember the return page if we weren't already showing the modal
+    // (back-to-back uploads from queue drain shouldn't lose the original page).
+    if (currentPage != PAGE_UPLOAD) upload_return_page = (uint8_t)currentPage;
+    currentPage     = PAGE_UPLOAD;
+    pageJustEntered = true;
+}
+
+static void closeUploadModal() {
+    upload_active      = false;
+    currentPage        = (Page)upload_return_page;
+    pageJustEntered    = true;
+    settingsDirty      = true;
+    invalidateAll();
+}
+
+static bool parseUploadLine(const String& line) {
+    // UPLOAD,START,<filename>,<total_bytes>
+    // UPLOAD,PROG,<bytes_done>
+    // UPLOAD,DONE,<OK|FAIL|CANCELLED>
+    const int c1 = line.indexOf(',');
+    if (c1 < 0) return false;
+    const int c2 = line.indexOf(',', c1 + 1);
+    const String tag = (c2 >= 0) ? line.substring(c1 + 1, c2) : line.substring(c1 + 1);
+    if (tag == "START") {
+        const int c3 = (c2 >= 0) ? line.indexOf(',', c2 + 1) : -1;
+        if (c3 < 0) return false;
+        const String fn = line.substring(c2 + 1, c3);
+        const uint32_t total = (uint32_t)line.substring(c3 + 1).toInt();
+        char fnBuf[64]; fn.toCharArray(fnBuf, sizeof(fnBuf));
+        openUploadModal(fnBuf, total);
+        return true;
+    }
+    if (tag == "PROG") {
+        if (c2 < 0) return false;
+        upload_done        = (uint32_t)line.substring(c2 + 1).toInt();
+        upload_modal_dirty = true;
+        return true;
+    }
+    if (tag == "DONE") {
+        const String status = (c2 >= 0) ? line.substring(c2 + 1) : String("OK");
+        // Hold the modal up for 800 ms with a status banner so the user
+        // sees the outcome rather than a flash-and-gone.
+        snprintf(upload_result_msg, sizeof(upload_result_msg), "%s", status.c_str());
+        upload_modal_dirty  = true;
+        upload_last_draw_ms = millis();   // start the post-DONE timer
+        upload_done         = upload_total;
+        return true;
+    }
+    return false;
+}
+
 static bool parseCldLine(const String& line) {
     // CLD,<live_ok>,<queue_depth>
     const int c1 = line.indexOf(',');
@@ -1108,6 +1185,7 @@ static bool parseLine(const String& line) {
     if (line.startsWith("SD,"))   return parseSdLine(line);
     if (line.startsWith("CLD,"))  return parseCldLine(line);
     if (line.startsWith("TIME,")) return parseTimeLine(line);
+    if (line.startsWith("UPLOAD,")) return parseUploadLine(line);
     return false;
 }
 static void pumpUart() {
@@ -1164,6 +1242,9 @@ static void openConfigPicker(int track_idx, bool from_auto, bool for_recording =
 static void handleConfigPickerTap(int x, int y);
 static void handleWifiScannerTap(int x, int y);
 static void drawWifiScannerPage();
+static void drawUploadModal();
+static void handleUploadModalTap(int x, int y);
+static bool parseUploadLine(const String& line);
 
 static void handleTouch() {
     int32_t x, y;
@@ -1171,6 +1252,20 @@ static void handleTouch() {
 
     // Keyboard + track picker pages use a tap-only model (with vertical
     // drag for picker scrolling). No swipe-back; CANCEL is the way out.
+    // While an upload is active the modal owns the screen — only its CANCEL
+    // button accepts input. Drop every other touch event.
+    if (currentPage == PAGE_UPLOAD) {
+        if (now && !tt.active) {
+            tt.startX = x; tt.startY = y;
+            tt.lastX  = x; tt.lastY  = y;
+            tt.startMs = millis();
+            tt.active  = true;
+        } else if (!now && tt.active) {
+            handleUploadModalTap(tt.startX, tt.startY);
+            tt.active = false;
+        }
+        return;
+    }
     if (currentPage == PAGE_NUM_KB || currentPage == PAGE_TEXT_KB ||
         currentPage == PAGE_CONFIG_PICKER || currentPage == PAGE_TIME_SET ||
         currentPage == PAGE_WIFI_SCAN) {
@@ -3338,6 +3433,124 @@ static void handleWifiScannerTap(int x, int y) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Upload progress modal — full-screen, blocks all other input. Driven by the
+// Teensy's UPLOAD,START/PROG/DONE lines emitted from httpPost() while it
+// streams a session/queue file. Only escape is the CANCEL button, which
+// emits UPLOAD,CANCEL to the Teensy. After CANCEL, no further uploads will
+// start until the system is power-cycled (the Teensy latches uploads_disabled).
+// ---------------------------------------------------------------------------
+namespace {
+    constexpr int UM_CARD_X = 100, UM_CARD_Y = 110, UM_CARD_W = 600, UM_CARD_H = 260;
+    constexpr int UM_BAR_X  = UM_CARD_X + 30, UM_BAR_Y = UM_CARD_Y + 130;
+    constexpr int UM_BAR_W  = UM_CARD_W - 60, UM_BAR_H = 32;
+    constexpr int UM_BTN_X  = UM_CARD_X + (UM_CARD_W - 220) / 2;
+    constexpr int UM_BTN_Y  = UM_CARD_Y + UM_CARD_H - 70;
+    constexpr int UM_BTN_W  = 220, UM_BTN_H = 56;
+}
+
+static void drawUploadModal() {
+    upload_modal_dirty = false;
+    if (pageJustEntered) {
+        // Dim the whole screen, then draw the card.
+        tft.fillScreen(TFT_BLACK);
+        tft.fillRect(UM_CARD_X, UM_CARD_Y, UM_CARD_W, UM_CARD_H, TFT_NAVY);
+        tft.drawRect(UM_CARD_X,   UM_CARD_Y,   UM_CARD_W,   UM_CARD_H,   TFT_WHITE);
+        tft.drawRect(UM_CARD_X+1, UM_CARD_Y+1, UM_CARD_W-2, UM_CARD_H-2, TFT_WHITE);
+        // Title
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("Uploading session", UM_CARD_X + UM_CARD_W / 2,
+                       UM_CARD_Y + 30);
+        // Static CANCEL button frame
+        tft.fillRect(UM_BTN_X, UM_BTN_Y, UM_BTN_W, UM_BTN_H, TFT_MAROON);
+        tft.drawRect(UM_BTN_X, UM_BTN_Y, UM_BTN_W, UM_BTN_H, TFT_WHITE);
+        tft.drawRect(UM_BTN_X+1, UM_BTN_Y+1, UM_BTN_W-2, UM_BTN_H-2, TFT_WHITE);
+        tft.setTextColor(TFT_WHITE, TFT_MAROON);
+        tft.drawString("CANCEL", UM_BTN_X + UM_BTN_W/2, UM_BTN_Y + UM_BTN_H/2);
+        tft.setTextDatum(textdatum_t::top_left);
+        pageJustEntered = false;
+    }
+
+    // Filename (truncated visually by the padded background).
+    tft.setFont(&fonts::Font2);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextPadding(UM_CARD_W - 40);
+    tft.drawString(upload_file, UM_CARD_X + UM_CARD_W / 2, UM_CARD_Y + 70);
+    tft.setTextPadding(0);
+
+    // Progress bar frame + fill
+    const uint32_t total = upload_total > 0 ? upload_total : 1;
+    const uint32_t done  = upload_done > total ? total : upload_done;
+    const int fillW = (int)((uint64_t)done * (UM_BAR_W - 4) / total);
+    tft.drawRect(UM_BAR_X, UM_BAR_Y, UM_BAR_W, UM_BAR_H, TFT_WHITE);
+    tft.fillRect(UM_BAR_X + 2, UM_BAR_Y + 2, UM_BAR_W - 4, UM_BAR_H - 4, TFT_BLACK);
+    if (fillW > 0)
+        tft.fillRect(UM_BAR_X + 2, UM_BAR_Y + 2, fillW, UM_BAR_H - 4, TFT_GREEN);
+
+    // Bytes / percentage line
+    char line[64];
+    const int pct = (int)((uint64_t)done * 100 / total);
+    if (upload_total >= 1024 * 1024) {
+        snprintf(line, sizeof(line), "%lu.%lu / %lu.%lu MB   %d%%",
+                 (unsigned long)(done  / (1024UL*1024UL)),
+                 (unsigned long)((done  % (1024UL*1024UL)) / 104858UL),   // 0-9 = 1/10 MB
+                 (unsigned long)(total / (1024UL*1024UL)),
+                 (unsigned long)((total % (1024UL*1024UL)) / 104858UL),
+                 pct);
+    } else {
+        snprintf(line, sizeof(line), "%lu / %lu KB   %d%%",
+                 (unsigned long)(done  / 1024UL),
+                 (unsigned long)(total / 1024UL),
+                 pct);
+    }
+    tft.setFont(&fonts::Font4);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextPadding(UM_CARD_W - 40);
+    tft.drawString(line, UM_CARD_X + UM_CARD_W / 2, UM_BAR_Y + UM_BAR_H + 24);
+    tft.setTextPadding(0);
+
+    // Result banner replaces filename area when DONE arrives.
+    if (upload_result_msg[0] != '\0') {
+        uint16_t banner = TFT_GREEN;
+        if (strcmp(upload_result_msg, "FAIL")      == 0) banner = TFT_RED;
+        if (strcmp(upload_result_msg, "CANCELLED") == 0) banner = TFT_ORANGE;
+        tft.setFont(&fonts::Font4);
+        tft.setTextColor(banner, TFT_NAVY);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextPadding(UM_CARD_W - 40);
+        tft.drawString(upload_result_msg, UM_CARD_X + UM_CARD_W / 2, UM_CARD_Y + 70);
+        tft.setTextPadding(0);
+    }
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleUploadModalTap(int x, int y) {
+    // Only the CANCEL button is tappable. Everything else: ignored.
+    if (x >= UM_BTN_X && x <= UM_BTN_X + UM_BTN_W &&
+        y >= UM_BTN_Y && y <= UM_BTN_Y + UM_BTN_H) {
+        if (!upload_locally_cancelled) {
+            Serial.println("UPLOAD,CANCEL");
+            upload_locally_cancelled = true;
+        }
+        // Update button to a 'cancelling...' indication while waiting for
+        // the Teensy's DONE,CANCELLED ack.
+        tft.fillRect(UM_BTN_X, UM_BTN_Y, UM_BTN_W, UM_BTN_H, TFT_DARKGREY);
+        tft.drawRect(UM_BTN_X, UM_BTN_Y, UM_BTN_W, UM_BTN_H, TFT_WHITE);
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("CANCELLING...", UM_BTN_X + UM_BTN_W/2, UM_BTN_Y + UM_BTN_H/2);
+        tft.setTextDatum(textdatum_t::top_left);
+    }
+}
+
 static void handleConfigPickerTap(int x, int y) {
     const TrackInfo& t = TRACKS[cp.track_idx];
     const int n = (int)t.n_configs;
@@ -3900,6 +4113,16 @@ void loop() {
         if (pageJustEntered || wifi_scan_dirty || now - lastDraw >= 250) {
             lastDraw = now;
             drawWifiScannerPage();
+        }
+    } else if (currentPage == PAGE_UPLOAD) {
+        if (pageJustEntered || upload_modal_dirty || now - lastDraw >= 250) {
+            lastDraw = now;
+            drawUploadModal();
+        }
+        // If DONE landed, hold modal for 1 s with the status banner, then close.
+        if (upload_result_msg[0] != '\0' &&
+            (int32_t)(millis() - upload_last_draw_ms) >= 1000) {
+            closeUploadModal();
         }
     }
 }
