@@ -1561,18 +1561,20 @@ static void drawDashPage() {
     }
 
     // ---- REC badge: confirmation that the Teensy actually opened a file. ----
-    // States the badge shows:
-    //   - hidden          when dash thinks recording=false
-    //   - amber "REC ?"   when dash sent REC,1 but Teensy hasn't acked
-    //                     SD,REC,1,... yet (after a brief grace period)
-    //   - red   "REC ● N" when both sides agree and N samples are on disk
-    // Plus a small "Q:N" line below when there's queued upload backlog.
+    // Sits ABOVE the START button in the empty strip just under the RPM bar,
+    // so it doesn't overlap the active-track name (which is drawn below the
+    // TRACK button). Text is Font2 size 1 — same as FIX/SATS/GPS labels.
+    //
+    // States:
+    //   - hidden                  when dash thinks recording=false
+    //   - amber "REC ? no ack"    when dash sent REC,1 but Teensy hasn't
+    //                             acked SD,REC,1,... within a grace window
+    //   - red   "REC ● N"         when both sides agree, N samples on disk
+    // Plus a small cyan "queue: N" replacement when idle + backlog > 0.
     {
         const uint32_t ackGrace = 800;   // ms before "REC ?" appears
         const bool dash_rec  = recording;
         const bool teensy_ok = sd_session_active;
-        // Build a 3-bit state tag so any flip forces a repaint.
-        // bit0=dash_rec, bit1=teensy_ok, bit2=mismatch (warning shown).
         const bool grace_passed = (rec_start_ms != 0) &&
                                   (millis() - rec_start_ms > ackGrace);
         const bool warn = dash_rec && !teensy_ok && grace_passed;
@@ -1582,29 +1584,26 @@ static void drawDashPage() {
         const uint32_t samples = teensy_ok ? sd_session_samples : 0;
         const uint32_t qd      = (!dash_rec) ? cloud_queue_depth : 0;
         if (tag != ld.rec_badge_tag || samples != ld.rec_samples || qd != ld.cld_queue) {
-            constexpr int BX = 30, BY = 305, BW = 220, BH = 30;
-            // Wipe the band first — cheap, 220x60 = 13 KB, < 1 ms even on PSUART.
-            tft.fillRect(BX, BY, BW, 60, bg);
-            tft.setFont(&fonts::Font4);
+            // Band: just below the RPM number's baseline (y=94), above START (y=155).
+            constexpr int BX = 30, BY = 125, BW = 220, BH = 22;
+            tft.fillRect(BX, BY, BW, BH, bg);
+            tft.setFont(&fonts::Font2);
             tft.setTextSize(1);
             tft.setTextDatum(textdatum_t::middle_left);
             if (dash_rec && teensy_ok) {
-                // Red dot + sample count.
-                tft.fillCircle(BX + 10, BY + BH/2, 8, TFT_RED);
+                tft.fillCircle(BX + 6, BY + BH/2, 5, TFT_RED);
                 tft.setTextColor(TFT_WHITE, bg);
                 char buf[24]; snprintf(buf, sizeof(buf), "REC  %lu", (unsigned long)samples);
-                tft.drawString(buf, BX + 28, BY + BH/2);
+                tft.drawString(buf, BX + 18, BY + BH/2);
             } else if (warn) {
-                tft.fillCircle(BX + 10, BY + BH/2, 8, TFT_ORANGE);
+                tft.fillCircle(BX + 6, BY + BH/2, 5, TFT_ORANGE);
                 tft.setTextColor(TFT_ORANGE, bg);
-                tft.drawString("REC ?  (no SD ack)", BX + 28, BY + BH/2);
-            }
-            // Queue depth line under the badge — only when idle + non-zero.
-            if (qd > 0) {
-                tft.setFont(&fonts::Font2);
+                tft.drawString("REC ? no ack", BX + 18, BY + BH/2);
+            } else if (qd > 0) {
+                // Same slot, replacement message when idle with backlog.
                 tft.setTextColor(TFT_CYAN, bg);
                 char qbuf[20]; snprintf(qbuf, sizeof(qbuf), "queue: %lu", (unsigned long)qd);
-                tft.drawString(qbuf, BX, BY + BH + 4);
+                tft.drawString(qbuf, BX, BY + BH/2);
             }
             tft.setTextDatum(textdatum_t::top_left);
             ld.rec_badge_tag = tag;
