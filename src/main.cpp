@@ -76,7 +76,10 @@ namespace {
   HardwareSerial& DASH_SERIAL = Serial3;            // pin 14 (TX3) -> CrowPanel UART0 RX
   constexpr uint32_t GPS_BAUD_PRIMARY  = 38400;     // SparkFun GPS-RTK boards default
   constexpr uint32_t GPS_BAUD_FALLBACK = 9600;      // u-blox factory default
-  constexpr uint32_t DASH_BAUD         = 115200;
+  constexpr uint32_t DASH_BAUD         = 921600;   // up from 115200 — 8× faster for
+                                                  // telemetry + file uploads. Both sides
+                                                  // must agree; if you mix old + new
+                                                  // firmware versions you'll see garbage.
   // NEO-M9N supports 25 Hz max nav rate. We push that hard for high-rate
   // logging and live telemetry. M8-class modules cap at 18 Hz — drop this
   // to 18 if you ever swap chips.
@@ -1288,6 +1291,13 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.begin(115200);
     DASH_SERIAL.begin(DASH_BAUD);
+    // Default Teensy HardwareSerial RX buffer is 64 bytes. At 921 600 baud
+    // that's only ~700 µs of buffering — any loop() block (SD sync, SPI burst,
+    // HTTP POST) blows it. Lift to 2 KB = ~22 ms of slack. Called on Serial3
+    // directly because addMemoryForRead lives on HardwareSerialIMXRT, not on
+    // the HardwareSerial& reference we use as DASH_SERIAL.
+    static uint8_t dashRxBuf[2048];
+    Serial3.addMemoryForRead(dashRxBuf, sizeof(dashRxBuf));
     setSyncProvider(getTeensyTime);
 
     // Wait briefly for USB serial; don't block forever if no host is attached.

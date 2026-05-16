@@ -3789,7 +3789,11 @@ static void drawStatusPage() {
 // Boot — same V3.0 init sequence that worked in PanelTest.ino.
 // ---------------------------------------------------------------------------
 void setup() {
-    Serial.begin(115200);
+    // Default ESP32 Serial RX buffer is 256 bytes; at 921 600 baud that's only
+    // ~2.7 ms of slack. Bump to 4 KB BEFORE begin() so the bigger buffer is
+    // allocated up front — keeps us safe across slow draw frames + WiFi work.
+    Serial.setRxBufferSize(4096);
+    Serial.begin(921600);
     delay(800);
     Serial.printf("\n=== racecar-35 dash crowpanel boot, firmware v%s ===\n",
                   FIRMWARE_VERSION);
