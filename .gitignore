@@ -9,6 +9,11 @@ build/
 *.bin
 *.map
 
+# ...except the firmware payloads we ship for OTA. These are the actual
+# release artifacts dashes download to self-update.
+!firmware/*.bin
+!firmware/*.hex
+
 # Claude Code local config / per-machine state
 .claude/
 
