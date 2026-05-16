@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.19"
+#define FIRMWARE_VERSION "0.1.20"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2310,6 +2310,13 @@ static void wifiKickNtp() {
 static void wifiTickNtp() {
     if (wifi_ntp_done) return;
     if (wifi_state != WS_CONNECTED) return;
+    // Never transmit on UART while a Teensy OTA is in flight. The Teensy is
+    // either receiving HEX lines (each line ACKed via UART) or inside
+    // flash_move() committing the new image. A stray SETTIME would jam the
+    // protocol or arrive mid-flash-rewrite.
+    if (currentPage == PAGE_OTA &&
+        (ota_state == OTA_S_TEENSY_DOWNLOADING ||
+         ota_state == OTA_S_TEENSY_WAITING)) return;
     const time_t t = time(nullptr);
     if (t > 1700000000) {   // sane (year 2023+)
         Serial.printf("SETTIME,%lu\n", (unsigned long)t);
@@ -4136,6 +4143,15 @@ static void otaDoTeensyWaiting() {
     const uint32_t TEENSY_REBOOT_TIMEOUT_MS = ota_teensy_commit_seen ? 30000UL : 180000UL;
     constexpr uint32_t TEENSY_VER_PING_MS   = 1000;
 
+    // Quiet-after-commit window: the Teensy can take several seconds inside
+    // flash_move() to physically copy the staged image into program flash,
+    // and we must not transmit on UART during that period. ANY incoming byte
+    // can fire a UART RX interrupt that vectors through code which may be
+    // mid-rewrite, or simply distract the FlexSPI sequence. After the window
+    // we resume sending VER? once per second, hoping the new image is alive
+    // and answering.
+    constexpr uint32_t QUIET_AFTER_COMMIT_MS = 8000;
+
     if (wait_start == 0) {
         wait_start   = now;
         last_ping_ms = 0;
@@ -4148,10 +4164,15 @@ static void otaDoTeensyWaiting() {
         // we're waiting for.
     }
 
-    // Periodically ask for the version. If the Teensy is still inside
-    // flash_move() or rebooting, this is harmless; once setup()/loop() are
-    // alive, handleDashCommand() answers with VER,teensy,<version>.
-    if (last_ping_ms == 0 || now - last_ping_ms >= TEENSY_VER_PING_MS) {
+    const uint32_t elapsed_since_start = now - wait_start;
+    const bool in_quiet_window =
+        ota_teensy_commit_seen && (elapsed_since_start < QUIET_AFTER_COMMIT_MS);
+
+    // Periodically ask for the version once we're past the quiet window.
+    // Inside the quiet window we ONLY listen — no UART tx. This keeps the
+    // Teensy fully alone while flash_move() is in progress.
+    if (!in_quiet_window &&
+        (last_ping_ms == 0 || now - last_ping_ms >= TEENSY_VER_PING_MS)) {
         Serial.println("VER?");
         Serial.flush();
         last_ping_ms = now;
