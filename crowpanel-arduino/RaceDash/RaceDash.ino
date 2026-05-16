@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.10"
+#define FIRMWARE_VERSION "0.1.11"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4059,44 +4059,53 @@ static void otaDoDownload() {
         http.end();
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
-    ota_total_bytes = (uint32_t)contentLen;
-    ota_done_bytes  = 0;
 
-    if (!Update.begin((size_t)contentLen)) {
-        snprintf(ota_err_msg, sizeof(ota_err_msg), "Update.begin: %s",
-                 Update.errorString());
+    // Download the CrowPanel .bin into PSRAM first, then close HTTPS BEFORE
+    // writing flash. This mirrors the Teensy-hex path and avoids doing LCD
+    // redraws + WiFi/TLS reads + Update.write flash erases all at once. The
+    // previous direct stream-to-Update path could make the RGB panel flicker
+    // badly while flash writes were occurring.
+    uint8_t* binbuf = (uint8_t*)ps_malloc((size_t)contentLen);
+    if (!binbuf) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg),
+                 "PSRAM alloc failed (%d B)", contentLen);
         http.end();
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
 
+    ota_total_bytes = (uint32_t)contentLen;
+    ota_done_bytes  = 0;
     WiFiClient* stream = http.getStreamPtr();
-    uint8_t buf[1024];
+    uint32_t dl_done = 0;
     uint32_t last_draw_ms = millis();
-    while (http.connected() && ota_done_bytes < ota_total_bytes) {
+    while (dl_done < (uint32_t)contentLen) {
         if (ota_cancel_requested) {
-            Update.abort();
-            http.end();
+            free(binbuf); http.end();
             snprintf(ota_err_msg, sizeof(ota_err_msg), "Cancelled by user");
             ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
         }
         const size_t avail = stream->available();
-        if (avail == 0) { delay(2); continue; }
-        const size_t want = avail > sizeof(buf) ? sizeof(buf) : avail;
-        const int got = stream->read(buf, want);
-        if (got <= 0) { delay(2); continue; }
-        const size_t w = Update.write(buf, (size_t)got);
-        if (w != (size_t)got) {
-            snprintf(ota_err_msg, sizeof(ota_err_msg), "Update.write: %s",
-                     Update.errorString());
-            Update.abort();
-            http.end();
-            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+        if (avail == 0) {
+            // If the HTTP socket closed and no buffered data remains, this is
+            // a real truncated download. Otherwise wait for more bytes.
+            if (!http.connected()) {
+                free(binbuf); http.end();
+                snprintf(ota_err_msg, sizeof(ota_err_msg),
+                         "dash download truncated: %lu/%d",
+                         (unsigned long)dl_done, contentLen);
+                ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+            }
+            delay(2); continue;
         }
-        ota_done_bytes += (uint32_t)got;
-        // ~2.5 Hz UI redraw during download. Slower than the human flicker
-        // threshold and reduces the apparent intensity of any small-area
-        // bg-then-text repaint the LCD scan might catch mid-frame.
-        if (millis() - last_draw_ms >= 400) {
+        const size_t want = avail > (uint32_t)contentLen - dl_done
+                            ? (uint32_t)contentLen - dl_done : avail;
+        const int got = stream->read(binbuf + dl_done, want);
+        if (got <= 0) { delay(2); continue; }
+        dl_done += (uint32_t)got;
+        ota_done_bytes = dl_done;
+        // Slow UI updates during download only; flash-write phase below does
+        // not repaint the screen at all.
+        if (millis() - last_draw_ms >= 500) {
             last_draw_ms = millis();
             ota_modal_dirty = true;
             drawOtaModal();
@@ -4104,9 +4113,38 @@ static void otaDoDownload() {
     }
     http.end();
 
+    // Stable one-time transition to APPLYING before flash writes begin.
     ota_state       = OTA_S_APPLYING;
+    ota_done_bytes  = ota_total_bytes;
     ota_modal_dirty = true;
     drawOtaModal();
+
+    if (!Update.begin((size_t)contentLen)) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "Update.begin: %s",
+                 Update.errorString());
+        free(binbuf);
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+
+    // Write to OTA partition from PSRAM. Do NOT redraw the LCD in this loop:
+    // Update.write triggers flash erases/writes, and mixing flash writes with
+    // RGB panel drawing is what caused the hard visible flashing.
+    uint32_t written_total = 0;
+    while (written_total < (uint32_t)contentLen) {
+        const size_t chunk = ((uint32_t)contentLen - written_total) > 4096
+                             ? 4096 : ((uint32_t)contentLen - written_total);
+        const size_t w = Update.write(binbuf + written_total, chunk);
+        if (w != chunk) {
+            snprintf(ota_err_msg, sizeof(ota_err_msg), "Update.write: %s",
+                     Update.errorString());
+            Update.abort();
+            free(binbuf);
+            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+        }
+        written_total += (uint32_t)w;
+        delay(0);   // feed background tasks, but no display work here
+    }
+    free(binbuf);
 
     if (!Update.end(true)) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "Update.end: %s",
