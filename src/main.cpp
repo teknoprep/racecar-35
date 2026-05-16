@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.30"
+#define FIRMWARE_VERSION "0.1.31"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -191,6 +191,11 @@ static uint32_t test_mode_start_ms = 0;
 // immediately. Cleared automatically when the queue empties or when a
 // drain attempt fails (to avoid hammering a dead server).
 static volatile bool drain_queue_now = false;
+
+// Most recent upload failure reason, set by the wupForwardFile / httpPost
+// paths and surfaced to the dash via UPLOAD,DONE,FAIL,<reason>. Empty when
+// the upload succeeded or wasn't attempted.
+static char last_upload_err[96] = "";
 
 // True when the active path is 'WiFi via dash': dash owns the WiFi link and we
 // forward session files to it over UART for cloud upload. Mirrors g_cfg.inet.
@@ -838,22 +843,41 @@ static bool sdReady() { return sd_card_status == SD_CARD_READY; }
 
 static void detectSD() {
     sd_total_mb = sd_free_mb = 0;
-    if (sdFat.begin(SdioConfig(FIFO_SDIO))) {
+
+    // SDIO bring-up is occasionally flaky on this Teensy + card combination.
+    // Some cards need a brief power/init settle before sdFat.begin() succeeds,
+    // especially when the card was inserted while the Teensy was already
+    // running. Try up to 4 times with short delays before reporting failure.
+    bool mounted = false;
+    for (int attempt = 0; attempt < 4 && !mounted; ++attempt) {
+        if (sdFat.begin(SdioConfig(FIFO_SDIO))) {
+            mounted = true;
+            break;
+        }
+        delay(50);
+    }
+
+    if (mounted) {
         sd_card_status = SD_CARD_READY;
         sd_total_mb = (uint32_t)(sdFat.card()->sectorCount() / 2048ULL);
         const uint64_t freeSects = (uint64_t)sdFat.vol()->freeClusterCount()
                                  * sdFat.vol()->sectorsPerCluster();
         sd_free_mb = (uint32_t)(freeSects / 2048ULL);
-    } else {
-        // Try card-only init — hardware responding means FS is missing/corrupt.
-        SdioCard rawCard;
+        return;
+    }
+
+    // Mount failed. Probe the raw card a couple of times to distinguish
+    // 'no card present' from 'card present but FS unmountable'.
+    SdioCard rawCard;
+    for (int attempt = 0; attempt < 3; ++attempt) {
         if (rawCard.begin(SdioConfig(FIFO_SDIO))) {
             sd_card_status = SD_CARD_NEEDS_FMT;
             sd_total_mb = (uint32_t)(rawCard.sectorCount() / 2048ULL);
-        } else {
-            sd_card_status = SD_CARD_NONE;
+            return;
         }
+        delay(50);
     }
+    sd_card_status = SD_CARD_NONE;
 }
 
 static void emitSdStatus() {
@@ -1000,7 +1024,7 @@ static void emitCloudStatus();
 static void liveStreamAppend(const char* line, size_t n);
 static void emitUploadStart(const char* filename, uint32_t total);
 static void emitUploadProg(uint32_t done);
-static void emitUploadDone(const char* status);
+static void emitUploadDone(const char* status, const char* reason = nullptr);
 
 static void closeSession() {
     if (session_file_open) {
@@ -1046,8 +1070,16 @@ static void closeSession() {
                     sdFat.remove(session_path);
                     Serial.println(F("[cloud] after-race OK — file deleted"));
                 } else {
-                    emitUploadDone("FAIL");
-                    Serial.printf("[cloud] after-race failed (status=%d)\n", status);
+                    char reason[96];
+                    if (last_upload_err[0])
+                        snprintf(reason, sizeof(reason), "%s", last_upload_err);
+                    else if (status > 0)
+                        snprintf(reason, sizeof(reason), "http %d", status);
+                    else
+                        snprintf(reason, sizeof(reason), "no route");
+                    emitUploadDone("FAIL", reason);
+                    Serial.printf("[cloud] after-race failed (status=%d reason=%s)\n",
+                                  status, reason);
                 }
             }
         }
@@ -1232,8 +1264,12 @@ static void emitUploadStart(const char* filename, uint32_t total) {
 static void emitUploadProg(uint32_t done) {
     DASH_SERIAL.printf("UPLOAD,PROG,%lu\n", (unsigned long)done);
 }
-static void emitUploadDone(const char* status) {
-    DASH_SERIAL.printf("UPLOAD,DONE,%s\n", status);
+static void emitUploadDone(const char* status, const char* reason) {
+    if (reason && reason[0]) {
+        DASH_SERIAL.printf("UPLOAD,DONE,%s,%s\n", status, reason);
+    } else {
+        DASH_SERIAL.printf("UPLOAD,DONE,%s\n", status);
+    }
 }
 
 // Single POST primitive. body may be a contiguous buffer (live stream) or a
@@ -1243,21 +1279,23 @@ static void emitUploadDone(const char* status) {
 // transport failure.
 static int httpPost(const char* path, const uint8_t* body, size_t body_len,
                     File32* file_body) {
-    if (uploads_disabled)                                   return 0;
-    if (!eth_hw_present)                                    return 0;
-    if (Ethernet.linkStatus() != LinkON)                    return 0;
-    if (g_cfg.host[0] == '\0' || g_cfg.port == 0)           return 0;
-    if (g_cfg.proto != 0) {
-        // HTTPS / FTP not yet wired. Skip silently — these are queued and
-        // will sit on the SD card until firmware grows the protocols.
+    auto fail = [](const char* why) -> int {
+        snprintf(last_upload_err, sizeof(last_upload_err), "%s", why);
         return 0;
+    };
+    if (uploads_disabled)                                   return fail("uploads disabled");
+    if (!eth_hw_present)                                    return fail("no W5500 detected");
+    if (Ethernet.linkStatus() != LinkON)                    return fail("Ethernet link down");
+    if (g_cfg.host[0] == '\0' || g_cfg.port == 0)           return fail("cloud host/port unset");
+    if (g_cfg.proto != 0) {
+        return fail("Teensy supports only HTTP (use WiFi for HTTPS)");
     }
 
     EthernetClient c;
-    c.setConnectionTimeout(800);   // ms; covers DNS + 3-way handshake on LAN
+    c.setConnectionTimeout(800);
     if (!c.connect(g_cfg.host, g_cfg.port)) {
         Serial.printf("[cloud] connect %s:%u failed\n", g_cfg.host, g_cfg.port);
-        return 0;
+        return fail("TCP connect failed");
     }
 
     // Build a single header blob and write in one go so the W5500 sends a
@@ -1383,9 +1421,13 @@ static bool wupReadLineTimeout(char* out, size_t outsize, uint32_t timeout_ms) {
 
 static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
                           size_t body_len, File32* file_body) {
-    if (uploads_disabled)                                   return 0;
-    if (!file_body)                                         return 0;
-    if (g_cfg.host[0] == '\0' || g_cfg.port == 0)           return 0;
+    auto fail = [](const char* why) -> int {
+        snprintf(last_upload_err, sizeof(last_upload_err), "%s", why);
+        return 0;
+    };
+    if (uploads_disabled)                                   return fail("uploads disabled");
+    if (!file_body)                                         return fail("no file handle");
+    if (g_cfg.host[0] == '\0' || g_cfg.port == 0)           return fail("cloud host/port unset");
 
     const char* base = strrchr(path, '/');
     base = base ? base + 1 : path;
@@ -1402,21 +1444,23 @@ static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
     char reply[160];
     if (!wupReadLineTimeout(reply, sizeof(reply), 5000)) {
         Serial.println(F("[wup] no WUP,READY — dash silent"));
-        return 0;
+        return fail("no WUP,READY (dash silent)");
     }
     if (strncmp(reply, "WUP,NACK", 8) == 0) {
         Serial.printf("[wup] dash NACK: %s\n", reply);
-        return 0;
+        // reply looks like 'WUP,NACK,<reason>'; surface the reason only.
+        const char* r = strchr(reply + 8, ',');
+        return fail(r ? r + 1 : reply);
     }
     if (strncmp(reply, "WUP,READY", 9) != 0) {
         Serial.printf("[wup] unexpected reply: %s\n", reply);
-        return 0;
+        return fail("bad WUP handshake reply");
     }
 
     // Stream the file as NDJSON lines. We trust each on-disk line is already
     // newline-terminated; we strip the trailing '\n' and wrap it as
     // 'WUP,L,<line>\n' so the dash can count bytes vs the original size.
-    if (!file_body->seek(0)) return 0;
+    if (!file_body->seek(0)) return fail("SD seek failed");
 
     upload_in_progress    = true;
     upload_cancel_pending = false;
@@ -1444,11 +1488,15 @@ static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
             if (!wupReadLineTimeout(ack_buf, sizeof(ack_buf), 3000)) {
                 Serial.printf("[wup] ACK timeout at line %lu\n", (unsigned long)lines);
                 upload_in_progress = false;
+                snprintf(last_upload_err, sizeof(last_upload_err),
+                         "ACK timeout at line %lu", (unsigned long)lines);
                 return 0;
             }
             if (ack_buf[0] != 'U') {
                 Serial.printf("[wup] unexpected ACK: %s\n", ack_buf);
                 upload_in_progress = false;
+                snprintf(last_upload_err, sizeof(last_upload_err),
+                         "bad ACK: %.40s", ack_buf);
                 return 0;
             }
             lines++;
@@ -1483,17 +1531,25 @@ static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
     if (!wupReadLineTimeout(reply, sizeof(reply), 120000)) {
         Serial.println(F("[wup] no WUP,RESULT — dash silent during POST"));
         upload_in_progress = false;
-        return 0;
+        return fail("no POST result from dash");
     }
     upload_in_progress = false;
     Serial.printf("[wup] result: %s\n", reply);
     if (strncmp(reply, "WUP,RESULT,OK", 13) == 0) {
-        // Parse optional status code after the OK,
         const char* p = strchr(reply + 13, ',');
         const int  http_status = p ? atoi(p + 1) : 200;
         return http_status >= 200 ? http_status : 200;
     }
-    return 0;   // FAIL: caller will queue
+    // reply is 'WUP,RESULT,FAIL,<reason>' (or older 'WUP,RESULT,FAIL'). Pull
+    // the reason out so the dash UPLOAD modal can show what actually broke.
+    if (strncmp(reply, "WUP,RESULT,FAIL", 15) == 0) {
+        const char* r = (reply[15] == ',') ? reply + 16 : "dash POST failed";
+        snprintf(last_upload_err, sizeof(last_upload_err), "%s", r);
+    } else {
+        snprintf(last_upload_err, sizeof(last_upload_err),
+                 "bad RESULT: %.40s", reply);
+    }
+    return 0;
 }
 
 // Pick the right upload mechanism based on inet mode. Ethernet uses the local
@@ -1501,6 +1557,7 @@ static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
 // has already been called by the session-end / queue-walker code paths so the
 // dash modal is already up.
 static int cloudUploadFile(const char* path, size_t body_len, File32* f) {
+    last_upload_err[0] = '\0';   // reset before each attempt
     if (wifiInetActive()) {
         return wupForwardFile(path, nullptr, body_len, f);
     }
@@ -1626,35 +1683,40 @@ static bool drainOneQueued() {
         Serial.printf("[queue] OK — %s deleted\n", chosen_path);
         return true;
     }
-    emitUploadDone("FAIL");
-    Serial.printf("[queue] %s POST failed (status=%d) — leaving for next pass\n",
-                  chosen_path, status);
+    char reason[96];
+    if (last_upload_err[0])
+        snprintf(reason, sizeof(reason), "%s", last_upload_err);
+    else if (status > 0)
+        snprintf(reason, sizeof(reason), "http %d", status);
+    else
+        snprintf(reason, sizeof(reason), "no route");
+    emitUploadDone("FAIL", reason);
+    Serial.printf("[queue] %s POST failed (status=%d reason=%s) — leaving for next pass\n",
+                  chosen_path, status, reason);
     return false;
 }
 
 static void cloudTick() {
     if (uploads_disabled) return;   // cancel-latched until reboot
     if (recording_active) {
-        // Only the live streamer runs during a session — queue walking is
-        // strictly between sessions to avoid contending with live POSTs.
-        // In WiFi mode liveStreamMaybeFlush() is a no-op (forced AfterRace).
+        // Live streamer runs during a session (a no-op in WiFi mode — we
+        // force AfterRace). No queue work while recording.
         liveStreamMaybeFlush();
         return;
     }
-    // Ethernet path requires a real link. WiFi-via-dash routes through the
-    // dash, so we don't gate on Ethernet hardware here — if the dash NACKs
-    // (no WiFi etc.) wupForwardFile returns 0 and the file stays queued.
+    // Manual-only drain. Auto-drain has been disabled: the queue walker
+    // only runs when the dash UPLOAD button sets drain_queue_now = true.
+    // Ethernet path also requires a real link before we let it try.
+    if (!drain_queue_now) return;
     if (!wifiInetActive() &&
-        (!eth_hw_present || Ethernet.linkStatus() != LinkON)) return;
+        (!eth_hw_present || Ethernet.linkStatus() != LinkON)) {
+        drain_queue_now = false;
+        return;
+    }
     if (queue_depth == 0) {
         drain_queue_now = false;
         return;
     }
-
-    static uint32_t last_drain_ms = 0;
-    // Auto-drain every 10 s OR immediately when the dash UPLOAD button asked.
-    if (!drain_queue_now && millis() - last_drain_ms < 10000) return;
-    last_drain_ms = millis();
 
     const bool ok = drainOneQueued();
     if (ok) {
@@ -1663,8 +1725,8 @@ static void cloudTick() {
         // Leave drain_queue_now set: the next cloudTick will immediately
         // start the next file, and the next, until queue_depth hits 0.
     } else {
-        // Failed upload — stop rapid drain so we don't hammer a dead server.
-        // The normal 10 s auto-walker still gets retried.
+        // Failed upload — stop draining so we don't hammer a dead server.
+        // User can tap UPLOAD again to retry once the cause is fixed.
         drain_queue_now = false;
     }
 }
@@ -2045,12 +2107,12 @@ void loop() {
 
     // Periodic SD card recheck. SDIO occasionally misses a card on boot —
     // particularly if the card was inserted while the Teensy was already
-    // powered. Poll every 10 s while we don't have a healthy mount, and
+    // powered. Poll every 3 s while we don't have a healthy mount, and
     // re-emit SD,* so the dash UI updates. Don't poke a working card.
     static uint32_t last_sd_poll_ms = 0;
     if ((sd_card_status == SD_CARD_NONE || sd_card_status == SD_CARD_ERROR) &&
         !recording_active &&
-        millis() - last_sd_poll_ms >= 10000) {
+        millis() - last_sd_poll_ms >= 3000) {
         last_sd_poll_ms = millis();
         const SdCardStatus before = sd_card_status;
         detectSD();

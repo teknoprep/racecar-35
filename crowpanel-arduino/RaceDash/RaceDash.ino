@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.30"
+#define FIRMWARE_VERSION "0.1.31"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4112,8 +4112,8 @@ static void drawUploadModal() {
     // Result banner replaces filename area when DONE arrives.
     if (upload_result_msg[0] != '\0') {
         uint16_t banner = TFT_GREEN;
-        if (strcmp(upload_result_msg, "FAIL")      == 0) banner = TFT_RED;
-        if (strcmp(upload_result_msg, "CANCELLED") == 0) banner = TFT_ORANGE;
+        if (strncmp(upload_result_msg, "FAIL", 4)      == 0) banner = TFT_RED;
+        if (strncmp(upload_result_msg, "CANCELLED", 9) == 0) banner = TFT_ORANGE;
         tft.setFont(&fonts::Font4);
         tft.setTextColor(banner, TFT_NAVY);
         tft.setTextDatum(textdatum_t::middle_center);
