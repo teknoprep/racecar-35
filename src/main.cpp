@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.7"
+#define FIRMWARE_VERSION "0.1.8"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -1402,12 +1402,17 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.begin(115200);
     DASH_SERIAL.begin(DASH_BAUD);
-    // Default Teensy HardwareSerial RX buffer is 64 bytes. At 921 600 baud
-    // that's only ~700 µs of buffering — any loop() block (SD sync, SPI burst,
-    // HTTP POST) blows it. Lift to 2 KB = ~22 ms of slack. Called on Serial3
-    // directly because addMemoryForRead lives on HardwareSerialIMXRT, not on
-    // the HardwareSerial& reference we use as DASH_SERIAL.
-    static uint8_t dashRxBuf[2048];
+    // RX buffer sizing matters BIG TIME for Phase 2b firmware updates:
+    // FlasherX's flash_write_block() does a 4 KB sector erase whenever the
+    // staged image crosses a sector boundary, and that erase can stall the
+    // read loop for ~25-100 ms. At 921 600 baud that's 2.3-9.2 KB streaming
+    // in while we can't read — a 2 KB buffer overflows badly, losing chars
+    // mid-line so the next hex record fails parse + FlasherX aborts the OTA.
+    //
+    // 32 KB gives ~348 ms of margin: bigger than any plausible flash stall.
+    // Plenty of RAM2 to spare (we have 511 KB free for malloc/new). Bonus:
+    // also more resilient to any loop() jitter from SD sync / SPI bursts.
+    static uint8_t dashRxBuf[32768];
     Serial3.addMemoryForRead(dashRxBuf, sizeof(dashRxBuf));
     setSyncProvider(getTeensyTime);
 

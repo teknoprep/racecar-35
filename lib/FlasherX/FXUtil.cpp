@@ -291,7 +291,10 @@ void update_firmware_noprompt( Stream *in, Stream *out,
   while (!hex.eof)  {
     read_ascii_line( in, line, sizeof(line) );
     if (parse_hex_line( (const char*)line, hex.data, &hex.addr, &hex.num, &hex.code ) == 0) {
-      out->printf( "FX: abort - bad hex line %s\n", line );
+      out->printf( "FX: abort - bad hex line @%d: '%s'\n", hex.lines, line );
+      // Echo a structured error back to the host so the dash modal can
+      // show 'bad_hex_line' instead of a generic timeout.
+      in->printf( "FW,ERR,bad_hex_line@%d\n", hex.lines );
       return;
     }
     else if (process_hex_record( &hex ) != 0) {
