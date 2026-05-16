@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.32"
+#define FIRMWARE_VERSION "0.1.33"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -324,6 +324,12 @@ static void handleDashCommand(const String& line) {
                           (unsigned long)(millis() - test_mode_start_ms));
             DASH_SERIAL.println(F("TEST,0"));
         }
+    } else if (line.startsWith("DBG,")) {
+        // Dash diagnostic relay. Dash doesn't have its own USB serial that's
+        // easy to monitor (UART0 / CH340 is the bridge to us), so it routes
+        // DBG,<text> lines through and we forward to our USB CDC console. Use
+        // `pio device monitor` on /dev/ttyACM0 to see dash-side state.
+        Serial.printf("[dash-dbg] %s\n", line.substring(4).c_str());
     } else if (line == "QUEUE,DRAIN") {
         // Dash UPLOAD button: kick the queue walker immediately instead of
         // waiting for the next 10 s cloudTick. Multiple presses are idempotent.
@@ -1471,7 +1477,10 @@ static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
     DASH_SERIAL.flush();
 
     char reply[160];
-    if (!wupReadLineTimeout(reply, sizeof(reply), 5000)) {
+    // Be generous with the handshake window. The dash may be mid-frame redraw
+    // when WUP,START arrives, and a fresh PSRAM alloc + WiFi/state checks can
+    // also add latency. 10 s is still well below any reasonable user wait.
+    if (!wupReadLineTimeout(reply, sizeof(reply), 10000)) {
         Serial.println(F("[wup] no WUP,READY — dash silent"));
         return fail("no WUP,READY (dash silent)");
     }

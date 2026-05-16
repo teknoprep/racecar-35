@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.32"
+#define FIRMWARE_VERSION "0.1.33"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2648,6 +2648,8 @@ static int wupDoCloudPost(int* http_status_out, char* err_out, size_t err_sz) {
     snprintf(url, sizeof(url), "%s://%s:%u/upload",
              s.cloud_protocol == 1 ? "https" : "http",
              s.cloud_host, (unsigned)s.cloud_port);
+    Serial.printf("DBG,wup_post_begin url=%s bytes=%u\n",
+                  url, (unsigned)wup_written);
 
     WiFiClientSecure secureClient;
     WiFiClient       plainClient;
@@ -2672,8 +2674,20 @@ static int wupDoCloudPost(int* http_status_out, char* err_out, size_t err_sz) {
     http.addHeader("X-Track-Name", wup_track);
     const int code = http.POST(wup_buf, wup_written);
     if (http_status_out) *http_status_out = code;
+    Serial.printf("DBG,wup_post_end code=%d\n", code);
     if (code <= 0) {
         snprintf(err_out, err_sz, "http error %d", code);
+    } else if (code < 200 || code >= 300) {
+        // Non-2xx is a failure even though the HTTP roundtrip succeeded. Pull
+        // a snippet of the server response so the dash can show why.
+        String body = http.getString();
+        if (body.length() > 0) {
+            char snippet[48];
+            snprintf(snippet, sizeof(snippet), "%s", body.c_str());
+            snprintf(err_out, err_sz, "http %d: %s", code, snippet);
+        } else {
+            snprintf(err_out, err_sz, "http %d", code);
+        }
     }
     http.end();
     return code;
@@ -2684,6 +2698,14 @@ static bool parseWupLine(const String& line) {
     const String tail = line.substring(4);
 
     if (tail.startsWith("START,")) {
+        // Diagnostic: report receipt + dash-side state. Routed to Teensy USB
+        // via our DBG relay so the developer can see exactly what's happening
+        // when an upload kicks off.
+        Serial.printf("DBG,wup_recv tail_len=%u inet=%u wifi=%u rxBufLen=%u\n",
+                      (unsigned)tail.length(),
+                      (unsigned)s.internet_mode,
+                      (unsigned)wifi_state,
+                      (unsigned)rxBuf.length());
         wupFree();
         const String s2 = tail.substring(6);
         int p1 = s2.indexOf(',');
