@@ -57,6 +57,12 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+
+// Compile-time firmware version. Increment via the release process when
+// publishing new firmware artifacts to firmware/manifest.json on main.
+// Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
+#define FIRMWARE_VERSION "0.1.0"
+
 #include <SPI.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
@@ -145,6 +151,7 @@ static struct {
     char     api_key[64] = "";
     bool     rec_sd     = true;
     bool     rec_cl     = false;
+    uint8_t  inet       = 0;     // 0=Ethernet, 1=WiFi (mirror of dash setting)
 } g_cfg;
 
 static uint8_t  live_buf[2048];
@@ -1010,6 +1017,13 @@ static void handleCfgLine(const String& line) {
     else if (key == "cl_key")   { strncpy(g_cfg.api_key, val.c_str(), sizeof(g_cfg.api_key)-1); g_cfg.api_key[sizeof(g_cfg.api_key)-1]=0; }
     else if (key == "rec_sd")   { g_cfg.rec_sd = (val.toInt() != 0); }
     else if (key == "rec_cl")   { g_cfg.rec_cl = (val.toInt() != 0); }
+    else if (key == "inet") {
+        // Internet routing mode. 0=Ethernet (Teensy owns the network),
+        // 1=WiFi (CrowPanel owns it). Phase 1: only relevant for NTP — in
+        // WiFi mode the dash pushes SETTIME and we skip our own NTP retries.
+        // Phase 3 will route cloud uploads accordingly.
+        g_cfg.inet = (uint8_t)val.toInt();
+    }
     else {
         Serial.printf("[cfg] unknown key %s\n", key.c_str());
         return;
@@ -1279,7 +1293,10 @@ void setup() {
     // Wait briefly for USB serial; don't block forever if no host is attached.
     unsigned long start = millis();
     while (!Serial && millis() - start < 1500) { /* spin */ }
-    Serial.println(F("racecar-35 dash: boot"));
+    Serial.printf("racecar-35 dash teensy boot, firmware v%s\n", FIRMWARE_VERSION);
+    // Tell the dash what firmware we're running so it can show it in settings
+    // and compare against GitHub's manifest.json when "Check for updates" runs.
+    DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
 
     // Tach input on pin 9 (FreqMeasure uses FlexPWM input capture on T4.x).
     // Must be called after Serial.begin to avoid weird interactions.

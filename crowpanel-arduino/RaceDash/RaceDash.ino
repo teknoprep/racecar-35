@@ -13,6 +13,15 @@
 
 #include <Wire.h>
 #include <PCA9557.h>
+#include <WiFi.h>          // ESP32-S3 built-in WiFi (Phase 1: NTP only; later: cloud + OTA)
+#include <esp_log.h>       // for esp_log_level_set("wifi", ESP_LOG_NONE)
+
+// Compile-time firmware version. Bump via the release process when shipping
+// a new build (eventually automated by scripts/release.sh + GitHub Action).
+// Settings page displays it; "Check for updates" compares to manifest.json
+// from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
+#define FIRMWARE_VERSION "0.1.0"
+
 #include <Preferences.h>
 #include <time.h>
 #include <driver/i2c.h>           // I2C_NUM_1 for Touch_GT911 config
@@ -27,7 +36,12 @@
 // be visible BEFORE the first function. Real definitions follow below.
 // ---------------------------------------------------------------------------
 enum SettingId : uint8_t {
-    ST_RPM_MIN = 0, ST_RPM_MAX, ST_ALERTS,
+    // Internet block at the very top — picks whether all internet-bound
+    // operations route via Teensy/W5500 (Ethernet) or CrowPanel/ESP32-S3 WiFi.
+    // SSID/pass/status rows are hidden when Mode=Ethernet.
+    ST_INET_MODE = 0,
+    ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
+    ST_RPM_MIN, ST_RPM_MAX, ST_ALERTS,
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
     ST_AM_RPM, ST_AM_COL, ST_AM_HZ,
     // Coolant temp warn-color + oil PSI warn-color. Each has a master
@@ -49,6 +63,12 @@ enum SettingId : uint8_t {
     ST_COUNT
 };
 struct NumBounds { uint16_t lo, hi, step; };
+
+// WiFi state machine values (full definition lives next to its tick function
+// further down). Forward-declared here because the Arduino IDE / arduino-cli
+// auto-injects function prototypes at the top of the TU — anything used in
+// a function signature must be visible before the first function.
+enum WifiState : uint8_t { WS_OFF = 0, WS_CONNECTING, WS_CONNECTED, WS_FAILED };
 
 // Single key descriptor for both numeric and text keyboards.
 struct KbKey {
@@ -308,6 +328,13 @@ struct Settings {
     char     cloud_auth_user[64] = "";   // user email (X-User-Email)
     char     cloud_auth_pass[96] = "";   // API key (X-API-Key); masked on display
 
+    // Internet routing. 0=Ethernet (Teensy/W5500), 1=WiFi (CrowPanel ESP32-S3).
+    // Phase 1: controls NTP path + (future) firmware update path. Cloud upload
+    // routing still flows through Teensy/Ethernet regardless until Phase 3.
+    uint8_t  internet_mode    = 0;       // default Ethernet
+    char     wifi_ssid[33]    = "";      // 802.11 max 32 + NUL
+    char     wifi_pass[64]    = "";      // WPA2 PSK max 63 + NUL
+
     // Engine sensor display + warn thresholds (drawn bottom-left on the dash).
     // show_*  : false hides that line entirely from the dash.
     // *_warn  : threshold past which the value flips to the warn colour.
@@ -353,6 +380,8 @@ const char* const STREAM_NAMES[]   = { "Live Stream", "After Race" };
 constexpr int N_STREAM   = 2;
 const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt" };
 constexpr int N_SENSOR_TYPE = 2;
+const char* const INET_MODE_NAMES[]   = { "Ethernet", "WiFi" };
+constexpr int N_INET_MODE   = 2;
 
 // ---------------------------------------------------------------------------
 // Time zones with DST rules.
@@ -659,6 +688,9 @@ static void loadSettings() {
     // shorter than the new buffer that's fine; nothing extra to do.
     s.auto_select_track  = prefs.getBool  ("auto_trk", s.auto_select_track);
     s.timezone_idx       = prefs.getUChar ("tz",       s.timezone_idx);
+    s.internet_mode      = prefs.getUChar ("inet",     s.internet_mode);
+    prefs.getString      ("wssid",    s.wifi_ssid, sizeof(s.wifi_ssid));
+    prefs.getString      ("wpass",    s.wifi_pass, sizeof(s.wifi_pass));
     s.show_coolant       = prefs.getBool  ("s_temp",   s.show_coolant);
     s.coolant_warn_f     = prefs.getUShort("t_warn",   s.coolant_warn_f);
     s.coolant_warn_col   = prefs.getUChar ("t_col",    s.coolant_warn_col);
@@ -714,6 +746,9 @@ static void saveSettings() {
     // (sendCfgToTeensy() is called at end of this function so any save also
     // re-syncs the cloud config to the Teensy.)
     prefs.putUChar ("tz",       s.timezone_idx);
+    prefs.putUChar ("inet",     s.internet_mode);
+    prefs.putString("wssid",    s.wifi_ssid);
+    prefs.putString("wpass",    s.wifi_pass);
     prefs.putBool  ("s_temp",   s.show_coolant);
     prefs.putUShort("t_warn",   s.coolant_warn_f);
     prefs.putUChar ("t_col",    s.coolant_warn_col);
@@ -742,6 +777,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,cl_key,%s\n",    s.cloud_auth_pass);
     Serial.printf("CFG,rec_sd,%d\n",    (int)s.record_sd);
     Serial.printf("CFG,rec_cl,%d\n",    (int)s.record_cloud);
+    Serial.printf("CFG,inet,%u\n",      (unsigned)s.internet_mode);
 }
 
 static void saveLastTrack(int idx, const char* display_name = nullptr) {
@@ -1842,9 +1878,15 @@ struct SettingRow {
     // ENUM = cycle through string list (PROTOCOL_NAMES, STREAM_NAMES).
     // TEXT = read-only display today; tap will open a popup keyboard once
     //        that's implemented (next iteration).
-    enum Kind { NUMERIC, TOGGLE, COLOR, ENUM, TEXT, ACTION } kind;
+    // INFO = read-only display row (no controls, no tap action). Used today
+    // for the WiFi connection status line in the Internet block.
+    enum Kind { NUMERIC, TOGGLE, COLOR, ENUM, TEXT, ACTION, INFO } kind;
 };
 static const SettingRow ROWS[ST_COUNT] = {
+    { ST_INET_MODE,    "Internet",              SettingRow::ENUM    },
+    { ST_WIFI_SSID,    "WiFi network (SSID)",   SettingRow::TEXT    },
+    { ST_WIFI_PASS,    "WiFi password",         SettingRow::TEXT    },
+    { ST_WIFI_STATUS,  "WiFi status",           SettingRow::INFO    },
     { ST_RPM_MIN,    "Min RPM display",      SettingRow::NUMERIC },
     { ST_RPM_MAX,    "Max RPM display",      SettingRow::NUMERIC },
     { ST_ALERTS,     "Enable RPM alerts",    SettingRow::TOGGLE  },
@@ -2015,8 +2057,134 @@ static bool boolValueOnState(SettingId id) {
         default:             return false;
     }
 }
+// ---------------------------------------------------------------------------
+// WiFi state machine — entire lifecycle of the ESP32-S3 radio. Driven by
+// the Internet=WiFi setting. Periodic tick from loop() at 1 Hz; only stays
+// up when mode==WiFi and an SSID is set. NTP runs once after successful
+// connect and pushes SETTIME,<epoch> to the Teensy (which sets its RTC).
+// (WifiState enum is forward-declared up top — see auto-prototyper note.)
+// ---------------------------------------------------------------------------
+static WifiState wifi_state          = WS_OFF;
+static char      wifi_ip[16]         = "";
+static uint32_t  wifi_state_ms       = 0;
+static bool      wifi_ntp_done       = false;   // set true once we pushed SETTIME
+static char      wifi_status_buf[64] = "";       // display string for INFO row
+
+static void formatWifiStatus() {
+    switch (wifi_state) {
+        case WS_OFF:        snprintf(wifi_status_buf, sizeof(wifi_status_buf),
+                                  s.internet_mode == 1 ? "idle (no SSID)" : "disabled");
+                              break;
+        case WS_CONNECTING: snprintf(wifi_status_buf, sizeof(wifi_status_buf),
+                                  "connecting to %s...", s.wifi_ssid);
+                              break;
+        case WS_CONNECTED:  snprintf(wifi_status_buf, sizeof(wifi_status_buf),
+                                  "connected: %s", wifi_ip);
+                              break;
+        case WS_FAILED:     snprintf(wifi_status_buf, sizeof(wifi_status_buf),
+                                  "failed — retry in 30s"); break;
+    }
+}
+
+static void setWifiState(WifiState st) {
+    if (st == wifi_state) return;
+    wifi_state    = st;
+    wifi_state_ms = millis();
+    formatWifiStatus();
+    settingsDirty = true;   // INFO row refresh
+}
+
+static void wifiKickNtp() {
+    if (wifi_ntp_done) return;
+    configTime(0, 0, "0.pool.ntp.org", "1.pool.ntp.org", "time.google.com");
+}
+
+static void wifiTickNtp() {
+    if (wifi_ntp_done) return;
+    if (wifi_state != WS_CONNECTED) return;
+    const time_t t = time(nullptr);
+    if (t > 1700000000) {   // sane (year 2023+)
+        Serial.printf("SETTIME,%lu\n", (unsigned long)t);
+        rtc_epoch     = (uint32_t)t;
+        wifi_ntp_done = true;
+        Serial.printf("[wifi-ntp] synced epoch=%lu\n", (unsigned long)t);
+    }
+}
+
+static void wifiTick() {
+    static uint32_t last_tick_ms = 0;
+    if (millis() - last_tick_ms < 1000) { wifiTickNtp(); return; }
+    last_tick_ms = millis();
+
+    if (s.internet_mode != 1) {
+        if (wifi_state != WS_OFF) {
+            WiFi.disconnect(true, true);
+            WiFi.mode(WIFI_OFF);   // ESP32 wifi_mode_t (radio off), NOT our WS_OFF state
+            wifi_ip[0]    = '\0';
+            wifi_ntp_done = false;
+            setWifiState(WS_OFF);
+        }
+        return;
+    }
+
+    if (s.wifi_ssid[0] == '\0') {
+        if (wifi_state != WS_OFF) {
+            WiFi.disconnect(true, true);
+            wifi_ip[0]    = '\0';
+            wifi_ntp_done = false;
+            setWifiState(WS_OFF);
+        }
+        return;
+    }
+
+    switch (wifi_state) {
+        case WS_OFF: {
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(s.wifi_ssid, s.wifi_pass);
+            setWifiState(WS_CONNECTING);
+            break;
+        }
+        case WS_CONNECTING: {
+            if (WiFi.status() == WL_CONNECTED) {
+                const IPAddress ip = WiFi.localIP();
+                snprintf(wifi_ip, sizeof(wifi_ip), "%d.%d.%d.%d",
+                         ip[0], ip[1], ip[2], ip[3]);
+                setWifiState(WS_CONNECTED);
+                wifiKickNtp();
+            } else if (millis() - wifi_state_ms > 20000) {
+                WiFi.disconnect(true, false);
+                setWifiState(WS_FAILED);
+            }
+            break;
+        }
+        case WS_CONNECTED: {
+            if (WiFi.status() != WL_CONNECTED) {
+                wifi_ip[0]    = '\0';
+                wifi_ntp_done = false;
+                setWifiState(WS_CONNECTING);
+                wifi_state_ms = millis();
+            } else {
+                wifiTickNtp();
+            }
+            break;
+        }
+        case WS_FAILED: {
+            if (millis() - wifi_state_ms > 30000) setWifiState(WS_OFF);
+            break;
+        }
+    }
+}
+
+static void wifiForceReconfigure() {
+    WiFi.disconnect(true, false);
+    wifi_ip[0]    = '\0';
+    wifi_ntp_done = false;
+    setWifiState(WS_OFF);   // next wifiTick (within 1 s) re-evaluates mode + creds
+}
+
 static const char* enumValue(SettingId id) {
     switch (id) {
+        case ST_INET_MODE:   return INET_MODE_NAMES[s.internet_mode % N_INET_MODE];
         case ST_CL_PROTO:    return PROTOCOL_NAMES[s.cloud_protocol % N_PROTOCOL];
         case ST_CL_STREAM:   return STREAM_NAMES[s.cloud_stream % N_STREAM];
         case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
@@ -2033,6 +2201,10 @@ static bool rowShouldShow(SettingId id) {
     switch (id) {
         case ST_REC_SD:    return sd_card_status == 2;  // hidden unless card is READY
         case ST_SD_FORMAT: return sd_card_status == 1;  // shown only when NEEDS_FORMAT
+        // WiFi credential + status rows only meaningful when mode=WiFi.
+        case ST_WIFI_SSID:
+        case ST_WIFI_PASS:
+        case ST_WIFI_STATUS: return s.internet_mode == 1;
         default:           return true;
     }
 }
@@ -2193,6 +2365,17 @@ static void drawSettingsPage() {
                                ACT_X + ACT_W / 2, y + SETTINGS_ROW_HEIGHT / 2);
             }
             tft.setTextDatum(textdatum_t::top_left);
+        } else if (r.kind == SettingRow::INFO) {
+            // Display-only row — WiFi status today. Right-aligned status string,
+            // no border, slightly dimmer text to read as a label not a control.
+            constexpr int INFO_X = 410, INFO_W = 360;
+            tft.fillRect(INFO_X, y, INFO_W, SETTINGS_ROW_HEIGHT, TFT_BLACK);
+            tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+            tft.setTextDatum(textdatum_t::middle_left);
+            const char* shown = "";
+            if (r.id == ST_WIFI_STATUS) shown = wifi_status_buf[0] ? wifi_status_buf : "-";
+            tft.drawString(shown, INFO_X + 10, y + SETTINGS_ROW_HEIGHT / 2);
+            tft.setTextDatum(textdatum_t::top_left);
         } else { // TEXT — tap-to-edit field. Used for cloud_host (string,
                  // opens text keyboard) and cloud_port (number, opens
                  // numeric keypad).
@@ -2215,6 +2398,18 @@ static void drawSettingsPage() {
                 } else {
                     // Mask: render '*' per char, capped at array size.
                     const int n = strlen(s.cloud_auth_pass);
+                    const int m = (n > (int)sizeof(passMask) - 1) ? (int)sizeof(passMask) - 1 : n;
+                    for (int k = 0; k < m; ++k) passMask[k] = '*';
+                    passMask[m] = '\0';
+                    shown = passMask;
+                }
+            } else if (r.id == ST_WIFI_SSID) {
+                shown = (s.wifi_ssid[0] == '\0') ? "<tap to set>" : s.wifi_ssid;
+            } else if (r.id == ST_WIFI_PASS) {
+                if (s.wifi_pass[0] == '\0') {
+                    shown = "<tap to set>";
+                } else {
+                    const int n = strlen(s.wifi_pass);
                     const int m = (n > (int)sizeof(passMask) - 1) ? (int)sizeof(passMask) - 1 : n;
                     for (int k = 0; k < m; ++k) passMask[k] = '*';
                     passMask[m] = '\0';
@@ -2303,6 +2498,10 @@ static void handleSettingsTap(int x, int y) {
                     // (SD filenames, cloud metadata). Display still uses UTC
                     // from the Teensy and we apply the offset locally.
                     Serial.printf("TZ,%s\n", TIMEZONES[s.timezone_idx].id);
+                } else if (r.id == ST_INET_MODE) {
+                    s.internet_mode = (s.internet_mode + 1) % N_INET_MODE;
+                    wifiForceReconfigure();
+                    Serial.printf("CFG,inet,%u\n", (unsigned)s.internet_mode);
                 } else if (r.id == ST_SENSOR_TYPE) {
                     s.sensor_type = (s.sensor_type + 1) % N_SENSOR_TYPE;
                     // Reset stale ECU state on a source flip so the dash
@@ -2456,6 +2655,8 @@ static void openTextKeyboard(SettingId target) {
         case ST_CL_HOST:      src = s.cloud_host;      break;
         case ST_CL_AUTH_USER: src = s.cloud_auth_user; break;
         case ST_CL_AUTH_PASS: src = s.cloud_auth_pass; break;
+        case ST_WIFI_SSID:    src = s.wifi_ssid;       break;
+        case ST_WIFI_PASS:    src = s.wifi_pass;       break;
         default:              src = "";                break;
     }
     strncpy(kb.editBuf, src, sizeof(kb.editBuf) - 1);
@@ -2487,6 +2688,16 @@ static void closeKeyboard(bool commit) {
             case ST_CL_AUTH_PASS:
                 strncpy(s.cloud_auth_pass, kb.editBuf, sizeof(s.cloud_auth_pass) - 1);
                 s.cloud_auth_pass[sizeof(s.cloud_auth_pass) - 1] = '\0';
+                break;
+            case ST_WIFI_SSID:
+                strncpy(s.wifi_ssid, kb.editBuf, sizeof(s.wifi_ssid) - 1);
+                s.wifi_ssid[sizeof(s.wifi_ssid) - 1] = '\0';
+                wifiForceReconfigure();
+                break;
+            case ST_WIFI_PASS:
+                strncpy(s.wifi_pass, kb.editBuf, sizeof(s.wifi_pass) - 1);
+                s.wifi_pass[sizeof(s.wifi_pass) - 1] = '\0';
+                wifiForceReconfigure();
                 break;
             default: break;
         }
@@ -2555,6 +2766,8 @@ static const char* kbTitleFor(SettingId id) {
         case ST_CL_PORT:      return "Edit Cloud port";
         case ST_CL_AUTH_USER: return "Edit user email (data tag, not auth)";
         case ST_CL_AUTH_PASS: return "Edit API key (sent as X-API-Key)";
+        case ST_WIFI_SSID:    return "Edit WiFi network name";
+        case ST_WIFI_PASS:    return "Edit WiFi password";
         default:              return "Edit value";
     }
 }
@@ -3380,7 +3593,15 @@ static void drawStatusPage() {
 void setup() {
     Serial.begin(115200);
     delay(800);
-    Serial.println("\n=== racecar-35 dash boot ===");
+    Serial.printf("\n=== racecar-35 dash crowpanel boot, firmware v%s ===\n",
+                  FIRMWARE_VERSION);
+
+    // Silence the ESP-IDF WiFi log output — it would otherwise spam Serial
+    // (= UART0 = the Teensy bridge) once WiFi.begin() runs. Without this,
+    // the Teensy parser sees junk lines and we get a noisy debug log.
+    esp_log_level_set("*",       ESP_LOG_NONE);
+    esp_log_level_set("wifi",    ESP_LOG_NONE);
+    esp_log_level_set("wifi_init", ESP_LOG_NONE);
 
     pinMode(38, OUTPUT);
     digitalWrite(38, LOW);
@@ -3432,6 +3653,7 @@ void setup() {
 void loop() {
     pumpUart();
     handleTouch();
+    wifiTick();   // WiFi state machine + one-shot NTP push to Teensy (1 Hz tick)
 
     // Expire SD format arm state after 5 s so the button reverts to red.
     if (sd_format_armed && millis() - sd_format_arm_ms >= 5000) {
