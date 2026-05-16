@@ -65,7 +65,11 @@ app = FastAPI(title=SERVICE_NAME, version="0.1.0", docs_url="/docs")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-_safe_re = re.compile(r"[^A-Za-z0-9._@+-]+")
+# Note: '@' is intentionally NOT in the allowed set. Even though POSIX allows
+# it in filenames, it's awkward in URLs (RFC 3986 reserves it for userinfo) and
+# trips up some browsers/proxies when present in path segments. john@x.com
+# becomes john_x.com on disk so download links work without %-encoding.
+_safe_re = re.compile(r"[^A-Za-z0-9._+-]+")
 
 
 def safe_name(s: Optional[str], default: str = "anon", maxlen: int = 96) -> str:

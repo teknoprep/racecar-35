@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.24"
+#define FIRMWARE_VERSION "0.1.25"
 
 #include <Preferences.h>
 #include <time.h>
@@ -5682,7 +5682,13 @@ void loop() {
     static uint32_t lastDraw = 0;
     const uint32_t now = millis();
     if (currentPage == PAGE_DASH) {
-        if (now - lastDraw >= 20) { lastDraw = now; drawDashPage(); }
+        // Cap the dash redraw to 25 Hz so it matches the Teensy's 25 Hz UART
+        // emit cadence. At 50 Hz we were repainting the speed/RPM/strings up
+        // to twice for the same data, and any repaint that lands mid-LCD-scan
+        // produces a visible tear on those big elements. 25 Hz aligns the
+        // paint with each fresh telemetry frame; there's no benefit to going
+        // faster than the data we're displaying.
+        if (now - lastDraw >= 40) { lastDraw = now; drawDashPage(); }
     } else if (currentPage == PAGE_SETTINGS) {
         // Cap scroll redraws to ~30 Hz so the LCD has time to scan a full
         // clean frame between renders. Without this cap we re-render on
