@@ -13,7 +13,10 @@
 
 #include <Wire.h>
 #include <PCA9557.h>
-#include <WiFi.h>          // ESP32-S3 built-in WiFi (Phase 1: NTP only; later: cloud + OTA)
+#include <WiFi.h>          // ESP32-S3 built-in WiFi (NTP, OTA HTTPS, future cloud upload)
+#include <WiFiClientSecure.h>   // HTTPS to GitHub for manifest + firmware download
+#include <HTTPClient.h>         // wraps WiFiClientSecure with a simple GET/POST API
+#include <Update.h>             // partition-swap OTA writer
 #include <esp_log.h>       // for esp_log_level_set("wifi", ESP_LOG_NONE)
 
 // Compile-time firmware version. Bump via the release process when shipping
@@ -60,6 +63,7 @@ enum SettingId : uint8_t {
     ST_TIMEZONE,    // ENUM: cycle through TIMEZONES[]
     ST_SD_FORMAT,   // action: format SD card — shown only when card needs formatting
     ST_SET_TIME,    // action: open time-set page
+    ST_OTA_CHECK,   // action: check GitHub for firmware update + apply
     ST_COUNT
 };
 struct NumBounds { uint16_t lo, hi, step; };
@@ -233,6 +237,36 @@ static uint32_t sd_free_mb       = 0;
 static bool     sd_session_active  = false;
 static char     sd_session_file[80] = "";
 static uint32_t sd_session_samples = 0;
+
+// ---------------------------------------------------------------------------
+// OTA state — driven by tapping "Check for updates" in settings.
+// Source of truth lives in firmware/manifest.json on this repo's main branch:
+//   https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/manifest.json
+//
+// State machine drives PAGE_OTA modal. otaTick() in loop() advances states
+// that perform network work (checking + downloading) without blocking the
+// touch handler. Cancel is implemented by setting ota_cancel_requested;
+// the tick checks it between chunks and bails.
+// ---------------------------------------------------------------------------
+enum OtaState : uint8_t {
+    OTA_S_IDLE = 0,
+    OTA_S_CHECKING,      // GET manifest.json
+    OTA_S_UPTODATE,      // version match — nothing to do
+    OTA_S_AVAILABLE,     // update found; modal waits for user Confirm/Cancel
+    OTA_S_DOWNLOADING,   // streaming firmware bytes into Update.write()
+    OTA_S_APPLYING,      // Update.end() in progress (finalising flash partition)
+    OTA_S_REBOOT,        // success; about to ESP.restart()
+    OTA_S_FAILED,        // any error; modal shows reason + Close
+};
+static OtaState ota_state              = OTA_S_IDLE;
+static char     ota_latest_version[16] = "";
+static char     ota_url[200]           = "";
+static char     ota_err_msg[80]        = "";
+static uint32_t ota_total_bytes        = 0;
+static uint32_t ota_done_bytes         = 0;
+static uint8_t  ota_return_page        = 0;     // page to restore on Close
+static bool     ota_modal_dirty        = false;
+static bool     ota_cancel_requested   = false;
 
 // Upload modal state — driven by UPLOAD,START/PROG/DONE lines from Teensy.
 // While upload_active, the dash forces PAGE_UPLOAD on top of whatever was
@@ -822,6 +856,7 @@ enum Page : uint8_t {
     PAGE_TIME_SET      = 7,
     PAGE_WIFI_SCAN     = 8,
     PAGE_UPLOAD        = 9,   // full-screen modal during file upload; blocks all other input
+    PAGE_OTA           = 10,  // full-screen modal during firmware update check / install
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -1245,6 +1280,10 @@ static void drawWifiScannerPage();
 static void drawUploadModal();
 static void handleUploadModalTap(int x, int y);
 static bool parseUploadLine(const String& line);
+static void drawOtaModal();
+static void handleOtaModalTap(int x, int y);
+static void otaTick();
+static void otaStart();
 
 static void handleTouch() {
     int32_t x, y;
@@ -1262,6 +1301,19 @@ static void handleTouch() {
             tt.active  = true;
         } else if (!now && tt.active) {
             handleUploadModalTap(tt.startX, tt.startY);
+            tt.active = false;
+        }
+        return;
+    }
+    // OTA modal: same as upload — only buttons on the modal are tappable.
+    if (currentPage == PAGE_OTA) {
+        if (now && !tt.active) {
+            tt.startX = x; tt.startY = y;
+            tt.lastX  = x; tt.lastY  = y;
+            tt.startMs = millis();
+            tt.active  = true;
+        } else if (!now && tt.active) {
+            handleOtaModalTap(tt.startX, tt.startY);
             tt.active = false;
         }
         return;
@@ -2019,6 +2071,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_TIMEZONE,     "Time zone",              SettingRow::ENUM    },
     { ST_SD_FORMAT,    "Format SD card",         SettingRow::ACTION  },
     { ST_SET_TIME,     "Set time",                SettingRow::ACTION  },
+    { ST_OTA_CHECK,    "Check for updates",      SettingRow::ACTION  },
 };
 
 constexpr int SETTINGS_ROW_Y0     = 70;
@@ -2683,6 +2736,10 @@ static void handleSettingsTap(int x, int y) {
                     }
                     currentPage     = PAGE_TIME_SET;
                     pageJustEntered = true;
+                    return;
+                }
+                if (r.id == ST_OTA_CHECK) {
+                    otaStart();
                     return;
                 }
                 if (r.id == ST_SD_FORMAT) {
@@ -3551,6 +3608,328 @@ static void handleUploadModalTap(int x, int y) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OTA modal + state machine (CrowPanel self-update over WiFi).
+// Pulls firmware/manifest.json from this repo's main branch on GitHub,
+// compares versions, and if newer is available, streams the .bin into
+// Update.h. Teensy forwarding lands in a follow-up patch (Phase 2b).
+//
+// CA validation: WiFiClientSecure.setInsecure() for v1. GitHub serves with
+// DigiCert; embedding the root would be more secure. Listed as future work.
+// ---------------------------------------------------------------------------
+static constexpr const char* OTA_MANIFEST_URL =
+    "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/manifest.json";
+
+namespace {
+    constexpr int OM_CARD_X = 80,  OM_CARD_Y = 100;
+    constexpr int OM_CARD_W = 640, OM_CARD_H = 280;
+    constexpr int OM_BAR_X  = OM_CARD_X + 30, OM_BAR_Y = OM_CARD_Y + 160;
+    constexpr int OM_BAR_W  = OM_CARD_W - 60, OM_BAR_H = 28;
+    // Two-button row: confirm (or close) + cancel
+    constexpr int OM_BTN_Y  = OM_CARD_Y + OM_CARD_H - 70;
+    constexpr int OM_BTN_H  = 56;
+    constexpr int OM_BTN1_X = OM_CARD_X + 60,  OM_BTN1_W = 220;
+    constexpr int OM_BTN2_X = OM_CARD_X + 360, OM_BTN2_W = 220;
+}
+
+static const char* otaStateLabel() {
+    switch (ota_state) {
+        case OTA_S_CHECKING:    return "Checking for updates...";
+        case OTA_S_UPTODATE:    return "Up to date";
+        case OTA_S_AVAILABLE:   return "Update available";
+        case OTA_S_DOWNLOADING: return "Downloading update...";
+        case OTA_S_APPLYING:    return "Applying update...";
+        case OTA_S_REBOOT:      return "Restarting...";
+        case OTA_S_FAILED:      return "Update failed";
+        default:                return "";
+    }
+}
+
+static void otaOpenModal() {
+    if (currentPage != PAGE_OTA) ota_return_page = (uint8_t)currentPage;
+    currentPage     = PAGE_OTA;
+    pageJustEntered = true;
+    ota_modal_dirty = true;
+}
+
+static void otaCloseModal() {
+    ota_state        = OTA_S_IDLE;
+    currentPage      = (Page)ota_return_page;
+    pageJustEntered  = true;
+    settingsDirty    = true;
+    invalidateAll();
+}
+
+// Very small JSON value extractor for our specific manifest shape. Looks for
+// the first '"key":"value"' AFTER the section marker. Robust enough for the
+// hand-authored manifest.json we ship; would be naive on arbitrary JSON.
+static bool jsonStr(const String& body, const char* section, const char* key,
+                    char* out, size_t outsize) {
+    int s = body.indexOf(section);
+    if (s < 0) return false;
+    int k = body.indexOf(key, s);
+    if (k < 0) return false;
+    int q = body.indexOf('"', k + strlen(key));
+    if (q < 0) return false;
+    int q2 = body.indexOf('"', q + 1);
+    if (q2 < 0) return false;
+    int n = q2 - q - 1;
+    if (n >= (int)outsize) n = (int)outsize - 1;
+    body.substring(q + 1, q + 1 + n).toCharArray(out, n + 1);
+    return true;
+}
+
+static int versionCmp(const char* a, const char* b) {
+    int aa[4] = {0,0,0,0}, bb[4] = {0,0,0,0};
+    sscanf(a, "%d.%d.%d.%d", &aa[0],&aa[1],&aa[2],&aa[3]);
+    sscanf(b, "%d.%d.%d.%d", &bb[0],&bb[1],&bb[2],&bb[3]);
+    for (int i = 0; i < 4; ++i) if (aa[i] != bb[i]) return aa[i] - bb[i];
+    return 0;
+}
+
+static void otaStart() {
+    if (s.internet_mode != 1) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg),
+                 "OTA needs WiFi mode (Ethernet OTA coming soon)");
+        ota_state = OTA_S_FAILED;
+    } else if (wifi_state != WS_CONNECTED) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "WiFi not connected");
+        ota_state = OTA_S_FAILED;
+    } else {
+        ota_latest_version[0] = '\0';
+        ota_url[0]            = '\0';
+        ota_err_msg[0]        = '\0';
+        ota_total_bytes       = 0;
+        ota_done_bytes        = 0;
+        ota_cancel_requested  = false;
+        ota_state             = OTA_S_CHECKING;
+    }
+    otaOpenModal();
+}
+
+static void otaDoCheck() {
+    WiFiClientSecure client;
+    client.setInsecure();   // TODO: embed GitHub root CA for proper validation
+    HTTPClient http;
+    if (!http.begin(client, OTA_MANIFEST_URL)) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "manifest HTTPS begin failed");
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+    const int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "manifest fetch HTTP %d", code);
+        http.end();
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+    const String body = http.getString();
+    http.end();
+
+    if (!jsonStr(body, "\"crowpanel\"", "\"version\"",
+                 ota_latest_version, sizeof(ota_latest_version)) ||
+        !jsonStr(body, "\"crowpanel\"", "\"url\"",
+                 ota_url, sizeof(ota_url))) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "manifest parse failed");
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+    if (versionCmp(ota_latest_version, FIRMWARE_VERSION) <= 0) {
+        ota_state = OTA_S_UPTODATE;
+    } else {
+        ota_state = OTA_S_AVAILABLE;
+    }
+    ota_modal_dirty = true;
+}
+
+static void otaDoDownload() {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15);   // seconds; setTimeout is in seconds for WiFiClient
+    HTTPClient http;
+    if (!http.begin(client, ota_url)) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), ".bin HTTPS begin failed");
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+    const int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), ".bin fetch HTTP %d", code);
+        http.end();
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+    const int contentLen = http.getSize();
+    if (contentLen <= 0) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "unknown content length");
+        http.end();
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+    ota_total_bytes = (uint32_t)contentLen;
+    ota_done_bytes  = 0;
+
+    if (!Update.begin((size_t)contentLen)) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "Update.begin: %s",
+                 Update.errorString());
+        http.end();
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t buf[1024];
+    uint32_t last_draw_ms = millis();
+    while (http.connected() && ota_done_bytes < ota_total_bytes) {
+        if (ota_cancel_requested) {
+            Update.abort();
+            http.end();
+            snprintf(ota_err_msg, sizeof(ota_err_msg), "Cancelled by user");
+            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+        }
+        const size_t avail = stream->available();
+        if (avail == 0) { delay(2); continue; }
+        const size_t want = avail > sizeof(buf) ? sizeof(buf) : avail;
+        const int got = stream->read(buf, want);
+        if (got <= 0) { delay(2); continue; }
+        const size_t w = Update.write(buf, (size_t)got);
+        if (w != (size_t)got) {
+            snprintf(ota_err_msg, sizeof(ota_err_msg), "Update.write: %s",
+                     Update.errorString());
+            Update.abort();
+            http.end();
+            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+        }
+        ota_done_bytes += (uint32_t)got;
+        // ~5 Hz UI redraw during download.
+        if (millis() - last_draw_ms >= 200) {
+            last_draw_ms = millis();
+            ota_modal_dirty = true;
+            drawOtaModal();
+        }
+    }
+    http.end();
+
+    ota_state       = OTA_S_APPLYING;
+    ota_modal_dirty = true;
+    drawOtaModal();
+
+    if (!Update.end(true)) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "Update.end: %s",
+                 Update.errorString());
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+    ota_state       = OTA_S_REBOOT;
+    ota_modal_dirty = true;
+    drawOtaModal();
+    delay(800);     // give the user a chance to see the success banner
+    ESP.restart();
+}
+
+static void otaTick() {
+    if (currentPage != PAGE_OTA) return;
+    if (ota_state == OTA_S_CHECKING)    { otaDoCheck();    return; }
+    if (ota_state == OTA_S_DOWNLOADING) { otaDoDownload(); return; }
+}
+
+static void drawOtaModal() {
+    if (!ota_modal_dirty && !pageJustEntered) return;
+    ota_modal_dirty = false;
+
+    if (pageJustEntered) {
+        tft.fillScreen(TFT_BLACK);
+        pageJustEntered = false;
+    }
+    tft.fillRect(OM_CARD_X, OM_CARD_Y, OM_CARD_W, OM_CARD_H, TFT_NAVY);
+    tft.drawRect(OM_CARD_X,   OM_CARD_Y,   OM_CARD_W,   OM_CARD_H,   TFT_WHITE);
+    tft.drawRect(OM_CARD_X+1, OM_CARD_Y+1, OM_CARD_W-2, OM_CARD_H-2, TFT_WHITE);
+
+    tft.setFont(&fonts::Font4);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.drawString("Firmware update", OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 30);
+
+    // Status line (state label)
+    tft.setFont(&fonts::Font2);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+    tft.setTextPadding(OM_CARD_W - 40);
+    tft.drawString(otaStateLabel(), OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 65);
+    tft.setTextPadding(0);
+
+    // Version comparison line (always show current; show latest when known)
+    char vline[64];
+    if (ota_latest_version[0]) {
+        snprintf(vline, sizeof(vline), "v%s  →  v%s", FIRMWARE_VERSION, ota_latest_version);
+    } else {
+        snprintf(vline, sizeof(vline), "current: v%s", FIRMWARE_VERSION);
+    }
+    tft.setFont(&fonts::Font4);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextPadding(OM_CARD_W - 40);
+    tft.drawString(vline, OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 100);
+    tft.setTextPadding(0);
+
+    // Progress bar / err message zone
+    if (ota_state == OTA_S_DOWNLOADING || ota_state == OTA_S_APPLYING ||
+        ota_state == OTA_S_REBOOT) {
+        const uint32_t total = ota_total_bytes > 0 ? ota_total_bytes : 1;
+        const uint32_t done  = ota_done_bytes  > total ? total : ota_done_bytes;
+        const int fillW = (int)((uint64_t)done * (OM_BAR_W - 4) / total);
+        tft.drawRect(OM_BAR_X, OM_BAR_Y, OM_BAR_W, OM_BAR_H, TFT_WHITE);
+        tft.fillRect(OM_BAR_X + 2, OM_BAR_Y + 2, OM_BAR_W - 4, OM_BAR_H - 4, TFT_BLACK);
+        if (fillW > 0)
+            tft.fillRect(OM_BAR_X + 2, OM_BAR_Y + 2, fillW, OM_BAR_H - 4, TFT_GREEN);
+        char pbline[40];
+        const int pct = (int)((uint64_t)done * 100 / total);
+        snprintf(pbline, sizeof(pbline), "%lu / %lu KB   %d%%",
+                 (unsigned long)(done / 1024UL), (unsigned long)(total / 1024UL), pct);
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.setTextPadding(OM_CARD_W - 40);
+        tft.drawString(pbline, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + OM_BAR_H + 16);
+        tft.setTextPadding(0);
+    } else if (ota_state == OTA_S_FAILED && ota_err_msg[0]) {
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_ORANGE, TFT_NAVY);
+        tft.setTextPadding(OM_CARD_W - 40);
+        tft.drawString(ota_err_msg, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + 10);
+        tft.setTextPadding(0);
+    }
+
+    // Bottom button row — content depends on state.
+    auto drawBtn = [](int x, int y, int w, int h, uint16_t fill, const char* label) {
+        tft.fillRect(x, y, w, h, fill);
+        tft.drawRect(x, y, w, h, TFT_WHITE);
+        tft.setFont(&fonts::Font4);
+        tft.setTextColor(TFT_WHITE, fill);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString(label, x + w/2, y + h/2);
+    };
+    // Wipe button band first
+    tft.fillRect(OM_CARD_X + 30, OM_BTN_Y, OM_CARD_W - 60, OM_BTN_H, TFT_NAVY);
+    if (ota_state == OTA_S_AVAILABLE) {
+        drawBtn(OM_BTN1_X, OM_BTN_Y, OM_BTN1_W, OM_BTN_H, TFT_DARKGREEN, "UPDATE NOW");
+        drawBtn(OM_BTN2_X, OM_BTN_Y, OM_BTN2_W, OM_BTN_H, TFT_MAROON,    "CANCEL");
+    } else if (ota_state == OTA_S_DOWNLOADING || ota_state == OTA_S_APPLYING) {
+        drawBtn(OM_BTN2_X, OM_BTN_Y, OM_BTN2_W, OM_BTN_H, TFT_MAROON, "CANCEL");
+    } else if (ota_state == OTA_S_UPTODATE || ota_state == OTA_S_FAILED) {
+        drawBtn(OM_BTN2_X, OM_BTN_Y, OM_BTN2_W, OM_BTN_H, TFT_DARKGREY, "CLOSE");
+    }
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleOtaModalTap(int x, int y) {
+    if (y < OM_BTN_Y || y > OM_BTN_Y + OM_BTN_H) return;
+    const bool inBtn1 = (x >= OM_BTN1_X && x <= OM_BTN1_X + OM_BTN1_W);
+    const bool inBtn2 = (x >= OM_BTN2_X && x <= OM_BTN2_X + OM_BTN2_W);
+    if (ota_state == OTA_S_AVAILABLE) {
+        if (inBtn1) {
+            ota_state       = OTA_S_DOWNLOADING;
+            ota_modal_dirty = true;
+            return;
+        }
+        if (inBtn2) { otaCloseModal(); return; }
+    } else if (ota_state == OTA_S_DOWNLOADING || ota_state == OTA_S_APPLYING) {
+        if (inBtn2) { ota_cancel_requested = true; return; }
+    } else if (ota_state == OTA_S_UPTODATE || ota_state == OTA_S_FAILED) {
+        if (inBtn2) { otaCloseModal(); return; }
+    }
+}
+
 static void handleConfigPickerTap(int x, int y) {
     const TrackInfo& t = TRACKS[cp.track_idx];
     const int n = (int)t.n_configs;
@@ -4113,6 +4492,12 @@ void loop() {
         if (pageJustEntered || wifi_scan_dirty || now - lastDraw >= 250) {
             lastDraw = now;
             drawWifiScannerPage();
+        }
+    } else if (currentPage == PAGE_OTA) {
+        otaTick();
+        if (pageJustEntered || ota_modal_dirty || now - lastDraw >= 250) {
+            lastDraw = now;
+            drawOtaModal();
         }
     } else if (currentPage == PAGE_UPLOAD) {
         if (pageJustEntered || upload_modal_dirty || now - lastDraw >= 250) {
