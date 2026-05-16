@@ -12,6 +12,7 @@
 //   ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>
 //   ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>   [planned]
 //   IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
+//   SD,REC,<0|1>,<filename>,<samples>     emitted on session open/close + 1 Hz during
 //
 // Example: GPS,3,12,40.123456,-74.123456,67.5,123.4,2
 //          ENG,3450,650,2185
@@ -120,18 +121,28 @@ SFE_UBLOX_GNSS myGNSS;
 //   REC,<0|1>          start/stop recording
 //   TRACK,<name>       set the current track name (sent right before REC,1)
 //
-// Recording is currently a state flag with debug logging; SD logging and
-// cloud upload land when the W5500 module arrives.
+// SD logging: on REC,1 we open /sessions/session_<unix>_<track>.ndjson and
+// append one NDJSON sample per emit window (25 Hz). On REC,0 we flush +
+// close. Cloud upload (HTTP POST live + after-race) lands in Phase B.
 // ---------------------------------------------------------------------------
 static bool     recording_active = false;
 static char     current_track[32] = "UNKNOWN";
 static uint32_t session_start_ms = 0;
+static uint32_t session_start_unix = 0;   // RTC epoch at REC,1 (0 if RTC unset)
 // Active timezone id sent by the dash (e.g. "ET", "PT", "UTC"). Used today
 // only for logging; future SD-filename / cloud-metadata code can consult it.
 // The Teensy's RTC and the wire-format TIME line are always UTC.
 static char     current_tz[8]    = "UTC";
 
 static void formatSDCard();   // defined below, after SD section
+static void openSession();    // forward decl — defined in SD section
+static void closeSession();
+static void writeSessionSample(uint8_t fix, uint8_t sats,
+                               float lat_deg, float lon_deg,
+                               float mph, float hdg_deg,
+                               uint16_t rpm, int16_t oil_x10, int16_t cool_x10,
+                               float ax, float ay, float az,
+                               float gx, float gy, float gz);
 
 // TimeLib sync provider — reads the Teensy 4.1 built-in RTC.
 static time_t getTeensyTime() { return Teensy3Clock.get(); }
@@ -143,11 +154,15 @@ static void handleDashCommand(const String& line) {
         if (now != recording_active) {
             recording_active = now;
             if (now) {
-                session_start_ms = millis();
-                Serial.printf("[teensy] REC START — track=\"%s\", t=%lums\n",
-                              current_track, (unsigned long)session_start_ms);
+                session_start_ms   = millis();
+                session_start_unix = (uint32_t)::now();
+                Serial.printf("[teensy] REC START — track=\"%s\", t=%lums unix=%lu\n",
+                              current_track, (unsigned long)session_start_ms,
+                              (unsigned long)session_start_unix);
+                openSession();
             } else {
                 const uint32_t dur = millis() - session_start_ms;
+                closeSession();
                 Serial.printf("[teensy] REC STOP — duration=%lums\n",
                               (unsigned long)dur);
             }
@@ -702,6 +717,176 @@ static void formatSDCard() {
     emitSdStatus();
 }
 
+// ---------------------------------------------------------------------------
+// Session writer — NDJSON sample log on the SD card.
+//
+// File path: /sessions/session_<unix>_<track>.ndjson  (or session_nortc_<ms>_<track>.
+// ndjson when RTC isn't set). Track name is sanitised — anything outside
+// [A-Za-z0-9._-] becomes '_'.
+//
+// One JSON object per line, descriptive keys, per CLAUDE.md:
+//   {"t":1714942567.234,"fix":3,"sats":12,"lat":40.123456,"lon":-74.123456,
+//    "speed_mph":67.5,"heading_deg":123.4,"rpm":5800,"oil_psi":65.0,
+//    "coolant_f":218.5,"ax":0.02,"ay":-0.98,"az":0.12,"gx":1.3,"gy":-0.5,"gz":0.2}
+//
+// Sub-second timestamp uses session-relative millis offset against the unix
+// epoch captured at REC,1 — monotonic, won't jump even if NTP later corrects
+// the RTC mid-session.
+//
+// Periodic flush every ~1 s so a power loss costs <=1 s of samples, not the
+// whole session.
+// ---------------------------------------------------------------------------
+static File32  session_file;
+static bool    session_file_open = false;
+static uint32_t session_samples       = 0;
+static uint32_t session_last_flush_ms = 0;
+static char    session_path[80]      = "";
+
+// Replace anything outside [A-Za-z0-9._-] with '_'. Truncates to outsize-1.
+static void sanitizeName(const char* in, char* out, size_t outsize) {
+    if (outsize == 0) return;
+    size_t n = 0;
+    for (; in[n] != '\0' && n + 1 < outsize; ++n) {
+        const char c = in[n];
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        out[n] = ok ? c : '_';
+    }
+    out[n] = '\0';
+    if (n == 0) { strncpy(out, "UNKNOWN", outsize); out[outsize-1] = '\0'; }
+}
+
+static void emitSessionStatus(bool active) {
+    // SD,REC,<0|1>,<filename>,<samples>
+    const char* fname = session_path[0] ? session_path : "";
+    DASH_SERIAL.printf("SD,REC,%u,%s,%lu\n",
+                       active ? 1 : 0, fname, (unsigned long)session_samples);
+    Serial.printf("[sd] SESSION %s  file=%s  samples=%lu\n",
+                  active ? "OPEN" : "CLOSE", fname, (unsigned long)session_samples);
+}
+
+static void openSession() {
+    session_file_open    = false;
+    session_samples      = 0;
+    session_last_flush_ms = millis();
+    session_path[0]      = '\0';
+
+    if (sd_card_status != SD_CARD_READY) {
+        Serial.println(F("[sd] openSession: card not READY — skipping"));
+        emitSessionStatus(false);
+        return;
+    }
+
+    if (!sdFat.exists("/sessions")) {
+        if (!sdFat.mkdir("/sessions")) {
+            Serial.println(F("[sd] mkdir /sessions failed"));
+            emitSessionStatus(false);
+            return;
+        }
+    }
+
+    char trackSafe[32];
+    sanitizeName(current_track, trackSafe, sizeof(trackSafe));
+
+    if (session_start_unix > 0) {
+        snprintf(session_path, sizeof(session_path),
+                 "/sessions/session_%lu_%s.ndjson",
+                 (unsigned long)session_start_unix, trackSafe);
+    } else {
+        snprintf(session_path, sizeof(session_path),
+                 "/sessions/session_nortc_%lu_%s.ndjson",
+                 (unsigned long)session_start_ms, trackSafe);
+    }
+
+    if (!session_file.open(session_path, O_WRITE | O_CREAT | O_TRUNC)) {
+        Serial.printf("[sd] open %s FAILED\n", session_path);
+        session_path[0] = '\0';
+        emitSessionStatus(false);
+        return;
+    }
+    session_file_open = true;
+    Serial.printf("[sd] opened %s\n", session_path);
+    emitSessionStatus(true);
+}
+
+static void closeSession() {
+    if (session_file_open) {
+        session_file.sync();
+        session_file.close();
+        session_file_open = false;
+    }
+    emitSessionStatus(false);
+    // Refresh free-MB count so the dash sees the new value next status emit.
+    if (sd_card_status == SD_CARD_READY) {
+        const uint64_t freeSects = (uint64_t)sdFat.vol()->freeClusterCount()
+                                 * sdFat.vol()->sectorsPerCluster();
+        sd_free_mb = (uint32_t)(freeSects / 2048ULL);
+    }
+}
+
+static void writeSessionSample(uint8_t fix, uint8_t sats,
+                               float lat_deg, float lon_deg,
+                               float mph, float hdg_deg,
+                               uint16_t rpm, int16_t oil_x10, int16_t cool_x10,
+                               float ax, float ay, float az,
+                               float gx, float gy, float gz) {
+    if (!session_file_open) return;
+
+    // Sub-second epoch timestamp anchored at session start (monotonic).
+    const uint32_t dt_ms  = millis() - session_start_ms;
+    const uint32_t whole  = dt_ms / 1000;
+    const uint32_t frac   = dt_ms % 1000;
+    const uint32_t t_sec  = session_start_unix + whole;
+
+    // Hand-rolled NDJSON — avoids ArduinoJson dep, ~250 bytes/sample.
+    // -1 sentinels for oil/coolant become JSON null so the server can
+    // distinguish "sensor faulted" from a real zero.
+    char buf[320];
+    int n = 0;
+    if (session_start_unix > 0) {
+        n = snprintf(buf, sizeof(buf),
+            "{\"t\":%lu.%03lu,\"fix\":%u,\"sats\":%u,\"lat\":%.6f,\"lon\":%.6f,"
+            "\"speed_mph\":%.1f,\"heading_deg\":%.1f,\"rpm\":%u,",
+            (unsigned long)t_sec, (unsigned long)frac,
+            fix, sats, lat_deg, lon_deg, mph, hdg_deg, rpm);
+    } else {
+        // No RTC: emit relative ms since session start as "t_ms" instead of "t".
+        n = snprintf(buf, sizeof(buf),
+            "{\"t_ms\":%lu,\"fix\":%u,\"sats\":%u,\"lat\":%.6f,\"lon\":%.6f,"
+            "\"speed_mph\":%.1f,\"heading_deg\":%.1f,\"rpm\":%u,",
+            (unsigned long)dt_ms,
+            fix, sats, lat_deg, lon_deg, mph, hdg_deg, rpm);
+    }
+    if (n < 0 || n >= (int)sizeof(buf)) return;
+
+    if (oil_x10 < 0)  n += snprintf(buf+n, sizeof(buf)-n, "\"oil_psi\":null,");
+    else              n += snprintf(buf+n, sizeof(buf)-n, "\"oil_psi\":%.1f,",  oil_x10 * 0.1f);
+    if (cool_x10 < 0) n += snprintf(buf+n, sizeof(buf)-n, "\"coolant_f\":null,");
+    else              n += snprintf(buf+n, sizeof(buf)-n, "\"coolant_f\":%.1f,", cool_x10 * 0.1f);
+
+    n += snprintf(buf+n, sizeof(buf)-n,
+        "\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"gx\":%.1f,\"gy\":%.1f,\"gz\":%.1f}\n",
+        ax, ay, az, gx, gy, gz);
+    if (n < 0 || n >= (int)sizeof(buf)) return;
+
+    const int written = session_file.write((const uint8_t*)buf, (size_t)n);
+    if (written != n) {
+        Serial.printf("[sd] short write (%d/%d) — closing session\n", written, n);
+        session_file.close();
+        session_file_open = false;
+        emitSessionStatus(false);
+        return;
+    }
+    session_samples++;
+
+    // Periodic flush so power-loss costs <=1 s, and 1 Hz status heartbeat to dash.
+    if (millis() - session_last_flush_ms >= 1000) {
+        session_last_flush_ms = millis();
+        session_file.sync();
+        emitSessionStatus(true);   // sends SD,REC,1,<file>,<samples>
+    }
+}
+
 // Compute current RPM from accumulated samples, then reset the accumulator.
 // Call from emitToDash() so each emit reflects fresh data.
 static uint16_t computeRpmAndReset() {
@@ -813,6 +998,13 @@ static void emitToDash() {
                        imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
     Serial.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                   imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
+
+    // SD logging: append one NDJSON sample with all the fields we just emitted.
+    if (recording_active && session_file_open) {
+        writeSessionSample(fix, sats, lat_deg, lon_deg, mph, hdg_deg,
+                           rpm, oil_psi_x10, cool_f_x10,
+                           imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
+    }
 
     // Time of day from RTC — piggybacks on the 1 Hz GPS heartbeat so the dash
     // gets a fresh TIME line every emit without a separate periodic block in
