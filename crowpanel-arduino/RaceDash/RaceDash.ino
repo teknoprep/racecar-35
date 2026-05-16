@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.16"
+#define FIRMWARE_VERSION "0.1.17"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4196,15 +4196,22 @@ static void otaDoTeensyWaiting() {
     if (elapsed >= TEENSY_REBOOT_TIMEOUT_MS) {
         wait_start = 0;
         if (ota_teensy_commit_seen) {
-            // The image was accepted by FlasherX and flash_move() was entered.
-            // At this point a missing VER is a verifier/visibility problem, not
-            // a reason to block the CrowPanel update. Continue; final STATUS
-            // after both reboots will re-query Teensy and show the truth.
-            strncpy(teensy_fw_version, versionNoV(ota_teensy_version),
-                    sizeof(teensy_fw_version) - 1);
-            teensy_fw_version[sizeof(teensy_fw_version) - 1] = '\0';
-            otaProceedAfterTeensy("Teensy committed; continuing");
-            return;
+            // FlasherX accepted the staged image and entered flash_move(), but
+            // we did NOT observe the target VER afterward. Do not fake the
+            // version here: field testing showed that can report success even
+            // when STATUS later proves the Teensy is still on the old image.
+            // If a CrowPanel update is also pending, continue so the dash can
+            // still be brought forward; final STATUS will show whether the
+            // Teensy actually changed. If this was a Teensy-only update, stop
+            // with an honest unverified result.
+            if (ota_need_crowpanel) {
+                otaProceedAfterTeensy("Teensy commit unverified; updating dash");
+                return;
+            }
+            snprintf(ota_err_msg, sizeof(ota_err_msg),
+                     "teensy commit unverified; STATUS says v%s",
+                     teensy_fw_version);
+            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
         }
         if (teensy_fw_version[0] && strcmp(teensy_fw_version, "?") != 0) {
             snprintf(ota_err_msg, sizeof(ota_err_msg),
