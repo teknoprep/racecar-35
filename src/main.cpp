@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.6"
+#define FIRMWARE_VERSION "0.1.7"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -1065,7 +1065,11 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
 // recording_active so closeSession() can reference them.)
 static void handleCfgLine(const String& line) {
     // line == "CFG,<key>,<value>"
-    const int c1 = 3;                                        // after "CFG,"
+    // 'CFG,' is FOUR characters — c1 was off-by-one as 3, which made every
+    // line parse as empty key + 'cl_host,...' value. Every CFG line came in
+    // as 'unknown key' and g_cfg never got populated, silently disabling
+    // all cloud config. Bug originally landed in Phase B + C.
+    const int c1 = 4;                                        // after "CFG,"
     const int c2 = line.indexOf(',', c1);
     if (c2 < 0) return;
     const String key = line.substring(c1, c2);

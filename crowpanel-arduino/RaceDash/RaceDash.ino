@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.6"
+#define FIRMWARE_VERSION "0.1.7"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1189,7 +1189,10 @@ static bool parseVerLine(const String& line) {
     const String ver = line.substring(c2 + 1);
     if (who == "teensy") {
         ver.toCharArray(teensy_fw_version, sizeof(teensy_fw_version));
-        Serial.printf("[dash] teensy reports v%s\n", teensy_fw_version);
+        // NOTE: do NOT Serial.printf() here — Serial is UART0 which goes back
+        // to the Teensy. Any diagnostic would round-trip and the Teensy would
+        // log it as 'unknown dash cmd'. If we ever add a separate USB CDC for
+        // dash diagnostics, log it there instead.
     }
     return true;
 }

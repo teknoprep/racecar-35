@@ -321,16 +321,18 @@ void update_firmware_noprompt( Stream *in, Stream *out,
   out->printf( "FX: %d hex records, hex.min=%08lX, hex.max=%08lX\n",
                hex.lines, hex.min, hex.max );
 
-  // Verify FSEC (T4.x only) and FLASH_ID, same checks as upstream.
+  // FSEC check matches upstream: only Kinetis (T3.x/LC) has an FSEC field at
+  // 0x40C in the flash header. IMXRT1062 (Teensy 4.x) has no such concept;
+  // upstream's update_firmware deliberately skips the check there, and my
+  // earlier copy had it inverted with the wrong expected value, which was
+  // failing every OTA on T4.1.
   #if defined(KINETISK) || defined(KINETISL)
-    // skip
-  #elif defined(__IMXRT1062__)
-    uint32_t value = *(uint32_t *)(0x60000000 + 0x40C);
-    if (value == 0xFFFFFFFF) {
-      // FSEC value is correctly programmed in flash header
+    uint32_t value = *(uint32_t *)(0x40C + buffer_addr);
+    if (value == 0xfffff9de) {
+      out->printf( "FX: new code contains correct FSEC value %08lX\n", value );
     }
     else {
-      out->printf( "FX: abort - FSEC value %08lX should be FFFFFFFF\n", value );
+      out->printf( "FX: abort - FSEC value %08lX should be FFFFF9DE\n", value );
       return;
     }
   #endif
