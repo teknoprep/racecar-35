@@ -18,12 +18,13 @@
 #include <HTTPClient.h>         // wraps WiFiClientSecure with a simple GET/POST API
 #include <Update.h>             // partition-swap OTA writer
 #include <esp_log.h>       // for esp_log_level_set("wifi", ESP_LOG_NONE)
+#include <mbedtls/sha256.h>     // OTA artifact integrity check vs manifest sha256
 
 // Compile-time firmware version. Bump via the release process when shipping
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.20"
+#define FIRMWARE_VERSION "0.1.21"
 
 #include <Preferences.h>
 #include <time.h>
@@ -270,6 +271,8 @@ static char     ota_url[200]           = "";
 static char     ota_err_msg[80]        = "";
 static uint32_t ota_total_bytes        = 0;
 static uint32_t ota_done_bytes         = 0;
+static char     ota_sha256[80]         = "";   // expected sha256 from manifest (crowpanel)
+static char     ota_teensy_sha256[80]  = "";   // expected sha256 from manifest (teensy)
 // Teensy OTA uses two visible phases: WiFi download into PSRAM, then
 // ACK-paced UART transfer to the Teensy/FlasherX. Keep separate counters so
 // the modal doesn't misleadingly show one bar that suddenly slows at 50%.
@@ -3741,6 +3744,42 @@ static int versionCmp(const char* a, const char* b) {
     return 0;
 }
 
+// Compute SHA256 of the given buffer and format it as lowercase hex into
+// `out_hex` (must be at least 65 bytes). Used to verify that downloaded OTA
+// artifacts match the sha256 in firmware/manifest.json before flashing. Raw
+// GitHub serves manifest.json and the artifacts independently and the
+// artifact CDN edge can lag the manifest after a push, so we may briefly
+// receive a fresh manifest pointing at a stale .bin/.hex. Verifying the
+// sha256 prevents flashing those stale bytes.
+static void computeSha256Hex(const uint8_t* data, size_t len, char* out_hex) {
+    uint8_t digest[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts_ret(&ctx, 0);   // 0 = SHA-256 (not SHA-224)
+    mbedtls_sha256_update_ret(&ctx, data, len);
+    mbedtls_sha256_finish_ret(&ctx, digest);
+    mbedtls_sha256_free(&ctx);
+    static const char H[] = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) {
+        out_hex[i*2]     = H[(digest[i] >> 4) & 0xF];
+        out_hex[i*2 + 1] = H[digest[i]        & 0xF];
+    }
+    out_hex[64] = '\0';
+}
+
+// Case-insensitive sha256 hex compare. Manifest uses lowercase but be lenient.
+static bool sha256HexEqual(const char* a, const char* b) {
+    if (!a || !b) return false;
+    for (int i = 0; i < 64; ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'F') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'F') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+        if (ca == '\0') return true;
+    }
+    return a[64] == '\0' && b[64] == '\0';
+}
+
 // Blocking but short version refresh used before making OTA decisions. The
 // normal pumpUart() path may have a stale teensy_fw_version if the previous
 // OTA attempt false-failed and the user immediately retries from the modal.
@@ -3833,15 +3872,20 @@ static void otaDoCheck() {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "manifest parse failed");
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
+    ota_sha256[0] = '\0';
+    jsonStr(body, "\"crowpanel\"", "\"sha256\"", ota_sha256, sizeof(ota_sha256));
     // Parse teensy entry too (optional — if missing, only crowpanel update considered)
     ota_teensy_version[0] = '\0';
     ota_teensy_url[0]     = '\0';
     ota_teensy_size       = 0;
+    ota_teensy_sha256[0]  = '\0';
     char tsize_buf[16] = "";
     jsonStr(body, "\"teensy\"", "\"version\"",
             ota_teensy_version, sizeof(ota_teensy_version));
     jsonStr(body, "\"teensy\"", "\"url\"",
             ota_teensy_url, sizeof(ota_teensy_url));
+    jsonStr(body, "\"teensy\"", "\"sha256\"",
+            ota_teensy_sha256, sizeof(ota_teensy_sha256));
     // Size is a number in the manifest, not a quoted string. Find it by hand.
     {
         int s = body.indexOf("\"teensy\"");
@@ -4029,6 +4073,20 @@ static void otaDoTeensyUpdate() {
         ota_t_dl_done = (uint32_t)contentLen;
         ota_modal_dirty = true;
         drawOtaModal();
+    }
+
+    // Verify the downloaded hex matches the manifest sha256 BEFORE we hand
+    // any of it to FlasherX. If GitHub's CDN edge is still serving a stale
+    // .hex (we have the fresh manifest already) we'd otherwise flash old code.
+    if (ota_teensy_sha256[0]) {
+        char actual_hex[65];
+        computeSha256Hex(hexbuf, (size_t)contentLen, actual_hex);
+        if (!sha256HexEqual(actual_hex, ota_teensy_sha256)) {
+            free(hexbuf);
+            snprintf(ota_err_msg, sizeof(ota_err_msg),
+                     "teensy hex stale (sha mismatch); retry in ~30s");
+            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+        }
     }
 
     // Drain anything the Teensy might have queued before our request.
@@ -4332,6 +4390,21 @@ static void otaDoDownload() {
         }
     }
     http.end();
+
+    // Verify against the manifest sha256 BEFORE writing to the OTA partition.
+    // Without this check, a stale CDN edge that returned an older .bin would
+    // be written + booted into, leaving the dash silently at the old version
+    // after reboot — exactly the symptom seen in v0.1.19 -> v0.1.20 testing.
+    if (ota_sha256[0]) {
+        char actual_hex[65];
+        computeSha256Hex(binbuf, (size_t)contentLen, actual_hex);
+        if (!sha256HexEqual(actual_hex, ota_sha256)) {
+            free(binbuf);
+            snprintf(ota_err_msg, sizeof(ota_err_msg),
+                     "dash bin stale (sha mismatch); retry in ~30s");
+            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+        }
+    }
 
     // Stable one-time transition to APPLYING before flash writes begin.
     ota_state       = OTA_S_APPLYING;
