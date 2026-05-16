@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.0"
+#define FIRMWARE_VERSION "0.1.1"
 
 #include <Preferences.h>
 #include <time.h>
@@ -3957,7 +3957,12 @@ static void drawToolsPage() {
         // Footer hint
         tft.setFont(&fonts::Font2);
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawString("swipe right ← to return to STATUS", 400, 460);
+        // Footer also stamps the running firmware version so we can see at a
+        // glance whether the last OTA actually landed.
+        char foot[64];
+        snprintf(foot, sizeof(foot), "firmware v%s   •   swipe right ← STATUS",
+                 FIRMWARE_VERSION);
+        tft.drawString(foot, 400, 460);
         tft.setTextDatum(textdatum_t::top_left);
         pageJustEntered = false;
     }
