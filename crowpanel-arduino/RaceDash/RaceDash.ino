@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.1"
+#define FIRMWARE_VERSION "0.1.2"
 
 #include <Preferences.h>
 #include <time.h>
@@ -3813,89 +3813,149 @@ static void otaTick() {
     if (ota_state == OTA_S_DOWNLOADING) { otaDoDownload(); return; }
 }
 
+// Anti-flicker version. Static chrome (card frame + title) painted once on
+// page entry. Dynamic regions (state label, version line, progress bar,
+// button strip) repaint only when their underlying value/state changes, and
+// use setTextColor(fg, TFT_NAVY) + setTextPadding so text changes don't
+// require a fillRect-then-drawString that catches the LCD mid-scan.
+static OtaState  om_last_state    = (OtaState)0xFF;       // sentinel
+static uint32_t  om_last_done_kb  = 0xFFFFFFFFu;
+static uint32_t  om_last_total_kb = 0xFFFFFFFFu;
+static char      om_last_status[16] = "\x01";              // sentinel
+static char      om_last_vline[40]  = "\x01";
+
+static void omPaintButton(int x, int w, uint16_t fill, const char* label) {
+    tft.fillRect(x, OM_BTN_Y, w, OM_BTN_H, fill);
+    tft.drawRect(x, OM_BTN_Y, w, OM_BTN_H, TFT_WHITE);
+    tft.setFont(&fonts::Font4);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, fill);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.drawString(label, x + w/2, OM_BTN_Y + OM_BTN_H/2);
+}
+
 static void drawOtaModal() {
     if (!ota_modal_dirty && !pageJustEntered) return;
     ota_modal_dirty = false;
 
     if (pageJustEntered) {
+        // Full chrome paint, once.
         tft.fillScreen(TFT_BLACK);
-        pageJustEntered = false;
-    }
-    tft.fillRect(OM_CARD_X, OM_CARD_Y, OM_CARD_W, OM_CARD_H, TFT_NAVY);
-    tft.drawRect(OM_CARD_X,   OM_CARD_Y,   OM_CARD_W,   OM_CARD_H,   TFT_WHITE);
-    tft.drawRect(OM_CARD_X+1, OM_CARD_Y+1, OM_CARD_W-2, OM_CARD_H-2, TFT_WHITE);
-
-    tft.setFont(&fonts::Font4);
-    tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
-    tft.setTextDatum(textdatum_t::middle_center);
-    tft.drawString("Firmware update", OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 30);
-
-    // Status line (state label)
-    tft.setFont(&fonts::Font2);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
-    tft.setTextPadding(OM_CARD_W - 40);
-    tft.drawString(otaStateLabel(), OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 65);
-    tft.setTextPadding(0);
-
-    // Version comparison line (always show current; show latest when known)
-    char vline[64];
-    if (ota_latest_version[0]) {
-        snprintf(vline, sizeof(vline), "v%s  →  v%s", FIRMWARE_VERSION, ota_latest_version);
-    } else {
-        snprintf(vline, sizeof(vline), "current: v%s", FIRMWARE_VERSION);
-    }
-    tft.setFont(&fonts::Font4);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
-    tft.setTextPadding(OM_CARD_W - 40);
-    tft.drawString(vline, OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 100);
-    tft.setTextPadding(0);
-
-    // Progress bar / err message zone
-    if (ota_state == OTA_S_DOWNLOADING || ota_state == OTA_S_APPLYING ||
-        ota_state == OTA_S_REBOOT) {
-        const uint32_t total = ota_total_bytes > 0 ? ota_total_bytes : 1;
-        const uint32_t done  = ota_done_bytes  > total ? total : ota_done_bytes;
-        const int fillW = (int)((uint64_t)done * (OM_BAR_W - 4) / total);
+        tft.fillRect(OM_CARD_X,   OM_CARD_Y,   OM_CARD_W,   OM_CARD_H,   TFT_NAVY);
+        tft.drawRect(OM_CARD_X,   OM_CARD_Y,   OM_CARD_W,   OM_CARD_H,   TFT_WHITE);
+        tft.drawRect(OM_CARD_X+1, OM_CARD_Y+1, OM_CARD_W-2, OM_CARD_H-2, TFT_WHITE);
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("Firmware update", OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 30);
+        // Progress bar outline (drawn once — only the inner fill is dynamic).
         tft.drawRect(OM_BAR_X, OM_BAR_Y, OM_BAR_W, OM_BAR_H, TFT_WHITE);
         tft.fillRect(OM_BAR_X + 2, OM_BAR_Y + 2, OM_BAR_W - 4, OM_BAR_H - 4, TFT_BLACK);
-        if (fillW > 0)
-            tft.fillRect(OM_BAR_X + 2, OM_BAR_Y + 2, fillW, OM_BAR_H - 4, TFT_GREEN);
-        char pbline[40];
-        const int pct = (int)((uint64_t)done * 100 / total);
-        snprintf(pbline, sizeof(pbline), "%lu / %lu KB   %d%%",
-                 (unsigned long)(done / 1024UL), (unsigned long)(total / 1024UL), pct);
+        pageJustEntered = false;
+        // Force every dynamic block to repaint on this first frame.
+        om_last_state      = (OtaState)0xFF;
+        om_last_done_kb    = 0xFFFFFFFFu;
+        om_last_total_kb   = 0xFFFFFFFFu;
+        om_last_status[0]  = '\x01';
+        om_last_vline[0]   = '\x01';
+    }
+
+    // ---- State label (line under title). Repaint only on label change. ----
+    const char* slabel = otaStateLabel();
+    if (strncmp(slabel, om_last_status, sizeof(om_last_status)) != 0) {
+        strncpy(om_last_status, slabel, sizeof(om_last_status));
+        om_last_status[sizeof(om_last_status)-1] = '\0';
         tft.setFont(&fonts::Font2);
-        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+        tft.setTextDatum(textdatum_t::middle_center);
         tft.setTextPadding(OM_CARD_W - 40);
-        tft.drawString(pbline, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + OM_BAR_H + 16);
+        tft.drawString(slabel, OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 65);
         tft.setTextPadding(0);
-    } else if (ota_state == OTA_S_FAILED && ota_err_msg[0]) {
+    }
+
+    // ---- Version line. Repaint only when string content changes. ----
+    char vline[40];
+    if (ota_latest_version[0])
+        snprintf(vline, sizeof(vline), "v%s  →  v%s", FIRMWARE_VERSION, ota_latest_version);
+    else
+        snprintf(vline, sizeof(vline), "current: v%s", FIRMWARE_VERSION);
+    if (strncmp(vline, om_last_vline, sizeof(om_last_vline)) != 0) {
+        strncpy(om_last_vline, vline, sizeof(om_last_vline));
+        om_last_vline[sizeof(om_last_vline)-1] = '\0';
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextPadding(OM_CARD_W - 40);
+        tft.drawString(vline, OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 100);
+        tft.setTextPadding(0);
+    }
+
+    // ---- Progress bar inner fill + KB/% line. Only when bytes-delta moves. ----
+    const bool show_bar = (ota_state == OTA_S_DOWNLOADING ||
+                           ota_state == OTA_S_APPLYING    ||
+                           ota_state == OTA_S_REBOOT);
+    if (show_bar) {
+        const uint32_t total_kb = ota_total_bytes > 0 ? (ota_total_bytes / 1024UL) : 1;
+        const uint32_t done_kb  = ota_done_bytes / 1024UL;
+        if (done_kb != om_last_done_kb || total_kb != om_last_total_kb) {
+            om_last_done_kb  = done_kb;
+            om_last_total_kb = total_kb;
+            const uint32_t total = ota_total_bytes > 0 ? ota_total_bytes : 1;
+            const uint32_t done  = ota_done_bytes  > total ? total : ota_done_bytes;
+            const int fillW = (int)((uint64_t)done * (OM_BAR_W - 4) / total);
+            // Paint only the green delta band — don't touch already-green cells.
+            // Right side beyond current fill stays black (drawn once on entry).
+            if (fillW > 0)
+                tft.fillRect(OM_BAR_X + 2, OM_BAR_Y + 2, fillW, OM_BAR_H - 4, TFT_GREEN);
+            const int pct = (int)((uint64_t)done * 100 / total);
+            char pbline[40];
+            snprintf(pbline, sizeof(pbline), "%lu / %lu KB   %d%%",
+                     (unsigned long)done_kb, (unsigned long)total_kb, pct);
+            tft.setFont(&fonts::Font2);
+            tft.setTextSize(1);
+            tft.setTextColor(TFT_WHITE, TFT_NAVY);
+            tft.setTextDatum(textdatum_t::middle_center);
+            tft.setTextPadding(OM_CARD_W - 40);
+            tft.drawString(pbline, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + OM_BAR_H + 16);
+            tft.setTextPadding(0);
+        }
+    } else if (ota_state == OTA_S_FAILED && ota_err_msg[0] &&
+               om_last_state != OTA_S_FAILED) {
+        // Wipe the bar area, draw error message in its place. Done once per
+        // state transition into FAILED.
+        tft.fillRect(OM_BAR_X, OM_BAR_Y, OM_BAR_W, OM_BAR_H + 32, TFT_NAVY);
         tft.setFont(&fonts::Font2);
+        tft.setTextSize(1);
         tft.setTextColor(TFT_ORANGE, TFT_NAVY);
+        tft.setTextDatum(textdatum_t::middle_center);
         tft.setTextPadding(OM_CARD_W - 40);
         tft.drawString(ota_err_msg, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + 10);
         tft.setTextPadding(0);
     }
 
-    // Bottom button row — content depends on state.
-    auto drawBtn = [](int x, int y, int w, int h, uint16_t fill, const char* label) {
-        tft.fillRect(x, y, w, h, fill);
-        tft.drawRect(x, y, w, h, TFT_WHITE);
-        tft.setFont(&fonts::Font4);
-        tft.setTextColor(TFT_WHITE, fill);
-        tft.setTextDatum(textdatum_t::middle_center);
-        tft.drawString(label, x + w/2, y + h/2);
-    };
-    // Wipe button band first
-    tft.fillRect(OM_CARD_X + 30, OM_BTN_Y, OM_CARD_W - 60, OM_BTN_H, TFT_NAVY);
-    if (ota_state == OTA_S_AVAILABLE) {
-        drawBtn(OM_BTN1_X, OM_BTN_Y, OM_BTN1_W, OM_BTN_H, TFT_DARKGREEN, "UPDATE NOW");
-        drawBtn(OM_BTN2_X, OM_BTN_Y, OM_BTN2_W, OM_BTN_H, TFT_MAROON,    "CANCEL");
-    } else if (ota_state == OTA_S_DOWNLOADING || ota_state == OTA_S_APPLYING) {
-        drawBtn(OM_BTN2_X, OM_BTN_Y, OM_BTN2_W, OM_BTN_H, TFT_MAROON, "CANCEL");
-    } else if (ota_state == OTA_S_UPTODATE || ota_state == OTA_S_FAILED) {
-        drawBtn(OM_BTN2_X, OM_BTN_Y, OM_BTN2_W, OM_BTN_H, TFT_DARKGREY, "CLOSE");
+    // ---- Bottom button row: repaint only on state transitions. ----
+    if (ota_state != om_last_state) {
+        om_last_state = ota_state;
+        // Wipe just the button band (not the whole card).
+        tft.fillRect(OM_CARD_X + 30, OM_BTN_Y, OM_CARD_W - 60, OM_BTN_H, TFT_NAVY);
+        switch (ota_state) {
+            case OTA_S_AVAILABLE:
+                omPaintButton(OM_BTN1_X, OM_BTN1_W, TFT_DARKGREEN, "UPDATE NOW");
+                omPaintButton(OM_BTN2_X, OM_BTN2_W, TFT_MAROON,    "CANCEL");
+                break;
+            case OTA_S_DOWNLOADING:
+            case OTA_S_APPLYING:
+                omPaintButton(OM_BTN2_X, OM_BTN2_W, TFT_MAROON,    "CANCEL");
+                break;
+            case OTA_S_UPTODATE:
+            case OTA_S_FAILED:
+                omPaintButton(OM_BTN2_X, OM_BTN2_W, TFT_DARKGREY,  "CLOSE");
+                break;
+            default: break;   // CHECKING / REBOOT — no button
+        }
     }
     tft.setTextDatum(textdatum_t::top_left);
 }

@@ -74,6 +74,11 @@ cat > "$FW_DIR/manifest.json" <<EOF
   }
 }
 EOF
+# Defensively touch both artifacts so git's stat-cache notices content changes
+# even when mtime + size happen to match the previous version (we hit this in
+# v0.1.1 and v0.1.2 — manifest content changed but mtime didn't, so the file
+# silently dropped out of `git status`).
+touch "$FW_DIR/crowpanel-dash.bin" "$FW_DIR/manifest.json"
 echo "== firmware/manifest.json updated"
 
 cat <<EOF
