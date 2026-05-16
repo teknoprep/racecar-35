@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.25"
+#define FIRMWARE_VERSION "0.1.26"
 
 #include <Preferences.h>
 #include <time.h>
@@ -377,8 +377,12 @@ namespace {
   // START/STOP button on the left). Drop the decimal at >=100 mph so a
   // 3-digit number stays narrow enough to fit the 400-px bg pad cleanly
   // without clipping at the right edge.
-  constexpr int SPEED_CX = 600;          // speed text middle-centre x
-  constexpr int SPEED_PAD_W = 400;       // bg-fill pad width (spans 400..800)
+  // Speed is integer MPH only (no decimal), so the layout never has to budget
+  // for a decimal point that vanishes at >= 100 mph. With 3 digits max we can
+  // pull the centre slightly inward from the right panel edge for breathing
+  // room around the largest values.
+  constexpr int SPEED_CX    = 580;       // speed text middle-centre x
+  constexpr int SPEED_PAD_W = 360;       // bg-fill pad width (spans 400..760)
 }
 
 struct Settings {
@@ -1628,7 +1632,7 @@ struct LastDrawn {
     int16_t  rpm_fillW   = -1;       // last drawn bar fill width in px
     uint16_t rpm_color   = 0;        // last drawn bar fill color
     int32_t  rpm_text    = -1;       // last drawn RPM number under the bar (sentinel = redraw)
-    int16_t  spd_x10     = -1;       // mph * 10, integer for stable equality checks
+    int16_t  spd_int     = -1;       // whole-MPH integer for stable equality checks
     uint8_t  fix         = 0xFF;
     uint8_t  sats        = 0xFF;
     uint8_t  status      = 0xFF;
@@ -1654,7 +1658,7 @@ struct LastDrawn {
 };
 static LastDrawn ld;
 static void invalidateAll() {
-    ld.rpm_fillW = -1; ld.rpm_text = -1; ld.spd_x10 = -1;
+    ld.rpm_fillW = -1; ld.rpm_text = -1; ld.spd_int = -1;
     ld.fix = 0xFF; ld.sats = 0xFF; ld.status = 0xFF;
     ld.recording = -1;
     ld.rec_badge_tag = 0xFF; ld.rec_samples = UINT32_MAX; ld.cld_queue = UINT32_MAX;
@@ -1794,28 +1798,25 @@ static void drawDashPage() {
     }
 
     // ---- HUGE speed number — Font7 size 4 ----
-    // Don't pad with spaces (Font7's space is wide; that pushes the visible
-    // digits off-centre). Instead use setTextPadding so the framework auto-
-    // fills bg around the centred digits to a fixed width — that keeps the
-    // visible digits exactly at x=400 and erases any leftover from a longer
-    // previous draw in the same operation.
+    // Always integer MPH so the visible string is at most 3 digits with no
+    // decimal point eating a character cell. setTextPadding auto-fills bg
+    // around the centred digits to a fixed width so the visible digits stay
+    // centred on SPEED_CX and any leftover from a longer previous draw is
+    // erased in the same atomic operation.
     {
-        const int spd_x10 = (int)(g.mph * 10.0f + 0.5f);
-        if (spd_x10 != ld.spd_x10) {
+        const int spd_int = (int)(g.mph + 0.5f);
+        if (spd_int != ld.spd_int) {
             tft.setTextColor(TFT_WHITE, bg);
             tft.setTextDatum(textdatum_t::middle_center);
             tft.setFont(&fonts::Font7);
             tft.setTextSize(4);
             tft.setTextPadding(SPEED_PAD_W);
-            char buf[16];
-            // Drop the decimal at 100+ mph so we stay 3 digits wide and
-            // fit the right-side band without clipping.
-            if (g.mph >= 100.0f) snprintf(buf, sizeof(buf), "%.0f", g.mph);
-            else                 snprintf(buf, sizeof(buf), "%.1f", g.mph);
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d", spd_int);
             tft.drawString(buf, SPEED_CX, 230);
             tft.setTextPadding(0);
             tft.setTextSize(1);
-            ld.spd_x10 = spd_x10;
+            ld.spd_int = (int16_t)spd_int;
             ld.recording = -1;        // speed redraw can clip the button — force its repaint
         }
     }
