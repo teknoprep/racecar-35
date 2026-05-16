@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.34"
+#define FIRMWARE_VERSION "0.1.35"
 
 #include <Preferences.h>
 #include <time.h>
@@ -91,6 +91,9 @@ enum WifiState : uint8_t { WS_OFF = 0, WS_CONNECTING, WS_CONNECTED, WS_FAILED };
 enum UploadFlowState : uint8_t {
     UF_IDLE = 0, UF_LISTING, UF_FETCH_HEAD, UF_FETCH_BODY,
     UF_POSTING, UF_DELETING, UF_DONE,
+};
+enum SessionsListState : uint8_t {
+    SL_IDLE = 0, SL_LISTING, SL_DELETING,
 };
 static bool wifiConnectedNow();
 
@@ -979,6 +982,7 @@ enum Page : uint8_t {
     PAGE_UPLOAD        = 9,   // full-screen modal during file upload; blocks all other input
     PAGE_OTA           = 10,  // full-screen modal during firmware update check / install
     PAGE_TOOLS         = 11,  // maintenance actions: Check for updates, Format SD
+    PAGE_SESSIONS      = 12,  // queued NDJSON sessions: select + delete + delete all
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -1366,6 +1370,74 @@ static void ufNextFile() {
     ufStartCurrentFile();
 }
 
+// ---------------------------------------------------------------------------
+// PAGE_SESSIONS state. Reuses the same Q,LIST / Q,DEL wire protocol that the
+// upload flow uses but keeps its own data so the user can still tap UPLOAD
+// on PAGE_DASH while browsing the queue here. The SessionsListState enum is
+// forward-declared at the top of the file (see uploads section) so the auto
+// prototyper can see slEnter(SessionsListState) signatures.
+// ---------------------------------------------------------------------------
+static constexpr int SESSIONS_MAX_FILES = 24;   // bounded to keep RAM use predictable
+
+struct SessionsList {
+    SessionsListState state;
+    uint32_t state_entered_ms;
+    char     files[SESSIONS_MAX_FILES][80];
+    uint32_t sizes[SESSIONS_MAX_FILES];
+    bool     selected[SESSIONS_MAX_FILES];
+    int      count;
+    // Delete batch progress.
+    int      del_idx;       // currently-being-deleted index in files[]
+    int      del_done;      // total OKs in this batch
+    int      del_fail;      // total fails in this batch
+    char     last_err[64];
+    bool     delete_all_mode;
+    bool     dirty;
+};
+static SessionsList sl = {};
+static int sessions_scroll_y = 0;
+
+static void slReset() {
+    memset(&sl, 0, sizeof(sl));
+    sl.state = SL_IDLE;
+    sessions_scroll_y = 0;
+}
+
+static void slEnter(SessionsListState st) {
+    sl.state = st;
+    sl.state_entered_ms = millis();
+    sl.dirty = true;
+}
+
+static void sessionsRequestList() {
+    slReset();
+    slEnter(SL_LISTING);
+    Serial.println("Q,LIST");
+    Serial.flush();
+}
+
+// Walk sl.files looking for the next selected file (or any file in delete-all
+// mode). Returns the index, or -1 if there are none left to delete.
+static int sl_next_to_delete(int from_idx) {
+    for (int i = from_idx; i < sl.count; ++i) {
+        if (sl.delete_all_mode || sl.selected[i]) return i;
+    }
+    return -1;
+}
+
+static void slStartDelete(bool delete_all) {
+    if (sl.state == SL_DELETING) return;       // already running
+    if (sl.count == 0) return;
+    sl.delete_all_mode = delete_all;
+    sl.del_done = sl.del_fail = 0;
+    sl.last_err[0] = '\0';
+    sl.del_idx = sl_next_to_delete(0);
+    if (sl.del_idx < 0) return;                // nothing selected
+    slEnter(SL_DELETING);
+    Serial.printf("Q,DEL,%s\n", sl.files[sl.del_idx]);
+    Serial.flush();
+}
+
 static bool parseQLine(const String& line) {
     // Q,FILE,<name>,<size>
     // Q,END[,<reason>]
@@ -1375,6 +1447,47 @@ static bool parseQLine(const String& line) {
     // Q,ERR,<reason>
     // Q,DEL,OK | Q,DEL,FAIL,<reason>
     const char* p = line.c_str() + 2;   // skip 'Q,'
+
+    // PAGE_SESSIONS consumer (preferred when it's actively listing/deleting).
+    if (strncmp(p, "FILE,", 5) == 0 && sl.state == SL_LISTING) {
+        const char* rest = p + 5;
+        const char* comma = strchr(rest, ',');
+        if (!comma || sl.count >= SESSIONS_MAX_FILES) return true;
+        const size_t name_len = (size_t)(comma - rest);
+        if (name_len >= sizeof(sl.files[0])) return true;
+        memcpy(sl.files[sl.count], rest, name_len);
+        sl.files[sl.count][name_len] = '\0';
+        sl.sizes[sl.count] = (uint32_t)strtoul(comma + 1, nullptr, 10);
+        sl.selected[sl.count] = false;
+        sl.count++;
+        sl.dirty = true;
+        return true;
+    }
+    if (strncmp(p, "END", 3) == 0 && sl.state == SL_LISTING) {
+        slEnter(SL_IDLE);
+        return true;
+    }
+    if (strncmp(p, "DEL,", 4) == 0 && sl.state == SL_DELETING) {
+        if (strncmp(p + 4, "OK", 2) == 0) sl.del_done++;
+        else {
+            sl.del_fail++;
+            snprintf(sl.last_err, sizeof(sl.last_err), "%s", p + 4);
+        }
+        // advance to next file to delete
+        const int next = sl_next_to_delete(sl.del_idx + 1);
+        if (next < 0) {
+            // Done; refresh list to drop the deleted entries.
+            sessionsRequestList();
+        } else {
+            sl.del_idx = next;
+            Serial.printf("Q,DEL,%s\n", sl.files[sl.del_idx]);
+            Serial.flush();
+            sl.state_entered_ms = millis();
+        }
+        return true;
+    }
+
+    // Upload-flow consumer.
     if (strncmp(p, "FILE,", 5) == 0 && uf.state == UF_LISTING) {
         const char* rest = p + 5;
         const char* comma = strchr(rest, ',');
@@ -1739,6 +1852,9 @@ static bool parseUploadLine(const String& line);
 static bool parseQLine(const String& line);
 static void ufStartListing();
 static void uploadTick();
+static void handleSessionsTap(int x, int y);
+static void drawSessionsPage();
+static void sessionsRequestList();
 static void drawOtaModal();
 static void handleOtaModalTap(int x, int y);
 static void otaTick();
@@ -1897,6 +2013,12 @@ static void handleTouch() {
                 } else if (dx > 0 && currentPage == PAGE_TOOLS) {
                     currentPage = PAGE_STATUS;
                     pageJustEntered = true;
+                } else if (dx < 0 && currentPage == PAGE_TOOLS) {
+                    currentPage = PAGE_SESSIONS;
+                    pageJustEntered = true;
+                } else if (dx > 0 && currentPage == PAGE_SESSIONS) {
+                    currentPage = PAGE_TOOLS;
+                    pageJustEntered = true;
                 }
             }
         } else {  // GESTURE_NONE — never moved much, treat as tap
@@ -1905,6 +2027,7 @@ static void handleTouch() {
                 else if (currentPage == PAGE_SETTINGS) handleSettingsTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_TOOLS)    handleToolsTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_STATUS)   handleStatusTap(tt.startX, tt.startY);
+                else if (currentPage == PAGE_SESSIONS) handleSessionsTap(tt.startX, tt.startY);
             }
         }
         tt.active = false;
@@ -5712,6 +5835,163 @@ static void handleToolsTap(int x, int y) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PAGE_SESSIONS — list of NDJSON files queued for upload, with per-row
+// checkboxes and Delete / Delete All footer buttons.
+//
+// Data comes from the Teensy via the existing Q,* protocol (Q,LIST emits
+// one Q,FILE,<name>,<size> per file, then Q,END). Delete actions send
+// Q,DEL,<name>; the Teensy responds Q,DEL,OK or Q,DEL,FAIL,<reason>. After a
+// delete batch finishes, the dash re-issues Q,LIST to refresh.
+// ---------------------------------------------------------------------------
+namespace {
+    constexpr int SES_HEAD_Y       = 0;
+    constexpr int SES_HEAD_H       = 42;
+    constexpr int SES_BODY_TOP     = 52;
+    constexpr int SES_BODY_BOTTOM  = 400;   // leaves room for footer
+    constexpr int SES_ROW_H        = 36;
+    constexpr int SES_ROW_PAD_Y    = 4;
+    constexpr int SES_CB_X         = 16;    // checkbox left
+    constexpr int SES_CB_SIZE      = 22;    // checkbox edge length
+    constexpr int SES_NAME_X       = 54;    // filename left
+    constexpr int SES_SIZE_X       = 670;   // right-aligned size
+    constexpr int SES_FOOT_Y       = 408;
+    constexpr int SES_FOOT_H       = 64;
+    constexpr int SES_BTN_DEL_X    = 40;
+    constexpr int SES_BTN_DELALL_X = 440;
+    constexpr int SES_BTN_W        = 320;
+    constexpr int SES_BTN_H        = SES_FOOT_H;
+}
+
+static int sessions_selected_count() {
+    int n = 0;
+    for (int i = 0; i < sl.count; ++i) if (sl.selected[i]) n++;
+    return n;
+}
+
+static void drawSessionsPage() {
+    sl.dirty = false;
+    constexpr uint16_t BG = TFT_BLACK;
+    if (pageJustEntered) {
+        tft.fillScreen(BG);
+        pageJustEntered = false;
+    } else {
+        // Wipe just the body and footer band; header repaints below.
+        tft.fillRect(0, SES_BODY_TOP, 800, SES_FOOT_Y + SES_FOOT_H - SES_BODY_TOP, BG);
+    }
+
+    // Header: title + busy indicator + queue count.
+    tft.fillRect(0, SES_HEAD_Y, 800, SES_HEAD_H, BG);
+    tft.setFont(&fonts::Font4);
+    tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::middle_left);
+    tft.setTextColor(TFT_WHITE, BG);
+    tft.drawString("SESSIONS", 16, SES_HEAD_Y + SES_HEAD_H / 2);
+    tft.setFont(&fonts::Font2);
+    tft.setTextDatum(textdatum_t::middle_right);
+    tft.setTextColor(TFT_LIGHTGREY, BG);
+    char hdr[48];
+    if (sl.state == SL_LISTING) {
+        snprintf(hdr, sizeof(hdr), "loading...");
+    } else if (sl.state == SL_DELETING) {
+        snprintf(hdr, sizeof(hdr), "deleting %d / %d", sl.del_done, sl.del_done + sl.del_fail + 1);
+    } else {
+        snprintf(hdr, sizeof(hdr), "%d in queue", sl.count);
+    }
+    tft.drawString(hdr, 784, SES_HEAD_Y + SES_HEAD_H / 2);
+    tft.fillRect(0, SES_HEAD_Y + SES_HEAD_H - 1, 800, 1, TFT_DARKGREY);
+
+    // Body: scrollable list. Each row gets a checkbox, filename, size.
+    tft.setTextDatum(textdatum_t::middle_left);
+    tft.setFont(&fonts::Font2);
+    if (sl.count == 0) {
+        tft.setTextColor(TFT_DARKGREY, BG);
+        tft.setTextDatum(textdatum_t::middle_center);
+        if (sl.state == SL_LISTING)
+            tft.drawString("loading queue...", 400, SES_BODY_TOP + 80);
+        else
+            tft.drawString("no queued sessions", 400, SES_BODY_TOP + 80);
+    } else {
+        for (int i = 0; i < sl.count; ++i) {
+            const int y = SES_BODY_TOP + SES_ROW_PAD_Y + i * SES_ROW_H - sessions_scroll_y;
+            if (y + SES_ROW_H < SES_BODY_TOP || y > SES_BODY_BOTTOM) continue;
+            // Checkbox
+            tft.drawRect(SES_CB_X, y, SES_CB_SIZE, SES_CB_SIZE, TFT_LIGHTGREY);
+            if (sl.selected[i]) {
+                tft.fillRect(SES_CB_X + 4, y + 4, SES_CB_SIZE - 8, SES_CB_SIZE - 8, TFT_GREEN);
+            }
+            // Filename (truncated if too long)
+            tft.setTextColor(TFT_WHITE, BG);
+            tft.setTextDatum(textdatum_t::middle_left);
+            tft.setTextPadding(SES_SIZE_X - SES_NAME_X - 10);
+            tft.drawString(sl.files[i], SES_NAME_X, y + SES_CB_SIZE / 2);
+            // Size
+            tft.setTextColor(TFT_LIGHTGREY, BG);
+            tft.setTextDatum(textdatum_t::middle_right);
+            char sizebuf[24];
+            if (sl.sizes[i] >= 1024 * 1024)
+                snprintf(sizebuf, sizeof(sizebuf), "%.1f MB", sl.sizes[i] / 1048576.0f);
+            else if (sl.sizes[i] >= 1024)
+                snprintf(sizebuf, sizeof(sizebuf), "%.1f KB", sl.sizes[i] / 1024.0f);
+            else
+                snprintf(sizebuf, sizeof(sizebuf), "%lu B", (unsigned long)sl.sizes[i]);
+            tft.setTextPadding(120);
+            tft.drawString(sizebuf, SES_SIZE_X + 100, y + SES_CB_SIZE / 2);
+            tft.setTextPadding(0);
+        }
+    }
+
+    // Footer: Delete selected (only enabled if any selected) and Delete All.
+    const int selected_n = sessions_selected_count();
+    const bool del_enabled  = sl.state == SL_IDLE && selected_n > 0;
+    const bool dall_enabled = sl.state == SL_IDLE && sl.count > 0;
+    const uint16_t del_fill  = del_enabled  ? TFT_MAROON : TFT_DARKGREY;
+    const uint16_t dall_fill = dall_enabled ? TFT_RED    : TFT_DARKGREY;
+    tft.fillRect(SES_BTN_DEL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, del_fill);
+    tft.drawRect(SES_BTN_DEL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, TFT_WHITE);
+    tft.drawRect(SES_BTN_DEL_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
+    tft.fillRect(SES_BTN_DELALL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, dall_fill);
+    tft.drawRect(SES_BTN_DELALL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, TFT_WHITE);
+    tft.drawRect(SES_BTN_DELALL_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
+    tft.setFont(&fonts::Font4);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, del_fill);
+    char delLabel[40];
+    if (selected_n > 0) snprintf(delLabel, sizeof(delLabel), "Delete (%d)", selected_n);
+    else                snprintf(delLabel, sizeof(delLabel), "Delete selected");
+    tft.drawString(delLabel, SES_BTN_DEL_X + SES_BTN_W / 2, SES_FOOT_Y + SES_BTN_H / 2);
+    tft.setTextColor(TFT_WHITE, dall_fill);
+    tft.drawString("Delete all", SES_BTN_DELALL_X + SES_BTN_W / 2, SES_FOOT_Y + SES_BTN_H / 2);
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleSessionsTap(int x, int y) {
+    // Footer buttons first.
+    if (y >= SES_FOOT_Y && y <= SES_FOOT_Y + SES_FOOT_H) {
+        if (x >= SES_BTN_DEL_X && x < SES_BTN_DEL_X + SES_BTN_W) {
+            if (sl.state == SL_IDLE && sessions_selected_count() > 0) {
+                slStartDelete(/*delete_all=*/false);
+            }
+            return;
+        }
+        if (x >= SES_BTN_DELALL_X && x < SES_BTN_DELALL_X + SES_BTN_W) {
+            if (sl.state == SL_IDLE && sl.count > 0) {
+                slStartDelete(/*delete_all=*/true);
+            }
+            return;
+        }
+    }
+    // Body rows: tap toggles selection of the row whose box you hit.
+    if (y < SES_BODY_TOP || y > SES_BODY_BOTTOM) return;
+    if (sl.state != SL_IDLE) return;            // ignore taps mid-delete/list
+    const int rel_y = y - SES_BODY_TOP - SES_ROW_PAD_Y + sessions_scroll_y;
+    if (rel_y < 0) return;
+    const int idx = rel_y / SES_ROW_H;
+    if (idx < 0 || idx >= sl.count) return;
+    sl.selected[idx] = !sl.selected[idx];
+    sl.dirty = true;
+}
+
 static void handleConfigPickerTap(int x, int y) {
     const TrackInfo& t = TRACKS[cp.track_idx];
     const int n = (int)t.n_configs;
@@ -6362,6 +6642,15 @@ void loop() {
         // visibly and the OTA gating subtext (WiFi connected? mode?) reflects
         // changes promptly. Cheap — only two buttons painted.
         if (pageJustEntered || now - lastDraw >= 250) { lastDraw = now; drawToolsPage(); }
+    } else if (currentPage == PAGE_SESSIONS) {
+        // On entry, kick a Q,LIST so the page populates from the SD queue.
+        if (pageJustEntered) {
+            sessionsRequestList();
+        }
+        if (pageJustEntered || sl.dirty || now - lastDraw >= 250) {
+            lastDraw = now;
+            drawSessionsPage();
+        }
     } else if (currentPage == PAGE_OTA) {
         otaTick();
         if (pageJustEntered || ota_modal_dirty || now - lastDraw >= 250) {

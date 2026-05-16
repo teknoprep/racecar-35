@@ -11,9 +11,10 @@ POST /upload   Whole-file AfterRace upload. Overwrites by session_id so
 POST /stream   Live streaming append. Each request body is appended to the
                session file. Reserved for the future Ethernet-mode live
                streamer; in WiFi mode the dash uses /upload only.
-GET  /         Tiny HTML index of every saved session.
+GET  /         HTML index: search, manual validated upload, delete, review links.
 GET  /sessions Same listing as JSON.
 GET  /sessions/<user>/<file>  Download one session file.
+DELETE /sessions/<user>/<file> Delete one session file (API key checked if set).
 GET  /health   Returns {"ok": true}; used by nginx / Docker healthcheck.
 
 Headers honored (must match the dash firmware):
@@ -32,16 +33,25 @@ Run locally with docker compose (see ../docker-compose.yml) or directly:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import html
 import json
 import logging
+import math
 import os
 import pathlib
 import re
+import secrets
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -51,6 +61,24 @@ API_KEY = os.environ.get("RACECAR_API_KEY", "").strip()
 SERVICE_NAME = os.environ.get("RACECAR_SERVICE_NAME", "racecar-35 cloud")
 MAX_BODY_BYTES = int(os.environ.get("RACECAR_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
+# Google OAuth is optional. If GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are
+# blank, the server stays in open dev mode. Once configured, all browser UI
+# routes require Google sign-in; dash ingestion still uses X-API-Key.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "").strip()
+ALLOWED_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("RACECAR_ALLOWED_EMAILS", "").split(",")
+    if e.strip()
+}
+SESSION_COOKIE = "racecar_session"
+OAUTH_STATE_COOKIE = "racecar_oauth_state"
+OAUTH_NEXT_COOKIE = "racecar_oauth_next"
+COOKIE_SECURE = os.environ.get("RACECAR_COOKIE_SECURE", "0").lower() in {"1", "true", "yes", "on"}
+SESSION_TTL_SECONDS = int(os.environ.get("RACECAR_SESSION_TTL_SECONDS", str(7 * 24 * 3600)))
+SESSION_SECRET = os.environ.get("RACECAR_SESSION_SECRET", "").strip() or API_KEY or "racecar-35-dev-session-secret-change-me"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 (DATA_DIR / "sessions").mkdir(parents=True, exist_ok=True)
 
@@ -59,6 +87,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("racecar.cloud")
+if SESSION_SECRET == "racecar-35-dev-session-secret-change-me":
+    log.warning("RACECAR_SESSION_SECRET is not set; OAuth sessions use a dev secret")
 
 app = FastAPI(title=SERVICE_NAME, version="0.1.0", docs_url="/docs")
 
@@ -105,9 +135,331 @@ def parse_session_id(filename: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def oauth_enabled() -> bool:
+    return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _sign(data: str) -> str:
+    mac = hmac.new(SESSION_SECRET.encode("utf-8"), data.encode("ascii"), hashlib.sha256).digest()
+    return _b64url(mac)
+
+
+def make_session_cookie(user: dict) -> str:
+    now = int(time.time())
+    payload = {
+        "email": str(user.get("email", "")).lower(),
+        "name": user.get("name") or user.get("email") or "",
+        "picture": user.get("picture") or "",
+        "sub": user.get("sub") or "",
+        "iat": now,
+        "exp": now + SESSION_TTL_SECONDS,
+    }
+    raw = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    return raw + "." + _sign(raw)
+
+
+def current_user(request: Request) -> Optional[dict]:
+    cookie = request.cookies.get(SESSION_COOKIE, "")
+    if not cookie or "." not in cookie:
+        return None
+    raw, sig = cookie.rsplit(".", 1)
+    if not hmac.compare_digest(_sign(raw), sig):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(raw))
+    except Exception:
+        return None
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    email = str(payload.get("email", "")).lower()
+    if not email:
+        return None
+    return payload
+
+
+def require_web_user(request: Request) -> Optional[dict]:
+    """Require Google login when OAuth is configured; no-op in dev mode."""
+    if not oauth_enabled():
+        return None
+    user = current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="login required")
+    return user
+
+
+def login_redirect(request: Request) -> RedirectResponse:
+    target = request.url.path
+    if request.url.query:
+        target += "?" + request.url.query
+    return RedirectResponse("/login?" + urllib.parse.urlencode({"next": target}))
+
+
+def authorize_api_or_user(request: Request, x_api_key: Optional[str]) -> Optional[dict]:
+    """Allow valid dash API key OR logged-in Google user.
+
+    If OAuth is not configured and RACECAR_API_KEY is blank, keep dev-mode
+    compatibility and allow the operation.
+    """
+    if API_KEY and x_api_key == API_KEY:
+        return None
+    user = current_user(request) if oauth_enabled() else None
+    if user:
+        return user
+    if API_KEY:
+        raise HTTPException(status_code=401, detail="login or valid api key required")
+    if oauth_enabled():
+        raise HTTPException(status_code=401, detail="login required")
+    return None
+
+
+def oauth_redirect_uri(request: Request) -> str:
+    if GOOGLE_REDIRECT_URI:
+        return GOOGLE_REDIRECT_URI
+    return str(request.url_for("auth_google_callback"))
+
+
+def cookie_kwargs() -> dict:
+    return {"httponly": True, "samesite": "lax", "secure": COOKIE_SECURE}
+
+
+def _json_constant_error(name: str) -> None:
+    """Reject Python json's non-standard NaN / Infinity extensions."""
+    raise ValueError(f"invalid JSON constant {name}")
+
+
+def _is_json_number(v: object) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
+
+
+_OPTIONAL_NUMERIC_FIELDS = {
+    "fix", "sats", "alt_m", "speed_mph", "heading_deg", "rpm",
+    "oil_psi", "coolant_f", "oil_psi_x10", "cool_f_x10",
+    "ax", "ay", "az", "gx", "gy", "gz",
+}
+
+
+def validate_ndjson_body(body: bytes) -> dict:
+    """Validate racecar session NDJSON before it is accepted.
+
+    Rules are intentionally strict enough to catch accidental uploads (CSV,
+    JSON arrays, browser error pages, partial files) but compatible with the
+    firmware's descriptive-key NDJSON serializer:
+      - non-empty UTF-8 text
+      - one JSON object per non-empty line
+      - every sample must have numeric finite t, lat, lon
+      - lat/lon must be in normal WGS84 ranges
+      - known telemetry numeric fields, when present, must be finite numbers
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    samples = 0
+    geo = 0
+    first_t: Optional[float] = None
+    last_t: Optional[float] = None
+
+    if body.startswith(b"\xef\xbb\xbf"):
+        body = body[3:]
+
+    try:
+        lines = body.decode("utf-8").splitlines()
+    except UnicodeDecodeError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "invalid NDJSON", "errors": [f"not UTF-8: {e}"]},
+        )
+
+    if not body.strip():
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "invalid NDJSON", "errors": ["file is empty"]},
+        )
+
+    for lineno, line in enumerate(lines, 1):
+        raw = line.strip()
+        if not raw:
+            warnings.append(f"line {lineno}: blank line ignored")
+            continue
+        try:
+            obj = json.loads(raw, parse_constant=_json_constant_error)
+        except Exception as e:
+            errors.append(f"line {lineno}: invalid JSON ({e})")
+            if len(errors) >= 25:
+                break
+            continue
+        if not isinstance(obj, dict):
+            errors.append(f"line {lineno}: expected a JSON object, got {type(obj).__name__}")
+            if len(errors) >= 25:
+                break
+            continue
+
+        samples += 1
+
+        t = obj.get("t")
+        if not _is_json_number(t):
+            errors.append(f"line {lineno}: missing/non-numeric t")
+        else:
+            tf = float(t)
+            if first_t is None:
+                first_t = tf
+            if last_t is not None and tf < last_t:
+                warnings.append(f"line {lineno}: timestamp moved backwards")
+            last_t = tf
+
+        lat = obj.get("lat")
+        lon = obj.get("lon")
+        if not _is_json_number(lat) or not _is_json_number(lon):
+            errors.append(f"line {lineno}: missing/non-numeric lat/lon")
+        else:
+            latf = float(lat)
+            lonf = float(lon)
+            if not (-90 <= latf <= 90):
+                errors.append(f"line {lineno}: lat out of range")
+            if not (-180 <= lonf <= 180):
+                errors.append(f"line {lineno}: lon out of range")
+            geo += 1
+
+        for field in _OPTIONAL_NUMERIC_FIELDS:
+            if field in obj and not _is_json_number(obj[field]):
+                errors.append(f"line {lineno}: {field} must be numeric")
+
+        if len(errors) >= 25:
+            break
+
+    if samples == 0:
+        errors.append("no JSON samples found")
+    if geo == 0:
+        errors.append("no valid lat/lon samples found")
+
+    if errors:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "invalid NDJSON", "errors": errors[:25], "warnings": warnings[:10]},
+        )
+
+    return {
+        "samples": samples,
+        "geo_samples": geo,
+        "warnings": warnings[:10],
+        "duration_s": (last_t - first_t) if first_t is not None and last_t is not None else 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+@app.get("/login", response_class=HTMLResponse)
+async def login(request: Request, next: str = "/") -> Response:
+    if not oauth_enabled():
+        return HTMLResponse(_LOGIN_DISABLED_HTML)
+    if current_user(request):
+        return RedirectResponse(next if next.startswith("/") else "/")
+
+    state = secrets.token_urlsafe(32)
+    safe_next = next if next.startswith("/") and not next.startswith("//") else "/"
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": oauth_redirect_uri(request),
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "prompt": "select_account",
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    page = _LOGIN_HTML.replace("__AUTH_URL__", html.escape(auth_url))
+    resp = HTMLResponse(page)
+    resp.set_cookie(OAUTH_STATE_COOKIE, state, max_age=600, **cookie_kwargs())
+    resp.set_cookie(OAUTH_NEXT_COOKIE, safe_next, max_age=600, **cookie_kwargs())
+    return resp
+
+
+@app.get("/auth/google/callback")
+async def auth_google_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+) -> Response:
+    if error:
+        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", html.escape(error)), status_code=400)
+    if not oauth_enabled():
+        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", "Google OAuth is not configured"), status_code=400)
+    expected_state = request.cookies.get(OAUTH_STATE_COOKIE, "")
+    if not code or not state or not expected_state or not hmac.compare_digest(state, expected_state):
+        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", "OAuth state mismatch; try again"), status_code=400)
+
+    token_body = urllib.parse.urlencode({
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": oauth_redirect_uri(request),
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+    try:
+        token_req = urllib.request.Request(
+            "https://oauth2.googleapis.com/token",
+            data=token_body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(token_req, timeout=15) as r:
+            token = json.loads(r.read().decode("utf-8"))
+        access_token = token.get("access_token")
+        if not access_token:
+            raise RuntimeError("token response did not include access_token")
+
+        user_req = urllib.request.Request(
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        with urllib.request.urlopen(user_req, timeout=15) as r:
+            user = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        log.exception("google oauth failed")
+        return HTMLResponse(
+            _LOGIN_ERROR_HTML.replace("__ERROR__", html.escape(str(e))),
+            status_code=502,
+        )
+
+    email = str(user.get("email", "")).lower()
+    verified = user.get("email_verified") in (True, "true", "True", "1", 1)
+    if not email or not verified:
+        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", "Google account email is not verified"), status_code=403)
+    if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", f"{html.escape(email)} is not allowed"), status_code=403)
+
+    next_url = request.cookies.get(OAUTH_NEXT_COOKIE, "/")
+    if not next_url.startswith("/") or next_url.startswith("//"):
+        next_url = "/"
+    resp = RedirectResponse(next_url)
+    resp.set_cookie(SESSION_COOKIE, make_session_cookie(user), max_age=SESSION_TTL_SECONDS, **cookie_kwargs())
+    resp.delete_cookie(OAUTH_STATE_COOKIE)
+    resp.delete_cookie(OAUTH_NEXT_COOKIE)
+    return resp
+
+
+@app.get("/logout")
+async def logout() -> RedirectResponse:
+    resp = RedirectResponse("/login")
+    resp.delete_cookie(SESSION_COOKIE)
+    resp.delete_cookie(OAUTH_STATE_COOKIE)
+    resp.delete_cookie(OAUTH_NEXT_COOKIE)
+    return resp
+
+
+@app.get("/me")
+async def me(request: Request) -> dict:
+    user = current_user(request)
+    return {"oauth_enabled": oauth_enabled(), "user": user}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": SERVICE_NAME, "data_dir": str(DATA_DIR)}
@@ -131,6 +483,8 @@ async def _save_body(
     if len(body) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="body too large")
 
+    validation = validate_ndjson_body(body)
+
     email = safe_name(x_user_email)
     sid = safe_name(x_session_id, default="0")
     track = safe_name(x_track_name, default="UNKNOWN")
@@ -143,7 +497,7 @@ async def _save_body(
     with open(out_path, flags) as f:
         f.write(body)
 
-    nl = body.count(b"\n")
+    nl = int(validation["samples"])
     size = out_path.stat().st_size
 
     log.info(
@@ -165,6 +519,7 @@ async def _save_body(
             "path": str(out_path.relative_to(DATA_DIR)),
             "bytes_received": len(body),
             "lines_received": nl,
+            "validation": validation,
             "file_size_bytes": size,
             "ts": int(time.time()),
         }
@@ -249,6 +604,35 @@ async def download_session(user: str, filename: str) -> FileResponse:
         media_type="application/x-ndjson",
         filename=p.name,
     )
+
+
+@app.delete("/sessions/{user}/{filename}")
+async def delete_session(
+    user: str,
+    filename: str,
+    x_api_key: Optional[str] = Header(None),
+) -> JSONResponse:
+    authorize(x_api_key)
+    p = _resolve_session(user, filename)
+    size = p.stat().st_size
+    rel = str(p.relative_to(DATA_DIR))
+    p.unlink()
+    try:
+        p.parent.rmdir()  # tidy empty per-user directory
+    except OSError:
+        pass
+    log.info("deleted session %s bytes=%d", rel, size)
+    return JSONResponse({"ok": True, "deleted": rel, "bytes": size})
+
+
+@app.post("/sessions/{user}/{filename}/delete")
+async def delete_session_form(
+    user: str,
+    filename: str,
+    x_api_key: Optional[str] = Header(None),
+) -> JSONResponse:
+    # Convenience alias for clients that can't send DELETE.
+    return await delete_session(user, filename, x_api_key)
 
 
 @app.get("/sessions/{user}/{filename}/data")
@@ -443,6 +827,28 @@ _INDEX_HEAD = f"""<!doctype html>
  .empty {{ color: var(--muted); font-style: italic; padding: 24px; text-align:center; }}
  .summary {{ color: var(--muted); margin-top: var(--sp-md); font-size: 12px; }}
  .no-match {{ display:none; color: var(--muted); padding: 24px; text-align:center; }}
+ .panel {{ background: var(--surface); border: 1px solid var(--line);
+   border-radius: var(--r-md); padding: var(--sp-md); margin-bottom: var(--sp-md); }}
+ .panel-head {{ display:flex; align-items:center; justify-content:space-between;
+   gap: var(--sp-md); margin-bottom: var(--sp-md); }}
+ .upload-grid {{ display:grid; grid-template-columns: 1.25fr 1fr 140px 1fr 1fr auto;
+   gap: var(--sp-sm); align-items:end; }}
+ .upload-grid label {{ display:block; color: var(--muted); font-size: 11px;
+   text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 5px; }}
+ .upload-grid input {{ min-width: 0; }}
+ input[type=file] {{ width: 100%; color: var(--muted); font: 13px var(--ff-ui); }}
+ input[type=file]::file-selector-button {{ margin-right: 10px; border: 1px solid var(--line);
+   border-radius: var(--r-sm); background: var(--surface-2); color: var(--text);
+   padding: 8px 12px; cursor: pointer; }}
+ .upload-help {{ margin-top: var(--sp-sm); color: var(--muted); font-size: 12px; }}
+ .upload-result {{ display:none; margin: var(--sp-md) 0 0; white-space: pre-wrap;
+   background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-sm);
+   padding: var(--sp-sm); color: var(--muted); max-height: 140px; overflow:auto; }}
+ .upload-result.ok {{ color: var(--good); }}
+ .upload-result.bad {{ color: var(--bad); }}
+ .btn.danger {{ color: var(--bad); }}
+ .actions {{ display:flex; gap: var(--sp-sm); align-items:center; }}
+ @media (max-width: 1100px) {{ .upload-grid {{ grid-template-columns: 1fr 1fr; }} }}
 </style>
 </head><body>
 <header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
@@ -450,17 +856,28 @@ _INDEX_HEAD = f"""<!doctype html>
 <main>
 """
 
-# Tiny dependency-free search filter. Splits the query on whitespace; every
-# token must be a substring of the row's text (case-insensitive). Lets you
-# narrow by combinations like "laguna 2025" or "john watkins".
+# Tiny dependency-free UI script: search/filter, browser-direct upload, delete.
 _INDEX_JS = """
 <script>
 (function(){
-  const q = document.getElementById('q');
-  const rows = Array.from(document.querySelectorAll('#rows tr'));
-  const vis = document.getElementById('vis');
-  const nomatch = document.getElementById('nomatch');
+  const $ = id => document.getElementById(id);
+  const q = $('q');
+  let rows = Array.from(document.querySelectorAll('#rows tr'));
+  const vis = $('vis');
+  const nomatch = $('nomatch');
+  const result = $('uploadResult');
+
+  function apiKey(){ return ($('apiKey')?.value || '').trim(); }
+  function authHeaders(){ const k = apiKey(); return k ? {'X-API-Key': k} : {}; }
+  function showResult(text, ok){
+    if (!result) return;
+    result.className = 'upload-result ' + (ok ? 'ok' : 'bad');
+    result.style.display = 'block';
+    result.textContent = text;
+  }
   function render(){
+    if (!q || !vis) return;
+    rows = Array.from(document.querySelectorAll('#rows tr'));
     const terms = q.value.toLowerCase().split(/\\s+/).filter(Boolean);
     let shown = 0;
     for (const r of rows){
@@ -470,12 +887,113 @@ _INDEX_JS = """
       if (ok) shown++;
     }
     vis.textContent = shown + ' / ' + rows.length;
-    nomatch.style.display = shown === 0 ? 'block' : 'none';
+    if (nomatch) nomatch.style.display = shown === 0 && rows.length ? 'block' : 'none';
   }
-  q.addEventListener('input', render);
+  if (q) q.addEventListener('input', render);
+
+  // Remember convenience fields locally in the browser only.
+  for (const id of ['userEmail', 'apiKey']) {
+    const el = $(id);
+    if (!el) continue;
+    const saved = localStorage.getItem('racecar.' + id);
+    if (saved) el.value = saved;
+    el.addEventListener('input', () => localStorage.setItem('racecar.' + id, el.value));
+  }
+
+  // Infer session id + track from common firmware filename:
+  //   1714942567_LagunaSeca.ndjson
+  const fileEl = $('sessionFile');
+  if (fileEl) fileEl.addEventListener('change', () => {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) return;
+    const base = f.name.replace(/\\.ndjson$/i, '');
+    const m = base.match(/^(\\d+)[_-](.+)$/);
+    if (m) {
+      if (!$('sessionId').value) $('sessionId').value = m[1];
+      if (!$('trackName').value) $('trackName').value = m[2];
+    } else if (!$('trackName').value) {
+      $('trackName').value = base || 'UNKNOWN';
+    }
+  });
+
+  const form = $('uploadForm');
+  if (form) form.addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) { showResult('Choose an .ndjson file first.', false); return; }
+    const user = ($('userEmail').value || 'manual@upload.local').trim();
+    const sid  = ($('sessionId').value || Math.floor(Date.now()/1000).toString()).trim();
+    const trk  = ($('trackName').value || 'UNKNOWN').trim();
+    try {
+      showResult('Validating + uploading ' + f.name + ' ...', true);
+      const body = await f.arrayBuffer();
+      const headers = Object.assign({
+        'Content-Type': 'application/x-ndjson',
+        'X-User-Email': user,
+        'X-Session-Id': sid,
+        'X-Track-Name': trk
+      }, authHeaders());
+      const resp = await fetch('/upload', { method: 'POST', headers, body });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const d = data.detail || data;
+        const errors = d.errors ? ('\n' + d.errors.join('\n')) : '';
+        throw new Error((d.message || data.detail || ('HTTP ' + resp.status)) + errors);
+      }
+      const v = data.validation || {};
+      showResult('OK: saved ' + data.path + '\n' + (v.samples || '?') + ' samples, '
+                 + (v.geo_samples || '?') + ' GPS samples', true);
+      setTimeout(() => location.reload(), 900);
+    } catch(e) {
+      showResult('Upload rejected: ' + e.message, false);
+    }
+  });
+
+  document.addEventListener('click', async ev => {
+    const btn = ev.target.closest('[data-delete]');
+    if (!btn) return;
+    const user = btn.dataset.user, file = btn.dataset.file;
+    if (!confirm('Delete session permanently?\n\n' + user + '/' + file)) return;
+    try {
+      btn.disabled = true;
+      const resp = await fetch('/sessions/' + encodeURIComponent(user) + '/' + encodeURIComponent(file), {
+        method: 'DELETE', headers: authHeaders()
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || ('HTTP ' + resp.status));
+      const tr = btn.closest('tr');
+      if (tr) tr.remove();
+      render();
+    } catch(e) {
+      alert('Delete failed: ' + e.message);
+      btn.disabled = false;
+    }
+  });
+
   render();
 })();
 </script>
+"""
+
+_UPLOAD_PANEL_HTML = """
+<section class="panel">
+  <div class="panel-head">
+    <div>
+      <div class="t-label">Manual Session Upload</div>
+      <div class="upload-help">Uploads are validated server-side before they are saved. Expected format: newline-delimited JSON, one telemetry object per line, with numeric <span class="mono">t</span>, <span class="mono">lat</span>, and <span class="mono">lon</span>.</div>
+    </div>
+    <span class="pill">.ndjson</span>
+  </div>
+  <form id="uploadForm" class="upload-grid">
+    <div><label for="sessionFile">file</label><input id="sessionFile" type="file" accept=".ndjson,application/x-ndjson,text/plain"></div>
+    <div><label for="userEmail">user email</label><input id="userEmail" type="text" placeholder="driver@example.com"></div>
+    <div><label for="sessionId">session id</label><input id="sessionId" type="text" placeholder="unix epoch"></div>
+    <div><label for="trackName">track</label><input id="trackName" type="text" placeholder="UNKNOWN"></div>
+    <div><label for="apiKey">api key</label><input id="apiKey" type="text" placeholder="optional"></div>
+    <button class="btn primary" type="submit">upload</button>
+  </form>
+  <pre id="uploadResult" class="upload-result"></pre>
+</section>
 """
 
 
@@ -513,34 +1031,40 @@ async def index() -> str:
                 if track.endswith(".ndjson"):
                     track = track[:-7]
                 track = re.sub(r"^\d+_", "", track) or "?"
+                user_h = html.escape(user_dir.name)
+                file_h = html.escape(f.name)
+                track_h = html.escape(track)
+                when_h = html.escape(when)
                 rows.append(
-                    f"<tr><td>{user_dir.name}</td>"
-                    f"<td class=mono>{when}</td>"
-                    f"<td>{track}</td>"
-                    f'<td class=mono><a href="/review/{user_dir.name}/{f.name}">{f.name}</a></td>'
+                    f"<tr><td>{user_h}</td>"
+                    f"<td class=mono>{when_h}</td>"
+                    f"<td>{track_h}</td>"
+                    f'<td class=mono><a href="/review/{user_h}/{file_h}">{file_h}</a></td>'
                     f"<td class=num>{size_str}</td>"
-                    f'<td><a href="/sessions/{user_dir.name}/{f.name}">download</a></td></tr>'
+                    f'<td><div class="actions">'
+                    f'<a class="btn" href="/sessions/{user_h}/{file_h}">download</a>'
+                    f'<button class="btn danger" data-delete="1" data-user="{user_h}" data-file="{file_h}">delete</button>'
+                    f'</div></td></tr>'
                 )
                 total += 1
                 total_bytes += st.st_size
 
     if rows:
-        body = (
+        listing = (
             '<div class="toolbar"><div class="grow">'
             '<input type="search" id="q" placeholder="filter by user / track / date / filename\u2026" autofocus>'
             '</div><span class="pill" id="vis"></span></div>'
             "<table><thead><tr><th>user</th><th>started (UTC)</th>"
-            "<th>track</th><th>filename</th><th>size</th><th></th></tr></thead><tbody id=\"rows\">"
+            "<th>track</th><th>filename</th><th>size</th><th>actions</th></tr></thead><tbody id=\"rows\">"
             + "\n".join(rows)
             + "</tbody></table>"
             + '<div class="no-match" id="nomatch">no sessions match that filter.</div>'
             + f'<p class="summary">{total} session(s), {_human_bytes(total_bytes)} total</p>'
-            + _INDEX_JS
         )
     else:
-        body = '<p class="empty">no sessions uploaded yet.</p>'
+        listing = '<p class="empty">no sessions uploaded yet.</p>'
 
-    return _INDEX_HEAD + body + "</main></body></html>"
+    return _INDEX_HEAD + _UPLOAD_PANEL_HTML + listing + _INDEX_JS + "</main></body></html>"
 
 
 # ---------------------------------------------------------------------------
