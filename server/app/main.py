@@ -475,7 +475,13 @@ async def _save_body(
     mode: str,
 ) -> JSONResponse:
     """Common body for /upload (mode='w') and /stream (mode='a')."""
-    authorize(x_api_key)
+    web_user = None
+    if API_KEY and x_api_key != API_KEY:
+        web_user = current_user(request) if oauth_enabled() else None
+        if not web_user:
+            raise HTTPException(status_code=401, detail="invalid api key")
+    elif oauth_enabled():
+        web_user = current_user(request)
 
     body = await request.body()
     if not body:
@@ -485,7 +491,7 @@ async def _save_body(
 
     validation = validate_ndjson_body(body)
 
-    email = safe_name(x_user_email)
+    email = safe_name(x_user_email or (web_user or {}).get("email"))
     sid = safe_name(x_session_id, default="0")
     track = safe_name(x_track_name, default="UNKNOWN")
     filename = f"{sid}_{track}.ndjson"
@@ -563,8 +569,9 @@ async def stream(
 
 
 @app.get("/sessions")
-async def list_sessions() -> dict:
+async def list_sessions(request: Request) -> dict:
     """JSON listing of saved sessions. Useful for tooling/cli inspection."""
+    require_web_user(request)
     out = []
     sessions_root = DATA_DIR / "sessions"
     if sessions_root.exists():
@@ -597,7 +604,8 @@ def _resolve_session(user: str, filename: str) -> pathlib.Path:
 
 
 @app.get("/sessions/{user}/{filename}")
-async def download_session(user: str, filename: str) -> FileResponse:
+async def download_session(request: Request, user: str, filename: str) -> FileResponse:
+    require_web_user(request)
     p = _resolve_session(user, filename)
     return FileResponse(
         p,
@@ -608,11 +616,12 @@ async def download_session(user: str, filename: str) -> FileResponse:
 
 @app.delete("/sessions/{user}/{filename}")
 async def delete_session(
+    request: Request,
     user: str,
     filename: str,
     x_api_key: Optional[str] = Header(None),
 ) -> JSONResponse:
-    authorize(x_api_key)
+    authorize_api_or_user(request, x_api_key)
     p = _resolve_session(user, filename)
     size = p.stat().st_size
     rel = str(p.relative_to(DATA_DIR))
@@ -627,16 +636,18 @@ async def delete_session(
 
 @app.post("/sessions/{user}/{filename}/delete")
 async def delete_session_form(
+    request: Request,
     user: str,
     filename: str,
     x_api_key: Optional[str] = Header(None),
 ) -> JSONResponse:
     # Convenience alias for clients that can't send DELETE.
-    return await delete_session(user, filename, x_api_key)
+    return await delete_session(request, user, filename, x_api_key)
 
 
 @app.get("/sessions/{user}/{filename}/data")
 async def session_data(
+    request: Request,
     user: str,
     filename: str,
     stride: int = Query(1, ge=1, le=100),
@@ -651,6 +662,7 @@ async def session_data(
         { "count": N, "samples": [ {t, lat, lon, speed_mph, ...}, ... ],
           "bounds": [[minLat,minLon],[maxLat,maxLon]] | null }
     """
+    require_web_user(request)
     p = _resolve_session(user, filename)
     samples: list[dict] = []
     min_lat = min_lon = float("inf")
@@ -691,7 +703,9 @@ async def session_data(
 
 
 @app.get("/review/{user}/{filename}", response_class=HTMLResponse)
-async def review(user: str, filename: str) -> str:
+async def review(request: Request, user: str, filename: str) -> Response:
+    if oauth_enabled() and not current_user(request):
+        return login_redirect(request)
     p = _resolve_session(user, filename)
     sid = parse_session_id(p.name)
     when = (
@@ -808,6 +822,57 @@ _FONTS_LINK = (
     'family=JetBrains+Mono:wght@400;500;600&display=swap">'
 )
 
+_LOGIN_EXTRA_CSS = """
+  body { min-height:100vh; display:grid; place-items:center; }
+  .login-card { width:min(520px, calc(100vw - 48px)); background:var(--surface);
+    border:1px solid var(--line); border-radius:var(--r-md); padding:var(--sp-xl); }
+  .login-card h1 { margin:0 0 var(--sp-sm); }
+  .login-card p { color:var(--muted); margin:0 0 var(--sp-lg); }
+  .google { width:100%; padding:12px 16px; font-size:12px; }
+  code { color:var(--primary); font-family:var(--ff-mono); }
+  pre { white-space:pre-wrap; background:var(--bg); border:1px solid var(--line);
+    border-radius:var(--r-sm); padding:var(--sp-md); color:var(--muted); }
+"""
+
+_LOGIN_HTML = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>sign in \u00b7 racecar-35</title>
+{_FONTS_LINK}<style>{_BASE_CSS}{_LOGIN_EXTRA_CSS}</style></head><body>
+  <section class="login-card">
+    <div class="pill good">Google OAuth</div>
+    <h1 class="t-display" style="margin-top:14px">racecar-35 pit wall</h1>
+    <p>Sign in with a Google account to review, upload, and delete sessions.</p>
+    <a class="btn primary google" href="__AUTH_URL__">sign in with Google</a>
+  </section>
+</body></html>"""
+
+_LOGIN_DISABLED_HTML = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>OAuth not configured</title>
+{_FONTS_LINK}<style>{_BASE_CSS}{_LOGIN_EXTRA_CSS}</style></head><body>
+  <section class="login-card">
+    <div class="pill">dev open</div>
+    <h1 class="t-display" style="margin-top:14px">Google OAuth is not configured</h1>
+    <p>The server is currently in open dev mode. To enable Google login, set these in <code>server/.env</code>, sync to <code>/tmp/server</code>, and rebuild.</p>
+    <pre>GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+GOOGLE_REDIRECT_URI=http://10.1.16.7:8089/auth/google/callback
+RACECAR_SESSION_SECRET=make-a-long-random-string
+# optional: restrict who can log in
+RACECAR_ALLOWED_EMAILS=cm.rawlings@gmail.com</pre>
+    <a class="btn primary" href="/">continue in dev mode</a>
+  </section>
+</body></html>"""
+
+_LOGIN_ERROR_HTML = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>login failed</title>
+{_FONTS_LINK}<style>{_BASE_CSS}{_LOGIN_EXTRA_CSS}</style></head><body>
+  <section class="login-card">
+    <div class="pill" style="color:var(--bad)">login failed</div>
+    <h1 class="t-display" style="margin-top:14px">Could not sign in</h1>
+    <p>__ERROR__</p>
+    <a class="btn primary" href="/login">try again</a>
+  </section>
+</body></html>"""
+
 _INDEX_HEAD = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -852,7 +917,7 @@ _INDEX_HEAD = f"""<!doctype html>
 </style>
 </head><body>
 <header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
-  <span class="crumbs">sessions</span></header>
+  <span class="crumbs">sessions</span><span style="flex:1"></span>__USER_CHIP__</header>
 <main>
 """
 
@@ -986,7 +1051,7 @@ _UPLOAD_PANEL_HTML = """
   </div>
   <form id="uploadForm" class="upload-grid">
     <div><label for="sessionFile">file</label><input id="sessionFile" type="file" accept=".ndjson,application/x-ndjson,text/plain"></div>
-    <div><label for="userEmail">user email</label><input id="userEmail" type="text" placeholder="driver@example.com"></div>
+    <div><label for="userEmail">user email</label><input id="userEmail" type="text" value="__CURRENT_EMAIL__" placeholder="driver@example.com"></div>
     <div><label for="sessionId">session id</label><input id="sessionId" type="text" placeholder="unix epoch"></div>
     <div><label for="trackName">track</label><input id="trackName" type="text" placeholder="UNKNOWN"></div>
     <div><label for="apiKey">api key</label><input id="apiKey" type="text" placeholder="optional"></div>
@@ -1005,8 +1070,20 @@ def _human_bytes(n: int) -> str:
     return f"{n / 1024 / 1024:.2f} MB"
 
 
+def _user_chip_html(user: Optional[dict]) -> str:
+    if not oauth_enabled():
+        return '<span class="pill">dev open</span>'
+    if not user:
+        return '<a class="btn primary" href="/login">sign in</a>'
+    email = html.escape(str(user.get("email", "")))
+    return f'<span class="pill good">{email}</span><a class="btn" href="/logout">logout</a>'
+
+
 @app.get("/", response_class=HTMLResponse)
-async def index() -> str:
+async def index(request: Request) -> Response:
+    user = current_user(request)
+    if oauth_enabled() and not user:
+        return login_redirect(request)
     sessions_root = DATA_DIR / "sessions"
     rows: list[str] = []
     total = 0
@@ -1064,7 +1141,10 @@ async def index() -> str:
     else:
         listing = '<p class="empty">no sessions uploaded yet.</p>'
 
-    return _INDEX_HEAD + _UPLOAD_PANEL_HTML + listing + _INDEX_JS + "</main></body></html>"
+    current_email = html.escape((user or {}).get("email", ""))
+    upload_panel = _UPLOAD_PANEL_HTML.replace("__CURRENT_EMAIL__", current_email)
+    user_chip = _user_chip_html(user)
+    return _INDEX_HEAD.replace("__USER_CHIP__", user_chip) + upload_panel + listing + _INDEX_JS + "</main></body></html>"
 
 
 # ---------------------------------------------------------------------------

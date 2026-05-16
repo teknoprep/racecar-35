@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.35"
+#define FIRMWARE_VERSION "0.1.36"
 
 #include <Preferences.h>
 #include <time.h>
@@ -390,7 +390,7 @@ static uint8_t  upload_return_page       = 0;        // PAGE_DASH; uint8_t becau
 static bool     upload_locally_cancelled = false;   // cleared only on reboot
 static bool     upload_modal_dirty       = false;
 static uint32_t upload_last_draw_ms      = 0;
-static char     upload_result_msg[32]    = "";       // brief banner after DONE
+static char     upload_result_msg[180]   = "";       // banner after DONE: status + optional reason
 
 // Cloud state — updated from CLD,<live_ok>,<queue_depth> lines.
 static bool     cloud_live_ok      = false;
@@ -1327,7 +1327,7 @@ struct UploadFlow {
     uint8_t* psbuf;
     size_t   psbuf_size;
     size_t   psbuf_used;
-    char     last_err[80];
+    char     last_err[180];    // big enough to hold an 'http NNN: <server msg>' snippet
 };
 static UploadFlow uf = {};
 
@@ -1601,10 +1601,30 @@ static bool ufDoPost() {
     http.addHeader("X-Track-Name", uf.files[uf.files_idx].name);
     const int code = http.POST(uf.psbuf, uf.psbuf_used);
     Serial.printf("DBG,uf_post_code=%d\n", code);
+    if (code >= 200 && code < 300) {
+        http.end();
+        return true;
+    }
+    // Non-2xx: capture a snippet of the response body so the dash modal can
+    // show *why* the server rejected the upload (FastAPI 422s carry a JSON
+    // 'detail' field; user's reverse-proxy may also wrap with its own text).
+    if (code > 0) {
+        String body = http.getString();
+        body.replace('\n', ' ');
+        body.replace('\r', ' ');
+        if (body.length() > 0) {
+            char snippet[140];
+            snprintf(snippet, sizeof(snippet), "%s", body.c_str());
+            snprintf(uf.last_err, sizeof(uf.last_err), "http %d: %s", code, snippet);
+        } else {
+            snprintf(uf.last_err, sizeof(uf.last_err), "http %d", code);
+        }
+        Serial.printf("DBG,uf_post_body=%s\n",
+                      body.length() > 0 ? body.c_str() : "(empty)");
+    } else {
+        snprintf(uf.last_err, sizeof(uf.last_err), "http error %d", code);
+    }
     http.end();
-    if (code >= 200 && code < 300) return true;
-    if (code <= 0) snprintf(uf.last_err, sizeof(uf.last_err), "http error %d", code);
-    else            snprintf(uf.last_err, sizeof(uf.last_err), "http %d", code);
     return false;
 }
 
