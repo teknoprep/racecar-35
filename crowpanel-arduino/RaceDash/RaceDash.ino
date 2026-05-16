@@ -61,10 +61,14 @@ enum SettingId : uint8_t {
     ST_CL_AUTH_USER, ST_CL_AUTH_PASS,
     ST_AUTO_TRACK,
     ST_TIMEZONE,    // ENUM: cycle through TIMEZONES[]
-    ST_SD_FORMAT,   // action: format SD card — shown only when card needs formatting
     ST_SET_TIME,    // action: open time-set page
-    ST_OTA_CHECK,   // action: check GitHub for firmware update + apply
-    ST_COUNT
+    ST_COUNT,
+    // Tool-page actions — NOT in the scrollable settings list. They live on
+    // PAGE_TOOLS (swipe right from STATUS). Their SettingId values are still
+    // useful as keyboard / tap dispatch keys (e.g. ST_OTA_CHECK is what
+    // handleSettingsTap looked for; now it's tools/handleToolsTap).
+    ST_SD_FORMAT,
+    ST_OTA_CHECK,
 };
 struct NumBounds { uint16_t lo, hi, step; };
 
@@ -857,6 +861,7 @@ enum Page : uint8_t {
     PAGE_WIFI_SCAN     = 8,
     PAGE_UPLOAD        = 9,   // full-screen modal during file upload; blocks all other input
     PAGE_OTA           = 10,  // full-screen modal during firmware update check / install
+    PAGE_TOOLS         = 11,  // maintenance actions: Check for updates, Format SD
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -1284,6 +1289,8 @@ static void drawOtaModal();
 static void handleOtaModalTap(int x, int y);
 static void otaTick();
 static void otaStart();
+static void drawToolsPage();
+static void handleToolsTap(int x, int y);
 
 static void handleTouch() {
     int32_t x, y;
@@ -1428,12 +1435,19 @@ static void handleTouch() {
                     currentPage = PAGE_SETTINGS;
                     pageJustEntered = true;
                     settingsDirty = true;
+                } else if (dx < 0 && currentPage == PAGE_STATUS) {
+                    currentPage = PAGE_TOOLS;
+                    pageJustEntered = true;
+                } else if (dx > 0 && currentPage == PAGE_TOOLS) {
+                    currentPage = PAGE_STATUS;
+                    pageJustEntered = true;
                 }
             }
         } else {  // GESTURE_NONE — never moved much, treat as tap
             if (abs(dx) < TAP_DXY_MAX && abs(dy) < TAP_DXY_MAX && dur < TAP_MS_MAX) {
                 if (currentPage == PAGE_DASH)          handleDashTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_SETTINGS) handleSettingsTap(tt.startX, tt.startY);
+                else if (currentPage == PAGE_TOOLS)    handleToolsTap(tt.startX, tt.startY);
             }
         }
         tt.active = false;
@@ -2069,9 +2083,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_CL_AUTH_PASS, "API key",               SettingRow::TEXT    },
     { ST_AUTO_TRACK,   "Auto select by GPS",    SettingRow::TOGGLE  },
     { ST_TIMEZONE,     "Time zone",              SettingRow::ENUM    },
-    { ST_SD_FORMAT,    "Format SD card",         SettingRow::ACTION  },
     { ST_SET_TIME,     "Set time",                SettingRow::ACTION  },
-    { ST_OTA_CHECK,    "Check for updates",      SettingRow::ACTION  },
 };
 
 constexpr int SETTINGS_ROW_Y0     = 70;
@@ -2396,13 +2408,14 @@ static const char* enumValue(SettingId id) {
 }
 
 // Conditionally hide settings rows based on hardware state.
-// ST_REC_SD only makes sense when a card is mounted; ST_SD_FORMAT only when
+// ST_REC_SD only makes sense when a card is mounted; ST_SD_FORMAT now lives
 // the card is present but unformatted. Hiding keeps the list uncluttered
 // and prevents tapping controls that have no effect.
 static bool rowShouldShow(SettingId id) {
     switch (id) {
         case ST_REC_SD:    return sd_card_status == 2;  // hidden unless card is READY
-        case ST_SD_FORMAT: return sd_card_status == 1;  // shown only when NEEDS_FORMAT
+        // (ST_SD_FORMAT row never appears in the settings list anymore —
+        //  the maintenance action moved to PAGE_TOOLS.)
         // WiFi credential + status rows only meaningful when mode=WiFi.
         case ST_WIFI_SSID:
         case ST_WIFI_PASS:
@@ -2556,15 +2569,6 @@ static void drawSettingsPage() {
                     strncpy(buf, "-- not set --", sizeof(buf));
                 }
                 tft.drawString(buf, ACT_X + ACT_W / 2, y + SETTINGS_ROW_HEIGHT / 2);
-            } else {
-                // SD format button: two-tap arming.
-                const bool armed = sd_format_armed && (millis() - sd_format_arm_ms < 5000);
-                const uint16_t fill = armed ? TFT_ORANGE : TFT_MAROON;
-                tft.fillRect(ACT_X, y, ACT_W, SETTINGS_ROW_HEIGHT, fill);
-                tft.drawRect(ACT_X, y, ACT_W, SETTINGS_ROW_HEIGHT, TFT_WHITE);
-                tft.setTextColor(TFT_WHITE, fill);
-                tft.drawString(armed ? "TAP AGAIN TO CONFIRM" : "FORMAT",
-                               ACT_X + ACT_W / 2, y + SETTINGS_ROW_HEIGHT / 2);
             }
             tft.setTextDatum(textdatum_t::top_left);
         } else if (r.kind == SettingRow::INFO) {
@@ -2738,24 +2742,8 @@ static void handleSettingsTap(int x, int y) {
                     pageJustEntered = true;
                     return;
                 }
-                if (r.id == ST_OTA_CHECK) {
-                    otaStart();
-                    return;
-                }
-                if (r.id == ST_SD_FORMAT) {
-                    const bool wasArmed = sd_format_armed
-                                      && (millis() - sd_format_arm_ms < 5000);
-                    if (wasArmed) {
-                        sd_format_armed = false;
-                        sd_card_status  = 4;
-                        Serial.printf("SDFORMAT\n");
-                    } else {
-                        sd_format_armed  = true;
-                        sd_format_arm_ms = millis();
-                    }
-                    settingsDirty = true;
-                    return;
-                }
+                // (Check for updates + Format SD have moved to PAGE_TOOLS.
+                //  Tap dispatch for those lives in handleToolsTap.)
             }
         } else { // TEXT — open the appropriate on-screen keyboard.
             constexpr int TEXT_X = 410, TEXT_W = 360;
@@ -3930,6 +3918,130 @@ static void handleOtaModalTap(int x, int y) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PAGE_TOOLS — maintenance actions. Swipe right from STATUS to reach it.
+// Big touch-friendly buttons, no scrolling. Currently:
+//   - Check for updates  (opens OTA modal)
+//   - Format SD card     (two-tap-armed; only sends SDFORMAT when NEEDS_FORMAT)
+// More tools can land here as the project grows (factory reset, diagnostics
+// dump, calibrate IMU zero, etc.) without re-cluttering settings.
+// ---------------------------------------------------------------------------
+namespace {
+    constexpr int TOOLS_BTN_X = 40,  TOOLS_BTN_W = 720;
+    constexpr int TOOLS_BTN_H = 90,  TOOLS_GAP   = 24;
+    constexpr int TOOLS_BTN1_Y = 80;
+    constexpr int TOOLS_BTN2_Y = TOOLS_BTN1_Y + TOOLS_BTN_H + TOOLS_GAP;
+}
+
+static const char* sdStatusText() {
+    switch (sd_card_status) {
+        case 0: return "no card";
+        case 1: return "needs format";
+        case 2: return "ready";
+        case 3: return "error";
+        case 4: return "formatting…";
+    }
+    return "";
+}
+
+static void drawToolsPage() {
+    if (pageJustEntered) {
+        tft.fillScreen(TFT_BLACK);
+        // Header strip
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("TOOLS", 400, 21);
+        tft.fillRect(0, 42, 800, 1, TFT_DARKGREY);
+        // Footer hint
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("swipe right ← to return to STATUS", 400, 460);
+        tft.setTextDatum(textdatum_t::top_left);
+        pageJustEntered = false;
+    }
+
+    // ---- Button 1: Check for updates ----
+    const bool ota_ready = (s.internet_mode == 1 && wifi_state == WS_CONNECTED);
+    const uint16_t b1_fill = ota_ready ? TFT_NAVY : TFT_DARKGREY;
+    tft.fillRect(TOOLS_BTN_X, TOOLS_BTN1_Y, TOOLS_BTN_W, TOOLS_BTN_H, b1_fill);
+    tft.drawRect(TOOLS_BTN_X, TOOLS_BTN1_Y, TOOLS_BTN_W, TOOLS_BTN_H, TFT_WHITE);
+    tft.drawRect(TOOLS_BTN_X+1, TOOLS_BTN1_Y+1, TOOLS_BTN_W-2, TOOLS_BTN_H-2, TFT_WHITE);
+    tft.setFont(&fonts::Font4);
+    tft.setTextColor(TFT_WHITE, b1_fill);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.drawString("Check for updates",
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + 30);
+    tft.setFont(&fonts::Font2);
+    tft.setTextColor(TFT_LIGHTGREY, b1_fill);
+    char b1sub[80];
+    if (!ota_ready) {
+        snprintf(b1sub, sizeof(b1sub),
+                 "requires WiFi mode (currently %s, %s)",
+                 s.internet_mode == 1 ? "WiFi"     : "Ethernet",
+                 wifi_state == WS_CONNECTED ? "connected" : "not connected");
+    } else {
+        snprintf(b1sub, sizeof(b1sub), "current v%s", FIRMWARE_VERSION);
+    }
+    tft.drawString(b1sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + 65);
+
+    // ---- Button 2: Format SD card (two-tap arming) ----
+    const bool armed = sd_format_armed && (millis() - sd_format_arm_ms < 5000);
+    const bool sd_busy = (sd_card_status == 4);
+    const uint16_t b2_fill = sd_busy  ? TFT_DARKGREY
+                            : armed   ? TFT_ORANGE
+                                       : TFT_MAROON;
+    tft.fillRect(TOOLS_BTN_X, TOOLS_BTN2_Y, TOOLS_BTN_W, TOOLS_BTN_H, b2_fill);
+    tft.drawRect(TOOLS_BTN_X, TOOLS_BTN2_Y, TOOLS_BTN_W, TOOLS_BTN_H, TFT_WHITE);
+    tft.drawRect(TOOLS_BTN_X+1, TOOLS_BTN2_Y+1, TOOLS_BTN_W-2, TOOLS_BTN_H-2, TFT_WHITE);
+    tft.setFont(&fonts::Font4);
+    tft.setTextColor(TFT_WHITE, b2_fill);
+    tft.drawString(armed ? "TAP AGAIN TO CONFIRM" : "Format SD card",
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 30);
+    tft.setFont(&fonts::Font2);
+    tft.setTextColor(TFT_LIGHTGREY, b2_fill);
+    char b2sub[64];
+    snprintf(b2sub, sizeof(b2sub), "SD: %s%s%s", sdStatusText(),
+             (sd_total_mb > 0 ? "  •  " : ""),
+             (sd_total_mb > 0 ? "" : ""));
+    if (sd_total_mb > 0) {
+        char ssz[24]; snprintf(ssz, sizeof(ssz), "%lu MB free / %lu MB total",
+                               (unsigned long)sd_free_mb, (unsigned long)sd_total_mb);
+        strncat(b2sub, ssz, sizeof(b2sub) - strlen(b2sub) - 1);
+    }
+    tft.drawString(b2sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 65);
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleToolsTap(int x, int y) {
+    // Button 1: Check for updates
+    if (x >= TOOLS_BTN_X && x <= TOOLS_BTN_X + TOOLS_BTN_W &&
+        y >= TOOLS_BTN1_Y && y <= TOOLS_BTN1_Y + TOOLS_BTN_H) {
+        // otaStart() handles "not in WiFi mode" + "WiFi not connected" itself,
+        // showing an error in the modal. Don't gate it here — the user gets
+        // explicit feedback inside the modal that way.
+        otaStart();
+        return;
+    }
+    // Button 2: Format SD card (two-tap arming)
+    if (x >= TOOLS_BTN_X && x <= TOOLS_BTN_X + TOOLS_BTN_W &&
+        y >= TOOLS_BTN2_Y && y <= TOOLS_BTN2_Y + TOOLS_BTN_H) {
+        if (sd_card_status == 4) return;   // already formatting
+        const bool wasArmed = sd_format_armed
+                          && (millis() - sd_format_arm_ms < 5000);
+        if (wasArmed) {
+            sd_format_armed = false;
+            sd_card_status  = 4;
+            Serial.printf("SDFORMAT\n");
+        } else {
+            sd_format_armed  = true;
+            sd_format_arm_ms = millis();
+        }
+        return;
+    }
+}
+
 static void handleConfigPickerTap(int x, int y) {
     const TrackInfo& t = TRACKS[cp.track_idx];
     const int n = (int)t.n_configs;
@@ -4493,6 +4605,11 @@ void loop() {
             lastDraw = now;
             drawWifiScannerPage();
         }
+    } else if (currentPage == PAGE_TOOLS) {
+        // Redraw frequently enough that the SD-format armed timer counts down
+        // visibly and the OTA gating subtext (WiFi connected? mode?) reflects
+        // changes promptly. Cheap — only two buttons painted.
+        if (pageJustEntered || now - lastDraw >= 250) { lastDraw = now; drawToolsPage(); }
     } else if (currentPage == PAGE_OTA) {
         otaTick();
         if (pageJustEntered || ota_modal_dirty || now - lastDraw >= 250) {
