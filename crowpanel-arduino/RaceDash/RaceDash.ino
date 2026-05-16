@@ -306,7 +306,7 @@ struct Settings {
     // Not an auth credential — the Teensy forwards it as X-User-Email header.
     // Real auth (Google OAuth) lives in the cloud-side Docker image.
     char     cloud_auth_user[64] = "";   // user email (X-User-Email)
-    char     cloud_auth_pass[48] = "";   // API key (X-API-Key); masked on display
+    char     cloud_auth_pass[96] = "";   // API key (X-API-Key); masked on display
 
     // Engine sensor display + warn thresholds (drawn bottom-left on the dash).
     // show_*  : false hides that line entirely from the dash.
@@ -654,6 +654,9 @@ static void loadSettings() {
     else                          prefs.getString("cl_user",  s.cloud_auth_user, sizeof(s.cloud_auth_user));
     if (prefs.isKey("cl_key"))    prefs.getString("cl_key",   s.cloud_auth_pass, sizeof(s.cloud_auth_pass));
     else                          prefs.getString("cl_pass",  s.cloud_auth_pass, sizeof(s.cloud_auth_pass));
+    // Long API keys (>47 chars) saved under the old smaller buffer would be
+    // truncated. NVS only stores what was put, so if the value present is
+    // shorter than the new buffer that's fine; nothing extra to do.
     s.auto_select_track  = prefs.getBool  ("auto_trk", s.auto_select_track);
     s.timezone_idx       = prefs.getUChar ("tz",       s.timezone_idx);
     s.show_coolant       = prefs.getBool  ("s_temp",   s.show_coolant);
@@ -774,9 +777,11 @@ static bool    pageJustEntered = true;
 // the target setting.
 struct KeyboardState {
     SettingId target = ST_RPM_MIN;       // which setting we're editing
-    char      editBuf[64] = "";
+    char      editBuf[96] = "";          // 95 char value max (fits SHA-256 hex + b64 etc.)
     uint8_t   editLen     = 0;
-    bool      dirty       = true;        // re-render needed
+    bool      shift       = false;       // SHIFT (caps-lock) state for text keyboard
+    bool      dirty       = true;        // edit-field re-render needed
+    bool      keys_dirty  = true;        // full key grid re-render needed (shift toggle)
 };
 static KeyboardState kb;
 // (LastDrawn struct below tracks per-element cached values; bg lives there.)
@@ -2308,6 +2313,7 @@ static void handleSettingsTap(int x, int y) {
 // ---------------------------------------------------------------------------
 
 // Action code constants — distinguish from printable ASCII.
+constexpr char K_SHIFT= 0x07;
 constexpr char K_BACK = 0x01;
 constexpr char K_CLR  = 0x02;
 constexpr char K_DONE = 0x03;
@@ -2344,17 +2350,36 @@ static const KbKey TEXT_KEYS[] = {
     { 484, 220, 75, 55, "j", 'j' }, { 563, 220, 75, 55, "k", 'k' }, { 642, 220, 75, 55, "l", 'l' },
     { 721, 220, 75, 55, ".", '.' },
     // Row 4: z-m + special chars. '/' dropped in favour of '@' — cloud host
-    // is always a bare DNS name (no paths) and emails need '@'.
+    // is always a bare DNS name (no paths) and emails need '@'. SHIFT key
+    // remaps these to capital letters and base64-ish symbols (see shiftedChar).
     { 10,  280, 75, 55, "z", 'z' }, { 89,  280, 75, 55, "x", 'x' }, { 168, 280, 75, 55, "c", 'c' },
     { 247, 280, 75, 55, "v", 'v' }, { 326, 280, 75, 55, "b", 'b' }, { 405, 280, 75, 55, "n", 'n' },
     { 484, 280, 75, 55, "m", 'm' }, { 563, 280, 75, 55, "-", '-' }, { 642, 280, 75, 55, "_", '_' },
     { 721, 280, 75, 55, "@", '@' },
-    // Action row
-    { 10,  350, 160, 60, "BACK",   K_BACK },
-    { 180, 350, 200, 60, "SPACE",  K_SPC  },
-    { 390, 350, 200, 60, "DONE",   K_DONE },
-    { 600, 350, 190, 60, "CANCEL", K_CXL  },
+    // Action row: SHIFT BACK SPACE DONE CANCEL (5 buttons; SHIFT toggles caps).
+    { 10,  350, 100, 60, "SHIFT",  K_SHIFT},
+    { 115, 350, 130, 60, "BACK",   K_BACK },
+    { 250, 350, 170, 60, "SPACE",  K_SPC  },
+    { 425, 350, 175, 60, "DONE",   K_DONE },
+    { 605, 350, 185, 60, "CANCEL", K_CXL  },
 };
+
+// Apply QWERTY-style shift mapping. Returns the unshifted char unchanged for
+// anything we don't have a shifted variant for (incl. action codes).
+static char shiftedChar(char c) {
+    if (c >= 'a' && c <= 'z') return (char)(c - 32);
+    switch (c) {
+        case '1': return '!';  case '2': return '@';  case '3': return '#';
+        case '4': return '$';  case '5': return '%';  case '6': return '^';
+        case '7': return '&';  case '8': return '*';  case '9': return '(';
+        case '0': return ')';
+        case '.': return ':';
+        case '-': return '+';
+        case '_': return '=';
+        case '@': return '/';   // gives us '/' back — useful for std base64 keys
+    }
+    return c;
+}
 constexpr int N_TEXT_KEYS = sizeof(TEXT_KEYS) / sizeof(TEXT_KEYS[0]);
 
 static void openNumericKeyboard(SettingId target) {
@@ -2413,12 +2438,17 @@ static void closeKeyboard(bool commit) {
     settingsDirty   = true;
 }
 
-// Render a single key.
+// Render a single key. Honours kb.shift: shows the shifted label/colour for
+// printable keys, and a brighter fill for the SHIFT button itself when active.
 static void drawKey(const KbKey& k) {
     const bool isAction = (k.action == K_DONE || k.action == K_CXL ||
                            k.action == K_BACK || k.action == K_CLR  ||
-                           k.action == K_SPC);
-    const uint16_t fill = isAction ? TFT_DARKGREY : TFT_NAVY;
+                           k.action == K_SPC  || k.action == K_SHIFT);
+    const bool isShiftKey = (k.action == K_SHIFT);
+    // SHIFT key glows blue when active so the state is unambiguous.
+    const uint16_t fill = isShiftKey && kb.shift ? TFT_BLUE
+                        : isAction               ? TFT_DARKGREY
+                                                 : TFT_NAVY;
     const uint16_t txtC = TFT_WHITE;
     tft.fillRect(k.x, k.y, k.w, k.h, fill);
     tft.drawRect(k.x, k.y, k.w, k.h, TFT_LIGHTGREY);
@@ -2426,7 +2456,15 @@ static void drawKey(const KbKey& k) {
     tft.setTextSize(1);
     tft.setTextColor(txtC, fill);
     tft.setTextDatum(textdatum_t::middle_center);
-    tft.drawString(k.label, k.x + k.w / 2, k.y + k.h / 2);
+
+    // For printable keys, show the shifted glyph when shift is on.
+    char buf[2] = { 0, 0 };
+    const char* label = k.label;
+    if (kb.shift && !isAction && k.action > 0x20) {
+        buf[0] = shiftedChar(k.action);
+        label  = buf;
+    }
+    tft.drawString(label, k.x + k.w / 2, k.y + k.h / 2);
     tft.setTextDatum(textdatum_t::top_left);
 }
 
@@ -2479,9 +2517,14 @@ static void drawNumKeyboard() {
 static void drawTextKeyboard() {
     if (pageJustEntered) {
         drawKeyboardChrome(kbTitleFor(kb.target));
-        for (int i = 0; i < N_TEXT_KEYS; ++i) drawKey(TEXT_KEYS[i]);
+        kb.shift      = false;
+        kb.keys_dirty = true;
         pageJustEntered = false;
         kb.dirty = true;
+    }
+    if (kb.keys_dirty) {
+        for (int i = 0; i < N_TEXT_KEYS; ++i) drawKey(TEXT_KEYS[i]);
+        kb.keys_dirty = false;
     }
     if (kb.dirty) {
         drawEditField();
@@ -2504,9 +2547,16 @@ static bool applyKey(char action, bool& commit) {
         kb.dirty = true;
         return true;
     }
-    // Insert printable char (space included).
+    if (action == K_SHIFT) {
+        kb.shift      = !kb.shift;
+        kb.keys_dirty = true;
+        kb.dirty      = true;   // ensure drawTextKeyboard runs the redraw branch
+        return true;
+    }
+    // Insert printable char (space included). Apply shift if active.
+    const char ch = kb.shift ? shiftedChar(action) : action;
     if (kb.editLen < sizeof(kb.editBuf) - 1) {
-        kb.editBuf[kb.editLen++] = action;
+        kb.editBuf[kb.editLen++] = ch;
         kb.editBuf[kb.editLen]   = '\0';
         kb.dirty = true;
     }
