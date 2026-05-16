@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.9"
+#define FIRMWARE_VERSION "0.1.10"
 
 #include <Preferences.h>
 #include <time.h>
@@ -3812,10 +3812,13 @@ static bool readSerialLineTimeout(char* out, size_t outsize, uint32_t timeout_ms
     return false;
 }
 
-// Download teensy.hex over WiFi and stream the raw bytes to the Teensy over
-// UART (same Serial we use for telemetry). Teensy's FlasherX update_firmware_
-// noprompt() reads the hex line-by-line and on EOF calls flash_move()
-// (it won't return — the Teensy reboots into the new image).
+// Download teensy.hex over WiFi into PSRAM, then forward line-by-line to the
+// Teensy over UART with per-line ACK. Why download upfront:
+//   - the ACK-paced UART transfer takes 30-60 s total
+//   - if we read from the HTTPS stream that whole time the GitHub CDN closes
+//     the connection from idleness (we previously saw 'ran out of stream
+//     at 51628 / 524284 B')
+//   - PSRAM has plenty of headroom (8 MB) for a ~512 KB hex file
 static void otaDoTeensyUpdate() {
     if (ota_teensy_url[0] == '\0' || ota_teensy_size == 0) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "teensy: missing url/size");
@@ -3845,18 +3848,60 @@ static void otaDoTeensyUpdate() {
     ota_total_bytes = (uint32_t)contentLen;
     ota_done_bytes  = 0;
 
+    // Phase 1/2: pull the entire hex body into PSRAM (fast, ~3 s for 512 KB).
+    uint8_t* hexbuf = (uint8_t*)ps_malloc((size_t)contentLen);
+    if (!hexbuf) {
+        snprintf(ota_err_msg, sizeof(ota_err_msg),
+                 "PSRAM alloc failed (%d B)", contentLen);
+        http.end();
+        ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+    }
+    {
+        WiFiClient* stream = http.getStreamPtr();
+        uint32_t dl_done = 0;
+        uint32_t last_dl_draw = millis();
+        while (http.connected() && dl_done < (uint32_t)contentLen) {
+            if (ota_cancel_requested) {
+                free(hexbuf); http.end();
+                snprintf(ota_err_msg, sizeof(ota_err_msg), "cancelled during download");
+                ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+            }
+            const size_t avail = stream->available();
+            if (avail == 0) { delay(2); continue; }
+            const size_t want = avail > (uint32_t)contentLen - dl_done
+                                ? (uint32_t)contentLen - dl_done : avail;
+            const int got = stream->read(hexbuf + dl_done, want);
+            if (got <= 0) { delay(2); continue; }
+            dl_done += (uint32_t)got;
+            // Modal progress for phase 1: show 0-50% of total.
+            if (millis() - last_dl_draw >= 250) {
+                last_dl_draw = millis();
+                ota_done_bytes = dl_done / 2;
+                ota_modal_dirty = true;
+                drawOtaModal();
+            }
+        }
+        http.end();
+        if (dl_done != (uint32_t)contentLen) {
+            free(hexbuf);
+            snprintf(ota_err_msg, sizeof(ota_err_msg),
+                     "download truncated: %lu/%d", (unsigned long)dl_done, contentLen);
+            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+        }
+    }
+
     // Drain anything the Teensy might have queued before our request.
     while (Serial.available()) Serial.read();
 
-    // Kick the Teensy into firmware-receive mode and wait for FW,READY.
+    // Phase 2/2: kick the Teensy into firmware-receive mode and wait for FW,READY.
     Serial.println("FWUPDATE");
     Serial.flush();
     char reply[80];
     if (!readSerialLineTimeout(reply, sizeof(reply), 3000) ||
         strncmp(reply, "FW,READY", 8) != 0) {
+        free(hexbuf);
         snprintf(ota_err_msg, sizeof(ota_err_msg),
                  "teensy didn't ack FW,READY (%s)", reply[0] ? reply : "timeout");
-        http.end();
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
 
@@ -3866,77 +3911,64 @@ static void otaDoTeensyUpdate() {
     // glitches during flash sector erases. With ACKs, the Teensy controls
     // the pace: each line is only sent once we know the previous one
     // landed cleanly.
-    WiFiClient* stream = http.getStreamPtr();
-    char    lineBuf[160];   // Intel HEX max line ~45 chars; 160 is plenty
-    size_t  lineLen      = 0;
     char    ack_buf[40];
     uint32_t last_draw_ms = millis();
-    while (http.connected() && ota_done_bytes < ota_total_bytes) {
+    uint32_t pos = 0;
+    uint32_t line_no = 0;
+    while (pos < (uint32_t)contentLen) {
         if (ota_cancel_requested) {
-            http.end();
+            free(hexbuf);
             snprintf(ota_err_msg, sizeof(ota_err_msg),
                      "teensy update cancelled — reflash via USB to recover");
             ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
         }
-        // Read until we have a complete Intel HEX line (ending in \n).
-        lineLen = 0;
-        bool got_line = false;
-        const uint32_t line_deadline = millis() + 8000;
-        while (millis() < line_deadline && lineLen + 1 < sizeof(lineBuf)) {
-            if (stream->available() == 0) { delay(1); continue; }
-            const int c = stream->read();
-            if (c < 0) { delay(1); continue; }
-            if (c == '\r') continue;
-            if (c == '\n') { got_line = true; break; }
-            lineBuf[lineLen++] = (char)c;
-        }
-        if (!got_line) {
-            snprintf(ota_err_msg, sizeof(ota_err_msg),
-                     "teensy hex: ran out of stream at %lu/%lu B",
-                     (unsigned long)ota_done_bytes, (unsigned long)ota_total_bytes);
-            http.end();
-            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
-        }
-        lineBuf[lineLen] = '\0';
+        // Locate the next '\n' in the PSRAM buffer.
+        uint32_t line_start = pos;
+        while (pos < (uint32_t)contentLen && hexbuf[pos] != '\n') pos++;
+        uint32_t line_len = pos - line_start;
+        if (pos < (uint32_t)contentLen) pos++;   // skip the '\n'
+        // Strip a trailing '\r' if present (CRLF line endings in the file).
+        if (line_len > 0 && hexbuf[line_start + line_len - 1] == '\r') line_len--;
+        if (line_len == 0) continue;
+        line_no++;
 
-        // Send the line followed by \n. Flush so the UART HW has actually
-        // pushed it out before we start polling for the ACK.
-        Serial.write((const uint8_t*)lineBuf, lineLen);
+        // Send line + '\n'.
+        Serial.write(hexbuf + line_start, (size_t)line_len);
         Serial.write('\n');
         Serial.flush();
 
-        // Wait for 'A\n' ack. Generous timeout: a sector erase can stall
-        // the Teensy ~100 ms; we give 2 s of headroom per line.
+        // Wait for 'A\n' ack (or FW,ERR,*). 2 s timeout covers any flash stall.
         if (!readSerialLineTimeout(ack_buf, sizeof(ack_buf), 2000)) {
+            free(hexbuf);
             snprintf(ota_err_msg, sizeof(ota_err_msg),
-                     "teensy ACK timeout after %lu lines", (unsigned long)ota_done_bytes / 45);
-            http.end();
+                     "teensy ACK timeout after %lu lines", (unsigned long)line_no);
             ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
         }
         if (ack_buf[0] == 'A' && (ack_buf[1] == '\0' || ack_buf[1] == '\r')) {
             // ack ok
         } else if (strncmp(ack_buf, "FW,ERR", 6) == 0) {
+            free(hexbuf);
             snprintf(ota_err_msg, sizeof(ota_err_msg), "teensy: %s", ack_buf);
-            http.end();
             ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
         } else {
-            // Stray telemetry or something — ignore + keep waiting one more time.
+            // Stray telemetry interleaved? Try one more line for the ACK.
             if (!readSerialLineTimeout(ack_buf, sizeof(ack_buf), 2000) ||
                 ack_buf[0] != 'A') {
+                free(hexbuf);
                 snprintf(ota_err_msg, sizeof(ota_err_msg),
                          "teensy unexpected ACK: %s", ack_buf);
-                http.end();
                 ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
             }
         }
-        ota_done_bytes += (uint32_t)(lineLen + 1);   // line + '\n'
+        // Modal progress for phase 2: 50% -> 100% of total bytes.
+        ota_done_bytes = (uint32_t)contentLen / 2 + pos / 2;
         if (millis() - last_draw_ms >= 400) {
             last_draw_ms = millis();
             ota_modal_dirty = true;
             drawOtaModal();
         }
     }
-    http.end();
+    free(hexbuf);
     Serial.flush();
     // EOF of the .hex file (':00000001FF') was sent in-stream. Teensy will now
     // call flash_move() and reboot. Transition to TEENSY_WAITING so the modal
