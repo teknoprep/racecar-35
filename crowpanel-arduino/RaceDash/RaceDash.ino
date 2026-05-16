@@ -34,6 +34,11 @@ enum SettingId : uint8_t {
     // show toggle, a threshold (°F or PSI), and the warning palette colour.
     ST_SHOW_TEMP, ST_TEMP_WARN_F, ST_TEMP_WARN_COL,
     ST_SHOW_PSI,  ST_PSI_WARN_PSI, ST_PSI_WARN_COL,
+    // Sensor data source (Direct / MegaSquirt) + AFR display (MS3 mode only).
+    // AFR has both a "too rich" (low) and "too lean" (high) warn threshold;
+    // either fires the same colour.
+    ST_SENSOR_TYPE,
+    ST_SHOW_AFR, ST_AFR_WARN_LO, ST_AFR_WARN_HI, ST_AFR_WARN_COL,
     ST_REC_SD, ST_REC_CLOUD,
     ST_CL_HOST, ST_CL_PORT, ST_CL_PROTO, ST_CL_STREAM,
     ST_CL_AUTH_USER, ST_CL_AUTH_PASS,
@@ -171,6 +176,22 @@ struct EngState {
 };
 static EngState eng;
 
+// MegaSquirt-via-CAN data, forwarded by the Teensy when the CAN transceiver is
+// wired up (planned — see Teensy main.cpp). All fields are x10 fixed-point
+// except RPM. -1 indicates "not received" / fault. The dash listens for ECU
+// lines only when settings.sensor_type == 1 (MegaSquirt).
+struct EcuState {
+    uint16_t rpm           = 0;
+    int16_t  coolant_f_x10 = -1;
+    int16_t  map_x10       = -1;     // manifold absolute pressure, kPa × 10
+    int16_t  tps_x10       = -1;     // throttle position, % × 10
+    int16_t  afr_x10       = -1;     // air/fuel ratio × 10 (e.g. 145 = 14.5)
+    int16_t  iat_f_x10     = -1;     // intake air temp, °F × 10
+    int16_t  bat_x10       = -1;     // battery voltage, V × 10
+    uint32_t last_ms       = 0;
+};
+static EcuState ecu;
+
 struct ImuState {
     float    ax = 0, ay = 0, az = 0;   // g  (±2g range)
     float    gx = 0, gy = 0, gz = 0;   // deg/s (±250 range)
@@ -286,6 +307,23 @@ struct Settings {
     uint16_t oil_warn_psi       = 20;      // PSI — typical 20 PSI low-oil floor
     uint8_t  oil_warn_col       = 0;       // RED
 
+    // Sensor data source. Selects which UART line type the dash trusts for
+    // engine telemetry that exists in both pipelines (coolant temp today; RPM
+    // and others as MS3 CAN comes online):
+    //   0 = Direct     — Teensy ADCs on A2/A3 (the wiring we built in §5b/5c)
+    //   1 = MegaSquirt — MS3 CAN broadcast, forwarded by Teensy as ECU,...
+    // Oil PSI stays direct regardless (MS3 typically doesn't have an oil
+    // pressure input wired). AFR is only available in MegaSquirt mode.
+    uint8_t  sensor_type        = 0;       // default Direct
+
+    // AFR (Air/Fuel Ratio) — only meaningful in MegaSquirt sensor mode.
+    // Two-sided warn band: too rich (< afr_warn_lo) and too lean (> afr_warn_hi)
+    // both flip the value to the warn colour. Values are AFR × 10 (so 145 = 14.5).
+    bool     show_afr           = true;
+    uint16_t afr_warn_lo_x10    = 115;     // 11.5 AFR — below this is dangerously rich
+    uint16_t afr_warn_hi_x10    = 160;     // 16.0 AFR — above this is dangerously lean
+    uint8_t  afr_warn_col       = 0;       // RED
+
     // Track selection
     bool     auto_select_track = true; // when on, skip picker if a clear closest match exists
 
@@ -300,6 +338,8 @@ const char* const PROTOCOL_NAMES[] = { "HTTP", "HTTPS", "FTP" };
 constexpr int N_PROTOCOL = 3;
 const char* const STREAM_NAMES[]   = { "Live Stream", "After Race" };
 constexpr int N_STREAM   = 2;
+const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt" };
+constexpr int N_SENSOR_TYPE = 2;
 
 // ---------------------------------------------------------------------------
 // Time zones with DST rules.
@@ -604,6 +644,11 @@ static void loadSettings() {
     s.show_oil_psi       = prefs.getBool  ("s_psi",    s.show_oil_psi);
     s.oil_warn_psi       = prefs.getUShort("p_warn",   s.oil_warn_psi);
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
+    s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
+    s.show_afr           = prefs.getBool  ("s_afr",    s.show_afr);
+    s.afr_warn_lo_x10    = prefs.getUShort("afr_lo",   s.afr_warn_lo_x10);
+    s.afr_warn_hi_x10    = prefs.getUShort("afr_hi",   s.afr_warn_hi_x10);
+    s.afr_warn_col       = prefs.getUChar ("afr_col",  s.afr_warn_col);
     if (s.timezone_idx >= N_TIMEZONES) s.timezone_idx = 0;   // sanitise stale NVS
     {
         char ltrk[64] = "";
@@ -647,6 +692,11 @@ static void saveSettings() {
     prefs.putBool  ("s_psi",    s.show_oil_psi);
     prefs.putUShort("p_warn",   s.oil_warn_psi);
     prefs.putUChar ("p_col",    s.oil_warn_col);
+    prefs.putUChar ("srctyp",   s.sensor_type);
+    prefs.putBool  ("s_afr",    s.show_afr);
+    prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
+    prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
+    prefs.putUChar ("afr_col",  s.afr_warn_col);
     prefs.end();
 }
 
@@ -845,6 +895,36 @@ static uint32_t predictiveLapMs() {
     return (uint32_t)((float)elapsed * ratio);
 }
 
+// ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>
+// Emitted by the Teensy once the MS3 CAN transceiver is wired and broadcast
+// frames are decoded. Until that lands, no ECU lines arrive and the dash
+// leaves ecu.* at -1, which the renderer treats as "---".
+//
+// All sensor fields are x10 fixed-point integers (e.g. 1450 = 14.5 AFR);
+// -1 in any slot means "this field not available from MS3 right now".
+static bool parseEcuLine(const String& line) {
+    int idx[9], n = 0;
+    for (int i = 0; i < (int)line.length() && n < 9; ++i)
+        if (line[i] == ',') idx[n++] = i;
+    if (n < 1) return false;
+    idx[n] = line.length();
+    auto field = [&](int k) { return line.substring(idx[k] + 1, idx[k + 1]); };
+
+    long rpm = field(0).toInt();
+    if (rpm < 0)     rpm = 0;
+    if (rpm > 65535) rpm = 65535;
+    ecu.rpm = (uint16_t)rpm;
+
+    if (n >= 2) ecu.coolant_f_x10 = (int16_t)field(1).toInt();
+    if (n >= 3) ecu.map_x10       = (int16_t)field(2).toInt();
+    if (n >= 4) ecu.tps_x10       = (int16_t)field(3).toInt();
+    if (n >= 5) ecu.afr_x10       = (int16_t)field(4).toInt();
+    if (n >= 6) ecu.iat_f_x10     = (int16_t)field(5).toInt();
+    if (n >= 7) ecu.bat_x10       = (int16_t)field(6).toInt();
+    ecu.last_ms = millis();
+    return true;
+}
+
 static bool parseImuLine(const String& line) {
     // IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
     int idx[7], n = 0;
@@ -916,6 +996,7 @@ static bool parseLine(const String& line) {
         return ok;
     }
     if (line.startsWith("ENG,")) return parseEngLine(line);
+    if (line.startsWith("ECU,")) return parseEcuLine(line);
     if (line.startsWith("IMU,")) return parseImuLine(line);
     if (line.startsWith("ETH,"))  return parseEthLine(line);
     if (line.startsWith("SD,"))   return parseSdLine(line);
@@ -1227,6 +1308,8 @@ struct LastDrawn {
     uint32_t temp_col_tag = UINT32_MAX;
     int32_t  psi_x10     = INT32_MIN;
     uint32_t psi_col_tag  = UINT32_MAX;
+    int32_t  afr_x10     = INT32_MIN;
+    uint32_t afr_col_tag  = UINT32_MAX;
 };
 static LastDrawn ld;
 static void invalidateAll() {
@@ -1237,6 +1320,7 @@ static void invalidateAll() {
     ld.track_tag   = UINT32_MAX;
     ld.temp_x10 = INT32_MIN; ld.temp_col_tag = UINT32_MAX;
     ld.psi_x10  = INT32_MIN; ld.psi_col_tag  = UINT32_MAX;
+    ld.afr_x10  = INT32_MIN; ld.afr_col_tag  = UINT32_MAX;
 }
 
 static void drawRecordButton() {
@@ -1276,8 +1360,16 @@ static void drawDashPage() {
         eng.rpm           = 0;
         eng.oil_psi_x10   = -1;   // -> "PSI: ---" rather than stale last read
         eng.coolant_f_x10 = -1;
-        // Don't touch g.last_ms / eng.last_ms — those are the parser's
-        // freshness timestamps. The next received line refills the state.
+        // ECU fields also clear — the CAN bridge runs on the Teensy, so if
+        // the Teensy is silent, the MS3 data can't reach us either.
+        ecu.coolant_f_x10 = -1;
+        ecu.afr_x10       = -1;
+        ecu.map_x10       = -1;
+        ecu.tps_x10       = -1;
+        ecu.iat_f_x10     = -1;
+        ecu.bat_x10       = -1;
+        // Don't touch g.last_ms / eng.last_ms / ecu.last_ms — those are the
+        // parser's freshness timestamps. The next received line refills.
     }
 
     const uint16_t bg = computeBgColor();
@@ -1409,20 +1501,29 @@ static void drawDashPage() {
     constexpr int SENS_X      = 20;
     constexpr int SENS_TEMP_Y = 358;
     constexpr int SENS_PSI_Y  = 398;
+    constexpr int SENS_AFR_Y  = 438;
     constexpr int SENS_W      = 230;   // wide enough for "TEMP: 250°F" at Font4
     constexpr int SENS_H      = 32;    // covers Font4 ascender/descender
 
+    // ECU staleness: no CAN frames received in ~2 s → treat MS3 fields as faulted.
+    // Matches the existing g.last_ms check at the top of this function.
+    const bool ecuStale = (ecu.last_ms == 0) || (nowMs - ecu.last_ms > 2000);
+
     // ---- Coolant temp line ----
+    // Source depends on sensor_type: direct ADC (eng.*) vs MS3 CAN (ecu.*).
+    // Oil PSI stays direct regardless — MS3 typically has no oil-PSI input.
     {
-        // col_tag composes (show_flag<<24 | warn_col_when_lit<<16 | fault_flag<<8 | warn_active)
-        const bool   fault       = (eng.coolant_f_x10 < 0);
-        const bool   warn_active = s.show_coolant && !fault
-                                   && (eng.coolant_f_x10 >= (int)s.coolant_warn_f * 10);
+        const bool    fromMs3   = (s.sensor_type == 1);
+        const int16_t coolant   = fromMs3 ? ecu.coolant_f_x10 : eng.coolant_f_x10;
+        const bool    fault     = (coolant < 0) || (fromMs3 && ecuStale);
+        const bool    warn_active = s.show_coolant && !fault
+                                    && (coolant >= (int)s.coolant_warn_f * 10);
         const uint32_t tag = ((uint32_t)s.show_coolant << 24)
                            | ((uint32_t)s.coolant_warn_col << 16)
                            | ((uint32_t)fault << 8)
-                           | ((uint32_t)warn_active);
-        const int32_t  val = s.show_coolant ? (int32_t)eng.coolant_f_x10 : INT32_MIN + 1;
+                           | ((uint32_t)warn_active)
+                           | ((uint32_t)fromMs3 << 12);   // re-render on source flip
+        const int32_t  val = s.show_coolant ? (int32_t)coolant : INT32_MIN + 1;
         if (val != ld.temp_x10 || tag != ld.temp_col_tag) {
             // Wipe the slot — turning the line on/off, fault toggling, or
             // shrinking from "250°F" to "98°F" all need stale pixels cleared.
@@ -1437,7 +1538,7 @@ static void drawDashPage() {
                     snprintf(buf, sizeof(buf), "TEMP: ---");
                     col = TFT_DARKGREY;
                 } else {
-                    const int t = (eng.coolant_f_x10 + 5) / 10;   // round to whole °F
+                    const int t = (coolant + 5) / 10;   // round to whole °F
                     snprintf(buf, sizeof(buf), "TEMP: %d\xB0""F", t);
                     col = warn_active ? PALETTE[s.coolant_warn_col] : TFT_WHITE;
                 }
@@ -1478,6 +1579,44 @@ static void drawDashPage() {
             }
             ld.psi_x10     = val;
             ld.psi_col_tag = tag;
+        }
+    }
+
+    // ---- AFR line ----
+    // Visible only in MegaSquirt sensor mode (no direct AFR source exists).
+    // Two-sided warn band: too rich (< afr_warn_lo) and too lean (> afr_warn_hi)
+    // both flip the value to s.afr_warn_col.
+    {
+        const bool    visible   = s.show_afr && (s.sensor_type == 1);
+        const bool    fault     = !visible || (ecu.afr_x10 < 0) || ecuStale;
+        const bool    warn_active = visible && !fault
+                                    && (ecu.afr_x10 < (int)s.afr_warn_lo_x10
+                                        || ecu.afr_x10 > (int)s.afr_warn_hi_x10);
+        const uint32_t tag = ((uint32_t)visible << 24)
+                           | ((uint32_t)s.afr_warn_col << 16)
+                           | ((uint32_t)fault << 8)
+                           | ((uint32_t)warn_active);
+        const int32_t  val = visible ? (int32_t)ecu.afr_x10 : INT32_MIN + 1;
+        if (val != ld.afr_x10 || tag != ld.afr_col_tag) {
+            tft.fillRect(SENS_X, SENS_AFR_Y, SENS_W, SENS_H, bg);
+            if (visible) {
+                tft.setFont(&fonts::Font4);
+                tft.setTextSize(1);
+                tft.setTextDatum(textdatum_t::top_left);
+                char buf[24];
+                uint16_t col;
+                if (fault) {
+                    snprintf(buf, sizeof(buf), "AFR: ---");
+                    col = TFT_DARKGREY;
+                } else {
+                    snprintf(buf, sizeof(buf), "AFR: %d.%d",
+                             ecu.afr_x10 / 10, ecu.afr_x10 % 10);
+                    col = warn_active ? PALETTE[s.afr_warn_col] : TFT_WHITE;
+                }
+                drawValue(SENS_X, SENS_AFR_Y, buf, col);
+            }
+            ld.afr_x10     = val;
+            ld.afr_col_tag = tag;
         }
     }
 
@@ -1593,6 +1732,11 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_SHOW_PSI,     "Show oil pressure",     SettingRow::TOGGLE  },
     { ST_PSI_WARN_PSI, "Oil low-warn (PSI)",    SettingRow::NUMERIC },
     { ST_PSI_WARN_COL, "Oil warn color",        SettingRow::COLOR   },
+    { ST_SENSOR_TYPE,  "Sensor data source",    SettingRow::ENUM    },
+    { ST_SHOW_AFR,     "Show AFR (MS3 only)",   SettingRow::TOGGLE  },
+    { ST_AFR_WARN_LO,  "AFR rich-warn (x10)",   SettingRow::NUMERIC },
+    { ST_AFR_WARN_HI,  "AFR lean-warn (x10)",   SettingRow::NUMERIC },
+    { ST_AFR_WARN_COL, "AFR warn color",        SettingRow::COLOR   },
     { ST_REC_SD,     "Record to SD card",    SettingRow::TOGGLE  },
     { ST_REC_CLOUD,  "Record to cloud",      SettingRow::TOGGLE  },
     { ST_CL_HOST,      "Cloud host (DNS/IP)",   SettingRow::TEXT    },
@@ -1633,6 +1777,10 @@ static NumBounds numBounds(SettingId id) {
         case ST_CL_PORT: return {    1, 65535,   1 };
         case ST_TEMP_WARN_F:  return { 150, 300, 5 };  // useful overheat range
         case ST_PSI_WARN_PSI: return {   5, 100, 1 };  // low-oil thresholds
+        // AFR thresholds are stored as AFR × 10; step 1 = 0.1 AFR per tap.
+        // Range 8.0–20.0 spans every realistic operating point on gasoline.
+        case ST_AFR_WARN_LO:  return {  80, 200, 1 };
+        case ST_AFR_WARN_HI:  return {  80, 200, 1 };
         default:         return {    0,     0,   0 };
     }
 }
@@ -1648,6 +1796,8 @@ static uint16_t getNum(SettingId id) {
         case ST_CL_PORT: return s.cloud_port;
         case ST_TEMP_WARN_F:  return s.coolant_warn_f;
         case ST_PSI_WARN_PSI: return s.oil_warn_psi;
+        case ST_AFR_WARN_LO:  return s.afr_warn_lo_x10;
+        case ST_AFR_WARN_HI:  return s.afr_warn_hi_x10;
         default:         return 0;
     }
 }
@@ -1662,6 +1812,8 @@ static void setNum(SettingId id, uint16_t v) {
         case ST_CL_PORT: s.cloud_port   = v; break;
         case ST_TEMP_WARN_F:  s.coolant_warn_f = v; break;
         case ST_PSI_WARN_PSI: s.oil_warn_psi   = v; break;
+        case ST_AFR_WARN_LO:  s.afr_warn_lo_x10 = v; break;
+        case ST_AFR_WARN_HI:  s.afr_warn_hi_x10 = v; break;
         default: break;
     }
 }
@@ -1685,6 +1837,11 @@ static void clampInvariants() {
     if (s.alertmax_rpm > s.rpm_max)     s.alertmax_rpm = s.rpm_max;
     if (s.alertmax_hz <= s.alert1_hz)   s.alertmax_hz  = s.alert1_hz + 1;
     if (s.alertmax_hz > 15)             s.alertmax_hz  = 15;
+    // AFR: low (rich) threshold must be below high (lean) threshold, with at
+    // least 0.5 AFR (5 in x10) between them so the "safe" band is meaningful.
+    if (s.afr_warn_hi_x10 <= s.afr_warn_lo_x10 + 5)
+        s.afr_warn_hi_x10 = s.afr_warn_lo_x10 + 5;
+    if (s.afr_warn_hi_x10 > 200) s.afr_warn_hi_x10 = 200;
 }
 
 // Settings page is repainted on entry and on every tap that mutates state.
@@ -1714,6 +1871,7 @@ static const char* boolValueOnRow(SettingId id) {
         case ST_AUTO_TRACK:  return s.auto_select_track ? "ON" : "OFF";
         case ST_SHOW_TEMP:   return s.show_coolant      ? "ON" : "OFF";
         case ST_SHOW_PSI:    return s.show_oil_psi      ? "ON" : "OFF";
+        case ST_SHOW_AFR:    return s.show_afr          ? "ON" : "OFF";
         default:             return "?";
     }
 }
@@ -1725,15 +1883,17 @@ static bool boolValueOnState(SettingId id) {
         case ST_AUTO_TRACK:  return s.auto_select_track;
         case ST_SHOW_TEMP:   return s.show_coolant;
         case ST_SHOW_PSI:    return s.show_oil_psi;
+        case ST_SHOW_AFR:    return s.show_afr;
         default:             return false;
     }
 }
 static const char* enumValue(SettingId id) {
     switch (id) {
-        case ST_CL_PROTO:  return PROTOCOL_NAMES[s.cloud_protocol % N_PROTOCOL];
-        case ST_CL_STREAM: return STREAM_NAMES[s.cloud_stream % N_STREAM];
-        case ST_TIMEZONE:  return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
-        default:           return "?";
+        case ST_CL_PROTO:    return PROTOCOL_NAMES[s.cloud_protocol % N_PROTOCOL];
+        case ST_CL_STREAM:   return STREAM_NAMES[s.cloud_stream % N_STREAM];
+        case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
+        case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
+        default:             return "?";
     }
 }
 
@@ -1855,6 +2015,7 @@ static void drawSettingsPage() {
                 case ST_AM_COL:        cidx = s.alertmax_color_idx; break;
                 case ST_TEMP_WARN_COL: cidx = s.coolant_warn_col;   break;
                 case ST_PSI_WARN_COL:  cidx = s.oil_warn_col;       break;
+                case ST_AFR_WARN_COL:  cidx = s.afr_warn_col;       break;
                 default: break;
             }
             tft.fillRect(CTRL_COLOR_X, y, CTRL_COLOR_W, SETTINGS_ROW_HEIGHT, PALETTE[cidx]);
@@ -1982,6 +2143,7 @@ static void handleSettingsTap(int x, int y) {
                     case ST_AUTO_TRACK: s.auto_select_track = !s.auto_select_track; break;
                     case ST_SHOW_TEMP:  s.show_coolant      = !s.show_coolant;      break;
                     case ST_SHOW_PSI:   s.show_oil_psi      = !s.show_oil_psi;      break;
+                    case ST_SHOW_AFR:   s.show_afr          = !s.show_afr;          break;
                     default: break;
                 }
                 settingsDirty = true;
@@ -1994,6 +2156,7 @@ static void handleSettingsTap(int x, int y) {
                     case ST_AM_COL:        s.alertmax_color_idx = (s.alertmax_color_idx + 1) % N_PALETTE; break;
                     case ST_TEMP_WARN_COL: s.coolant_warn_col   = (s.coolant_warn_col   + 1) % N_PALETTE; break;
                     case ST_PSI_WARN_COL:  s.oil_warn_col       = (s.oil_warn_col       + 1) % N_PALETTE; break;
+                    case ST_AFR_WARN_COL:  s.afr_warn_col       = (s.afr_warn_col       + 1) % N_PALETTE; break;
                     default: break;
                 }
                 settingsDirty = true;
@@ -2012,6 +2175,12 @@ static void handleSettingsTap(int x, int y) {
                     // (SD filenames, cloud metadata). Display still uses UTC
                     // from the Teensy and we apply the offset locally.
                     Serial.printf("TZ,%s\n", TIMEZONES[s.timezone_idx].id);
+                } else if (r.id == ST_SENSOR_TYPE) {
+                    s.sensor_type = (s.sensor_type + 1) % N_SENSOR_TYPE;
+                    // Reset stale ECU state on a source flip so the dash
+                    // doesn't show stale CAN data right after switching to
+                    // MegaSquirt, or stale direct data after switching back.
+                    ecu = EcuState{};
                 }
                 settingsDirty = true;
                 return;

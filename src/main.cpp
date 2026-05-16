@@ -6,15 +6,23 @@
 // then forwards all three to the CrowPanel ESP32 dash over Serial3 (pin
 // 14=TX3, pin 15=RX3 -> CrowPanel UART0).
 //
-// Wire format on Serial3, 115200 8N1, '\n'-terminated, three line types:
+// Wire format on Serial3, 115200 8N1, '\n'-terminated, line types:
 //
 //   GPS,<fix>,<sats>,<lat_deg>,<lon_deg>,<speed_mph>,<heading_deg>,<gps_status>
 //   ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>
+//   ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>   [planned]
 //   IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
 //
 // Example: GPS,3,12,40.123456,-74.123456,67.5,123.4,2
 //          ENG,3450,650,2185
+//          ECU,3450,1850,420,150,145,720,138
 //          IMU,0.02,-0.98,0.12,1.3,-0.5,0.2
+//
+// ECU is planned — emitted once the MS3 CAN transceiver (SN65HVD230) is wired
+// to CAN1 (pin 22 TX, pin 23 RX) and FlexCAN decoding lands here. Fields are
+// MS3-derived: coolant, MAP, TPS, AFR, IAT, battery. -1 in any slot means
+// "MS3 doesn't broadcast / didn't broadcast yet". The dash uses these when
+// settings.sensor_type == 1 (MegaSquirt); ENG fields are used when == 0 (Direct).
 //
 // GPS fields:
 //   fix          0=None 1=DR 2=2D 3=3D 4=3D+DR 5=Time-only
