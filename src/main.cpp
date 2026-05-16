@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.28"
+#define FIRMWARE_VERSION "0.1.29"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -186,6 +186,12 @@ static uint32_t queue_depth         = 0;       // updated by scanQueue()
 static bool     test_mode_active   = false;
 static uint32_t test_mode_start_ms = 0;
 
+// Manual drain request. Set true by the dash UPLOAD button so cloudTick
+// stops waiting for its 10 s interval and starts draining the queue
+// immediately. Cleared automatically when the queue empties or when a
+// drain attempt fails (to avoid hammering a dead server).
+static volatile bool drain_queue_now = false;
+
 // True when the active path is 'WiFi via dash': dash owns the WiFi link and we
 // forward session files to it over UART for cloud upload. Mirrors g_cfg.inet.
 static bool wifiInetActive() { return g_cfg.inet == 1; }
@@ -300,6 +306,11 @@ static void handleDashCommand(const String& line) {
                           (unsigned long)(millis() - test_mode_start_ms));
             DASH_SERIAL.println(F("TEST,0"));
         }
+    } else if (line == "QUEUE,DRAIN") {
+        // Dash UPLOAD button: kick the queue walker immediately instead of
+        // waiting for the next 10 s cloudTick. Multiple presses are idempotent.
+        drain_queue_now = true;
+        Serial.println(F("[cloud] QUEUE,DRAIN requested by dash"));
     } else if (line == "UPLOAD,CANCEL") {
         // Dash requested cancel-all. Latch the disabled flag (clears only
         // on reboot) and signal the in-progress upload loop to bail out at
@@ -1617,16 +1628,26 @@ static void cloudTick() {
     // (no WiFi etc.) wupForwardFile returns 0 and the file stays queued.
     if (!wifiInetActive() &&
         (!eth_hw_present || Ethernet.linkStatus() != LinkON)) return;
-    if (queue_depth == 0) return;
+    if (queue_depth == 0) {
+        drain_queue_now = false;
+        return;
+    }
 
     static uint32_t last_drain_ms = 0;
-    if (millis() - last_drain_ms < 10000) return;
+    // Auto-drain every 10 s OR immediately when the dash UPLOAD button asked.
+    if (!drain_queue_now && millis() - last_drain_ms < 10000) return;
     last_drain_ms = millis();
 
     const bool ok = drainOneQueued();
     if (ok) {
         scanQueue();
         emitCloudStatus();
+        // Leave drain_queue_now set: the next cloudTick will immediately
+        // start the next file, and the next, until queue_depth hits 0.
+    } else {
+        // Failed upload — stop rapid drain so we don't hammer a dead server.
+        // The normal 10 s auto-walker still gets retried.
+        drain_queue_now = false;
     }
 }
 

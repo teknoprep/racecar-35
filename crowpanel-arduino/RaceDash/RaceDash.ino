@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.28"
+#define FIRMWARE_VERSION "0.1.29"
 
 #include <Preferences.h>
 #include <time.h>
@@ -207,6 +207,7 @@ namespace {
     LGFX_Sprite spr_lap(&tft);         // last lap time (middle column)
     LGFX_Sprite spr_track_name(&tft);  // active track name under TRACK btn
     LGFX_Sprite spr_recbtn(&tft);      // START/STOP button face
+    LGFX_Sprite spr_upbtn(&tft);       // manual queue-upload button
 }
 static bool   dash_sprites_ready = false;
 
@@ -232,7 +233,8 @@ static void setupDashSprites() {
         mk(spr_pred,       110, 24)  &&
         mk(spr_lap,        110, 24)  &&
         mk(spr_track_name, 320, 22)  &&
-        mk(spr_recbtn,     160, 70);
+        mk(spr_recbtn,     160, 70)  &&
+        mk(spr_upbtn,      180, 70);
     if (dash_sprites_ready) Serial.println("dash sprites: ok");
     else                    Serial.println("WARNING: dash sprite alloc failed \u2014 dash will fall back to direct draw");
 }
@@ -442,6 +444,13 @@ namespace {
   constexpr int TRKBTN_Y = 235;   // RECBTN_Y + RECBTN_H + 10
   constexpr int TRKBTN_W = 160;
   constexpr int TRKBTN_H = 60;
+  // Manual queue-upload button. Shows only when there is a backlog of
+  // sessions waiting in /queue/ AND we aren't currently recording. Sits in
+  // the empty band between the START button and the big speed digit.
+  constexpr int UPBTN_X = 210;
+  constexpr int UPBTN_Y = 155;
+  constexpr int UPBTN_W = 180;
+  constexpr int UPBTN_H = 70;
   // Speed sits on the right side of the screen (out of the way of the
   // START/STOP button on the left). Drop the decimal at >=100 mph so a
   // 3-digit number stays narrow enough to fit the 400-px bg pad cleanly
@@ -1599,6 +1608,19 @@ static void handleDashTap(int x, int y) {
         return;
     }
 
+    // Manual UPLOAD button (only acts when visible: idle + queue > 0).
+    if (x >= UPBTN_X && x < UPBTN_X + UPBTN_W &&
+        y >= UPBTN_Y && y < UPBTN_Y + UPBTN_H) {
+        if (!recording && cloud_queue_depth > 0) {
+            Serial.println("QUEUE,DRAIN");
+            // Force the local button to repaint as "sent" briefly so the
+            // user gets a tap acknowledgement; the next CLD,* line from
+            // the Teensy will update the actual queue count.
+            ld.upbtn_tag = UINT32_MAX;
+        }
+        return;
+    }
+
     // Start/Stop button.
     if (x >= RECBTN_X && x < RECBTN_X + RECBTN_W &&
         y >= RECBTN_Y && y < RECBTN_Y + RECBTN_H) {
@@ -1724,6 +1746,9 @@ struct LastDrawn {
     uint8_t  rec_badge_tag = 0xFF;
     uint32_t rec_samples  = UINT32_MAX;
     uint32_t cld_queue    = UINT32_MAX;
+    // Composite tag for the manual UPLOAD button: low bit = visible, upper
+    // bits = queue count. Sentinel UINT32_MAX = needs redraw.
+    uint32_t upbtn_tag    = UINT32_MAX;
 };
 static LastDrawn ld;
 static void invalidateAll() {
@@ -1731,6 +1756,7 @@ static void invalidateAll() {
     ld.fix = 0xFF; ld.sats = 0xFF; ld.status = 0xFF;
     ld.recording = -1;
     ld.rec_badge_tag = 0xFF; ld.rec_samples = UINT32_MAX; ld.cld_queue = UINT32_MAX;
+    ld.upbtn_tag = UINT32_MAX;
     ld.pred_lap_cs = UINT32_MAX; ld.last_lap_cs = UINT32_MAX;
     ld.track_tag   = UINT32_MAX;
     ld.temp_x10 = INT32_MIN; ld.temp_col_tag = UINT32_MAX;
@@ -1932,6 +1958,61 @@ static void drawDashPage() {
     if ((int)recording != ld.recording) {
         drawRecordButton();
         ld.recording = recording;
+    }
+
+    // ---- Manual UPLOAD button (between START and the speed digit) ----
+    // Visible whenever we are idle (not recording) and the SD queue has
+    // at least one file waiting. The Teensy queue walker runs every 10 s
+    // automatically; this button just kicks it immediately so the user
+    // can manually trigger a drain from the dash.
+    {
+        const bool visible = (!recording) && (cloud_queue_depth > 0);
+        const uint32_t tag = (visible ? (uint32_t)1 : 0)
+                           | ((cloud_queue_depth & 0xFFFFFF) << 1);
+        if (tag != ld.upbtn_tag) {
+            if (dash_sprites_ready) {
+                if (visible) {
+                    spr_upbtn.fillSprite(TFT_DARKCYAN);
+                    spr_upbtn.drawRect(0, 0, UPBTN_W,     UPBTN_H,     TFT_WHITE);
+                    spr_upbtn.drawRect(1, 1, UPBTN_W - 2, UPBTN_H - 2, TFT_WHITE);
+                    spr_upbtn.setFont(&fonts::Font4);
+                    spr_upbtn.setTextSize(1);
+                    spr_upbtn.setTextDatum(textdatum_t::middle_center);
+                    spr_upbtn.setTextColor(TFT_WHITE);
+                    spr_upbtn.drawString("UPLOAD", UPBTN_W / 2, UPBTN_H / 2 - 12);
+                    char buf[24];
+                    snprintf(buf, sizeof(buf), "%lu file%s",
+                             (unsigned long)cloud_queue_depth,
+                             cloud_queue_depth == 1 ? "" : "s");
+                    spr_upbtn.setFont(&fonts::Font2);
+                    spr_upbtn.drawString(buf, UPBTN_W / 2, UPBTN_H / 2 + 16);
+                } else {
+                    spr_upbtn.fillSprite(bg);
+                }
+                spr_upbtn.pushSprite(UPBTN_X, UPBTN_Y);
+            } else {
+                if (visible) {
+                    tft.fillRect(UPBTN_X, UPBTN_Y, UPBTN_W, UPBTN_H, TFT_DARKCYAN);
+                    tft.drawRect(UPBTN_X,     UPBTN_Y,     UPBTN_W,     UPBTN_H,     TFT_WHITE);
+                    tft.drawRect(UPBTN_X + 1, UPBTN_Y + 1, UPBTN_W - 2, UPBTN_H - 2, TFT_WHITE);
+                    tft.setFont(&fonts::Font4);
+                    tft.setTextSize(1);
+                    tft.setTextDatum(textdatum_t::middle_center);
+                    tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+                    tft.drawString("UPLOAD", UPBTN_X + UPBTN_W / 2, UPBTN_Y + UPBTN_H / 2 - 12);
+                    char buf[24];
+                    snprintf(buf, sizeof(buf), "%lu file%s",
+                             (unsigned long)cloud_queue_depth,
+                             cloud_queue_depth == 1 ? "" : "s");
+                    tft.setFont(&fonts::Font2);
+                    tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+                    tft.drawString(buf, UPBTN_X + UPBTN_W / 2, UPBTN_Y + UPBTN_H / 2 + 16);
+                } else {
+                    tft.fillRect(UPBTN_X, UPBTN_Y, UPBTN_W, UPBTN_H, bg);
+                }
+            }
+            ld.upbtn_tag = tag;
+        }
     }
 
     // ---- REC badge: confirmation that the Teensy actually opened a file. ----
