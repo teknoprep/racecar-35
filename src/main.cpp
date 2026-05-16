@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.23"
+#define FIRMWARE_VERSION "0.1.24"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -1742,6 +1742,76 @@ void setup() {
 // active is true so we can exercise the full SD-write + cloud-upload pipeline
 // without real sensors. Track is a smooth circle near a known coordinate so
 // any map view of the uploaded session shows recognizable motion.
+// ---------------------------------------------------------------------------
+// Test mode synthetic track — NJMP Thunderbolt (Millville, NJ).
+//
+// We follow a hand-tuned polyline that roughly matches Thunderbolt's 2.25 mi
+// / 14-turn layout. Each waypoint has a target speed and signed lateral G;
+// position, speed, and ay are linearly interpolated between adjacent points
+// so the dash shows smooth-ish acceleration into a corner and back out, not a
+// staircase.
+//
+// Geometry is approximate. The user knows the real track and can refine the
+// numbers (just adjust lat/lon/mph/lat_g in NJMP_THUNDERBOLT[] and the lap
+// will animate the new shape on the next session). Heading is computed from
+// the segment direction so the dash compass tracks reality.
+//
+//   lat_g convention: positive = right-hand turn (driver feels pulled left).
+//                     negative = left-hand turn  (driver feels pulled right).
+//   ax convention:    positive = accelerating, negative = braking.
+// ---------------------------------------------------------------------------
+struct TrackPoint {
+    float lat;
+    float lon;
+    float mph;
+    float lat_g;
+};
+
+static const TrackPoint NJMP_THUNDERBOLT[] = {
+    { 39.36500f, -75.08400f, 130.0f,  0.00f },   // S/F line (south end of front straight)
+    { 39.36700f, -75.08400f, 140.0f,  0.00f },   // mid front straight
+    { 39.36930f, -75.08400f, 150.0f,  0.00f },   // end of front straight
+    { 39.37000f, -75.08350f,  55.0f, -1.40f },   // T1: hard brake into right-hander
+    { 39.37020f, -75.08230f,  72.0f, -0.80f },   // T1 exit
+    { 39.36970f, -75.08120f,  85.0f, -0.50f },   // T2 right
+    { 39.36900f, -75.08050f,  78.0f,  0.70f },   // T3 esses (left)
+    { 39.36850f, -75.07980f,  82.0f, -0.80f },   // T4 right
+    { 39.36810f, -75.07900f,  92.0f, -0.45f },   // T5 fast right
+    { 39.36800f, -75.07800f, 108.0f, -0.20f },   // T5 exit / fast mid-section
+    { 39.36770f, -75.07720f,  95.0f, -0.55f },   // T6 right
+    { 39.36720f, -75.07690f,  68.0f,  1.10f },   // T7 tight left
+    { 39.36650f, -75.07720f,  78.0f,  0.95f },   // T8 left
+    { 39.36580f, -75.07800f,  88.0f,  0.65f },   // T9 carousel (long left)
+    { 39.36510f, -75.07900f, 108.0f,  0.35f },   // T10 exit onto back straight
+    { 39.36400f, -75.08050f, 118.0f,  0.00f },   // back straight mid
+    { 39.36380f, -75.08200f,  68.0f,  1.20f },   // T13 chicane left
+    { 39.36420f, -75.08320f,  82.0f, -1.00f },   // T14 right onto S/F
+};
+static constexpr int NJMP_N = sizeof(NJMP_THUNDERBOLT) / sizeof(NJMP_THUNDERBOLT[0]);
+
+static float trackWrap360(float deg) {
+    while (deg <  0.0f)   deg += 360.0f;
+    while (deg >= 360.0f) deg -= 360.0f;
+    return deg;
+}
+
+static float trackBearingDeg(float lat1, float lon1, float lat2, float lon2) {
+    // Flat-earth bearing. NJMP's footprint is ~3.6 km — within flat-earth
+    // accuracy limits and way cheaper than full great-circle math on Teensy.
+    const float lat_rad = lat1 * 0.0174533f;
+    const float dlat_m  = (lat2 - lat1) * 111319.0f;
+    const float dlon_m  = (lon2 - lon1) * cosf(lat_rad) * 111319.0f;
+    if (dlat_m == 0.0f && dlon_m == 0.0f) return 0.0f;
+    return trackWrap360(atan2f(dlon_m, dlat_m) * 57.29578f);
+}
+
+static float trackDistanceM(float lat1, float lon1, float lat2, float lon2) {
+    const float lat_rad = lat1 * 0.0174533f;
+    const float dlat_m  = (lat2 - lat1) * 111319.0f;
+    const float dlon_m  = (lon2 - lon1) * cosf(lat_rad) * 111319.0f;
+    return sqrtf(dlat_m * dlat_m + dlon_m * dlon_m);
+}
+
 static void generateTestSample(uint8_t& fix, uint8_t& sats,
                                float& lat_deg, float& lon_deg,
                                float& mph, float& hdg_deg,
@@ -1750,35 +1820,84 @@ static void generateTestSample(uint8_t& fix, uint8_t& sats,
                                int16_t& oil_psi_x10, int16_t& cool_f_x10,
                                float& ax, float& ay, float& az,
                                float& gx, float& gy, float& gz) {
-    const float t_sec = (millis() - test_mode_start_ms) * 0.001f;
-    // Circle of ~150 m radius around Lime Rock Park-ish coords.
-    const float lat0 = 41.928f;
-    const float lon0 = -73.385f;
-    const float r_deg = 0.00135f;  // ~150 m
-    const float omega = 0.10f;     // rad/s -> lap every ~63 s
-    const float theta = t_sec * omega;
-    lat_deg = lat0 + r_deg * cosf(theta);
-    lon_deg = lon0 + r_deg * sinf(theta);
-    fix     = 3;
-    sats    = 12;
-    status  = 2;
-    // Speed and heading consistent with the circle motion.
-    const float circumference_m = 2.0f * 3.14159265f * 150.0f;
-    const float speed_mps = circumference_m / (2.0f * 3.14159265f / omega);
-    mph     = speed_mps * 2.23694f;
-    hdg_deg = fmodf((theta * 57.29578f) + 90.0f, 360.0f);
-    if (hdg_deg < 0) hdg_deg += 360.0f;
-    // Engine: idle-ish with a slow oscillation between 1500 and 6000 RPM.
-    rpm         = (uint16_t)(3750 + 2250 * sinf(t_sec * 0.6f));
-    oil_psi_x10 = (int16_t)(450 + 50 * sinf(t_sec * 0.4f));      // ~45 PSI
-    cool_f_x10  = (int16_t)(1900 + 20 * sinf(t_sec * 0.15f));    // ~190 F
-    // IMU: gentle accel under cornering, no big spikes.
-    ax = 0.10f * sinf(t_sec * 0.8f);
-    ay = 0.30f * sinf(theta);
-    az = 1.00f;
-    gx = 1.5f * sinf(t_sec * 1.2f);
-    gy = 1.0f * sinf(t_sec * 0.7f);
-    gz = 10.0f * sinf(theta);
+    // Persistent state across calls. Reset on every new test_mode session
+    // (detected by test_mode_start_ms changing).
+    static int      seg            = 0;
+    static float    prog           = 0.0f;
+    static uint32_t last_call_ms   = 0;
+    static uint32_t last_start_ms  = 0;
+    static float    prev_speed_mph = 0.0f;
+
+    const uint32_t now_ms = millis();
+    if (test_mode_start_ms != last_start_ms) {
+        seg            = 0;
+        prog           = 0.0f;
+        last_call_ms   = now_ms;
+        last_start_ms  = test_mode_start_ms;
+        prev_speed_mph = NJMP_THUNDERBOLT[0].mph;
+    }
+    float dt_s = (now_ms - last_call_ms) * 0.001f;
+    if (dt_s > 0.5f) dt_s = 0.5f;   // clamp on first call / after big stalls
+    last_call_ms = now_ms;
+
+    const TrackPoint& p0 = NJMP_THUNDERBOLT[seg];
+    const TrackPoint& p1 = NJMP_THUNDERBOLT[(seg + 1) % NJMP_N];
+
+    // Interpolate position, speed, lateral G along the current segment.
+    lat_deg = p0.lat   + (p1.lat   - p0.lat)   * prog;
+    lon_deg = p0.lon   + (p1.lon   - p0.lon)   * prog;
+    mph     = p0.mph   + (p1.mph   - p0.mph)   * prog;
+    ay      = p0.lat_g + (p1.lat_g - p0.lat_g) * prog;
+
+    // Heading: bearing of the current segment.
+    hdg_deg = trackBearingDeg(p0.lat, p0.lon, p1.lat, p1.lon);
+
+    // GPS state for downstream parsers.
+    fix    = 3;
+    sats   = 12;
+    status = 2;   // OK
+
+    // Engine. RPM scales with speed in a mid-range gear; cap at 8 k.
+    int rpm_calc = 1500 + (int)(mph * 35.0f);
+    if (rpm_calc > 8000) rpm_calc = 8000;
+    rpm = (uint16_t)rpm_calc;
+    // Healthy oil and coolant numbers, slowly drifting.
+    oil_psi_x10 = (int16_t)(450 + 30 * sinf(now_ms * 0.0001f));
+    cool_f_x10  = (int16_t)(1900 + 15 * sinf(now_ms * 0.00003f));
+
+    // IMU. ax derived from speed delta this tick. Clamped to plausible values
+    // so a 100 mph -> 60 mph braking zone doesn't read 6 g.
+    if (dt_s > 0.001f) {
+        const float dv_mps = (mph - prev_speed_mph) * 0.44704f;
+        ax = (dv_mps / dt_s) / 9.81f;
+        if (ax >  1.5f) ax =  1.5f;
+        if (ax < -2.0f) ax = -2.0f;
+    } else {
+        ax = 0.0f;
+    }
+    prev_speed_mph = mph;
+    az = 1.0f;
+
+    // Gyro: yaw rate from cornering (consistent with ay + speed), pitch/roll
+    // small and proportional to longitudinal/lateral accel so the IMU traces
+    // look organic on the dash.
+    const float v_ms = mph * 0.44704f;
+    gz = (v_ms > 1.0f) ? (ay * 9.81f / v_ms) * 57.29578f : 0.0f;   // deg/s
+    gx = ay * 4.0f;
+    gy = ax * 4.0f;
+
+    // Advance progress along the polyline based on distance covered this tick.
+    const float seg_len_m = trackDistanceM(p0.lat, p0.lon, p1.lat, p1.lon);
+    if (seg_len_m > 0.1f) {
+        const float dist_m = v_ms * dt_s;
+        prog += dist_m / seg_len_m;
+    } else {
+        prog = 1.0f;
+    }
+    while (prog >= 1.0f) {
+        prog -= 1.0f;
+        seg = (seg + 1) % NJMP_N;
+    }
 }
 
 static void emitToDash() {
