@@ -1380,12 +1380,18 @@ struct LastDrawn {
     uint32_t psi_col_tag  = UINT32_MAX;
     int32_t  afr_x10     = INT32_MIN;
     uint32_t afr_col_tag  = UINT32_MAX;
+    // REC badge state: composite tag of (dash recording bit, teensy ack bit,
+    // mismatch-warning bit), plus the last-drawn sample count and queue depth.
+    uint8_t  rec_badge_tag = 0xFF;
+    uint32_t rec_samples  = UINT32_MAX;
+    uint32_t cld_queue    = UINT32_MAX;
 };
 static LastDrawn ld;
 static void invalidateAll() {
     ld.rpm_fillW = -1; ld.rpm_text = -1; ld.spd_x10 = -1;
     ld.fix = 0xFF; ld.sats = 0xFF; ld.status = 0xFF;
     ld.recording = -1;
+    ld.rec_badge_tag = 0xFF; ld.rec_samples = UINT32_MAX; ld.cld_queue = UINT32_MAX;
     ld.pred_lap_cs = UINT32_MAX; ld.last_lap_cs = UINT32_MAX;
     ld.track_tag   = UINT32_MAX;
     ld.temp_x10 = INT32_MIN; ld.temp_col_tag = UINT32_MAX;
@@ -1552,6 +1558,59 @@ static void drawDashPage() {
     if ((int)recording != ld.recording) {
         drawRecordButton();
         ld.recording = recording;
+    }
+
+    // ---- REC badge: confirmation that the Teensy actually opened a file. ----
+    // States the badge shows:
+    //   - hidden          when dash thinks recording=false
+    //   - amber "REC ?"   when dash sent REC,1 but Teensy hasn't acked
+    //                     SD,REC,1,... yet (after a brief grace period)
+    //   - red   "REC ● N" when both sides agree and N samples are on disk
+    // Plus a small "Q:N" line below when there's queued upload backlog.
+    {
+        const uint32_t ackGrace = 800;   // ms before "REC ?" appears
+        const bool dash_rec  = recording;
+        const bool teensy_ok = sd_session_active;
+        // Build a 3-bit state tag so any flip forces a repaint.
+        // bit0=dash_rec, bit1=teensy_ok, bit2=mismatch (warning shown).
+        const bool grace_passed = (rec_start_ms != 0) &&
+                                  (millis() - rec_start_ms > ackGrace);
+        const bool warn = dash_rec && !teensy_ok && grace_passed;
+        const uint8_t tag = (uint8_t)((dash_rec ? 1 : 0) |
+                                     (teensy_ok ? 2 : 0) |
+                                     (warn     ? 4 : 0));
+        const uint32_t samples = teensy_ok ? sd_session_samples : 0;
+        const uint32_t qd      = (!dash_rec) ? cloud_queue_depth : 0;
+        if (tag != ld.rec_badge_tag || samples != ld.rec_samples || qd != ld.cld_queue) {
+            constexpr int BX = 30, BY = 305, BW = 220, BH = 30;
+            // Wipe the band first — cheap, 220x60 = 13 KB, < 1 ms even on PSUART.
+            tft.fillRect(BX, BY, BW, 60, bg);
+            tft.setFont(&fonts::Font4);
+            tft.setTextSize(1);
+            tft.setTextDatum(textdatum_t::middle_left);
+            if (dash_rec && teensy_ok) {
+                // Red dot + sample count.
+                tft.fillCircle(BX + 10, BY + BH/2, 8, TFT_RED);
+                tft.setTextColor(TFT_WHITE, bg);
+                char buf[24]; snprintf(buf, sizeof(buf), "REC  %lu", (unsigned long)samples);
+                tft.drawString(buf, BX + 28, BY + BH/2);
+            } else if (warn) {
+                tft.fillCircle(BX + 10, BY + BH/2, 8, TFT_ORANGE);
+                tft.setTextColor(TFT_ORANGE, bg);
+                tft.drawString("REC ?  (no SD ack)", BX + 28, BY + BH/2);
+            }
+            // Queue depth line under the badge — only when idle + non-zero.
+            if (qd > 0) {
+                tft.setFont(&fonts::Font2);
+                tft.setTextColor(TFT_CYAN, bg);
+                char qbuf[20]; snprintf(qbuf, sizeof(qbuf), "queue: %lu", (unsigned long)qd);
+                tft.drawString(qbuf, BX, BY + BH + 4);
+            }
+            tft.setTextDatum(textdatum_t::top_left);
+            ld.rec_badge_tag = tag;
+            ld.rec_samples   = samples;
+            ld.cld_queue     = qd;
+        }
     }
 
     // ---- Status fields ----
