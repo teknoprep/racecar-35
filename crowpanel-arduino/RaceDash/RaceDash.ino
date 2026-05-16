@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.31"
+#define FIRMWARE_VERSION "0.1.32"
 
 #include <Preferences.h>
 #include <time.h>
@@ -307,6 +307,7 @@ static uint32_t rec_start_ms     = 0;                // millis() when recording 
 static uint8_t  sd_card_status   = 0;
 static uint32_t sd_total_mb      = 0;
 static uint32_t sd_free_mb       = 0;
+static char     sd_err_hex[8]    = "";   // last SdFat err code (hex from SD,NONE,<errcode>)
 
 // Active session state — updated from SD,REC,<0|1>,<file>,<samples> lines.
 // The dash uses this to show a REC indicator + a live sample count.
@@ -1217,6 +1218,16 @@ static bool parseSdLine(const String& line) {
     const uint8_t prev = sd_card_status;
     if (tag == "NONE") {
         sd_card_status = 0; sd_total_mb = 0; sd_free_mb = 0;
+        // Optional 3rd field: hex error code from the Teensy SdFat probe.
+        // Helps the user see *why* the card didn't mount (eg 0x14 == init
+        // timeout, 0x06 == CMD8 fail). Empty when no extra info.
+        if (c2 >= 0) {
+            String e = line.substring(c2 + 1);
+            e.trim();
+            e.toCharArray(sd_err_hex, sizeof(sd_err_hex));
+        } else {
+            sd_err_hex[0] = '\0';
+        }
     } else if (tag == "FMT") {
         sd_card_status = 1; sd_free_mb = 0;
         sd_total_mb = (c2 >= 0) ? line.substring(c2 + 1, c3 >= 0 ? c3 : (int)line.length()).toInt() : 0;
@@ -1224,6 +1235,7 @@ static bool parseSdLine(const String& line) {
         sd_card_status = 2;
         sd_total_mb = (c2 >= 0) ? line.substring(c2 + 1, c3 >= 0 ? c3 : (int)line.length()).toInt() : 0;
         sd_free_mb  = (c3 >= 0) ? line.substring(c3 + 1).toInt() : 0;
+        sd_err_hex[0] = '\0';   // clear stale error
     } else if (tag == "ERR") {
         sd_card_status = 3; sd_total_mb = 0; sd_free_mb = 0;
     } else if (tag == "ACTIVE") {
@@ -5778,7 +5790,10 @@ static void drawStatusPage() {
     {
         char buf[32];
         if (sd_card_status == 0) {
-            strncpy(buf, "No card", sizeof(buf));
+            if (sd_err_hex[0])
+                snprintf(buf, sizeof(buf), "No card (err 0x%s)", sd_err_hex);
+            else
+                strncpy(buf, "No card", sizeof(buf));
         } else if (sd_card_status == 1) {
             if (sd_total_mb >= 1024)
                 snprintf(buf, sizeof(buf), "Fmt reqd (%.1f GB)", (float)sd_total_mb / 1024.0f);

@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.31"
+#define FIRMWARE_VERSION "0.1.32"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -216,6 +216,10 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float gx, float gy, float gz);
 static void handleCfgLine(const String& line);   // cloud section below
 static bool sdReady();                            // SD status helper, defined below
+static void detectSD();                           // SD detect, defined below
+static void emitSdStatus();                       // SD wire emit, defined below
+static void scanQueue();                          // /queue/ walker, defined below
+static void emitCloudStatus();                    // CLD wire emit, defined below
 
 // TimeLib sync provider — reads the Teensy 4.1 built-in RTC.
 static time_t getTeensyTime() { return Teensy3Clock.get(); }
@@ -361,6 +365,16 @@ static void pumpDashCommands() {
 static void handleUsbCommand(const String& line) {
     if (line == "VER?") {
         Serial.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
+    } else if (line == "SDRE") {
+        // Manual SD re-detection. Useful from `pio device monitor` to test
+        // recovery without rebooting or physically replugging the card.
+        Serial.println(F("[sd] manual re-detect requested via USB"));
+        detectSD();
+        emitSdStatus();
+        if (sdReady()) {
+            scanQueue();
+            emitCloudStatus();
+        }
     } else if (line == "USBFWUPDATE") {
         // Developer/test path: push local firmware.hex directly over Teensy's
         // native USB CDC port. This bypasses GitHub + CrowPanel WiFi + UART0
@@ -841,20 +855,27 @@ static uint32_t     sd_free_mb     = 0;
 // Declared at the top of the file with the rest of the forward decls.
 static bool sdReady() { return sd_card_status == SD_CARD_READY; }
 
+// Last SdFat error code from the most recent detectSD() failure path. Set on
+// every NONE result so we can include it in the SD,* wire message AND log to
+// USB serial; reset to 0 when a card mounts cleanly. SdFat error codes are
+// documented in SdFat/src/common/SysCall.h (e.g. 0x14 = card init timeout).
+static uint8_t sd_last_err  = 0;
+static uint8_t sd_last_data = 0;
+
 static void detectSD() {
     sd_total_mb = sd_free_mb = 0;
+    sd_last_err = sd_last_data = 0;
 
-    // SDIO bring-up is occasionally flaky on this Teensy + card combination.
-    // Some cards need a brief power/init settle before sdFat.begin() succeeds,
-    // especially when the card was inserted while the Teensy was already
-    // running. Try up to 4 times with short delays before reporting failure.
+    // Aggressive SDIO bring-up. The user's card + Teensy 4.1 slot combo can
+    // require up to ~1 s of retries after a cold boot or unclean reset to
+    // mount. 8 attempts * 100 ms gives the card plenty of time to settle.
     bool mounted = false;
-    for (int attempt = 0; attempt < 4 && !mounted; ++attempt) {
+    for (int attempt = 0; attempt < 8 && !mounted; ++attempt) {
         if (sdFat.begin(SdioConfig(FIFO_SDIO))) {
             mounted = true;
             break;
         }
-        delay(50);
+        delay(100);
     }
 
     if (mounted) {
@@ -866,18 +887,25 @@ static void detectSD() {
         return;
     }
 
-    // Mount failed. Probe the raw card a couple of times to distinguish
-    // 'no card present' from 'card present but FS unmountable'.
+    // Snapshot the error so we can report it to the dash + USB serial.
+    sd_last_err  = sdFat.sdErrorCode();
+    sd_last_data = sdFat.sdErrorData();
+
+    // Mount failed. Probe the raw card to distinguish 'no card present' from
+    // 'card present but FS unmountable'. Same retry budget for symmetry.
     SdioCard rawCard;
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    for (int attempt = 0; attempt < 4; ++attempt) {
         if (rawCard.begin(SdioConfig(FIFO_SDIO))) {
             sd_card_status = SD_CARD_NEEDS_FMT;
             sd_total_mb = (uint32_t)(rawCard.sectorCount() / 2048ULL);
+            sd_last_err = sd_last_data = 0;   // FS issue, not card issue
             return;
         }
-        delay(50);
+        delay(100);
     }
     sd_card_status = SD_CARD_NONE;
+    Serial.printf("[sd] detect FAILED  err=0x%02X data=0x%02X\n",
+                  sd_last_err, sd_last_data);
 }
 
 static void emitSdStatus() {
@@ -890,7 +918,8 @@ static void emitSdStatus() {
             DASH_SERIAL.printf("SD,FMT,%lu\n", (unsigned long)sd_total_mb);
             break;
         case SD_CARD_NONE:
-            DASH_SERIAL.printf("SD,NONE\n");   break;
+            DASH_SERIAL.printf("SD,NONE,%02X%02X\n", sd_last_err, sd_last_data);
+            break;
         case SD_CARD_ERROR:
             DASH_SERIAL.printf("SD,ERR\n");    break;
         case SD_CARD_FORMATTING:
