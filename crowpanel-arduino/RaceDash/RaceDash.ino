@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.29"
+#define FIRMWARE_VERSION "0.1.30"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1613,10 +1613,8 @@ static void handleDashTap(int x, int y) {
         y >= UPBTN_Y && y < UPBTN_Y + UPBTN_H) {
         if (!recording && cloud_queue_depth > 0) {
             Serial.println("QUEUE,DRAIN");
-            // Force the local button to repaint as "sent" briefly so the
-            // user gets a tap acknowledgement; the next CLD,* line from
-            // the Teensy will update the actual queue count.
-            ld.upbtn_tag = UINT32_MAX;
+            // Visual tap feedback happens on the next CLD,* update from
+            // Teensy (queue_depth will decrement as each file uploads).
         }
         return;
     }

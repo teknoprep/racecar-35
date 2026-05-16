@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.29"
+#define FIRMWARE_VERSION "0.1.30"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -210,6 +210,7 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float ax, float ay, float az,
                                float gx, float gy, float gz);
 static void handleCfgLine(const String& line);   // cloud section below
+static bool sdReady();                            // SD status helper, defined below
 
 // TimeLib sync provider — reads the Teensy 4.1 built-in RTC.
 static time_t getTeensyTime() { return Teensy3Clock.get(); }
@@ -282,6 +283,14 @@ static void handleDashCommand(const String& line) {
         // the same code path as a normal REC,1 so the closeSession() upload
         // pipeline (Ethernet HTTP or WiFi-via-WUP) is exercised end-to-end.
         if (!recording_active) {
+            if (!sdReady()) {
+                Serial.println(F("[teensy] TESTSTART rejected: SD not ready"));
+                // Tell the dash to flip the button back so the user knows it
+                // didn't actually start. The dash already shows the real SD
+                // status on the TOOLS page next to Format SD card.
+                DASH_SERIAL.println(F("TEST,0"));
+                return;
+            }
             test_mode_active     = true;
             test_mode_start_ms   = millis();
             if (current_track[0] == '\0' ||
@@ -822,6 +831,11 @@ static SdCardStatus sd_card_status = SD_CARD_NONE;
 static uint32_t     sd_total_mb    = 0;
 static uint32_t     sd_free_mb     = 0;
 
+// Forward-decl-compatible accessor so callers defined ABOVE this section
+// don't need to see the SdCardStatus enum / sd_card_status global directly.
+// Declared at the top of the file with the rest of the forward decls.
+static bool sdReady() { return sd_card_status == SD_CARD_READY; }
+
 static void detectSD() {
     sd_total_mb = sd_free_mb = 0;
     if (sdFat.begin(SdioConfig(FIFO_SDIO))) {
@@ -999,6 +1013,10 @@ static void closeSession() {
     // Decide whether to upload now, queue for later, or do nothing.
     // (Order matters: the path we use depends on whether the file made it to SD.)
     const bool have_file = (session_path[0] != '\0' && sdFat.exists(session_path));
+    Serial.printf("[closeSession] path=%s have_file=%d rec_cl=%d inet=%u stream=%u host=%s port=%u\n",
+                  session_path, (int)have_file, (int)g_cfg.rec_cl,
+                  (unsigned)g_cfg.inet, (unsigned)g_cfg.stream,
+                  g_cfg.host[0] ? g_cfg.host : "<unset>", (unsigned)g_cfg.port);
     if (have_file && g_cfg.rec_cl) {
         bool tried_now    = false;
         bool upload_ok    = false;
@@ -2024,6 +2042,29 @@ void loop() {
 
     // Tach FIFO drain — interrupt-driven; we just pull samples off.
     pumpTach();
+
+    // Periodic SD card recheck. SDIO occasionally misses a card on boot —
+    // particularly if the card was inserted while the Teensy was already
+    // powered. Poll every 10 s while we don't have a healthy mount, and
+    // re-emit SD,* so the dash UI updates. Don't poke a working card.
+    static uint32_t last_sd_poll_ms = 0;
+    if ((sd_card_status == SD_CARD_NONE || sd_card_status == SD_CARD_ERROR) &&
+        !recording_active &&
+        millis() - last_sd_poll_ms >= 10000) {
+        last_sd_poll_ms = millis();
+        const SdCardStatus before = sd_card_status;
+        detectSD();
+        if (sd_card_status != before) {
+            Serial.printf("[sd] poll: status %d -> %d\n",
+                          (int)before, (int)sd_card_status);
+            emitSdStatus();
+            // Queue may have been there all along but unmountable; rescan now.
+            if (sd_card_status == SD_CARD_READY) {
+                scanQueue();
+                emitCloudStatus();
+            }
+        }
+    }
 
     // Cloud upload tick — live streamer during recording, queue drainer between.
     cloudTick();
