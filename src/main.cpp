@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.17"
+#define FIRMWARE_VERSION "0.1.18"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -196,6 +196,24 @@ static void handleCfgLine(const String& line);   // cloud section below
 // TimeLib sync provider — reads the Teensy 4.1 built-in RTC.
 static time_t getTeensyTime() { return Teensy3Clock.get(); }
 
+static void runFirmwareUpdate(Stream& io, const char* tag) {
+    uint32_t buffer_addr = 0, buffer_size = 0;
+    if (firmware_buffer_init(&buffer_addr, &buffer_size) == 0) {
+        io.println(F("FW,ERR,buffer_init_failed"));
+        return;
+    }
+    Serial.printf("[%s fwupdate] buffer @ 0x%08lX, size=%lu\n",
+                  tag, (unsigned long)buffer_addr, (unsigned long)buffer_size);
+    io.printf("FW,READY,%lu\n", (unsigned long)buffer_size);
+    // Per-line ACK protocol. The input/output/ack streams may all be the
+    // same Stream (USB Serial test mode), or input+ack may be DASH_SERIAL and
+    // diagnostics USB Serial (normal dash-driven OTA).
+    update_firmware_acked(&io, &Serial, &io, buffer_addr, buffer_size);
+    // If we get here, update_firmware_acked failed/returned before reboot.
+    firmware_buffer_free(buffer_addr, buffer_size);
+    io.println(F("FW,ERR,update_failed"));
+}
+
 static void handleDashCommand(const String& line) {
     if (line.startsWith("REC,")) {
         const int v = line.substring(4).toInt();
@@ -249,31 +267,10 @@ static void handleDashCommand(const String& line) {
         // missed our boot-time emit can catch up immediately.
         DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
     } else if (line == "FWUPDATE") {
-        // Dash kicking off a Teensy OTA. We're about to hand the UART over to
-        // the FlasherX hex-receive loop, which is BLOCKING until EOF or error.
-        // No telemetry / commands flow during that window. Dash is expected
-        // to send Intel HEX lines (':...\n') for the whole image, then either
-        // succeed (we never return — flash_move reboots us into new firmware)
-        // or fail (we resume normal operation + emit FW,ERR for the dash).
-        uint32_t buffer_addr = 0, buffer_size = 0;
-        if (firmware_buffer_init(&buffer_addr, &buffer_size) == 0) {
-            DASH_SERIAL.println(F("FW,ERR,buffer_init_failed"));
-            return;
-        }
-        Serial.printf("[fwupdate] buffer @ 0x%08lX, size=%lu\n",
-                      (unsigned long)buffer_addr, (unsigned long)buffer_size);
-        DASH_SERIAL.printf("FW,READY,%lu\n", (unsigned long)buffer_size);
-        // Per-line ACK protocol. Each Intel HEX line is parsed, written to
-        // the flash buffer, then we send 'A\n' on DASH_SERIAL. The dash waits
-        // for that ACK before sending the next line, which gives us reliable
-        // flow control across arbitrary flash erase stalls (~100 ms each) at
-        // 921 600 baud. The earlier byte-streaming version saw mid-stream
-        // byte loss — with ACKs, that's structurally impossible.
-        update_firmware_acked(&DASH_SERIAL, &Serial, &DASH_SERIAL,
-                              buffer_addr, buffer_size);
-        // If we get here, the update failed. Free the buffer and report.
-        firmware_buffer_free(buffer_addr, buffer_size);
-        DASH_SERIAL.println(F("FW,ERR,update_failed"));
+        // Dash kicking off a Teensy OTA over Serial3. We're about to hand the
+        // UART to the FlasherX hex-receive loop, which is BLOCKING until EOF
+        // or error. No telemetry/commands flow during that window.
+        runFirmwareUpdate(DASH_SERIAL, "dash-uart");
     } else if (line.length() > 0) {
         Serial.printf("[teensy] unknown dash cmd: %s\n", line.c_str());
     }
@@ -285,6 +282,30 @@ static void pumpDashCommands() {
         const char c = (char)DASH_SERIAL.read();
         if (c == '\r') continue;
         if (c == '\n') { handleDashCommand(cmdBuf); cmdBuf = ""; }
+        else if (cmdBuf.length() < 256) { cmdBuf += c; }
+        else { cmdBuf = ""; }
+    }
+}
+
+static void handleUsbCommand(const String& line) {
+    if (line == "VER?") {
+        Serial.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
+    } else if (line == "USBFWUPDATE") {
+        // Developer/test path: push local firmware.hex directly over Teensy's
+        // native USB CDC port. This bypasses GitHub + CrowPanel WiFi + UART0
+        // forwarding, making FlasherX tests fast and deterministic.
+        runFirmwareUpdate(Serial, "usb");
+    } else if (line.length() > 0) {
+        Serial.printf("[usb] unknown cmd: %s\n", line.c_str());
+    }
+}
+
+static void pumpUsbCommands() {
+    static String cmdBuf;
+    while (Serial.available()) {
+        const char c = (char)Serial.read();
+        if (c == '\r') continue;
+        if (c == '\n') { handleUsbCommand(cmdBuf); cmdBuf = ""; }
         else if (cmdBuf.length() < 256) { cmdBuf += c; }
         else { cmdBuf = ""; }
     }
@@ -1550,8 +1571,10 @@ void loop() {
         digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
     }
 
-    // Drain commands from the dash (REC, TRACK, SDFORMAT, …).
+    // Drain commands from the dash (REC, TRACK, SDFORMAT, …) and developer
+    // commands from native USB (VER?, USBFWUPDATE).
     pumpDashCommands();
+    pumpUsbCommands();
 
     // NOTE: Ethernet maintenance and periodic SD/ETH status emission used to
     // happen here in a 2 s block. That block was causing UART stalls — when
