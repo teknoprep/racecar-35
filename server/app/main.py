@@ -32,6 +32,7 @@ Run locally with docker compose (see ../docker-compose.yml) or directly:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import pathlib
@@ -39,7 +40,7 @@ import re
 import time
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 # ---------------------------------------------------------------------------
@@ -231,41 +232,156 @@ async def list_sessions() -> dict:
     return {"sessions": out, "count": len(out)}
 
 
-@app.get("/sessions/{user}/{filename}")
-async def download_session(user: str, filename: str) -> FileResponse:
+def _resolve_session(user: str, filename: str) -> pathlib.Path:
     user = safe_name(user)
     filename = safe_name(filename, maxlen=256)
     p = DATA_DIR / "sessions" / user / filename
     if not p.exists() or not p.is_file():
         raise HTTPException(status_code=404, detail="not found")
+    return p
+
+
+@app.get("/sessions/{user}/{filename}")
+async def download_session(user: str, filename: str) -> FileResponse:
+    p = _resolve_session(user, filename)
     return FileResponse(
         p,
         media_type="application/x-ndjson",
-        filename=filename,
+        filename=p.name,
     )
+
+
+@app.get("/sessions/{user}/{filename}/data")
+async def session_data(
+    user: str,
+    filename: str,
+    stride: int = Query(1, ge=1, le=100),
+) -> JSONResponse:
+    """Parsed NDJSON for the review UI.
+
+    Returns every Nth sample (default every sample). The dash logs at 25 Hz, so
+    a one-hour session is ~90 000 samples; the slider only needs maybe 5-10k
+    points to feel smooth, so the client may request stride=10 for long files.
+
+    Response shape:
+        { "count": N, "samples": [ {t, lat, lon, speed_mph, ...}, ... ],
+          "bounds": [[minLat,minLon],[maxLat,maxLon]] | null }
+    """
+    p = _resolve_session(user, filename)
+    samples: list[dict] = []
+    min_lat = min_lon = float("inf")
+    max_lat = max_lon = float("-inf")
+    has_geo = False
+    with open(p, "rb") as f:
+        for i, raw in enumerate(f):
+            if i % stride != 0:
+                continue
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            samples.append(obj)
+            lat = obj.get("lat")
+            lon = obj.get("lon")
+            if (
+                isinstance(lat, (int, float))
+                and isinstance(lon, (int, float))
+                and -90 <= lat <= 90
+                and -180 <= lon <= 180
+                and (lat or lon)
+            ):
+                has_geo = True
+                if lat < min_lat: min_lat = lat
+                if lat > max_lat: max_lat = lat
+                if lon < min_lon: min_lon = lon
+                if lon > max_lon: max_lon = lon
+    bounds = (
+        [[min_lat, min_lon], [max_lat, max_lon]] if has_geo else None
+    )
+    return JSONResponse(
+        {"count": len(samples), "stride": stride, "bounds": bounds, "samples": samples}
+    )
+
+
+@app.get("/review/{user}/{filename}", response_class=HTMLResponse)
+async def review(user: str, filename: str) -> str:
+    p = _resolve_session(user, filename)
+    sid = parse_session_id(p.name)
+    when = (
+        time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(sid)) if sid else "?"
+    )
+    return _REVIEW_HTML.replace("__USER__", safe_name(user)) \
+                       .replace("__FILE__", p.name) \
+                       .replace("__WHEN__", when)
 
 
 # ---------------------------------------------------------------------------
 # Minimal HTML index (intentionally dependency-free; just <table>).
 # Behind nginx you can replace / augment this with a real UI later.
 # ---------------------------------------------------------------------------
-_INDEX_HEAD = """<!doctype html>
+# ---------------------------------------------------------------------------
+# Shared dark-dashboard CSS, used by index + review pages.
+# Palette: near-black surfaces, off-white text, single saffron accent
+# (#ffb020) that matches the dash RPM bar, mono numerics for telemetry.
+# ---------------------------------------------------------------------------
+_BASE_CSS = """
+  :root {
+    --bg: #0e1014; --surface: #181b22; --surface-2: #20242e;
+    --line: #2a2f3a; --text: #e6e8ee; --muted: #8a92a3;
+    --accent: #ffb020; --accent-dim: #6a4a10; --good: #6cd07a; --bad: #ff5d5d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header.app { display:flex; align-items:center; gap:16px; padding:14px 24px;
+    border-bottom:1px solid var(--line); background:var(--surface); }
+  header.app h1 { margin:0; font-size:16px; font-weight:600; letter-spacing:.04em; }
+  header.app .dot { width:8px; height:8px; border-radius:50%; background:var(--accent);
+    box-shadow:0 0 8px var(--accent); }
+  header.app .crumbs { color:var(--muted); font-size:13px; }
+  main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+  .mono, td.num { font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  input[type=text], input[type=search] {
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 8px 12px; font-size: 14px; outline: none; width: 100%;
+  }
+  input[type=search]:focus { border-color: var(--accent); }
+  .toolbar { display:flex; gap:12px; align-items:center; margin: 0 0 16px; }
+  .toolbar .grow { flex: 1; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px;
+    background: var(--surface-2); color: var(--muted); font-size: 12px; }
+"""
+
+_INDEX_HEAD = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<title>racecar-35 cloud</title>
-<style>
- body { font-family: -apple-system, system-ui, sans-serif; margin: 32px; color: #222; }
- h1   { font-weight: 600; }
- table{ border-collapse: collapse; }
- th, td { border: 1px solid #ccc; padding: 6px 12px; font-size: 14px; }
- th   { background: #f4f4f4; text-align: left; }
- td.num { text-align: right; font-variant-numeric: tabular-nums; }
- .empty { color: #888; font-style: italic; }
- a    { color: #06c; text-decoration: none; }
- a:hover { text-decoration: underline; }
+<title>racecar-35 sessions</title>
+<style>{_BASE_CSS}
+ table {{ width: 100%; border-collapse: separate; border-spacing: 0;
+   background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+   overflow: hidden; }}
+ th, td {{ padding: 10px 14px; font-size: 13px; text-align: left;
+   border-bottom: 1px solid var(--line); }}
+ th {{ background: var(--surface-2); color: var(--muted); font-weight: 600;
+   text-transform: uppercase; letter-spacing: .06em; font-size: 11px; }}
+ tbody tr:last-child td {{ border-bottom: none; }}
+ tbody tr:hover {{ background: rgba(255,176,32,0.04); }}
+ td.num {{ text-align: right; }}
+ .empty {{ color: var(--muted); font-style: italic; padding: 24px; text-align:center; }}
+ .summary {{ color: var(--muted); margin-top: 14px; font-size: 13px; }}
+ .no-match {{ display:none; color: var(--muted); padding: 24px; text-align:center; }}
 </style>
 </head><body>
-<h1>racecar-35 sessions</h1>
+<header class="app"><span class="dot"></span><h1>racecar-35 cloud</h1>
+  <span class="crumbs">sessions</span></header>
+<main>
 """
 
 
@@ -298,10 +414,16 @@ async def index() -> str:
                     else "?"
                 )
                 size_str = _human_bytes(st.st_size)
+                # Track name = filename middle bit: <sid>_<track>.ndjson
+                track = f.name
+                if track.endswith(".ndjson"):
+                    track = track[:-7]
+                track = re.sub(r"^\d+_", "", track) or "?"
                 rows.append(
                     f"<tr><td>{user_dir.name}</td>"
-                    f"<td>{when}</td>"
-                    f"<td>{f.name}</td>"
+                    f"<td class=mono>{when}</td>"
+                    f"<td>{track}</td>"
+                    f'<td class=mono><a href="/review/{user_dir.name}/{f.name}">{f.name}</a></td>'
                     f"<td class=num>{size_str}</td>"
                     f'<td><a href="/sessions/{user_dir.name}/{f.name}">download</a></td></tr>'
                 )
@@ -310,13 +432,18 @@ async def index() -> str:
 
     if rows:
         body = (
+            '<div class="toolbar"><div class="grow">'
+            '<input type="search" id="q" placeholder="filter by user / track / date / filename\u2026" autofocus>'
+            '</div><span class="pill" id="vis"></span></div>'
             "<table><thead><tr><th>user</th><th>started (UTC)</th>"
-            "<th>filename</th><th>size</th><th></th></tr></thead><tbody>"
+            "<th>track</th><th>filename</th><th>size</th><th></th></tr></thead><tbody id=\"rows\">"
             + "\n".join(rows)
             + "</tbody></table>"
-            + f"<p>{total} session(s), {_human_bytes(total_bytes)} total</p>"
+            + '<div class="no-match" id="nomatch">no sessions match that filter.</div>'
+            + f'<p class="summary">{total} session(s), {_human_bytes(total_bytes)} total</p>'
+            + _INDEX_JS
         )
     else:
         body = '<p class="empty">no sessions uploaded yet.</p>'
 
-    return _INDEX_HEAD + body + "</body></html>"
+    return _INDEX_HEAD + body + "</main></body></html>"
