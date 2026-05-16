@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.14"
+#define FIRMWARE_VERSION "0.1.15"
 
 #include <Preferences.h>
 #include <time.h>
@@ -279,6 +279,7 @@ static char     ota_teensy_url[200]    = "";
 static uint32_t ota_teensy_size        = 0;
 static bool     ota_need_teensy        = false;
 static bool     ota_need_crowpanel     = false;
+static bool     ota_teensy_commit_seen = false;   // saw FW,COMMITTING from FlasherX
 
 // Upload modal state — driven by UPLOAD,START/PROG/DONE lines from Teensy.
 // While upload_active, the dash forces PAGE_UPLOAD on top of whatever was
@@ -3725,6 +3726,49 @@ static int versionCmp(const char* a, const char* b) {
     return 0;
 }
 
+// Blocking but short version refresh used before making OTA decisions. The
+// normal pumpUart() path may have a stale teensy_fw_version if the previous
+// OTA attempt false-failed and the user immediately retries from the modal.
+// Query here so we don't reflash a Teensy that already updated successfully.
+static bool queryTeensyVersionBlocking(uint32_t timeout_ms) {
+    Serial.println("VER?");
+    Serial.flush();
+
+    char line[180];
+    size_t n = 0;
+    bool got = false;
+    const uint32_t end = millis() + timeout_ms;
+    while ((int32_t)(end - millis()) > 0) {
+        while (Serial.available()) {
+            const char c = (char)Serial.read();
+            if (c == '\r') continue;
+            if (c == '\n') {
+                line[n] = '\0';
+                if (n > 0) {
+                    if (strncmp(line, "VER,teensy,", 11) == 0) {
+                        strncpy(teensy_fw_version, versionNoV(line + 11),
+                                sizeof(teensy_fw_version) - 1);
+                        teensy_fw_version[sizeof(teensy_fw_version) - 1] = '\0';
+                        got = true;
+                    } else {
+                        // Don't discard useful telemetry/status lines just
+                        // because we are doing a synchronous OTA preflight.
+                        parseLine(String(line));
+                    }
+                }
+                n = 0;
+                if (got) return true;
+            } else if (n + 1 < sizeof(line)) {
+                line[n++] = c;
+            } else {
+                n = 0;
+            }
+        }
+        delay(2);
+    }
+    return got;
+}
+
 static void otaStart() {
     if (s.internet_mode != 1) {
         snprintf(ota_err_msg, sizeof(ota_err_msg),
@@ -3740,6 +3784,7 @@ static void otaStart() {
         ota_total_bytes       = 0;
         ota_done_bytes        = 0;
         ota_cancel_requested  = false;
+        ota_teensy_commit_seen = false;
         ota_state             = OTA_S_CHECKING;
     }
     otaOpenModal();
@@ -3785,6 +3830,12 @@ static void otaDoCheck() {
         int colon = (k >= 0) ? body.indexOf(':', k + 6) : -1;
         if (colon >= 0) ota_teensy_size = (uint32_t)body.substring(colon + 1).toInt();
     }
+
+    // Refresh Teensy version RIGHT BEFORE deciding whether it needs an update.
+    // This prevents stale cached versions from causing an unnecessary second
+    // Teensy flash after a previous attempt actually succeeded but the dash
+    // missed the final VER response.
+    queryTeensyVersionBlocking(1500);
 
     ota_need_crowpanel = (versionCmp(ota_latest_version, FIRMWARE_VERSION) > 0);
     const bool teensy_known = (strcmp(teensy_fw_version, "?") != 0);
@@ -3847,6 +3898,19 @@ static int waitForFwCommitting(uint32_t timeout_ms, char* last_seen, size_t last
     return 0;
 }
 
+static void otaProceedAfterTeensy(const char* msg) {
+    ota_need_teensy = false;
+    if (ota_need_crowpanel) {
+        ota_total_bytes = 0;
+        ota_done_bytes  = 0;
+        ota_state       = OTA_S_DOWNLOADING;
+    } else {
+        if (msg && msg[0]) snprintf(ota_err_msg, sizeof(ota_err_msg), "%s", msg);
+        ota_state = OTA_S_UPTODATE;
+    }
+    ota_modal_dirty = true;
+}
+
 // Download teensy.hex over WiFi into PSRAM, then forward line-by-line to the
 // Teensy over UART with per-line ACK. Why download upfront:
 //   - the ACK-paced UART transfer takes 30-60 s total
@@ -3859,6 +3923,18 @@ static void otaDoTeensyUpdate() {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "teensy: missing url/size");
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
+
+    // Final preflight. If the Teensy is already at/above target, skip its
+    // flash entirely and go straight to the dash update. This is especially
+    // important on retry after a false verifier failure.
+    queryTeensyVersionBlocking(1500);
+    if (strcmp(teensy_fw_version, "?") != 0 &&
+        versionCmp(teensy_fw_version, ota_teensy_version) >= 0) {
+        otaProceedAfterTeensy("Teensy already current");
+        return;
+    }
+
+    ota_teensy_commit_seen = false;
 
     WiFiClientSecure client;
     client.setInsecure();
@@ -4017,6 +4093,7 @@ static void otaDoTeensyUpdate() {
     char commit_last[80];
     const int commit = waitForFwCommitting(15000, commit_last, sizeof(commit_last));
     if (commit < 0) return;
+    ota_teensy_commit_seen = (commit == 1);
 
     ota_state       = OTA_S_TEENSY_WAITING;
     ota_modal_dirty = true;
@@ -4035,8 +4112,8 @@ static void otaDoTeensyWaiting() {
     static char     last_seen[80];
 
     const uint32_t now = millis();
-    constexpr uint32_t TEENSY_REBOOT_TIMEOUT_MS = 180000;
-    constexpr uint32_t TEENSY_VER_PING_MS       = 1000;
+    const uint32_t TEENSY_REBOOT_TIMEOUT_MS = ota_teensy_commit_seen ? 30000UL : 180000UL;
+    constexpr uint32_t TEENSY_VER_PING_MS   = 1000;
 
     if (wait_start == 0) {
         wait_start   = now;
@@ -4090,23 +4167,24 @@ static void otaDoTeensyWaiting() {
 
     if (saw_target) {
         wait_start = 0;
-        // Teensy is now at the target version. Continue to CrowPanel if needed.
-        if (ota_need_crowpanel) {
-            ota_total_bytes = 0;
-            ota_done_bytes  = 0;
-            ota_state       = OTA_S_DOWNLOADING;
-        } else {
-            snprintf(ota_err_msg, sizeof(ota_err_msg),
-                     "Teensy updated to v%s", teensy_fw_version);
-            ota_state = OTA_S_UPTODATE;
-        }
-        ota_modal_dirty = true;
+        otaProceedAfterTeensy("Teensy verified");
         return;
     }
 
     const uint32_t elapsed = now - wait_start;
     if (elapsed >= TEENSY_REBOOT_TIMEOUT_MS) {
         wait_start = 0;
+        if (ota_teensy_commit_seen) {
+            // The image was accepted by FlasherX and flash_move() was entered.
+            // At this point a missing VER is a verifier/visibility problem, not
+            // a reason to block the CrowPanel update. Continue; final STATUS
+            // after both reboots will re-query Teensy and show the truth.
+            strncpy(teensy_fw_version, versionNoV(ota_teensy_version),
+                    sizeof(teensy_fw_version) - 1);
+            teensy_fw_version[sizeof(teensy_fw_version) - 1] = '\0';
+            otaProceedAfterTeensy("Teensy committed; continuing");
+            return;
+        }
         if (teensy_fw_version[0] && strcmp(teensy_fw_version, "?") != 0) {
             snprintf(ota_err_msg, sizeof(ota_err_msg),
                      "teensy still v%s; expected v%s",
