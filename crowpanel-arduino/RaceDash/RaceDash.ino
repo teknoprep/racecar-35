@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.13"
+#define FIRMWARE_VERSION "0.1.14"
 
 #include <Preferences.h>
 #include <time.h>
@@ -3801,7 +3801,7 @@ static void otaDoCheck() {
 
 // Read one line (terminated by \n) from Serial with a timeout. Returns true if
 // a line was captured into `out` (NUL-terminated), false on timeout. Used to
-// catch the Teensy's 'FW,READY,<size>' ack without going through pumpUart
+// catch the Teensy's FW handshake lines without going through pumpUart
 // (which is not running while we're inside the synchronous OTA loop).
 static bool readSerialLineTimeout(char* out, size_t outsize, uint32_t timeout_ms) {
     out[0] = '\0';
@@ -3817,6 +3817,34 @@ static bool readSerialLineTimeout(char* out, size_t outsize, uint32_t timeout_ms
     }
     out[n] = '\0';
     return false;
+}
+
+// After the final Intel HEX EOF line is ACKed, FlasherX still validates the
+// staged image, then emits FW,COMMITTING immediately before flash_move(). The
+// reboot/version wait timer should start AFTER that marker, not after the last
+// line ACK. Starting too early caused false failures where the dash gave up at
+// 60 s, then the Teensy finished flash_move() and rebooted successfully a few
+// seconds later.
+// Return:  1 = marker seen, 0 = timeout/no marker (continue anyway), -1 = FW,ERR.
+static int waitForFwCommitting(uint32_t timeout_ms, char* last_seen, size_t last_seen_size) {
+    if (last_seen_size) last_seen[0] = '\0';
+    char line[100];
+    const uint32_t end = millis() + timeout_ms;
+    while ((int32_t)(end - millis()) > 0) {
+        if (!readSerialLineTimeout(line, sizeof(line), 250)) continue;
+        if (line[0] && last_seen_size) {
+            strncpy(last_seen, line, last_seen_size - 1);
+            last_seen[last_seen_size - 1] = '\0';
+        }
+        if (strncmp(line, "FW,COMMITTING", 13) == 0) return 1;
+        if (strncmp(line, "FW,ERR", 6) == 0) {
+            snprintf(ota_err_msg, sizeof(ota_err_msg), "teensy: %s", line);
+            ota_state = OTA_S_FAILED;
+            ota_modal_dirty = true;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 // Download teensy.hex over WiFi into PSRAM, then forward line-by-line to the
@@ -3980,9 +4008,16 @@ static void otaDoTeensyUpdate() {
     }
     free(hexbuf);
     Serial.flush();
-    // EOF of the .hex file (':00000001FF') was sent in-stream. Teensy will now
-    // call flash_move() and reboot. Transition to TEENSY_WAITING so the modal
-    // shows the wait + future ticks come back through.
+
+    // EOF of the .hex file (':00000001FF') was sent and ACKed. Now wait for
+    // FlasherX's explicit commit marker before starting the reboot/version
+    // timer. If the marker is missed, continue anyway after 15 s — older
+    // firmware or a dropped marker should not brick the process — but don't
+    // count those 15 s against the reboot window.
+    char commit_last[80];
+    const int commit = waitForFwCommitting(15000, commit_last, sizeof(commit_last));
+    if (commit < 0) return;
+
     ota_state       = OTA_S_TEENSY_WAITING;
     ota_modal_dirty = true;
 }
@@ -4000,7 +4035,7 @@ static void otaDoTeensyWaiting() {
     static char     last_seen[80];
 
     const uint32_t now = millis();
-    constexpr uint32_t TEENSY_REBOOT_TIMEOUT_MS = 60000;
+    constexpr uint32_t TEENSY_REBOOT_TIMEOUT_MS = 180000;
     constexpr uint32_t TEENSY_VER_PING_MS       = 1000;
 
     if (wait_start == 0) {
@@ -4009,9 +4044,10 @@ static void otaDoTeensyWaiting() {
         last_draw_ms = 0;
         line_n       = 0;
         last_seen[0] = '\0';
-        // Clear any stale bytes left from FW,COMMITTING/boot chatter; from
-        // here onward we parse every full line so we don't miss VER.
-        while (Serial.available()) Serial.read();
+        // Do NOT drain Serial here. We now enter this state only after waiting
+        // for FW,COMMITTING, so any bytes already queued may be the new boot's
+        // VER,teensy,<target> line. Draining here can discard the exact line
+        // we're waiting for.
     }
 
     // Periodically ask for the version. If the Teensy is still inside
@@ -4073,14 +4109,14 @@ static void otaDoTeensyWaiting() {
         wait_start = 0;
         if (teensy_fw_version[0] && strcmp(teensy_fw_version, "?") != 0) {
             snprintf(ota_err_msg, sizeof(ota_err_msg),
-                     "teensy reports v%s, expected v%s",
+                     "teensy still v%s; expected v%s",
                      teensy_fw_version, ota_teensy_version);
         } else if (last_seen[0]) {
             snprintf(ota_err_msg, sizeof(ota_err_msg),
                      "no VER from teensy; last: %.45s", last_seen);
         } else {
             snprintf(ota_err_msg, sizeof(ota_err_msg),
-                     "no VER from teensy after 60s");
+                     "no VER from teensy after 180s");
         }
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
@@ -4323,18 +4359,23 @@ static void drawOtaModal() {
         tft.setTextPadding(0);
     }
 
-    // ---- Progress bar inner fill + KB/% line. Only when bytes-delta moves. ----
+    // ---- Progress bar inner fill + KB/% (or seconds/% while waiting). ----
     const bool show_bar = (ota_state == OTA_S_DOWNLOADING        ||
                            ota_state == OTA_S_TEENSY_DOWNLOADING ||
                            ota_state == OTA_S_TEENSY_WAITING     ||
                            ota_state == OTA_S_APPLYING           ||
                            ota_state == OTA_S_REBOOT);
     if (show_bar) {
-        const uint32_t total_kb = ota_total_bytes > 0 ? (ota_total_bytes / 1024UL) : 1;
-        const uint32_t done_kb  = ota_done_bytes / 1024UL;
-        if (done_kb != om_last_done_kb || total_kb != om_last_total_kb) {
-            om_last_done_kb  = done_kb;
-            om_last_total_kb = total_kb;
+        const bool waiting_for_teensy = (ota_state == OTA_S_TEENSY_WAITING);
+        const uint32_t total_units = waiting_for_teensy
+                                     ? ((ota_total_bytes + 999UL) / 1000UL)
+                                     : (ota_total_bytes > 0 ? (ota_total_bytes / 1024UL) : 1);
+        const uint32_t done_units  = waiting_for_teensy
+                                     ? (ota_done_bytes / 1000UL)
+                                     : (ota_done_bytes / 1024UL);
+        if (done_units != om_last_done_kb || total_units != om_last_total_kb) {
+            om_last_done_kb  = done_units;
+            om_last_total_kb = total_units;
             const uint32_t total = ota_total_bytes > 0 ? ota_total_bytes : 1;
             const uint32_t done  = ota_done_bytes  > total ? total : ota_done_bytes;
             const int fillW = (int)((uint64_t)done * (OM_BAR_W - 4) / total);
@@ -4343,9 +4384,14 @@ static void drawOtaModal() {
             if (fillW > 0)
                 tft.fillRect(OM_BAR_X + 2, OM_BAR_Y + 2, fillW, OM_BAR_H - 4, TFT_GREEN);
             const int pct = (int)((uint64_t)done * 100 / total);
-            char pbline[40];
-            snprintf(pbline, sizeof(pbline), "%lu / %lu KB   %d%%",
-                     (unsigned long)done_kb, (unsigned long)total_kb, pct);
+            char pbline[44];
+            if (waiting_for_teensy) {
+                snprintf(pbline, sizeof(pbline), "%lu / %lu sec   %d%%",
+                         (unsigned long)done_units, (unsigned long)total_units, pct);
+            } else {
+                snprintf(pbline, sizeof(pbline), "%lu / %lu KB   %d%%",
+                         (unsigned long)done_units, (unsigned long)total_units, pct);
+            }
             tft.setFont(&fonts::Font2);
             tft.setTextSize(1);
             tft.setTextColor(TFT_WHITE, TFT_NAVY);
