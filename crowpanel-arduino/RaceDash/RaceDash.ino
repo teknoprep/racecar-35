@@ -208,6 +208,16 @@ static uint8_t  sd_card_status   = 0;
 static uint32_t sd_total_mb      = 0;
 static uint32_t sd_free_mb       = 0;
 
+// Active session state — updated from SD,REC,<0|1>,<file>,<samples> lines.
+// The dash uses this to show a REC indicator + a live sample count.
+static bool     sd_session_active  = false;
+static char     sd_session_file[80] = "";
+static uint32_t sd_session_samples = 0;
+
+// Cloud state — updated from CLD,<live_ok>,<queue_depth> lines.
+static bool     cloud_live_ok      = false;
+static uint32_t cloud_queue_depth  = 0;
+
 // Two-tap arming for the SD format action in settings.
 static bool     sd_format_armed  = false;
 static uint32_t sd_format_arm_ms = 0;
@@ -288,12 +298,15 @@ struct Settings {
     // Recording / streaming
     bool     record_sd        = false;
     bool     record_cloud     = false;
-    char     cloud_host[64]   = "";    // DNS name or IP
+    char     cloud_host[64]   = "racecar.api.blueuc.com";  // default endpoint
     uint16_t cloud_port       = 80;
-    uint8_t  cloud_protocol   = 0;     // 0=HTTP, 1=HTTPS, 2=FTP
+    uint8_t  cloud_protocol   = 0;     // 0=HTTP, 1=HTTPS, 2=FTP (only HTTP wired today)
     uint8_t  cloud_stream     = 0;     // 0=Live, 1=AfterRace
-    char     cloud_auth_user[32] = "";
-    char     cloud_auth_pass[32] = "";
+    // cloud_user repurposed as a free-text USER EMAIL tag for data ownership.
+    // Not an auth credential — the Teensy forwards it as X-User-Email header.
+    // Real auth (Google OAuth) lives in the cloud-side Docker image.
+    char     cloud_auth_user[64] = "";   // user email (X-User-Email)
+    char     cloud_auth_pass[48] = "";   // API key (X-API-Key); masked on display
 
     // Engine sensor display + warn thresholds (drawn bottom-left on the dash).
     // show_*  : false hides that line entirely from the dash.
@@ -634,8 +647,13 @@ static void loadSettings() {
     s.cloud_port         = prefs.getUShort("cl_port",  s.cloud_port);
     s.cloud_protocol     = prefs.getUChar ("cl_proto", s.cloud_protocol);
     s.cloud_stream       = prefs.getUChar ("cl_strm",  s.cloud_stream);
-    prefs.getString      ("cl_user",  s.cloud_auth_user, sizeof(s.cloud_auth_user));
-    prefs.getString      ("cl_pass",  s.cloud_auth_pass, sizeof(s.cloud_auth_pass));
+    // Renamed in NVS: cl_user -> cl_email, cl_pass -> cl_key. Old key reads
+    // are kept as fallback for one release so existing dashes don't lose
+    // their settings on upgrade. Drop after a deploy or two.
+    if (prefs.isKey("cl_email")) prefs.getString("cl_email", s.cloud_auth_user, sizeof(s.cloud_auth_user));
+    else                          prefs.getString("cl_user",  s.cloud_auth_user, sizeof(s.cloud_auth_user));
+    if (prefs.isKey("cl_key"))    prefs.getString("cl_key",   s.cloud_auth_pass, sizeof(s.cloud_auth_pass));
+    else                          prefs.getString("cl_pass",  s.cloud_auth_pass, sizeof(s.cloud_auth_pass));
     s.auto_select_track  = prefs.getBool  ("auto_trk", s.auto_select_track);
     s.timezone_idx       = prefs.getUChar ("tz",       s.timezone_idx);
     s.show_coolant       = prefs.getBool  ("s_temp",   s.show_coolant);
@@ -682,9 +700,16 @@ static void saveSettings() {
     prefs.putUShort("cl_port",  s.cloud_port);
     prefs.putUChar ("cl_proto", s.cloud_protocol);
     prefs.putUChar ("cl_strm",  s.cloud_stream);
-    prefs.putString("cl_user",  s.cloud_auth_user);
-    prefs.putString("cl_pass",  s.cloud_auth_pass);
+    prefs.putString("cl_email", s.cloud_auth_user);   // user email
+    prefs.putString("cl_key",   s.cloud_auth_pass);   // API key
+    // Clean up the renamed legacy keys so they don't shadow the new ones on
+    // next boot's loadSettings() (the load path prefers cl_email/cl_key if
+    // present, but stale cl_user/cl_pass values are confusing in debug dumps).
+    if (prefs.isKey("cl_user")) prefs.remove("cl_user");
+    if (prefs.isKey("cl_pass")) prefs.remove("cl_pass");
     prefs.putBool  ("auto_trk", s.auto_select_track);
+    // (sendCfgToTeensy() is called at end of this function so any save also
+    // re-syncs the cloud config to the Teensy.)
     prefs.putUChar ("tz",       s.timezone_idx);
     prefs.putBool  ("s_temp",   s.show_coolant);
     prefs.putUShort("t_warn",   s.coolant_warn_f);
@@ -698,6 +723,22 @@ static void saveSettings() {
     prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
     prefs.putUChar ("afr_col",  s.afr_warn_col);
     prefs.end();
+    sendCfgToTeensy();   // keep Teensy in sync after every settings save
+}
+
+// Push the runtime config the Teensy needs to do cloud uploads. Format:
+//   CFG,<key>,<value>\n   (one line per setting; Teensy stores in g_cfg)
+// Call after loadSettings() at boot and at the end of saveSettings(). The
+// Teensy parser tolerates unknown keys, so we can grow this list freely.
+static void sendCfgToTeensy() {
+    Serial.printf("CFG,cl_host,%s\n",   s.cloud_host);
+    Serial.printf("CFG,cl_port,%u\n",   (unsigned)s.cloud_port);
+    Serial.printf("CFG,cl_proto,%u\n",  (unsigned)s.cloud_protocol);
+    Serial.printf("CFG,cl_strm,%u\n",   (unsigned)s.cloud_stream);
+    Serial.printf("CFG,cl_email,%s\n",  s.cloud_auth_user);
+    Serial.printf("CFG,cl_key,%s\n",    s.cloud_auth_pass);
+    Serial.printf("CFG,rec_sd,%d\n",    (int)s.record_sd);
+    Serial.printf("CFG,rec_cl,%d\n",    (int)s.record_cloud);
 }
 
 static void saveLastTrack(int idx, const char* display_name = nullptr) {
@@ -982,10 +1023,33 @@ static bool parseSdLine(const String& line) {
         sd_card_status = 3; sd_total_mb = 0; sd_free_mb = 0;
     } else if (tag == "ACTIVE") {
         sd_card_status = 4;
+    } else if (tag == "REC") {
+        // SD,REC,<0|1>,<filename>,<samples>
+        //   c1=after SD, c2=after REC, c3=after 0|1, c4=after filename
+        const int c4 = (c3 >= 0) ? line.indexOf(',', c3 + 1) : -1;
+        sd_session_active = (c3 >= 0) ? (line.substring(c2 + 1, c3).toInt() != 0) : false;
+        if (c3 >= 0) {
+            const int end = (c4 >= 0) ? c4 : (int)line.length();
+            line.substring(c3 + 1, end).toCharArray(sd_session_file, sizeof(sd_session_file));
+        } else {
+            sd_session_file[0] = '\0';
+        }
+        sd_session_samples = (c4 >= 0) ? line.substring(c4 + 1).toInt() : 0;
+        return true;
     } else {
         return false;
     }
     if (sd_card_status != prev) settingsDirty = true;
+    return true;
+}
+
+static bool parseCldLine(const String& line) {
+    // CLD,<live_ok>,<queue_depth>
+    const int c1 = line.indexOf(',');
+    const int c2 = (c1 >= 0) ? line.indexOf(',', c1 + 1) : -1;
+    if (c1 < 0 || c2 < 0) return false;
+    cloud_live_ok     = (line.substring(c1 + 1, c2).toInt() != 0);
+    cloud_queue_depth = (uint32_t)line.substring(c2 + 1).toInt();
     return true;
 }
 
@@ -1000,6 +1064,7 @@ static bool parseLine(const String& line) {
     if (line.startsWith("IMU,")) return parseImuLine(line);
     if (line.startsWith("ETH,"))  return parseEthLine(line);
     if (line.startsWith("SD,"))   return parseSdLine(line);
+    if (line.startsWith("CLD,"))  return parseCldLine(line);
     if (line.startsWith("TIME,")) return parseTimeLine(line);
     return false;
 }
@@ -1743,8 +1808,8 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_CL_PORT,      "Cloud port",            SettingRow::TEXT    },
     { ST_CL_PROTO,     "Cloud protocol",        SettingRow::ENUM    },
     { ST_CL_STREAM,    "Cloud stream mode",     SettingRow::ENUM    },
-    { ST_CL_AUTH_USER, "Cloud AUTH user",       SettingRow::TEXT    },
-    { ST_CL_AUTH_PASS, "Cloud AUTH pass",       SettingRow::TEXT    },
+    { ST_CL_AUTH_USER, "User email",            SettingRow::TEXT    },
+    { ST_CL_AUTH_PASS, "API key",               SettingRow::TEXT    },
     { ST_AUTO_TRACK,   "Auto select by GPS",    SettingRow::TOGGLE  },
     { ST_TIMEZONE,     "Time zone",              SettingRow::ENUM    },
     { ST_SD_FORMAT,    "Format SD card",         SettingRow::ACTION  },
@@ -2391,8 +2456,8 @@ static const char* kbTitleFor(SettingId id) {
     switch (id) {
         case ST_CL_HOST:      return "Edit Cloud host (DNS or IP)";
         case ST_CL_PORT:      return "Edit Cloud port";
-        case ST_CL_AUTH_USER: return "Edit Cloud AUTH user";
-        case ST_CL_AUTH_PASS: return "Edit Cloud AUTH password";
+        case ST_CL_AUTH_USER: return "Edit user email (data tag, not auth)";
+        case ST_CL_AUTH_PASS: return "Edit API key (sent as X-API-Key)";
         default:              return "Edit value";
     }
 }
@@ -3247,6 +3312,9 @@ void setup() {
     // cloud metadata. Display still uses UTC from the wire and applies the
     // offset locally; the Teensy doesn't currently act on this.
     Serial.printf("TZ,%s\n", TIMEZONES[s.timezone_idx].id);
+
+    // Push the cloud/record config so the Teensy knows where to POST etc.
+    sendCfgToTeensy();
 
     pageJustEntered = true;
     Serial.println("dash UI ready — listening on UART0");

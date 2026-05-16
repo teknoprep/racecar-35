@@ -13,6 +13,7 @@
 //   ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>   [planned]
 //   IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
 //   SD,REC,<0|1>,<filename>,<samples>     emitted on session open/close + 1 Hz during
+//   CLD,<live_ok>,<queue_depth>          emitted whenever either field changes (cloud status)
 //
 // Example: GPS,3,12,40.123456,-74.123456,67.5,123.4,2
 //          ENG,3450,650,2185
@@ -123,12 +124,35 @@ SFE_UBLOX_GNSS myGNSS;
 //
 // SD logging: on REC,1 we open /sessions/session_<unix>_<track>.ndjson and
 // append one NDJSON sample per emit window (25 Hz). On REC,0 we flush +
-// close. Cloud upload (HTTP POST live + after-race) lands in Phase B.
+// close. Cloud upload runs alongside — live POSTs during the session in
+// Live mode, whole-file POST on close in AfterRace mode. Failed uploads
+// get queued to /queue/ and retried when the link comes back up.
 // ---------------------------------------------------------------------------
 static bool     recording_active = false;
 static char     current_track[32] = "UNKNOWN";
 static uint32_t session_start_ms = 0;
 static uint32_t session_start_unix = 0;   // RTC epoch at REC,1 (0 if RTC unset)
+
+// Cloud / live-stream state lives up here because closeSession() (defined in
+// the SD section below) references it. Function definitions are in the cloud
+// section further down.
+static struct {
+    char     host[64]   = "";
+    uint16_t port       = 80;
+    uint8_t  proto      = 0;     // 0=HTTP, 1=HTTPS (NYI), 2=FTP (NYI)
+    uint8_t  stream     = 0;     // 0=Live, 1=AfterRace
+    char     email[64]  = "";
+    char     api_key[64] = "";
+    bool     rec_sd     = true;
+    bool     rec_cl     = false;
+} g_cfg;
+
+static uint8_t  live_buf[2048];
+static size_t   live_buf_n          = 0;
+static uint32_t live_last_flush_ms  = 0;
+static bool     live_failed_session = false;   // give up on live POSTs for this session
+static bool     live_status_last_ok = false;   // last successful POST flag
+static uint32_t queue_depth         = 0;       // updated by scanQueue()
 // Active timezone id sent by the dash (e.g. "ET", "PT", "UTC"). Used today
 // only for logging; future SD-filename / cloud-metadata code can consult it.
 // The Teensy's RTC and the wire-format TIME line are always UTC.
@@ -143,6 +167,7 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
                                uint16_t rpm, int16_t oil_x10, int16_t cool_x10,
                                float ax, float ay, float az,
                                float gx, float gy, float gz);
+static void handleCfgLine(const String& line);   // cloud section below
 
 // TimeLib sync provider — reads the Teensy 4.1 built-in RTC.
 static time_t getTeensyTime() { return Teensy3Clock.get(); }
@@ -185,6 +210,8 @@ static void handleDashCommand(const String& line) {
         strncpy(current_tz, tz.c_str(), sizeof(current_tz) - 1);
         current_tz[sizeof(current_tz) - 1] = '\0';
         Serial.printf("[teensy] timezone set to \"%s\"\n", current_tz);
+    } else if (line.startsWith("CFG,")) {
+        handleCfgLine(line);   // defined in cloud section below
     } else if (line.length() > 0) {
         Serial.printf("[teensy] unknown dash cmd: %s\n", line.c_str());
     }
@@ -809,6 +836,13 @@ static void openSession() {
     emitSessionStatus(true);
 }
 
+// Forward decl — cloud helpers live below this block but closeSession() uses them.
+static int  httpPost(const char* path, const uint8_t* body, size_t body_len, File32* file_body);
+static bool moveToQueue(const char* src_path);
+static void scanQueue();
+static void emitCloudStatus();
+static void liveStreamAppend(const char* line, size_t n);
+
 static void closeSession() {
     if (session_file_open) {
         session_file.sync();
@@ -816,6 +850,48 @@ static void closeSession() {
         session_file_open = false;
     }
     emitSessionStatus(false);
+
+    // Decide whether to upload now, queue for later, or do nothing.
+    // (Order matters: the path we use depends on whether the file made it to SD.)
+    const bool have_file = (session_path[0] != '\0' && sdFat.exists(session_path));
+    if (have_file && g_cfg.rec_cl) {
+        bool tried_now    = false;
+        bool upload_ok    = false;
+        if (g_cfg.stream == 1 && !live_failed_session) {
+            // AfterRace mode: try to POST the whole file now.
+            File32 f;
+            if (f.open(session_path, O_READ)) {
+                const uint32_t sz = f.fileSize();
+                Serial.printf("[cloud] after-race POST %s (%lu bytes)...\n",
+                              session_path, (unsigned long)sz);
+                const int status = httpPost("/upload", nullptr, sz, &f);
+                f.close();
+                tried_now = true;
+                upload_ok = (status >= 200 && status < 300);
+                if (upload_ok) {
+                    sdFat.remove(session_path);
+                    Serial.println(F("[cloud] after-race OK — file deleted"));
+                } else {
+                    Serial.printf("[cloud] after-race failed (status=%d)\n", status);
+                }
+            }
+        }
+        if (!upload_ok && !tried_now) {
+            // Live mode where streaming failed, OR after-race not attempted (no link).
+            // Push the whole file to /queue/ for later retry.
+            moveToQueue(session_path);
+        } else if (!upload_ok && tried_now) {
+            moveToQueue(session_path);
+        }
+        scanQueue();
+        emitCloudStatus();
+    }
+
+    // Reset session-scoped state.
+    live_failed_session = false;
+    live_buf_n          = 0;
+    session_path[0]     = '\0';
+
     // Refresh free-MB count so the dash sees the new value next status emit.
     if (sd_card_status == SD_CARD_READY) {
         const uint64_t freeSects = (uint64_t)sdFat.vol()->freeClusterCount()
@@ -879,11 +955,297 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
     }
     session_samples++;
 
+    // Feed live cloud streamer (no-op if cloud disabled / Live mode off /
+    // session already gave up on live this run).
+    liveStreamAppend(buf, (size_t)n);
+
     // Periodic flush so power-loss costs <=1 s, and 1 Hz status heartbeat to dash.
     if (millis() - session_last_flush_ms >= 1000) {
         session_last_flush_ms = millis();
         session_file.sync();
         emitSessionStatus(true);   // sends SD,REC,1,<file>,<samples>
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cloud upload (HTTP only — HTTPS + FTP deferred; see CLAUDE.md).
+//
+// Settings arrive from the dash as CFG,<key>,<val> lines (see handleCfgLine).
+// Three upload paths share one POST primitive (httpPostNdjson):
+//
+//   1. Live stream (rec_cl=1, cl_strm=0): liveStreamAppend() accumulates
+//      NDJSON lines in a small RAM buffer. Every ~200 ms we POST the buffer
+//      to /stream. If a POST fails we set live_failed_session=true; the rest
+//      of the file then becomes a queue candidate on closeSession().
+//   2. After Race (rec_cl=1, cl_strm=1): no live POSTs. closeSession() POSTs
+//      the whole file to /upload. Failure -> move file to /queue/.
+//   3. Queue walker: on link-up and once per 10 s when link is up + no
+//      active session, walk /queue/ oldest-first and POST each to /upload.
+//      Delete on 2xx, leave on failure for next pass.
+//
+// HTTP request format (both endpoints):
+//   POST /stream HTTP/1.1                  (or /upload)
+//   Host: <cl_host>
+//   Content-Type: application/x-ndjson
+//   X-API-Key:    <cl_key>
+//   X-User-Email: <cl_email>
+//   X-Session-Id: <unix epoch from REC,1>
+//   X-Track-Name: <url-encoded track>
+//   Content-Length: <n>
+// ---------------------------------------------------------------------------
+// (g_cfg, live_buf, live_failed_session, queue_depth declared up above near
+// recording_active so closeSession() can reference them.)
+static void handleCfgLine(const String& line) {
+    // line == "CFG,<key>,<value>"
+    const int c1 = 3;                                        // after "CFG,"
+    const int c2 = line.indexOf(',', c1);
+    if (c2 < 0) return;
+    const String key = line.substring(c1, c2);
+    const String val = line.substring(c2 + 1);
+    if      (key == "cl_host")  { strncpy(g_cfg.host,    val.c_str(), sizeof(g_cfg.host)-1);    g_cfg.host[sizeof(g_cfg.host)-1]=0; }
+    else if (key == "cl_port")  { g_cfg.port  = (uint16_t)val.toInt(); }
+    else if (key == "cl_proto") { g_cfg.proto = (uint8_t) val.toInt(); }
+    else if (key == "cl_strm")  { g_cfg.stream= (uint8_t) val.toInt(); }
+    else if (key == "cl_email") { strncpy(g_cfg.email,   val.c_str(), sizeof(g_cfg.email)-1);   g_cfg.email[sizeof(g_cfg.email)-1]=0; }
+    else if (key == "cl_key")   { strncpy(g_cfg.api_key, val.c_str(), sizeof(g_cfg.api_key)-1); g_cfg.api_key[sizeof(g_cfg.api_key)-1]=0; }
+    else if (key == "rec_sd")   { g_cfg.rec_sd = (val.toInt() != 0); }
+    else if (key == "rec_cl")   { g_cfg.rec_cl = (val.toInt() != 0); }
+    else {
+        Serial.printf("[cfg] unknown key %s\n", key.c_str());
+        return;
+    }
+    Serial.printf("[cfg] %s = %s\n", key.c_str(), val.c_str());
+}
+
+// URL-encode the small subset that actually shows up in track names. Anything
+// outside [A-Za-z0-9._~-] becomes %XX. Writes up to outsize-1 chars + NUL.
+static void urlEncode(const char* in, char* out, size_t outsize) {
+    // 'HEX' would collide with Teensy core Print.h's HEX macro — use a name
+    // unlikely to be a #define.
+    static const char HEX_DIGITS[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 4 < outsize; ++i) {
+        const unsigned char c = (unsigned char)in[i];
+        const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                          c == '~' || c == '-';
+        if (safe) { out[o++] = (char)c; }
+        else      { out[o++] = '%'; out[o++] = HEX_DIGITS[c >> 4]; out[o++] = HEX_DIGITS[c & 0xF]; }
+    }
+    out[o] = '\0';
+}
+
+// Single POST primitive. body may be a contiguous buffer (live stream) or a
+// file streamed in fixed-size chunks (after-race / queue). For the file path
+// the caller passes body=nullptr + body_len=total + file=open File32. Returns
+// HTTP status code, or 0 on connect/transport failure.
+static int httpPost(const char* path, const uint8_t* body, size_t body_len,
+                    File32* file_body) {
+    if (!eth_hw_present)                                    return 0;
+    if (Ethernet.linkStatus() != LinkON)                    return 0;
+    if (g_cfg.host[0] == '\0' || g_cfg.port == 0)           return 0;
+    if (g_cfg.proto != 0) {
+        // HTTPS / FTP not yet wired. Skip silently — these are queued and
+        // will sit on the SD card until firmware grows the protocols.
+        return 0;
+    }
+
+    EthernetClient c;
+    c.setConnectionTimeout(800);   // ms; covers DNS + 3-way handshake on LAN
+    if (!c.connect(g_cfg.host, g_cfg.port)) {
+        Serial.printf("[cloud] connect %s:%u failed\n", g_cfg.host, g_cfg.port);
+        return 0;
+    }
+
+    // Build a single header blob and write in one go so the W5500 sends a
+    // single short TCP segment for the request line + headers.
+    char trackEsc[64]; urlEncode(current_track, trackEsc, sizeof(trackEsc));
+    char hdr[512];
+    int hn = snprintf(hdr, sizeof(hdr),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/x-ndjson\r\n"
+        "X-API-Key: %s\r\n"
+        "X-User-Email: %s\r\n"
+        "X-Session-Id: %lu\r\n"
+        "X-Track-Name: %s\r\n"
+        "Content-Length: %u\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        path, g_cfg.host, g_cfg.api_key, g_cfg.email,
+        (unsigned long)session_start_unix, trackEsc, (unsigned)body_len);
+    if (hn < 0 || hn >= (int)sizeof(hdr)) { c.stop(); return 0; }
+    c.write((const uint8_t*)hdr, (size_t)hn);
+
+    if (file_body) {
+        // Stream the file in 1 KB chunks. Rewinds the file to the start first.
+        if (!file_body->seek(0)) { c.stop(); return 0; }
+        uint8_t chunk[1024];
+        size_t remaining = body_len;
+        while (remaining > 0 && c.connected()) {
+            size_t want = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
+            const int got = file_body->read(chunk, want);
+            if (got <= 0) break;
+            const int w   = c.write(chunk, (size_t)got);
+            if (w != got) { c.stop(); return 0; }
+            remaining -= (size_t)got;
+        }
+    } else if (body && body_len > 0) {
+        c.write(body, body_len);
+    }
+
+    // Read just enough of the response to grab the status code: "HTTP/1.1 NNN ..."
+    int status = 0;
+    const uint32_t deadline = millis() + 1500;
+    String line; line.reserve(64);
+    while (millis() < deadline && (c.connected() || c.available())) {
+        while (c.available() && (int32_t)(deadline - millis()) > 0) {
+            const char ch = (char)c.read();
+            if (ch == '\n') goto done_status;
+            if (ch != '\r' && line.length() < 60) line += ch;
+        }
+        delay(1);
+    }
+done_status:
+    if (line.length() >= 12 && line.startsWith("HTTP/")) {
+        status = line.substring(9, 12).toInt();
+    }
+    c.stop();
+    return status;
+}
+
+// --- Live streamer -------------------------------------------------------
+// Accumulates NDJSON sample lines in a small RAM buffer. Flushed periodically
+// from emitToDash() via liveStreamMaybeFlush(). (Storage declared up above
+// next to recording_active.)
+static void emitCloudStatus() {
+    DASH_SERIAL.printf("CLD,%u,%lu\n",
+                       (unsigned)(live_status_last_ok ? 1 : 0),
+                       (unsigned long)queue_depth);
+}
+
+static void liveStreamAppend(const char* line, size_t n) {
+    if (!g_cfg.rec_cl || g_cfg.stream != 0) return;     // not in Live mode
+    if (live_failed_session)                return;     // already gave up for this session
+    if (live_buf_n + n > sizeof(live_buf))  return;     // drop — next flush will catch up
+    memcpy(live_buf + live_buf_n, line, n);
+    live_buf_n += n;
+}
+
+static void liveStreamMaybeFlush() {
+    if (live_buf_n == 0) return;
+    if (millis() - live_last_flush_ms < 200) return;
+    live_last_flush_ms = millis();
+
+    const int status = httpPost("/stream", live_buf, live_buf_n, nullptr);
+    const bool ok = (status >= 200 && status < 300);
+    if (ok) {
+        live_buf_n = 0;
+        if (!live_status_last_ok) { live_status_last_ok = true; emitCloudStatus(); }
+    } else {
+        Serial.printf("[cloud] live POST failed (status=%d) — session will queue on close\n", status);
+        live_failed_session = true;
+        live_buf_n = 0;   // drop buffered samples — the SD file has them anyway
+        if (live_status_last_ok) { live_status_last_ok = false; emitCloudStatus(); }
+    }
+}
+
+// --- /queue/ walker ------------------------------------------------------
+// Move a session file from /sessions/ to /queue/ atomically. SdFat's rename()
+// is fine within the same volume.
+static bool moveToQueue(const char* src_path) {
+    if (!sdFat.exists("/queue") && !sdFat.mkdir("/queue")) {
+        Serial.println(F("[queue] mkdir /queue failed"));
+        return false;
+    }
+    const char* base = strrchr(src_path, '/');
+    base = base ? base + 1 : src_path;
+    char dst[96];
+    snprintf(dst, sizeof(dst), "/queue/%s", base);
+    if (!sdFat.rename(src_path, dst)) {
+        Serial.printf("[queue] rename %s -> %s failed\n", src_path, dst);
+        return false;
+    }
+    Serial.printf("[queue] %s -> %s\n", src_path, dst);
+    return true;
+}
+
+static void scanQueue() {
+    queue_depth = 0;
+    if (sd_card_status != SD_CARD_READY) return;
+    if (!sdFat.exists("/queue")) return;
+    File32 dir;
+    if (!dir.open("/queue", O_READ)) return;
+    File32 entry;
+    while (entry.openNext(&dir, O_READ)) {
+        if (!entry.isDir()) queue_depth++;
+        entry.close();
+    }
+    dir.close();
+}
+
+// Try to upload one queued file. Returns true on 2xx + delete; false otherwise.
+static bool drainOneQueued() {
+    if (sd_card_status != SD_CARD_READY) return false;
+    if (!sdFat.exists("/queue")) return false;
+
+    File32 dir;
+    if (!dir.open("/queue", O_READ)) return false;
+    char  chosen_path[96] = "";
+    File32 entry;
+    // Pick first regular file. We don't sort by mtime; FAT order is roughly
+    // insertion order on freshly-formatted cards, which is good enough.
+    while (entry.openNext(&dir, O_READ)) {
+        if (!entry.isDir()) {
+            char name[64];
+            entry.getName(name, sizeof(name));
+            snprintf(chosen_path, sizeof(chosen_path), "/queue/%s", name);
+            entry.close();
+            break;
+        }
+        entry.close();
+    }
+    dir.close();
+    if (chosen_path[0] == '\0') return false;
+
+    File32 f;
+    if (!f.open(chosen_path, O_READ)) {
+        Serial.printf("[queue] open %s failed\n", chosen_path);
+        return false;
+    }
+    const uint32_t sz = f.fileSize();
+    Serial.printf("[queue] uploading %s (%lu bytes)...\n",
+                  chosen_path, (unsigned long)sz);
+    const int status = httpPost("/upload", nullptr, sz, &f);
+    f.close();
+    if (status >= 200 && status < 300) {
+        sdFat.remove(chosen_path);
+        Serial.printf("[queue] OK — %s deleted\n", chosen_path);
+        return true;
+    }
+    Serial.printf("[queue] %s POST failed (status=%d) — leaving for next pass\n",
+                  chosen_path, status);
+    return false;
+}
+
+static void cloudTick() {
+    if (recording_active) {
+        // Only the live streamer runs during a session — queue walking is
+        // strictly between sessions to avoid contending with live POSTs.
+        liveStreamMaybeFlush();
+        return;
+    }
+    if (!eth_hw_present || Ethernet.linkStatus() != LinkON) return;
+    if (queue_depth == 0) return;
+
+    static uint32_t last_drain_ms = 0;
+    if (millis() - last_drain_ms < 10000) return;
+    last_drain_ms = millis();
+
+    const bool ok = drainOneQueued();
+    if (ok) {
+        scanQueue();
+        emitCloudStatus();
     }
 }
 
@@ -943,6 +1305,10 @@ void setup() {
     // Built-in SDIO SD card. Non-fatal if absent.
     detectSD();
     emitSdStatus();
+
+    // Scan /queue/ once at boot so the dash sees the backlog count right away.
+    scanQueue();
+    emitCloudStatus();
 
     // SparkFun RTK boards ship at 38400; bare modules at 9600 — try both.
     if (tryConnectGNSS(GPS_BAUD_PRIMARY) || tryConnectGNSS(GPS_BAUD_FALLBACK)) {
@@ -1052,6 +1418,9 @@ void loop() {
 
     // Tach FIFO drain — interrupt-driven; we just pull samples off.
     pumpTach();
+
+    // Cloud upload tick — live streamer during recording, queue drainer between.
+    cloudTick();
 
     // IMU accumulate — rate-limited internally to ~250 Hz.
     readIMU();
