@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.21"
+#define FIRMWARE_VERSION "0.1.22"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -177,6 +177,18 @@ static uint32_t live_last_flush_ms  = 0;
 static bool     live_failed_session = false;   // give up on live POSTs for this session
 static bool     live_status_last_ok = false;   // last successful POST flag
 static uint32_t queue_depth         = 0;       // updated by scanQueue()
+
+// Test data generator. When test_mode_active is true, emitToDash() and the
+// SD writer substitute synthetic, deterministic-but-plausible values for GPS,
+// engine, and IMU instead of reading the real hardware. The dash toggles
+// this via TESTSTART/TESTSTOP and observes the same UPLOAD,*/cloud lifecycle
+// it sees during real sessions.
+static bool     test_mode_active   = false;
+static uint32_t test_mode_start_ms = 0;
+
+// True when the active path is 'WiFi via dash': dash owns the WiFi link and we
+// forward session files to it over UART for cloud upload. Mirrors g_cfg.inet.
+static bool wifiInetActive() { return g_cfg.inet == 1; }
 // Active timezone id sent by the dash (e.g. "ET", "PT", "UTC"). Used today
 // only for logging; future SD-filename / cloud-metadata code can consult it.
 // The Teensy's RTC and the wire-format TIME line are always UTC.
@@ -230,6 +242,10 @@ static void handleDashCommand(const String& line) {
             } else {
                 const uint32_t dur = millis() - session_start_ms;
                 closeSession();
+                if (test_mode_active) {
+                    test_mode_active = false;
+                    DASH_SERIAL.println(F("TEST,0"));
+                }
                 Serial.printf("[teensy] REC STOP — duration=%lums\n",
                               (unsigned long)dur);
             }
@@ -254,6 +270,36 @@ static void handleDashCommand(const String& line) {
         Serial.printf("[teensy] timezone set to \"%s\"\n", current_tz);
     } else if (line.startsWith("CFG,")) {
         handleCfgLine(line);   // defined in cloud section below
+    } else if (line == "TESTSTART") {
+        // Begin a synthetic-data session. Track defaults to 'TEST' if the dash
+        // didn't send a TRACK line first. We open a real /sessions/ file using
+        // the same code path as a normal REC,1 so the closeSession() upload
+        // pipeline (Ethernet HTTP or WiFi-via-WUP) is exercised end-to-end.
+        if (!recording_active) {
+            test_mode_active     = true;
+            test_mode_start_ms   = millis();
+            if (current_track[0] == '\0' ||
+                strcmp(current_track, "UNKNOWN") == 0) {
+                strncpy(current_track, "TEST", sizeof(current_track) - 1);
+                current_track[sizeof(current_track) - 1] = '\0';
+            }
+            recording_active   = true;
+            session_start_ms   = millis();
+            session_start_unix = (uint32_t)::now();
+            Serial.printf("[teensy] TEST START \u2014 track=\"%s\"\n", current_track);
+            openSession();
+            DASH_SERIAL.println(F("TEST,1"));
+        }
+    } else if (line == "TESTSTOP") {
+        // Stop synthetic session and run the same upload pipeline as REC,0.
+        if (recording_active && test_mode_active) {
+            recording_active   = false;
+            closeSession();
+            test_mode_active   = false;
+            Serial.printf("[teensy] TEST STOP \u2014 duration=%lums\n",
+                          (unsigned long)(millis() - test_mode_start_ms));
+            DASH_SERIAL.println(F("TEST,0"));
+        }
     } else if (line == "UPLOAD,CANCEL") {
         // Dash requested cancel-all. Latch the disabled flag (clears only
         // on reboot) and signal the in-progress upload loop to bail out at
@@ -922,6 +968,7 @@ static void openSession() {
 // Forward decl — cloud helpers live below this block but closeSession() uses them.
 static constexpr int HTTP_STATUS_CANCELLED = -1;
 static int  httpPost(const char* path, const uint8_t* body, size_t body_len, File32* file_body);
+static int  cloudUploadFile(const char* path, size_t body_len, File32* f);
 static bool moveToQueue(const char* src_path);
 static void scanQueue();
 static void emitCloudStatus();
@@ -944,17 +991,21 @@ static void closeSession() {
     if (have_file && g_cfg.rec_cl) {
         bool tried_now    = false;
         bool upload_ok    = false;
-        if (g_cfg.stream == 1 && !live_failed_session && !uploads_disabled) {
-            // AfterRace mode: try to POST the whole file now.
+        // WiFi mode forces After-Race semantics regardless of cl_strm: live
+        // streaming over UART-to-dash adds back-pressure into the recording
+        // loop and isn't worth it for v1. When the W5500 lands the Ethernet
+        // path can resume offering Live as today.
+        const bool after_race_mode = wifiInetActive() || (g_cfg.stream == 1);
+        if (after_race_mode && !live_failed_session && !uploads_disabled) {
             File32 f;
             if (f.open(session_path, O_READ)) {
                 const uint32_t sz = f.fileSize();
-                Serial.printf("[cloud] after-race POST %s (%lu bytes)...\n",
-                              session_path, (unsigned long)sz);
-                // Filename only — don't ship the full SD path to the dash UI.
+                Serial.printf("[cloud] after-race upload %s (%lu bytes) via %s...\n",
+                              session_path, (unsigned long)sz,
+                              wifiInetActive() ? "WiFi-via-dash" : "Ethernet");
                 const char* base = strrchr(session_path, '/');
                 emitUploadStart(base ? base + 1 : session_path, sz);
-                const int status = httpPost("/upload", nullptr, sz, &f);
+                const int status = cloudUploadFile(session_path, sz, &f);
                 f.close();
                 tried_now = true;
                 upload_ok = (status >= 200 && status < 300);
@@ -1258,6 +1309,175 @@ done_status:
     return status;
 }
 
+// --- WiFi-via-dash forwarder --------------------------------------------
+// When g_cfg.inet == 1 (WiFi), the dash owns the WiFi link. We can't HTTP
+// from the Teensy in that case. Instead we forward session files to the dash
+// over UART using a tiny line-oriented protocol; the dash performs the
+// actual HTTPS POST and reports back. NDJSON files are naturally line-based
+// so each sample (~250 B) becomes one WUP,L,<line> message.
+//
+//   Teensy -> Dash:
+//     WUP,START,<basename>,<size>,<session_id>,<track>
+//     WUP,L,<one ndjson line, no leading/trailing whitespace>
+//     ... (one per sample)
+//     WUP,END,<line_count>,<total_bytes>
+//     WUP,CANCEL                            (on user cancel)
+//
+//   Dash -> Teensy:
+//     WUP,READY                             (dash buffered metadata, send data)
+//     WUP,NACK,<reason>                     (dash declined: no wifi/no PSRAM/...)
+//     U                                     (per-line ACK after each WUP,L)
+//     WUP,RESULT,OK,<http_status>            (cloud accepted -> delete file)
+//     WUP,RESULT,FAIL,<reason_or_status>     (caller decides to queue)
+//
+// Returns HTTP-status-like code so callers reuse the existing branching:
+//   2xx           upload succeeded, file should be deleted
+//   HTTP_STATUS_CANCELLED  user cancelled
+//   any other     transport/protocol/upload failure -> queue file
+static bool wupReadLineTimeout(char* out, size_t outsize, uint32_t timeout_ms) {
+    out[0] = '\0';
+    size_t n = 0;
+    const uint32_t end = millis() + timeout_ms;
+    while ((int32_t)(end - millis()) > 0) {
+        pumpDashCommands();   // service inbound cancels/CFG during the wait
+        while (DASH_SERIAL.available()) {
+            const char c = (char)DASH_SERIAL.read();
+            if (c == '\r') continue;
+            if (c == '\n') { out[n] = '\0'; return true; }
+            if (n + 1 < outsize) out[n++] = c;
+        }
+        delay(1);
+    }
+    out[n] = '\0';
+    return false;
+}
+
+static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
+                          size_t body_len, File32* file_body) {
+    if (uploads_disabled)                                   return 0;
+    if (!file_body)                                         return 0;
+    if (g_cfg.host[0] == '\0' || g_cfg.port == 0)           return 0;
+
+    const char* base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+
+    // Drain any stale UART bytes so the WUP,READY handshake isn't fooled
+    // by leftover telemetry from before we entered this function.
+    while (DASH_SERIAL.available()) DASH_SERIAL.read();
+
+    DASH_SERIAL.printf("WUP,START,%s,%lu,%lu,%s\n",
+                       base, (unsigned long)body_len,
+                       (unsigned long)session_start_unix, current_track);
+    DASH_SERIAL.flush();
+
+    char reply[160];
+    if (!wupReadLineTimeout(reply, sizeof(reply), 5000)) {
+        Serial.println(F("[wup] no WUP,READY — dash silent"));
+        return 0;
+    }
+    if (strncmp(reply, "WUP,NACK", 8) == 0) {
+        Serial.printf("[wup] dash NACK: %s\n", reply);
+        return 0;
+    }
+    if (strncmp(reply, "WUP,READY", 9) != 0) {
+        Serial.printf("[wup] unexpected reply: %s\n", reply);
+        return 0;
+    }
+
+    // Stream the file as NDJSON lines. We trust each on-disk line is already
+    // newline-terminated; we strip the trailing '\n' and wrap it as
+    // 'WUP,L,<line>\n' so the dash can count bytes vs the original size.
+    if (!file_body->seek(0)) return 0;
+
+    upload_in_progress    = true;
+    upload_cancel_pending = false;
+    emitUploadProg(0);
+
+    char     line[320];
+    size_t   line_n      = 0;
+    uint32_t lines       = 0;
+    uint32_t bytes       = 0;
+    uint32_t last_prog_ms = 0;
+    char     ack_buf[24];
+    while (true) {
+        const int c = file_body->read();
+        if (c < 0 && line_n == 0) break;   // EOF
+        if (c == '\r') continue;
+        if (c == '\n' || c < 0) {
+            // Send one record.
+            line[line_n] = '\0';
+            if (line_n == 0) continue;
+            DASH_SERIAL.print(F("WUP,L,"));
+            DASH_SERIAL.write((const uint8_t*)line, line_n);
+            DASH_SERIAL.write('\n');
+            DASH_SERIAL.flush();
+            // Per-line ACK so the dash can pace us if its PSRAM append stalls.
+            if (!wupReadLineTimeout(ack_buf, sizeof(ack_buf), 3000)) {
+                Serial.printf("[wup] ACK timeout at line %lu\n", (unsigned long)lines);
+                upload_in_progress = false;
+                return 0;
+            }
+            if (ack_buf[0] != 'U') {
+                Serial.printf("[wup] unexpected ACK: %s\n", ack_buf);
+                upload_in_progress = false;
+                return 0;
+            }
+            lines++;
+            bytes += line_n + 1;   // include the newline that was on disk
+            line_n = 0;
+            if (upload_cancel_pending) {
+                DASH_SERIAL.println(F("WUP,CANCEL"));
+                upload_in_progress = false;
+                return HTTP_STATUS_CANCELLED;
+            }
+            if (millis() - last_prog_ms >= 250) {
+                last_prog_ms = millis();
+                emitUploadProg(bytes);
+            }
+            if (c < 0) break;
+            continue;
+        }
+        if (line_n + 1 < sizeof(line)) line[line_n++] = (char)c;
+        else {
+            // Single NDJSON line bigger than expected — truncate is safer than
+            // silently splitting JSON across two messages.
+            line[sizeof(line) - 1] = '\0';
+        }
+    }
+    emitUploadProg(bytes);
+
+    DASH_SERIAL.printf("WUP,END,%lu,%lu\n", (unsigned long)lines, (unsigned long)bytes);
+    DASH_SERIAL.flush();
+
+    // Dash now does the HTTPS POST. This can take a while for a big file on
+    // marginal WiFi, so a generous timeout.
+    if (!wupReadLineTimeout(reply, sizeof(reply), 120000)) {
+        Serial.println(F("[wup] no WUP,RESULT — dash silent during POST"));
+        upload_in_progress = false;
+        return 0;
+    }
+    upload_in_progress = false;
+    Serial.printf("[wup] result: %s\n", reply);
+    if (strncmp(reply, "WUP,RESULT,OK", 13) == 0) {
+        // Parse optional status code after the OK,
+        const char* p = strchr(reply + 13, ',');
+        const int  http_status = p ? atoi(p + 1) : 200;
+        return http_status >= 200 ? http_status : 200;
+    }
+    return 0;   // FAIL: caller will queue
+}
+
+// Pick the right upload mechanism based on inet mode. Ethernet uses the local
+// httpPost(); WiFi-via-dash routes through wupForwardFile(). emitUploadStart
+// has already been called by the session-end / queue-walker code paths so the
+// dash modal is already up.
+static int cloudUploadFile(const char* path, size_t body_len, File32* f) {
+    if (wifiInetActive()) {
+        return wupForwardFile(path, nullptr, body_len, f);
+    }
+    return httpPost("/upload", nullptr, body_len, f);
+}
+
 // --- Live streamer -------------------------------------------------------
 // Accumulates NDJSON sample lines in a small RAM buffer. Flushed periodically
 // from emitToDash() via liveStreamMaybeFlush(). (Storage declared up above
@@ -1278,6 +1498,7 @@ static void liveStreamAppend(const char* line, size_t n) {
 
 static void liveStreamMaybeFlush() {
     if (uploads_disabled) { live_buf_n = 0; return; }
+    if (wifiInetActive())  { live_buf_n = 0; return; }   // WiFi mode: AfterRace only
     if (live_buf_n == 0) return;
     if (millis() - live_last_flush_ms < 200) return;
     live_last_flush_ms = millis();
@@ -1363,7 +1584,7 @@ static bool drainOneQueued() {
                   chosen_path, (unsigned long)sz);
     const char* base = strrchr(chosen_path, '/');
     emitUploadStart(base ? base + 1 : chosen_path, sz);
-    const int status = httpPost("/upload", nullptr, sz, &f);
+    const int status = cloudUploadFile(chosen_path, sz, &f);
     f.close();
     if (status == HTTP_STATUS_CANCELLED) {
         emitUploadDone("CANCELLED");
@@ -1387,10 +1608,15 @@ static void cloudTick() {
     if (recording_active) {
         // Only the live streamer runs during a session — queue walking is
         // strictly between sessions to avoid contending with live POSTs.
+        // In WiFi mode liveStreamMaybeFlush() is a no-op (forced AfterRace).
         liveStreamMaybeFlush();
         return;
     }
-    if (!eth_hw_present || Ethernet.linkStatus() != LinkON) return;
+    // Ethernet path requires a real link. WiFi-via-dash routes through the
+    // dash, so we don't gate on Ethernet hardware here — if the dash NACKs
+    // (no WiFi etc.) wupForwardFile returns 0 and the file stays queued.
+    if (!wifiInetActive() &&
+        (!eth_hw_present || Ethernet.linkStatus() != LinkON)) return;
     if (queue_depth == 0) return;
 
     static uint32_t last_drain_ms = 0;
@@ -1512,49 +1738,102 @@ void setup() {
     }
 }
 
+// Deterministic-but-plausible synthetic data generator. Used when test_mode_
+// active is true so we can exercise the full SD-write + cloud-upload pipeline
+// without real sensors. Track is a smooth circle near a known coordinate so
+// any map view of the uploaded session shows recognizable motion.
+static void generateTestSample(uint8_t& fix, uint8_t& sats,
+                               float& lat_deg, float& lon_deg,
+                               float& mph, float& hdg_deg,
+                               uint8_t& status,
+                               uint16_t& rpm,
+                               int16_t& oil_psi_x10, int16_t& cool_f_x10,
+                               float& ax, float& ay, float& az,
+                               float& gx, float& gy, float& gz) {
+    const float t_sec = (millis() - test_mode_start_ms) * 0.001f;
+    // Circle of ~150 m radius around Lime Rock Park-ish coords.
+    const float lat0 = 41.928f;
+    const float lon0 = -73.385f;
+    const float r_deg = 0.00135f;  // ~150 m
+    const float omega = 0.10f;     // rad/s -> lap every ~63 s
+    const float theta = t_sec * omega;
+    lat_deg = lat0 + r_deg * cosf(theta);
+    lon_deg = lon0 + r_deg * sinf(theta);
+    fix     = 3;
+    sats    = 12;
+    status  = 2;
+    // Speed and heading consistent with the circle motion.
+    const float circumference_m = 2.0f * 3.14159265f * 150.0f;
+    const float speed_mps = circumference_m / (2.0f * 3.14159265f / omega);
+    mph     = speed_mps * 2.23694f;
+    hdg_deg = fmodf((theta * 57.29578f) + 90.0f, 360.0f);
+    if (hdg_deg < 0) hdg_deg += 360.0f;
+    // Engine: idle-ish with a slow oscillation between 1500 and 6000 RPM.
+    rpm         = (uint16_t)(3750 + 2250 * sinf(t_sec * 0.6f));
+    oil_psi_x10 = (int16_t)(450 + 50 * sinf(t_sec * 0.4f));      // ~45 PSI
+    cool_f_x10  = (int16_t)(1900 + 20 * sinf(t_sec * 0.15f));    // ~190 F
+    // IMU: gentle accel under cornering, no big spikes.
+    ax = 0.10f * sinf(t_sec * 0.8f);
+    ay = 0.30f * sinf(theta);
+    az = 1.00f;
+    gx = 1.5f * sinf(t_sec * 1.2f);
+    gy = 1.0f * sinf(t_sec * 0.7f);
+    gz = 10.0f * sinf(theta);
+}
+
 static void emitToDash() {
     // Only read the SparkFun lib's PVT cache after we've confirmed at least
     // ONE fresh PVT arrived (gnss_last_fresh_ms != 0). Calling getFixType()
     // etc. before that returns uninitialized heap memory — at boot we saw
     // fix=128 sats=121 speed=2 million as a result.
     const bool have_pvt = gnss_lib_ok && gnss_last_fresh_ms != 0;
-    const uint8_t fix     = have_pvt ? myGNSS.getFixType()       : 0;
-    const uint8_t sats    = have_pvt ? myGNSS.getSIV()           : 0;
-    const float   lat_deg = have_pvt ? myGNSS.getLatitude()    * 1e-7f      : 0.0f;
-    const float   lon_deg = have_pvt ? myGNSS.getLongitude()   * 1e-7f      : 0.0f;
-    const float   mph     = have_pvt ? myGNSS.getGroundSpeed() * 0.00223694f : 0.0f;
-    const float   hdg_deg = have_pvt ? myGNSS.getHeading()     * 1e-5f      : 0.0f;
-    const uint8_t status  = gpsStatus();
-
-    DASH_SERIAL.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u\n",
-                       fix, sats, lat_deg, lon_deg, mph, hdg_deg, status);
-    // Echo to USB serial for debugging.
-    Serial.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u  (raw_bytes=%lu)\n",
-                  fix, sats, lat_deg, lon_deg, mph, hdg_deg, status,
-                  (unsigned long)gnss_raw_bytes);
+    uint8_t fix     = have_pvt ? myGNSS.getFixType()       : 0;
+    uint8_t sats    = have_pvt ? myGNSS.getSIV()           : 0;
+    float   lat_deg = have_pvt ? myGNSS.getLatitude()    * 1e-7f      : 0.0f;
+    float   lon_deg = have_pvt ? myGNSS.getLongitude()   * 1e-7f      : 0.0f;
+    float   mph     = have_pvt ? myGNSS.getGroundSpeed() * 0.00223694f : 0.0f;
+    float   hdg_deg = have_pvt ? myGNSS.getHeading()     * 1e-5f      : 0.0f;
+    uint8_t status  = gpsStatus();
 
     // Engine RPM + analog sensors (oil PSI, coolant degF). All emitted as
     // integers scaled x10 except RPM. -1 on the analog values signals a
     // sensor fault to the dash (it shows '---' rather than zero).
-    const uint16_t rpm          = computeRpmAndReset();
-    const int16_t  oil_psi_x10  = readOilPsiX10();
-    const int16_t  cool_f_x10   = readCoolantFx10();
-    DASH_SERIAL.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
-    Serial.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
+    uint16_t rpm          = computeRpmAndReset();
+    int16_t  oil_psi_x10  = readOilPsiX10();
+    int16_t  cool_f_x10   = readCoolantFx10();
 
     // IMU — flush averaged samples and emit even when absent (zeroes keep the
     // dash parser's field count stable and make it easy to detect a missing IMU).
     flushImu();
+    float ax = imu.ax, ay = imu.ay, az = imu.az;
+    float gx = imu.gx, gy = imu.gy, gz = imu.gz;
+
+    // Test mode override — substitute synthetic data BEFORE any emit so the
+    // dash UI, the SD write, and the cloud-upload pipeline all see the same
+    // synthetic sample.
+    if (test_mode_active) {
+        generateTestSample(fix, sats, lat_deg, lon_deg, mph, hdg_deg, status,
+                           rpm, oil_psi_x10, cool_f_x10, ax, ay, az, gx, gy, gz);
+    }
+
+    DASH_SERIAL.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u\n",
+                       fix, sats, lat_deg, lon_deg, mph, hdg_deg, status);
+    Serial.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u  (raw_bytes=%lu)\n",
+                  fix, sats, lat_deg, lon_deg, mph, hdg_deg, status,
+                  (unsigned long)gnss_raw_bytes);
+
+    DASH_SERIAL.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
+    Serial.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
     DASH_SERIAL.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
-                       imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
+                       ax, ay, az, gx, gy, gz);
     Serial.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
-                  imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
+                  ax, ay, az, gx, gy, gz);
 
     // SD logging: append one NDJSON sample with all the fields we just emitted.
     if (recording_active && session_file_open) {
         writeSessionSample(fix, sats, lat_deg, lon_deg, mph, hdg_deg,
                            rpm, oil_psi_x10, cool_f_x10,
-                           imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
+                           ax, ay, az, gx, gy, gz);
     }
 
     // Time of day from RTC — piggybacks on the 1 Hz GPS heartbeat so the dash

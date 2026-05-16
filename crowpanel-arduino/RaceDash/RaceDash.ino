@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.21"
+#define FIRMWARE_VERSION "0.1.22"
 
 #include <Preferences.h>
 #include <time.h>
@@ -398,8 +398,8 @@ struct Settings {
     bool     record_cloud     = false;
     char     cloud_host[64]   = "racecar.api.blueuc.com";  // default endpoint
     uint16_t cloud_port       = 80;
-    uint8_t  cloud_protocol   = 0;     // 0=HTTP, 1=HTTPS, 2=FTP (only HTTP wired today)
-    uint8_t  cloud_stream     = 0;     // 0=Live, 1=AfterRace
+    uint8_t  cloud_protocol   = 1;     // 0=HTTP, 1=HTTPS, 2=FTP (default HTTPS; FTP NYI)
+    uint8_t  cloud_stream     = 1;     // 0=Live, 1=AfterRace (default AfterRace; WiFi forces AfterRace anyway)
     // cloud_user repurposed as a free-text USER EMAIL tag for data ownership.
     // Not an auth credential — the Teensy forwards it as X-User-Email header.
     // Real auth (Google OAuth) lives in the cloud-side Docker image.
@@ -1254,6 +1254,22 @@ static bool parseCldLine(const String& line) {
     return true;
 }
 
+// Local mirror of the Teensy test_mode_active flag. Updated by TEST,<0|1>
+// lines so the Tools page button shows the correct label even across reboots.
+static bool test_mode_active = false;
+static bool parseTestLine(const String& line) {
+    // TEST,<0|1>
+    const int c1 = line.indexOf(',');
+    if (c1 < 0) return false;
+    test_mode_active = (line.substring(c1 + 1).toInt() != 0);
+    return true;
+}
+
+// parseWupLine() is defined far below — it touches wifi_state which lives in
+// the WiFi section. Just a forward decl up here so parseLine() can dispatch
+// to it from this top-of-file UART parsing block.
+static bool parseWupLine(const String& line);
+
 static bool parseLine(const String& line) {
     if (line.startsWith("GPS,")) {
         const bool ok = parseGpsLine(line);
@@ -1269,6 +1285,8 @@ static bool parseLine(const String& line) {
     if (line.startsWith("TIME,")) return parseTimeLine(line);
     if (line.startsWith("UPLOAD,")) return parseUploadLine(line);
     if (line.startsWith("VER,"))    return parseVerLine(line);
+    if (line.startsWith("TEST,"))   return parseTestLine(line);
+    if (line.startsWith("WUP,"))    return parseWupLine(line);
     return false;
 }
 static void pumpUart() {
@@ -2276,6 +2294,186 @@ static bool boolValueOnState(SettingId id) {
 // (WifiState enum is forward-declared up top — see auto-prototyper note.)
 // ---------------------------------------------------------------------------
 static WifiState wifi_state          = WS_OFF;
+
+// ---------------------------------------------------------------------------
+// WiFi-via-dash cloud forwarder (WUP).
+// When the Teensy needs to upload an NDJSON session file while we're the WiFi
+// owner, it streams the file over UART using WUP,* and we POST it to the
+// configured cloud endpoint over HTTP/HTTPS. See the matching block in
+// src/main.cpp for the protocol description. Defined in this section so it
+// has direct access to wifi_state without needing extern indirection.
+// ---------------------------------------------------------------------------
+static constexpr size_t WUP_MAX_BYTES = 4 * 1024 * 1024;  // 4 MB PSRAM cap per session
+static uint8_t*  wup_buf       = nullptr;
+static size_t   wup_capacity   = 0;
+static size_t   wup_written    = 0;
+static uint32_t wup_expected   = 0;
+static uint32_t wup_lines      = 0;
+static char     wup_file[80]   = "";
+static char     wup_track[40]  = "";
+static uint32_t wup_session_id = 0;
+static bool     wup_active     = false;
+static bool     wup_cancelled  = false;
+
+static void wupFree() {
+    if (wup_buf) { free(wup_buf); wup_buf = nullptr; }
+    wup_capacity = wup_written = wup_expected = wup_lines = 0;
+    wup_file[0] = '\0';
+    wup_track[0] = '\0';
+    wup_session_id = 0;
+    wup_active = false;
+    wup_cancelled = false;
+}
+
+static int wupDoCloudPost(int* http_status_out, char* err_out, size_t err_sz) {
+    if (!wup_buf || wup_written == 0) {
+        snprintf(err_out, err_sz, "empty buffer");
+        return 0;
+    }
+    if (s.internet_mode != 1 || wifi_state != WS_CONNECTED) {
+        snprintf(err_out, err_sz, "wifi not connected");
+        return 0;
+    }
+    if (s.cloud_host[0] == '\0' || s.cloud_port == 0) {
+        snprintf(err_out, err_sz, "cloud host/port unset");
+        return 0;
+    }
+    char url[256];
+    snprintf(url, sizeof(url), "%s://%s:%u/upload",
+             s.cloud_protocol == 1 ? "https" : "http",
+             s.cloud_host, (unsigned)s.cloud_port);
+
+    WiFiClientSecure secureClient;
+    WiFiClient       plainClient;
+    HTTPClient http;
+    bool ok;
+    if (s.cloud_protocol == 1) {
+        secureClient.setInsecure();   // TODO: pin the racecar API CA
+        ok = http.begin(secureClient, url);
+    } else {
+        ok = http.begin(plainClient, url);
+    }
+    if (!ok) {
+        snprintf(err_out, err_sz, "http.begin failed");
+        return 0;
+    }
+    http.setTimeout(60000);
+    http.addHeader("Content-Type", "application/x-ndjson");
+    http.addHeader("X-API-Key",    s.cloud_auth_pass);
+    http.addHeader("X-User-Email", s.cloud_auth_user);
+    char sid[24]; snprintf(sid, sizeof(sid), "%lu", (unsigned long)wup_session_id);
+    http.addHeader("X-Session-Id", sid);
+    http.addHeader("X-Track-Name", wup_track);
+    const int code = http.POST(wup_buf, wup_written);
+    if (http_status_out) *http_status_out = code;
+    if (code <= 0) {
+        snprintf(err_out, err_sz, "http error %d", code);
+    }
+    http.end();
+    return code;
+}
+
+static bool parseWupLine(const String& line) {
+    if (!line.startsWith("WUP,")) return false;
+    const String tail = line.substring(4);
+
+    if (tail.startsWith("START,")) {
+        wupFree();
+        const String s2 = tail.substring(6);
+        int p1 = s2.indexOf(',');
+        int p2 = (p1 >= 0) ? s2.indexOf(',', p1 + 1) : -1;
+        int p3 = (p2 >= 0) ? s2.indexOf(',', p2 + 1) : -1;
+        if (p1 < 0 || p2 < 0 || p3 < 0) {
+            Serial.println("WUP,NACK,bad_start");
+            Serial.flush();
+            return true;
+        }
+        const String fn   = s2.substring(0, p1);
+        const uint32_t sz = (uint32_t)s2.substring(p1 + 1, p2).toInt();
+        const uint32_t sid= (uint32_t)s2.substring(p2 + 1, p3).toInt();
+        const String trk  = s2.substring(p3 + 1);
+        if (s.internet_mode != 1) {
+            Serial.println("WUP,NACK,not_wifi_mode"); Serial.flush(); return true;
+        }
+        if (wifi_state != WS_CONNECTED) {
+            Serial.println("WUP,NACK,no_wifi"); Serial.flush(); return true;
+        }
+        if (sz == 0 || sz > WUP_MAX_BYTES) {
+            Serial.printf("WUP,NACK,size %lu\n", (unsigned long)sz); Serial.flush();
+            return true;
+        }
+        wup_buf = (uint8_t*)ps_malloc((size_t)sz + 32 * 1024);
+        if (!wup_buf) {
+            Serial.println("WUP,NACK,no_psram"); Serial.flush(); return true;
+        }
+        wup_capacity   = (size_t)sz + 32 * 1024;
+        wup_written    = 0;
+        wup_expected   = sz;
+        wup_lines      = 0;
+        fn .toCharArray(wup_file,  sizeof(wup_file));
+        trk.toCharArray(wup_track, sizeof(wup_track));
+        wup_session_id = sid;
+        wup_active     = true;
+        wup_cancelled  = false;
+        Serial.println("WUP,READY");
+        Serial.flush();
+        return true;
+    }
+    if (tail.startsWith("L,")) {
+        if (!wup_active || !wup_buf) return true;
+        const char* data = line.c_str() + 4 + 2;   // skip "WUP,L,"
+        const size_t n   = strlen(data);
+        if (wup_written + n + 1 > wup_capacity) {
+            wupFree();
+            Serial.println("WUP,NACK,overflow");
+            Serial.flush();
+            return true;
+        }
+        memcpy(wup_buf + wup_written, data, n);
+        wup_written += n;
+        wup_buf[wup_written++] = '\n';
+        wup_lines++;
+        Serial.println("U");
+        Serial.flush();
+        return true;
+    }
+    if (tail == "CANCEL") {
+        wup_cancelled = true;
+        wupFree();
+        return true;
+    }
+    if (tail.startsWith("END")) {
+        if (!wup_active || !wup_buf) {
+            Serial.println("WUP,RESULT,FAIL,not_active"); Serial.flush();
+            wupFree();
+            return true;
+        }
+        const int p1 = tail.indexOf(',');
+        const int p2 = (p1 >= 0) ? tail.indexOf(',', p1 + 1) : -1;
+        const uint32_t teensy_bytes = (p2 >= 0)
+            ? (uint32_t)tail.substring(p2 + 1).toInt()
+            : 0;
+        if (teensy_bytes != 0 && teensy_bytes != wup_expected) {
+            Serial.printf("WUP,RESULT,FAIL,size_drift teensy=%lu dash=%u\n",
+                          (unsigned long)teensy_bytes, (unsigned)wup_written);
+            Serial.flush();
+            wupFree();
+            return true;
+        }
+        char err[64] = "";
+        int  http_status = 0;
+        const int code = wupDoCloudPost(&http_status, err, sizeof(err));
+        if (code >= 200 && code < 300) {
+            Serial.printf("WUP,RESULT,OK,%d\n", code);
+        } else {
+            Serial.printf("WUP,RESULT,FAIL,%s\n", err[0] ? err : "http_fail");
+        }
+        Serial.flush();
+        wupFree();
+        return true;
+    }
+    return false;
+}
 static char      wifi_ip[16]         = "";
 static uint32_t  wifi_state_ms       = 0;
 static bool      wifi_ntp_done       = false;   // set true once we pushed SETTIME
@@ -2473,6 +2671,10 @@ static bool rowShouldShow(SettingId id) {
         case ST_WIFI_SSID:
         case ST_WIFI_PASS:
         case ST_WIFI_STATUS: return s.internet_mode == 1;
+        // Live/AfterRace toggle is only meaningful in Ethernet mode. In WiFi
+        // mode the dash forwards files to the cloud after the session ends;
+        // live streaming over UART-to-WiFi is intentionally deferred.
+        case ST_CL_STREAM:   return s.internet_mode == 0;
         default:           return true;
     }
 }
@@ -4732,8 +4934,9 @@ static void handleOtaModalTap(int x, int y) {
 namespace {
     constexpr int TOOLS_BTN_X = 40,  TOOLS_BTN_W = 720;
     constexpr int TOOLS_BTN_H = 90,  TOOLS_GAP   = 24;
-    constexpr int TOOLS_BTN1_Y = 80;
+    constexpr int TOOLS_BTN1_Y = 60;
     constexpr int TOOLS_BTN2_Y = TOOLS_BTN1_Y + TOOLS_BTN_H + TOOLS_GAP;
+    constexpr int TOOLS_BTN3_Y = TOOLS_BTN2_Y + TOOLS_BTN_H + TOOLS_GAP;
 }
 
 static const char* sdStatusText() {
@@ -4819,6 +5022,26 @@ static void drawToolsPage() {
         strncat(b2sub, ssz, sizeof(b2sub) - strlen(b2sub) - 1);
     }
     tft.drawString(b2sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 65);
+
+    // ---- Button 3: Test mode ----
+    // Generates synthetic GPS/RPM/IMU on the Teensy and writes a real SD
+    // session, exercising the SD-write + cloud-upload pipeline without
+    // needing real sensors. STOP closes the session, which triggers upload
+    // via either Ethernet (when W5500 lands) or WiFi-via-dash.
+    const uint16_t b3_fill = test_mode_active ? TFT_DARKGREEN : TFT_NAVY;
+    tft.fillRect(TOOLS_BTN_X, TOOLS_BTN3_Y, TOOLS_BTN_W, TOOLS_BTN_H, b3_fill);
+    tft.drawRect(TOOLS_BTN_X, TOOLS_BTN3_Y, TOOLS_BTN_W, TOOLS_BTN_H, TFT_WHITE);
+    tft.drawRect(TOOLS_BTN_X+1, TOOLS_BTN3_Y+1, TOOLS_BTN_W-2, TOOLS_BTN_H-2, TFT_WHITE);
+    tft.setFont(&fonts::Font4);
+    tft.setTextColor(TFT_WHITE, b3_fill);
+    tft.drawString(test_mode_active ? "Stop test mode" : "Start test mode",
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 30);
+    tft.setFont(&fonts::Font2);
+    tft.setTextColor(TFT_LIGHTGREY, b3_fill);
+    const char* b3sub = test_mode_active
+        ? "recording synthetic data — tap to stop + upload"
+        : "record synthetic session for cloud upload test";
+    tft.drawString(b3sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 65);
     tft.setTextDatum(textdatum_t::top_left);
 }
 
@@ -4846,6 +5069,15 @@ static void handleToolsTap(int x, int y) {
             sd_format_armed  = true;
             sd_format_arm_ms = millis();
         }
+        return;
+    }
+    // Button 3: Test mode toggle
+    if (x >= TOOLS_BTN_X && x <= TOOLS_BTN_X + TOOLS_BTN_W &&
+        y >= TOOLS_BTN3_Y && y <= TOOLS_BTN3_Y + TOOLS_BTN_H) {
+        Serial.printf(test_mode_active ? "TESTSTOP\n" : "TESTSTART\n");
+        // Optimistically flip the local state so the button re-paints
+        // immediately; the Teensy TEST,<0|1> reply will reconcile.
+        test_mode_active = !test_mode_active;
         return;
     }
 }
