@@ -28,19 +28,26 @@ fi
 NEW_VER="$1"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INO="$ROOT/crowpanel-arduino/RaceDash/RaceDash.ino"
+TEENSY_CPP="$ROOT/src/main.cpp"
 FW_DIR="$ROOT/firmware"
 FQBN='esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none'
+PIO="$HOME/.local/bin/pio"
 
 if ! command -v arduino-cli >/dev/null; then
   echo "arduino-cli not in PATH; add ~/.local/bin or install it" >&2
   exit 1
 fi
+if [ ! -x "$PIO" ]; then
+  echo "PlatformIO not at $PIO; install via pipx install platformio" >&2
+  exit 1
+fi
 
-echo "== bump FIRMWARE_VERSION -> $NEW_VER"
+echo "== bump FIRMWARE_VERSION -> $NEW_VER (CrowPanel + Teensy in lock-step)"
 sed -i "s/#define FIRMWARE_VERSION \"[^\"]*\"/#define FIRMWARE_VERSION \"$NEW_VER\"/" "$INO"
-grep 'FIRMWARE_VERSION' "$INO" | head -1
+sed -i "s/#define FIRMWARE_VERSION \"[^\"]*\"/#define FIRMWARE_VERSION \"$NEW_VER\"/" "$TEENSY_CPP"
+grep '#define FIRMWARE_VERSION' "$INO" "$TEENSY_CPP"
 
-echo "== build"
+echo "== build CrowPanel"
 arduino-cli compile --fqbn "$FQBN" "$ROOT/crowpanel-arduino/RaceDash"
 
 # arduino-cli caches builds at ~/.cache/arduino/sketches/<hash>/RaceDash.ino.bin
@@ -58,6 +65,18 @@ SHA=$(sha256sum "$FW_DIR/crowpanel-dash.bin" | awk '{print $1}')
 SIZE=$(stat -c%s "$FW_DIR/crowpanel-dash.bin")
 echo "== sha256=$SHA size=$SIZE"
 
+echo "== build Teensy"
+( cd "$ROOT" && "$PIO" run )   # produces .pio/build/teensy41/firmware.hex
+THEX="$ROOT/.pio/build/teensy41/firmware.hex"
+if [ ! -f "$THEX" ]; then
+  echo "Teensy build artifact missing at $THEX" >&2
+  exit 1
+fi
+cp "$THEX" "$FW_DIR/teensy41-dash.hex"
+TSHA=$(sha256sum "$FW_DIR/teensy41-dash.hex" | awk '{print $1}')
+TSIZE=$(stat -c%s "$FW_DIR/teensy41-dash.hex")
+echo "== teensy sha256=$TSHA size=$TSIZE"
+
 cat > "$FW_DIR/manifest.json" <<EOF
 {
   "crowpanel": {
@@ -67,10 +86,10 @@ cat > "$FW_DIR/manifest.json" <<EOF
     "size":    $SIZE
   },
   "teensy": {
-    "version": "0.1.0",
+    "version": "$NEW_VER",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/teensy41-dash.hex",
-    "sha256":  "(not-yet-built)",
-    "note":    "Teensy OTA pending Phase 2b (FlasherX + UART transfer)"
+    "sha256":  "$TSHA",
+    "size":    $TSIZE
   }
 }
 EOF
@@ -78,7 +97,7 @@ EOF
 # even when mtime + size happen to match the previous version (we hit this in
 # v0.1.1 and v0.1.2 — manifest content changed but mtime didn't, so the file
 # silently dropped out of `git status`).
-touch "$FW_DIR/crowpanel-dash.bin" "$FW_DIR/manifest.json"
+touch "$FW_DIR/crowpanel-dash.bin" "$FW_DIR/teensy41-dash.hex" "$FW_DIR/manifest.json"
 echo "== firmware/manifest.json updated"
 
 cat <<EOF

@@ -57,11 +57,16 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include "FXUtil.h"        // FlasherX: in-application reflash for Teensy 4.x
+extern "C" {
+  #include "FlashTxx.h"     // low-level flash primitives (firmware_buffer_init, etc.)
+}
 
 // Compile-time firmware version. Increment via the release process when
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
-#define FIRMWARE_VERSION "0.1.0"
+// Teensy version is bumped in lock-step with the dash via scripts/release.sh.
+#define FIRMWARE_VERSION "0.1.5"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -243,6 +248,26 @@ static void handleDashCommand(const String& line) {
         // page does this whenever it opens, so a freshly-booted dash that
         // missed our boot-time emit can catch up immediately.
         DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
+    } else if (line == "FWUPDATE") {
+        // Dash kicking off a Teensy OTA. We're about to hand the UART over to
+        // the FlasherX hex-receive loop, which is BLOCKING until EOF or error.
+        // No telemetry / commands flow during that window. Dash is expected
+        // to send Intel HEX lines (':...\n') for the whole image, then either
+        // succeed (we never return — flash_move reboots us into new firmware)
+        // or fail (we resume normal operation + emit FW,ERR for the dash).
+        uint32_t buffer_addr = 0, buffer_size = 0;
+        if (firmware_buffer_init(&buffer_addr, &buffer_size) == 0) {
+            DASH_SERIAL.println(F("FW,ERR,buffer_init_failed"));
+            return;
+        }
+        Serial.printf("[fwupdate] buffer @ 0x%08lX, size=%lu\n",
+                      (unsigned long)buffer_addr, (unsigned long)buffer_size);
+        DASH_SERIAL.printf("FW,READY,%lu\n", (unsigned long)buffer_size);
+        // Diagnostic output via USB serial; UART is busy receiving hex lines.
+        update_firmware_noprompt(&DASH_SERIAL, &Serial, buffer_addr, buffer_size);
+        // If we get here, the update failed. Free the buffer and report.
+        firmware_buffer_free(buffer_addr, buffer_size);
+        DASH_SERIAL.println(F("FW,ERR,update_failed"));
     } else if (line.length() > 0) {
         Serial.printf("[teensy] unknown dash cmd: %s\n", line.c_str());
     }
@@ -1386,6 +1411,11 @@ void setup() {
     unsigned long start = millis();
     while (!Serial && millis() - start < 1500) { /* spin */ }
     Serial.printf("racecar-35 dash teensy boot, firmware v%s\n", FIRMWARE_VERSION);
+    // FlasherX check_flash_id() will search the staged OTA image for this
+    // literal (FLASH_ID == "fw_teensy41" on Teensy 4.1, defined in FlashTxx.h).
+    // We print it here so the linker keeps the string in our image too — the
+    // staged image must contain the same literal for the check to pass.
+    Serial.println(F("FLASH_ID:" FLASH_ID));
     // Tell the dash what firmware we're running so it can show it in settings
     // and compare against GitHub's manifest.json when "Check for updates" runs.
     DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
