@@ -1394,7 +1394,17 @@ void setup() {
     // hardware averaging gives a stable, noise-floor-free reading at 25 Hz.
     analogReadResolution(12);
     analogReadAveraging(16);
-    Serial.println(F("Analog: oil PSI on A2, coolant degF on A3 (12-bit, x16 avg)"));
+    // Internal pull-down on both ADC pins so a disconnected pin reads ~0 V
+    // and the per-channel fault detection (v_sensor < 0.3 V for oil,
+    // raw <= 4 for coolant) trips reliably. When a real sensor circuit is
+    // wired (oil: 10k/20k divider from a 0.5-4.5 V transducer; coolant:
+    // 150 Ω pull-up to 3.3 V with NTC to GND), the external source impedance
+    // (~6.7 kΩ oil divider, 150 Ω coolant pull-up) is far stiffer than the
+    // internal ~50 kΩ pull-down, so the real reading dominates with a <5%
+    // calibration shift absorbed during sensor calibration.
+    pinMode(OIL_ADC_PIN,     INPUT_PULLDOWN);
+    pinMode(COOLANT_ADC_PIN, INPUT_PULLDOWN);
+    Serial.println(F("Analog: oil PSI on A2, coolant degF on A3 (12-bit, x16 avg, pulldown)"));
 
     // IMU on Wire (SDA=18, SCL=19). Non-fatal if absent.
     imu_present = setupIMU();
