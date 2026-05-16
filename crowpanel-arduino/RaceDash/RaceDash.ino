@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.27"
+#define FIRMWARE_VERSION "0.1.28"
 
 #include <Preferences.h>
 #include <time.h>
@@ -199,6 +199,14 @@ namespace {
     LGFX_Sprite spr_temp(&tft);        // "TEMP: ..." line
     LGFX_Sprite spr_psi(&tft);         // "PSI:  ..." line
     LGFX_Sprite spr_afr(&tft);         // "AFR:  ..." line (MS3 mode only)
+    LGFX_Sprite spr_rec_badge(&tft);   // REC ● N  /  queue: N  /  REC ? no ack
+    LGFX_Sprite spr_fix(&tft);         // FIX value (right column)
+    LGFX_Sprite spr_sats(&tft);        // SATS value (right column)
+    LGFX_Sprite spr_gps(&tft);         // GPS status value (right column)
+    LGFX_Sprite spr_pred(&tft);        // predictive lap time (middle column)
+    LGFX_Sprite spr_lap(&tft);         // last lap time (middle column)
+    LGFX_Sprite spr_track_name(&tft);  // active track name under TRACK btn
+    LGFX_Sprite spr_recbtn(&tft);      // START/STOP button face
 }
 static bool   dash_sprites_ready = false;
 
@@ -211,12 +219,20 @@ static void setupDashSprites() {
     // Inner-of-border for the RPM bar so the static white border outline
     // drawn directly on the framebuffer at pageJustEntered isn't clobbered.
     dash_sprites_ready =
-        mk(spr_rpm_bar,  756, 76)  &&
-        mk(spr_rpm_text, 110, 26)  &&
-        mk(spr_speed,    360, 200) &&    // covers Font7-size-4 (≈192 px tall)
-        mk(spr_temp,     240, 38)  &&
-        mk(spr_psi,      240, 38)  &&
-        mk(spr_afr,      240, 38);
+        mk(spr_rpm_bar,    756, 76)  &&
+        mk(spr_rpm_text,   110, 26)  &&
+        mk(spr_speed,      360, 200) &&    // covers Font7-size-4 (≈192 px tall)
+        mk(spr_temp,       240, 38)  &&
+        mk(spr_psi,        240, 38)  &&
+        mk(spr_afr,        240, 38)  &&
+        mk(spr_rec_badge,  220, 22)  &&
+        mk(spr_fix,        110, 24)  &&
+        mk(spr_sats,        60, 24)  &&
+        mk(spr_gps,        110, 24)  &&
+        mk(spr_pred,       110, 24)  &&
+        mk(spr_lap,        110, 24)  &&
+        mk(spr_track_name, 320, 22)  &&
+        mk(spr_recbtn,     160, 70);
     if (dash_sprites_ready) Serial.println("dash sprites: ok");
     else                    Serial.println("WARNING: dash sprite alloc failed \u2014 dash will fall back to direct draw");
 }
@@ -1727,17 +1743,28 @@ static void drawRecordButton() {
     const uint16_t border = TFT_WHITE;
     const char*    label  = recording ? "STOP"    : "START";
 
-    tft.fillRect(RECBTN_X, RECBTN_Y, RECBTN_W, RECBTN_H, fill);
-    // 3-pixel border for some visual weight
-    tft.drawRect(RECBTN_X,     RECBTN_Y,     RECBTN_W,     RECBTN_H,     border);
-    tft.drawRect(RECBTN_X + 1, RECBTN_Y + 1, RECBTN_W - 2, RECBTN_H - 2, border);
-    tft.drawRect(RECBTN_X + 2, RECBTN_Y + 2, RECBTN_W - 4, RECBTN_H - 4, border);
-
-    tft.setFont(&fonts::Font4);
-    tft.setTextSize(1);
-    tft.setTextDatum(textdatum_t::middle_center);
-    tft.setTextColor(TFT_WHITE, fill);
-    tft.drawString(label, RECBTN_X + RECBTN_W / 2, RECBTN_Y + RECBTN_H / 2);
+    if (dash_sprites_ready) {
+        spr_recbtn.fillSprite(fill);
+        spr_recbtn.drawRect(0, 0, RECBTN_W,     RECBTN_H,     border);
+        spr_recbtn.drawRect(1, 1, RECBTN_W - 2, RECBTN_H - 2, border);
+        spr_recbtn.drawRect(2, 2, RECBTN_W - 4, RECBTN_H - 4, border);
+        spr_recbtn.setFont(&fonts::Font4);
+        spr_recbtn.setTextSize(1);
+        spr_recbtn.setTextDatum(textdatum_t::middle_center);
+        spr_recbtn.setTextColor(TFT_WHITE);
+        spr_recbtn.drawString(label, RECBTN_W / 2, RECBTN_H / 2);
+        spr_recbtn.pushSprite(RECBTN_X, RECBTN_Y);
+    } else {
+        tft.fillRect(RECBTN_X, RECBTN_Y, RECBTN_W, RECBTN_H, fill);
+        tft.drawRect(RECBTN_X,     RECBTN_Y,     RECBTN_W,     RECBTN_H,     border);
+        tft.drawRect(RECBTN_X + 1, RECBTN_Y + 1, RECBTN_W - 2, RECBTN_H - 2, border);
+        tft.drawRect(RECBTN_X + 2, RECBTN_Y + 2, RECBTN_W - 4, RECBTN_H - 4, border);
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextColor(TFT_WHITE, fill);
+        tft.drawString(label, RECBTN_X + RECBTN_W / 2, RECBTN_Y + RECBTN_H / 2);
+    }
 }
 
 static void drawDashPage() {
@@ -1933,24 +1960,45 @@ static void drawDashPage() {
         if (tag != ld.rec_badge_tag || samples != ld.rec_samples || qd != ld.cld_queue) {
             // Band: just below the RPM number's baseline (y=94), above START (y=155).
             constexpr int BX = 30, BY = 125, BW = 220, BH = 22;
-            tft.fillRect(BX, BY, BW, BH, bg);
-            tft.setFont(&fonts::Font2);
-            tft.setTextSize(1);
-            tft.setTextDatum(textdatum_t::middle_left);
-            if (dash_rec && teensy_ok) {
-                tft.fillCircle(BX + 6, BY + BH/2, 5, TFT_RED);
-                tft.setTextColor(TFT_WHITE, bg);
-                char buf[24]; snprintf(buf, sizeof(buf), "REC  %lu", (unsigned long)samples);
-                tft.drawString(buf, BX + 18, BY + BH/2);
-            } else if (warn) {
-                tft.fillCircle(BX + 6, BY + BH/2, 5, TFT_ORANGE);
-                tft.setTextColor(TFT_ORANGE, bg);
-                tft.drawString("REC ? no ack", BX + 18, BY + BH/2);
-            } else if (qd > 0) {
-                // Same slot, replacement message when idle with backlog.
-                tft.setTextColor(TFT_CYAN, bg);
-                char qbuf[20]; snprintf(qbuf, sizeof(qbuf), "queue: %lu", (unsigned long)qd);
-                tft.drawString(qbuf, BX, BY + BH/2);
+            if (dash_sprites_ready) {
+                spr_rec_badge.fillSprite(bg);
+                spr_rec_badge.setFont(&fonts::Font2);
+                spr_rec_badge.setTextSize(1);
+                spr_rec_badge.setTextDatum(textdatum_t::middle_left);
+                if (dash_rec && teensy_ok) {
+                    spr_rec_badge.fillCircle(6, BH/2, 5, TFT_RED);
+                    spr_rec_badge.setTextColor(TFT_WHITE);
+                    char buf[24]; snprintf(buf, sizeof(buf), "REC  %lu", (unsigned long)samples);
+                    spr_rec_badge.drawString(buf, 18, BH/2);
+                } else if (warn) {
+                    spr_rec_badge.fillCircle(6, BH/2, 5, TFT_ORANGE);
+                    spr_rec_badge.setTextColor(TFT_ORANGE);
+                    spr_rec_badge.drawString("REC ? no ack", 18, BH/2);
+                } else if (qd > 0) {
+                    spr_rec_badge.setTextColor(TFT_CYAN);
+                    char qbuf[20]; snprintf(qbuf, sizeof(qbuf), "queue: %lu", (unsigned long)qd);
+                    spr_rec_badge.drawString(qbuf, 0, BH/2);
+                }
+                spr_rec_badge.pushSprite(BX, BY);
+            } else {
+                tft.fillRect(BX, BY, BW, BH, bg);
+                tft.setFont(&fonts::Font2);
+                tft.setTextSize(1);
+                tft.setTextDatum(textdatum_t::middle_left);
+                if (dash_rec && teensy_ok) {
+                    tft.fillCircle(BX + 6, BY + BH/2, 5, TFT_RED);
+                    tft.setTextColor(TFT_WHITE, bg);
+                    char buf[24]; snprintf(buf, sizeof(buf), "REC  %lu", (unsigned long)samples);
+                    tft.drawString(buf, BX + 18, BY + BH/2);
+                } else if (warn) {
+                    tft.fillCircle(BX + 6, BY + BH/2, 5, TFT_ORANGE);
+                    tft.setTextColor(TFT_ORANGE, bg);
+                    tft.drawString("REC ? no ack", BX + 18, BY + BH/2);
+                } else if (qd > 0) {
+                    tft.setTextColor(TFT_CYAN, bg);
+                    char qbuf[20]; snprintf(qbuf, sizeof(qbuf), "queue: %lu", (unsigned long)qd);
+                    tft.drawString(qbuf, BX, BY + BH/2);
+                }
             }
             tft.setTextDatum(textdatum_t::top_left);
             ld.rec_badge_tag = tag;
@@ -2133,31 +2181,45 @@ static void drawDashPage() {
     tft.setFont(&fonts::Font2);
     tft.setTextDatum(textdatum_t::top_left);
 
-    // Right column: FIX / SATS / GPS. Pushed further right (x=550 label,
-    // value at x=610) so they sit closer to the right edge.
-    if (g.fix != ld.fix) {
-        const uint16_t col = (g.fix >= 3) ? TFT_GREEN : (g.fix >= 2) ? TFT_YELLOW : TFT_RED;
-        char buf[8]; snprintf(buf, sizeof(buf), "%-5s", fixName(g.fix));
-        drawValue(680,355, buf, col);
-        ld.fix = g.fix;
-    }
-    if (g.sats != ld.sats) {
-        char buf[8]; snprintf(buf, sizeof(buf), "%2u", (unsigned)g.sats);
-        drawValue(680,380, buf, TFT_WHITE);
-        ld.sats = g.sats;
-    }
-    if (g.status != ld.status) {
-        char buf[8]; snprintf(buf, sizeof(buf), "%-5s", gpsStatusName(g.status));
-        drawValue(680,405, buf, gpsStatusColor(g.status));
-        ld.status = g.status;
+    // Right column: FIX / SATS / GPS. Sprite-buffered so the value flips are
+    // atomic to the LCD scan; the static labels at x=620 were painted once on
+    // pageJustEntered and aren't touched here.
+    {
+        auto drawTextSprite = [&](LGFX_Sprite& s, int sx, int sy,
+                                  const char* str, uint16_t col) {
+            s.fillSprite(bg);
+            s.setFont(&fonts::Font2);
+            s.setTextSize(1);
+            s.setTextDatum(textdatum_t::top_left);
+            s.setTextColor(col);
+            s.drawString(str, 0, 0);
+            s.pushSprite(sx, sy);
+        };
+        if (g.fix != ld.fix) {
+            const uint16_t col = (g.fix >= 3) ? TFT_GREEN : (g.fix >= 2) ? TFT_YELLOW : TFT_RED;
+            char buf[8]; snprintf(buf, sizeof(buf), "%-5s", fixName(g.fix));
+            if (dash_sprites_ready) drawTextSprite(spr_fix, 680, 355, buf, col);
+            else                    drawValue(680, 355, buf, col);
+            ld.fix = g.fix;
+        }
+        if (g.sats != ld.sats) {
+            char buf[8]; snprintf(buf, sizeof(buf), "%2u", (unsigned)g.sats);
+            if (dash_sprites_ready) drawTextSprite(spr_sats, 680, 380, buf, TFT_WHITE);
+            else                    drawValue(680, 380, buf, TFT_WHITE);
+            ld.sats = g.sats;
+        }
+        if (g.status != ld.status) {
+            char buf[8]; snprintf(buf, sizeof(buf), "%-5s", gpsStatusName(g.status));
+            const uint16_t col = gpsStatusColor(g.status);
+            if (dash_sprites_ready) drawTextSprite(spr_gps, 680, 405, buf, col);
+            else                    drawValue(680, 405, buf, col);
+            ld.status = g.status;
+        }
     }
 
     // Middle column: predictive (PRED) and last completed (LAP) lap times.
     // PRED is green if on pace for a faster lap, red if slower, grey when
     // there's not enough data. LAP is white — it's a static fact.
-    tft.setFont(&fonts::Font2);
-    tft.setTextDatum(textdatum_t::top_left);
-    tft.setTextPadding(100);    // wide enough to overwrite "--:--.--" (8 chars)
     {
         const uint32_t predMs = predictiveLapMs();
         const uint32_t cs = predMs / 10;
@@ -2172,8 +2234,22 @@ static void drawDashPage() {
                 col = (lapTimer.last_lap_ms > 0 && predMs < lapTimer.last_lap_ms)
                       ? TFT_GREEN : TFT_RED;
             }
-            tft.setTextColor(col, bg);
-            tft.drawString(buf, 305, 380);
+            if (dash_sprites_ready) {
+                spr_pred.fillSprite(bg);
+                spr_pred.setFont(&fonts::Font2);
+                spr_pred.setTextSize(1);
+                spr_pred.setTextDatum(textdatum_t::top_left);
+                spr_pred.setTextColor(col);
+                spr_pred.drawString(buf, 0, 0);
+                spr_pred.pushSprite(305, 380);
+            } else {
+                tft.setFont(&fonts::Font2);
+                tft.setTextDatum(textdatum_t::top_left);
+                tft.setTextPadding(100);
+                tft.setTextColor(col, bg);
+                tft.drawString(buf, 305, 380);
+                tft.setTextPadding(0);
+            }
             ld.pred_lap_cs = cs;
         }
     }
@@ -2183,31 +2259,55 @@ static void drawDashPage() {
             char buf[12];
             if (lapTimer.last_lap_ms == 0) snprintf(buf, sizeof(buf), "--:--.--");
             else                           formatLapTime(lapTimer.last_lap_ms, buf, sizeof(buf));
-            tft.setTextColor(TFT_WHITE, bg);
-            tft.drawString(buf, 305, 405);
+            if (dash_sprites_ready) {
+                spr_lap.fillSprite(bg);
+                spr_lap.setFont(&fonts::Font2);
+                spr_lap.setTextSize(1);
+                spr_lap.setTextDatum(textdatum_t::top_left);
+                spr_lap.setTextColor(TFT_WHITE);
+                spr_lap.drawString(buf, 0, 0);
+                spr_lap.pushSprite(305, 405);
+            } else {
+                tft.setFont(&fonts::Font2);
+                tft.setTextDatum(textdatum_t::top_left);
+                tft.setTextPadding(100);
+                tft.setTextColor(TFT_WHITE, bg);
+                tft.drawString(buf, 305, 405);
+                tft.setTextPadding(0);
+            }
             ld.last_lap_cs = cs;
         }
     }
-    tft.setTextPadding(0);
 
-    // Active track name displayed under the TRACK button (Font2, same as HDG/LAT/LON labels).
-    // Changes only when the user confirms a new track, so we track a tag to avoid redrawing
-    // every frame. UINT32_MAX sentinel forces draw on page enter (set in invalidateAll).
+    // Active track name displayed under the TRACK button (Font2). Changes only
+    // when the user confirms a new track, but sprite-buffered for consistency.
     {
         uint32_t tag = 0;
         memcpy(&tag, active_track_name, sizeof(tag));
         if (tag != ld.track_tag) {
-            tft.setFont(&fonts::Font2);
-            tft.setTextSize(1);
-            tft.setTextDatum(textdatum_t::top_left);
-            tft.setTextPadding(TRKBTN_W + 160);   // wide enough to clear any leftover
-            if (active_track_name[0]) {
-                tft.setTextColor(TFT_LIGHTGREY, bg);
-                tft.drawString(active_track_name, TRKBTN_X, TRKBTN_Y + TRKBTN_H + 6);
+            if (dash_sprites_ready) {
+                spr_track_name.fillSprite(bg);
+                if (active_track_name[0]) {
+                    spr_track_name.setFont(&fonts::Font2);
+                    spr_track_name.setTextSize(1);
+                    spr_track_name.setTextDatum(textdatum_t::top_left);
+                    spr_track_name.setTextColor(TFT_LIGHTGREY);
+                    spr_track_name.drawString(active_track_name, 0, 0);
+                }
+                spr_track_name.pushSprite(TRKBTN_X, TRKBTN_Y + TRKBTN_H + 6);
             } else {
-                tft.fillRect(TRKBTN_X, TRKBTN_Y + TRKBTN_H + 6, TRKBTN_W + 160, 18, bg);
+                tft.setFont(&fonts::Font2);
+                tft.setTextSize(1);
+                tft.setTextDatum(textdatum_t::top_left);
+                tft.setTextPadding(TRKBTN_W + 160);
+                if (active_track_name[0]) {
+                    tft.setTextColor(TFT_LIGHTGREY, bg);
+                    tft.drawString(active_track_name, TRKBTN_X, TRKBTN_Y + TRKBTN_H + 6);
+                } else {
+                    tft.fillRect(TRKBTN_X, TRKBTN_Y + TRKBTN_H + 6, TRKBTN_W + 160, 18, bg);
+                }
+                tft.setTextPadding(0);
             }
-            tft.setTextPadding(0);
             ld.track_tag = tag;
         }
     }
@@ -5802,13 +5902,11 @@ void loop() {
     static uint32_t lastDraw = 0;
     const uint32_t now = millis();
     if (currentPage == PAGE_DASH) {
-        // Cap the dash redraw to 25 Hz so it matches the Teensy's 25 Hz UART
-        // emit cadence. At 50 Hz we were repainting the speed/RPM/strings up
-        // to twice for the same data, and any repaint that lands mid-LCD-scan
-        // produces a visible tear on those big elements. 25 Hz aligns the
-        // paint with each fresh telemetry frame; there's no benefit to going
-        // faster than the data we're displaying.
-        if (now - lastDraw >= 40) { lastDraw = now; drawDashPage(); }
+        // Back to 50 Hz now that the tearing-prone regions are sprite-buffered.
+        // The conditional repaint already short-circuits when no value changed,
+        // and 50 Hz keeps the alert blink (and any future high-rate animation
+        // like an oil-pressure warning flash) smooth.
+        if (now - lastDraw >= 20) { lastDraw = now; drawDashPage(); }
     } else if (currentPage == PAGE_SETTINGS) {
         // Cap scroll redraws to ~30 Hz so the LCD has time to scan a full
         // clean frame between renders. Without this cap we re-render on

@@ -1,14 +1,14 @@
 {
   "crowpanel": {
-    "version": "0.1.27",
+    "version": "0.1.28",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel-dash.bin",
-    "sha256":  "90cc38f265ef183a458daa649884ab9cbac5b18c6340c9ea0f533e289fca4740",
-    "size":    1029680
+    "sha256":  "262ea97dbfee53f1f80fd1ef4c4591550f858fdf9b6a7e3435ed9e11a0e5f939",
+    "size":    1030912
   },
   "teensy": {
-    "version": "0.1.27",
+    "version": "0.1.28",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/teensy41-dash.hex",
-    "sha256":  "72175f2b72be06e653ec675657070224a6a6519f783d25b678fb17267b1153d5",
+    "sha256":  "70d0b46f18e87553c909aed15396c34acb9700a1f4748067dad007c301e22dc3",
     "size":    541564
   }
 }
