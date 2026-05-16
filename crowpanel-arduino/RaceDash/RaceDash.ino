@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.15"
+#define FIRMWARE_VERSION "0.1.16"
 
 #include <Preferences.h>
 #include <time.h>
@@ -270,6 +270,13 @@ static char     ota_url[200]           = "";
 static char     ota_err_msg[80]        = "";
 static uint32_t ota_total_bytes        = 0;
 static uint32_t ota_done_bytes         = 0;
+// Teensy OTA uses two visible phases: WiFi download into PSRAM, then
+// ACK-paced UART transfer to the Teensy/FlasherX. Keep separate counters so
+// the modal doesn't misleadingly show one bar that suddenly slows at 50%.
+static uint32_t ota_t_dl_total         = 0;
+static uint32_t ota_t_dl_done          = 0;
+static uint32_t ota_t_tx_total         = 0;
+static uint32_t ota_t_tx_done          = 0;
 static uint8_t  ota_return_page        = 0;     // page to restore on Close
 static bool     ota_modal_dirty        = false;
 static bool     ota_cancel_requested   = false;
@@ -3645,10 +3652,11 @@ static constexpr const char* OTA_MANIFEST_URL =
     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/manifest.json";
 
 namespace {
-    constexpr int OM_CARD_X = 80,  OM_CARD_Y = 100;
-    constexpr int OM_CARD_W = 640, OM_CARD_H = 280;
-    constexpr int OM_BAR_X  = OM_CARD_X + 30, OM_BAR_Y = OM_CARD_Y + 160;
-    constexpr int OM_BAR_W  = OM_CARD_W - 60, OM_BAR_H = 28;
+    constexpr int OM_CARD_X = 80,  OM_CARD_Y = 55;
+    constexpr int OM_CARD_W = 640, OM_CARD_H = 370;
+    constexpr int OM_BAR_X  = OM_CARD_X + 30, OM_BAR_Y = OM_CARD_Y + 145;
+    constexpr int OM_BAR_W  = OM_CARD_W - 60, OM_BAR_H = 24;
+    constexpr int OM_BAR2_Y = OM_BAR_Y + 72;
     // Two-button row: confirm (or close) + cancel
     constexpr int OM_BTN_Y  = OM_CARD_Y + OM_CARD_H - 70;
     constexpr int OM_BTN_H  = 56;
@@ -3783,6 +3791,10 @@ static void otaStart() {
         ota_err_msg[0]        = '\0';
         ota_total_bytes       = 0;
         ota_done_bytes        = 0;
+        ota_t_dl_total        = 0;
+        ota_t_dl_done         = 0;
+        ota_t_tx_total        = 0;
+        ota_t_tx_done         = 0;
         ota_cancel_requested  = false;
         ota_teensy_commit_seen = false;
         ota_state             = OTA_S_CHECKING;
@@ -3958,6 +3970,10 @@ static void otaDoTeensyUpdate() {
     }
     ota_total_bytes = (uint32_t)contentLen;
     ota_done_bytes  = 0;
+    ota_t_dl_total  = (uint32_t)contentLen;
+    ota_t_dl_done   = 0;
+    ota_t_tx_total  = (uint32_t)contentLen;
+    ota_t_tx_done   = 0;
 
     // Phase 1/2: pull the entire hex body into PSRAM (fast, ~3 s for 512 KB).
     uint8_t* hexbuf = (uint8_t*)ps_malloc((size_t)contentLen);
@@ -3993,15 +4009,19 @@ static void otaDoTeensyUpdate() {
             const int got = stream->read(hexbuf + dl_done, want);
             if (got <= 0) { delay(2); continue; }
             dl_done += (uint32_t)got;
-            // Modal progress for phase 1: show 0-50% of total.
+            // Modal progress for phase 1: the WiFi download bar.
             if (millis() - last_dl_draw >= 250) {
                 last_dl_draw = millis();
-                ota_done_bytes = dl_done / 2;
+                ota_t_dl_done  = dl_done;
+                ota_done_bytes = dl_done / 2;  // legacy overall progress
                 ota_modal_dirty = true;
                 drawOtaModal();
             }
         }
         http.end();
+        ota_t_dl_done = (uint32_t)contentLen;
+        ota_modal_dirty = true;
+        drawOtaModal();
     }
 
     // Drain anything the Teensy might have queued before our request.
@@ -4074,8 +4094,9 @@ static void otaDoTeensyUpdate() {
                 ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
             }
         }
-        // Modal progress for phase 2: 50% -> 100% of total bytes.
-        ota_done_bytes = (uint32_t)contentLen / 2 + pos / 2;
+        // Modal progress for phase 2: the ACK-paced UART transfer bar.
+        ota_t_tx_done  = pos;
+        ota_done_bytes = (uint32_t)contentLen / 2 + pos / 2;  // legacy overall progress
         if (millis() - last_draw_ms >= 400) {
             last_draw_ms = millis();
             ota_modal_dirty = true;
@@ -4342,11 +4363,15 @@ static void otaTick() {
 // button strip) repaint only when their underlying value/state changes, and
 // use setTextColor(fg, TFT_NAVY) + setTextPadding so text changes don't
 // require a fillRect-then-drawString that catches the LCD mid-scan.
-static OtaState  om_last_state    = (OtaState)0xFF;       // sentinel
-static uint32_t  om_last_done_kb  = 0xFFFFFFFFu;
-static uint32_t  om_last_total_kb = 0xFFFFFFFFu;
-static char      om_last_status[16] = "\x01";              // sentinel
-static char      om_last_vline[40]  = "\x01";
+static OtaState  om_last_state       = (OtaState)0xFF;       // sentinel
+static uint32_t  om_last_done_kb     = 0xFFFFFFFFu;
+static uint32_t  om_last_total_kb    = 0xFFFFFFFFu;
+static uint32_t  om_last_tdl_done_kb = 0xFFFFFFFFu;
+static uint32_t  om_last_tdl_total_kb= 0xFFFFFFFFu;
+static uint32_t  om_last_ttx_done_kb = 0xFFFFFFFFu;
+static uint32_t  om_last_ttx_total_kb= 0xFFFFFFFFu;
+static char      om_last_status[16]  = "\x01";              // sentinel
+static char      om_last_vline[40]   = "\x01";
 
 static void omPaintButton(int x, int w, uint16_t fill, const char* label) {
     tft.fillRect(x, OM_BTN_Y, w, OM_BTN_H, fill);
@@ -4356,6 +4381,73 @@ static void omPaintButton(int x, int w, uint16_t fill, const char* label) {
     tft.setTextColor(TFT_WHITE, fill);
     tft.setTextDatum(textdatum_t::middle_center);
     tft.drawString(label, x + w/2, OM_BTN_Y + OM_BTN_H/2);
+}
+
+static void omResetProgressCache() {
+    om_last_done_kb      = 0xFFFFFFFFu;
+    om_last_total_kb     = 0xFFFFFFFFu;
+    om_last_tdl_done_kb  = 0xFFFFFFFFu;
+    om_last_tdl_total_kb = 0xFFFFFFFFu;
+    om_last_ttx_done_kb  = 0xFFFFFFFFu;
+    om_last_ttx_total_kb = 0xFFFFFFFFu;
+}
+
+static void omPaintBarShell(int y, const char* label) {
+    tft.setFont(&fonts::Font2);
+    tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::top_left);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+    tft.setTextPadding(0);
+    tft.drawString(label, OM_BAR_X, y - 19);
+    tft.drawRect(OM_BAR_X, y, OM_BAR_W, OM_BAR_H, TFT_WHITE);
+    tft.fillRect(OM_BAR_X + 2, y + 2, OM_BAR_W - 4, OM_BAR_H - 4, TFT_BLACK);
+}
+
+static void omPaintProgressLayout(bool teensy_two_bars, const char* single_label) {
+    tft.fillRect(OM_BAR_X - 4, OM_BAR_Y - 24,
+                 OM_BAR_W + 8, OM_BTN_Y - (OM_BAR_Y - 24) - 6, TFT_NAVY);
+    if (teensy_two_bars) {
+        omPaintBarShell(OM_BAR_Y,  "1  Download from GitHub to dash");
+        omPaintBarShell(OM_BAR2_Y, "2  Send to Teensy over UART");
+    } else if (single_label && single_label[0]) {
+        omPaintBarShell(OM_BAR_Y, single_label);
+    }
+    omResetProgressCache();
+}
+
+static void omPaintBarValue(int y, uint32_t done, uint32_t total,
+                            bool seconds, uint32_t* last_done_units,
+                            uint32_t* last_total_units) {
+    if (total == 0) total = 1;
+    if (done > total) done = total;
+    const uint32_t total_units = seconds ? ((total + 999UL) / 1000UL)
+                                         : (total / 1024UL);
+    const uint32_t done_units  = seconds ? (done / 1000UL)
+                                         : (done / 1024UL);
+    if (done_units == *last_done_units && total_units == *last_total_units) return;
+    *last_done_units  = done_units;
+    *last_total_units = total_units;
+
+    const int fillW = (int)((uint64_t)done * (OM_BAR_W - 4) / total);
+    tft.fillRect(OM_BAR_X + 2, y + 2, OM_BAR_W - 4, OM_BAR_H - 4, TFT_BLACK);
+    if (fillW > 0) tft.fillRect(OM_BAR_X + 2, y + 2, fillW, OM_BAR_H - 4, TFT_GREEN);
+
+    const int pct = (int)((uint64_t)done * 100 / total);
+    char pbline[48];
+    if (seconds) {
+        snprintf(pbline, sizeof(pbline), "%lu / %lu sec   %d%%",
+                 (unsigned long)done_units, (unsigned long)total_units, pct);
+    } else {
+        snprintf(pbline, sizeof(pbline), "%lu / %lu KB   %d%%",
+                 (unsigned long)done_units, (unsigned long)total_units, pct);
+    }
+    tft.setFont(&fonts::Font2);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextDatum(textdatum_t::middle_right);
+    tft.setTextPadding(210);
+    tft.drawString(pbline, OM_BAR_X + OM_BAR_W, y - 10);
+    tft.setTextPadding(0);
 }
 
 static void drawOtaModal() {
@@ -4373,14 +4465,10 @@ static void drawOtaModal() {
         tft.setTextColor(TFT_WHITE, TFT_NAVY);
         tft.setTextDatum(textdatum_t::middle_center);
         tft.drawString("Firmware update", OM_CARD_X + OM_CARD_W / 2, OM_CARD_Y + 30);
-        // Progress bar outline (drawn once — only the inner fill is dynamic).
-        tft.drawRect(OM_BAR_X, OM_BAR_Y, OM_BAR_W, OM_BAR_H, TFT_WHITE);
-        tft.fillRect(OM_BAR_X + 2, OM_BAR_Y + 2, OM_BAR_W - 4, OM_BAR_H - 4, TFT_BLACK);
         pageJustEntered = false;
         // Force every dynamic block to repaint on this first frame.
         om_last_state      = (OtaState)0xFF;
-        om_last_done_kb    = 0xFFFFFFFFu;
-        om_last_total_kb   = 0xFFFFFFFFu;
+        omResetProgressCache();
         om_last_status[0]  = '\x01';
         om_last_vline[0]   = '\x01';
     }
@@ -4437,62 +4525,52 @@ static void drawOtaModal() {
         tft.setTextPadding(0);
     }
 
-    // ---- Progress bar inner fill + KB/% (or seconds/% while waiting). ----
+    // ---- Progress bars. Teensy update shows separate WiFi download and UART
+    // transfer bars; other states use one bar. Re-layout on state transitions.
+    const bool om_state_changed = (ota_state != om_last_state);
     const bool show_bar = (ota_state == OTA_S_DOWNLOADING        ||
                            ota_state == OTA_S_TEENSY_DOWNLOADING ||
                            ota_state == OTA_S_TEENSY_WAITING     ||
                            ota_state == OTA_S_APPLYING           ||
                            ota_state == OTA_S_REBOOT);
     if (show_bar) {
-        const bool waiting_for_teensy = (ota_state == OTA_S_TEENSY_WAITING);
-        const uint32_t total_units = waiting_for_teensy
-                                     ? ((ota_total_bytes + 999UL) / 1000UL)
-                                     : (ota_total_bytes > 0 ? (ota_total_bytes / 1024UL) : 1);
-        const uint32_t done_units  = waiting_for_teensy
-                                     ? (ota_done_bytes / 1000UL)
-                                     : (ota_done_bytes / 1024UL);
-        if (done_units != om_last_done_kb || total_units != om_last_total_kb) {
-            om_last_done_kb  = done_units;
-            om_last_total_kb = total_units;
-            const uint32_t total = ota_total_bytes > 0 ? ota_total_bytes : 1;
-            const uint32_t done  = ota_done_bytes  > total ? total : ota_done_bytes;
-            const int fillW = (int)((uint64_t)done * (OM_BAR_W - 4) / total);
-            // Paint only the green delta band — don't touch already-green cells.
-            // Right side beyond current fill stays black (drawn once on entry).
-            if (fillW > 0)
-                tft.fillRect(OM_BAR_X + 2, OM_BAR_Y + 2, fillW, OM_BAR_H - 4, TFT_GREEN);
-            const int pct = (int)((uint64_t)done * 100 / total);
-            char pbline[44];
-            if (waiting_for_teensy) {
-                snprintf(pbline, sizeof(pbline), "%lu / %lu sec   %d%%",
-                         (unsigned long)done_units, (unsigned long)total_units, pct);
-            } else {
-                snprintf(pbline, sizeof(pbline), "%lu / %lu KB   %d%%",
-                         (unsigned long)done_units, (unsigned long)total_units, pct);
-            }
-            tft.setFont(&fonts::Font2);
-            tft.setTextSize(1);
-            tft.setTextColor(TFT_WHITE, TFT_NAVY);
-            tft.setTextDatum(textdatum_t::middle_center);
-            // Tight padding (300 px) instead of card-wide so the bg wipe area
-            // is small — LCD scan-out won't visibly catch a 300 px strip the
-            // way it caught a 600 px one. "4000 / 4000 KB   100%" fits.
-            tft.setTextPadding(300);
-            tft.drawString(pbline, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + OM_BAR_H + 16);
-            tft.setTextPadding(0);
+        const bool teensy_two_bars   = (ota_state == OTA_S_TEENSY_DOWNLOADING);
+        const bool waiting_for_teensy= (ota_state == OTA_S_TEENSY_WAITING);
+        if (om_state_changed) {
+            const char* single_label = waiting_for_teensy ? "Waiting for Teensy to report version"
+                                    : (ota_state == OTA_S_DOWNLOADING) ? "Download dash firmware"
+                                    : (ota_state == OTA_S_APPLYING)    ? "Write dash firmware"
+                                    : (ota_state == OTA_S_REBOOT)      ? "Restarting dash"
+                                    : "Progress";
+            omPaintProgressLayout(teensy_two_bars, single_label);
         }
-    } else if (ota_state == OTA_S_FAILED && ota_err_msg[0] &&
-               om_last_state != OTA_S_FAILED) {
-        // Wipe the bar area, draw error message in its place. Done once per
-        // state transition into FAILED.
-        tft.fillRect(OM_BAR_X, OM_BAR_Y, OM_BAR_W, OM_BAR_H + 32, TFT_NAVY);
+
+        if (teensy_two_bars) {
+            omPaintBarValue(OM_BAR_Y,  ota_t_dl_done, ota_t_dl_total, false,
+                            &om_last_tdl_done_kb, &om_last_tdl_total_kb);
+            omPaintBarValue(OM_BAR2_Y, ota_t_tx_done, ota_t_tx_total, false,
+                            &om_last_ttx_done_kb, &om_last_ttx_total_kb);
+        } else {
+            omPaintBarValue(OM_BAR_Y, ota_done_bytes, ota_total_bytes,
+                            waiting_for_teensy,
+                            &om_last_done_kb, &om_last_total_kb);
+        }
+    } else if (ota_state == OTA_S_FAILED && ota_err_msg[0] && om_state_changed) {
+        // Wipe the progress area, draw error message in its place. Done once
+        // per state transition into FAILED.
+        tft.fillRect(OM_BAR_X - 4, OM_BAR_Y - 24,
+                     OM_BAR_W + 8, OM_BTN_Y - (OM_BAR_Y - 24) - 6, TFT_NAVY);
         tft.setFont(&fonts::Font2);
         tft.setTextSize(1);
         tft.setTextColor(TFT_ORANGE, TFT_NAVY);
         tft.setTextDatum(textdatum_t::middle_center);
         tft.setTextPadding(OM_CARD_W - 40);
-        tft.drawString(ota_err_msg, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + 10);
+        tft.drawString(ota_err_msg, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + 22);
         tft.setTextPadding(0);
+    } else if (om_state_changed) {
+        tft.fillRect(OM_BAR_X - 4, OM_BAR_Y - 24,
+                     OM_BAR_W + 8, OM_BTN_Y - (OM_BAR_Y - 24) - 6, TFT_NAVY);
+        omResetProgressCache();
     }
 
     // ---- Bottom button row: repaint only on state transitions. ----
