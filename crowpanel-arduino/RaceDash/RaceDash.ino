@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.36"
+#define FIRMWARE_VERSION "0.1.37"
 
 #include <Preferences.h>
 #include <time.h>
@@ -89,8 +89,13 @@ enum WifiState : uint8_t { WS_OFF = 0, WS_CONNECTING, WS_CONNECTED, WS_FAILED };
 // the TU. wifiConnectedNow() is a helper for ufDoPost so it doesn't have to
 // reach into the file-scope `wifi_state` global from above its definition.
 enum UploadFlowState : uint8_t {
-    UF_IDLE = 0, UF_LISTING, UF_FETCH_HEAD, UF_FETCH_BODY,
-    UF_POSTING, UF_DELETING, UF_DONE,
+    UF_IDLE = 0,
+    UF_LISTING,         // Q,LIST sent, awaiting Q,FILE / Q,END
+    UF_FETCH_HEAD,      // Q,GET sent, awaiting Q,DATA
+    UF_STREAMING,       // open TCP socket, writing bytes as Q,L arrives
+    UF_STREAM_FINISH,   // EOF sent, draining HTTP response from socket
+    UF_DELETING,        // Q,DEL sent, awaiting Q,DEL,OK
+    UF_DONE,
 };
 enum SessionsListState : uint8_t {
     SL_IDLE = 0, SL_LISTING, SL_DELETING,
@@ -1300,17 +1305,20 @@ static void openUploadModal(const char* filename, uint32_t total) {
 //     -> Teensy responds: Q,FILE,<name>,<size> per file, then Q,END
 //     -> for each file:
 //          state = UF_FETCH_HEAD; emit 'Q,GET,<name>\n'
-//          Teensy responds: Q,DATA,<name>,<size> then Q,L,<line>* then Q,EOF
-//          state = UF_FETCH_BODY: accumulate Q,L lines into PSRAM buffer
-//          on Q,EOF: state = UF_POSTING
-//        uploadTick() does the synchronous HTTPS POST to s.cloud_host:port
+//          Teensy responds: Q,DATA,<name>,<size>
+//            dash opens a raw TCP (or TLS) socket to s.cloud_host:port and
+//            writes the HTTP request headers (Content-Length = file size).
+//            state = UF_STREAMING
+//          Teensy streams Q,L,<line> ... we forward each line + '\n' to the
+//            open socket, incrementing bytes_written. No PSRAM staging.
+//          Q,EOF arrives: verify bytes_written == expected_size for integrity,
+//            flush socket, state = UF_STREAM_FINISH
+//        uploadTick drains the response progressively, parses HTTP status
 //          on 2xx: emit 'Q,DEL,<name>\n'; state = UF_DELETING
 //          on fail: skip; advance to next file (file stays on SD)
 //        on Q,DEL,OK: advance to next file
 //     -> when all files processed: state = UF_DONE; show summary banner
 // ---------------------------------------------------------------------------
-// (UploadFlowState already declared at the top of the file with the other
-// forward decls; full struct layout for the upload flow follows here.)
 struct UfPendingFile {
     char     name[80];
     uint32_t size;
@@ -1324,20 +1332,36 @@ struct UploadFlow {
     int      files_idx;
     int      uploaded;
     int      failed;
-    uint8_t* psbuf;
-    size_t   psbuf_size;
-    size_t   psbuf_used;
-    char     last_err[180];    // big enough to hold an 'http NNN: <server msg>' snippet
+    // Streaming TCP socket. Owned. Polymorphic across WiFiClient (HTTP) and
+    // WiFiClientSecure (HTTPS); deleted via base virtual destructor.
+    WiFiClient* tcp;
+    bool       tcp_secure;
+    uint32_t   expected_size;   // Content-Length value (from Q,DATA)
+    uint32_t   bytes_written;   // bytes written to socket so far (line + '\n' per Q,L)
+    uint32_t   lines_recv;      // Q,L count for current file (debug + DBG progress)
+    uint32_t   last_rx_ms;      // most recent UART or socket activity (for stall watchdog)
+    char       response[1024];  // accumulated HTTP response (headers + body)
+    size_t     response_len;
+    char       last_err[180];
 };
 static UploadFlow uf = {};
 
-static void ufFreeBuf() {
-    if (uf.psbuf) { free(uf.psbuf); uf.psbuf = nullptr; }
-    uf.psbuf_size = uf.psbuf_used = 0;
+static void ufCloseTcp() {
+    if (uf.tcp) {
+        uf.tcp->stop();
+        delete uf.tcp;
+        uf.tcp = nullptr;
+    }
+    uf.tcp_secure   = false;
+    uf.expected_size = 0;
+    uf.bytes_written = 0;
+    uf.lines_recv   = 0;
+    uf.response_len = 0;
+    uf.response[0]  = '\0';
 }
 
 static void ufReset() {
-    ufFreeBuf();
+    ufCloseTcp();
     memset(&uf, 0, sizeof(uf));
     uf.state = UF_IDLE;
 }
@@ -1345,6 +1369,7 @@ static void ufReset() {
 static void ufEnter(UploadFlowState s) {
     uf.state = s;
     uf.state_entered_ms = millis();
+    uf.last_rx_ms       = millis();
 }
 
 static void ufStartListing() {
@@ -1365,9 +1390,71 @@ static void ufStartCurrentFile() {
 }
 
 static void ufNextFile() {
-    ufFreeBuf();
+    ufCloseTcp();
     uf.files_idx++;
     ufStartCurrentFile();
+}
+
+// Parse the unix-epoch session id out of a 'session_<epoch>_<track>.ndjson'
+// filename; falls back to millis() when the filename doesn't match.
+static long ufExtractSessionId(const char* filename) {
+    if (filename && strncmp(filename, "session_", 8) == 0) {
+        const long v = strtol(filename + 8, nullptr, 10);
+        if (v > 0) return v;
+    }
+    return (long)millis();
+}
+
+// Open the TCP/TLS socket to the cloud and write the HTTP request headers.
+// Body bytes are written incrementally as Q,L lines arrive. Returns true on
+// success; on failure, last_err is set and the caller should advance to the
+// next file.
+static bool ufOpenStream(uint32_t content_length) {
+    if (s.cloud_host[0] == '\0' || s.cloud_port == 0) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "cloud host/port unset");
+        return false;
+    }
+    if (s.internet_mode != 1 || !wifiConnectedNow()) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "WiFi not connected");
+        return false;
+    }
+    ufCloseTcp();
+    if (s.cloud_protocol == 1) {
+        WiFiClientSecure* sec = new WiFiClientSecure();
+        sec->setInsecure();   // TODO: pin server cert when going public
+        sec->setTimeout(15);   // seconds
+        uf.tcp = sec;
+        uf.tcp_secure = true;
+    } else {
+        WiFiClient* plain = new WiFiClient();
+        plain->setTimeout(15);
+        uf.tcp = plain;
+        uf.tcp_secure = false;
+    }
+    Serial.printf("DBG,uf_connect host=%s port=%u sec=%d size=%lu\n",
+                  s.cloud_host, (unsigned)s.cloud_port, (int)uf.tcp_secure,
+                  (unsigned long)content_length);
+    if (!uf.tcp->connect(s.cloud_host, s.cloud_port)) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "TCP connect failed");
+        ufCloseTcp();
+        return false;
+    }
+    const long sid = ufExtractSessionId(uf.files[uf.files_idx].name);
+    uf.tcp->printf("POST /upload HTTP/1.1\r\n");
+    uf.tcp->printf("Host: %s\r\n",            s.cloud_host);
+    uf.tcp->printf("Content-Type: application/x-ndjson\r\n");
+    uf.tcp->printf("Content-Length: %lu\r\n", (unsigned long)content_length);
+    uf.tcp->printf("X-API-Key: %s\r\n",       s.cloud_auth_pass);
+    uf.tcp->printf("X-User-Email: %s\r\n",    s.cloud_auth_user);
+    uf.tcp->printf("X-Session-Id: %ld\r\n",   sid);
+    uf.tcp->printf("X-Track-Name: %s\r\n",    uf.files[uf.files_idx].name);
+    uf.tcp->printf("Connection: close\r\n");
+    uf.tcp->printf("\r\n");
+    uf.expected_size = content_length;
+    uf.bytes_written = 0;
+    uf.lines_recv    = 0;
+    uf.response_len  = 0;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,33 +1600,78 @@ static bool parseQLine(const String& line) {
         const char* comma = strchr(rest, ',');
         if (!comma) return true;
         const uint32_t sz = (uint32_t)strtoul(comma + 1, nullptr, 10);
-        ufFreeBuf();
-        // Reserve ~5% headroom for any line-length variability.
-        uf.psbuf_size = (size_t)sz + 8192;
-        uf.psbuf = (uint8_t*)ps_malloc(uf.psbuf_size);
-        if (!uf.psbuf) {
-            snprintf(uf.last_err, sizeof(uf.last_err),
-                     "PSRAM alloc failed (%lu)", (unsigned long)sz);
+        // Open the cloud socket NOW and write the HTTP headers. Body bytes
+        // will be written line-by-line as Q,L messages arrive (no PSRAM
+        // buffer); the server reads exactly Content-Length=sz body bytes.
+        if (!ufOpenStream(sz)) {
             uf.failed++;
             ufNextFile();
             return true;
         }
-        uf.psbuf_used = 0;
-        ufEnter(UF_FETCH_BODY);
+        ufEnter(UF_STREAMING);
         return true;
     }
-    if (strncmp(p, "L,", 2) == 0 && uf.state == UF_FETCH_BODY) {
+    if (strncmp(p, "L,", 2) == 0 && uf.state == UF_STREAMING) {
         const char* data = p + 2;
         const size_t n = strlen(data);
-        if (uf.psbuf && uf.psbuf_used + n + 1 <= uf.psbuf_size) {
-            memcpy(uf.psbuf + uf.psbuf_used, data, n);
-            uf.psbuf_used += n;
-            uf.psbuf[uf.psbuf_used++] = '\n';
+        if (!uf.tcp || !uf.tcp->connected()) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "TCP died at %lu bytes", (unsigned long)uf.bytes_written);
+            ufCloseTcp();
+            uf.failed++;
+            ufNextFile();
+            return true;
+        }
+        const size_t w = uf.tcp->write((const uint8_t*)data, n);
+        if (w != n) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "TCP short write %u/%u", (unsigned)w, (unsigned)n);
+            ufCloseTcp();
+            uf.failed++;
+            ufNextFile();
+            return true;
+        }
+        uf.tcp->write('\n');
+        uf.bytes_written += n + 1;
+        uf.last_rx_ms     = millis();
+        uf.lines_recv++;
+        if ((uf.lines_recv % 500) == 0) {
+            Serial.printf("DBG,uf_stream lines=%lu bytes=%lu/%lu\n",
+                          (unsigned long)uf.lines_recv,
+                          (unsigned long)uf.bytes_written,
+                          (unsigned long)uf.expected_size);
         }
         return true;
     }
-    if (strncmp(p, "EOF", 3) == 0 && uf.state == UF_FETCH_BODY) {
-        ufEnter(UF_POSTING);
+    if (strncmp(p, "EOF", 3) == 0 && uf.state == UF_STREAMING) {
+        if (!uf.tcp) {
+            snprintf(uf.last_err, sizeof(uf.last_err), "no tcp at EOF");
+            uf.failed++;
+            ufNextFile();
+            return true;
+        }
+        if (uf.bytes_written != uf.expected_size) {
+            // Server is waiting for exactly Content-Length bytes. Anything
+            // less is a data integrity failure: lines dropped, the file got
+            // truncated mid-stream, etc.
+            Serial.printf("DBG,uf_eof_short wrote=%lu expected=%lu lines=%lu\n",
+                          (unsigned long)uf.bytes_written,
+                          (unsigned long)uf.expected_size,
+                          (unsigned long)uf.lines_recv);
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "stream short: %lu/%lu B",
+                     (unsigned long)uf.bytes_written,
+                     (unsigned long)uf.expected_size);
+            ufCloseTcp();
+            uf.failed++;
+            ufNextFile();
+            return true;
+        }
+        uf.tcp->flush();
+        Serial.printf("DBG,uf_eof_ok wrote=%lu lines=%lu\n",
+                      (unsigned long)uf.bytes_written,
+                      (unsigned long)uf.lines_recv);
+        ufEnter(UF_STREAM_FINISH);
         return true;
     }
     if (strncmp(p, "ERR,", 4) == 0) {
@@ -1560,72 +1692,34 @@ static bool parseQLine(const String& line) {
     return false;
 }
 
-static bool ufDoPost() {
-    // Synchronous HTTPS/HTTP POST of uf.psbuf[0..psbuf_used] to the cloud.
-    if (uf.psbuf_used == 0) return false;
-    if (s.cloud_host[0] == '\0' || s.cloud_port == 0) {
-        snprintf(uf.last_err, sizeof(uf.last_err), "cloud host/port unset");
-        return false;
-    }
-    if (s.internet_mode != 1 || !wifiConnectedNow()) {
-        snprintf(uf.last_err, sizeof(uf.last_err), "WiFi not connected");
-        return false;
-    }
-    char url[256];
-    snprintf(url, sizeof(url), "%s://%s:%u/upload",
-             s.cloud_protocol == 1 ? "https" : "http",
-             s.cloud_host, (unsigned)s.cloud_port);
-    Serial.printf("DBG,uf_post url=%s bytes=%u\n", url, (unsigned)uf.psbuf_used);
-
-    WiFiClientSecure secureClient;
-    WiFiClient       plainClient;
-    HTTPClient http;
-    bool ok;
-    if (s.cloud_protocol == 1) {
-        secureClient.setInsecure();
-        ok = http.begin(secureClient, url);
-    } else {
-        ok = http.begin(plainClient, url);
-    }
-    if (!ok) {
-        snprintf(uf.last_err, sizeof(uf.last_err), "http.begin failed");
-        return false;
-    }
-    http.setTimeout(30000);
-    http.addHeader("Content-Type", "application/x-ndjson");
-    http.addHeader("X-API-Key",    s.cloud_auth_pass);
-    http.addHeader("X-User-Email", s.cloud_auth_user);
-    char sid[24];
-    snprintf(sid, sizeof(sid), "%lu", (unsigned long)millis());
-    http.addHeader("X-Session-Id", sid);
-    http.addHeader("X-Track-Name", uf.files[uf.files_idx].name);
-    const int code = http.POST(uf.psbuf, uf.psbuf_used);
-    Serial.printf("DBG,uf_post_code=%d\n", code);
-    if (code >= 200 && code < 300) {
-        http.end();
-        return true;
-    }
-    // Non-2xx: capture a snippet of the response body so the dash modal can
-    // show *why* the server rejected the upload (FastAPI 422s carry a JSON
-    // 'detail' field; user's reverse-proxy may also wrap with its own text).
-    if (code > 0) {
-        String body = http.getString();
-        body.replace('\n', ' ');
-        body.replace('\r', ' ');
-        if (body.length() > 0) {
-            char snippet[140];
-            snprintf(snippet, sizeof(snippet), "%s", body.c_str());
-            snprintf(uf.last_err, sizeof(uf.last_err), "http %d: %s", code, snippet);
+// Parse the accumulated HTTP response in uf.response and return the status
+// code. body_snip is filled with a one-line snippet of the response body for
+// display in the modal banner. Returns 0 if no parseable status line.
+static int ufParseResponse(char* body_snip, size_t body_snip_sz) {
+    body_snip[0] = '\0';
+    if (uf.response_len == 0) return 0;
+    int code = 0;
+    const char* sp = strchr(uf.response, ' ');
+    if (sp) code = atoi(sp + 1);
+    const char* bs = strstr(uf.response, "\r\n\r\n");
+    const char* body = bs ? bs + 4 : "";
+    // Strip CR/LF for display; collapse runs of whitespace into single spaces.
+    size_t k = 0;
+    bool   prev_space = false;
+    for (size_t i = 0; body[i] && k < body_snip_sz - 1; ++i) {
+        const char c = body[i];
+        if (c == '\n' || c == '\r' || c == '\t' || c == ' ') {
+            if (!prev_space && k > 0) {
+                body_snip[k++] = ' ';
+                prev_space = true;
+            }
         } else {
-            snprintf(uf.last_err, sizeof(uf.last_err), "http %d", code);
+            body_snip[k++] = c;
+            prev_space = false;
         }
-        Serial.printf("DBG,uf_post_body=%s\n",
-                      body.length() > 0 ? body.c_str() : "(empty)");
-    } else {
-        snprintf(uf.last_err, sizeof(uf.last_err), "http error %d", code);
     }
-    http.end();
-    return false;
+    body_snip[k] = '\0';
+    return code;
 }
 
 static void uploadTick() {
@@ -1638,8 +1732,11 @@ static void uploadTick() {
         uint32_t total = 1, done = 0;
         if (uf.files_idx < uf.files_n) {
             snprintf(fname, sizeof(fname), "%s", uf.files[uf.files_idx].name);
-            total = uf.files[uf.files_idx].size > 0 ? uf.files[uf.files_idx].size : 1;
-            done  = (uint32_t)uf.psbuf_used;
+            total = uf.expected_size > 0 ? uf.expected_size
+                                          : uf.files[uf.files_idx].size > 0
+                                              ? uf.files[uf.files_idx].size
+                                              : 1;
+            done  = uf.bytes_written;
         }
         if (strcmp(upload_file, fname) != 0 ||
             total != upload_total || done != upload_done) {
@@ -1652,16 +1749,46 @@ static void uploadTick() {
     }
 
     // Per-state housekeeping.
-    if (uf.state == UF_POSTING) {
-        const bool ok = ufDoPost();
-        if (ok) {
-            Serial.printf("Q,DEL,%s\n", uf.files[uf.files_idx].name);
-            Serial.flush();
-            ufFreeBuf();
-            ufEnter(UF_DELETING);
-        } else {
+    if (uf.state == UF_STREAM_FINISH) {
+        if (!uf.tcp) {
+            snprintf(uf.last_err, sizeof(uf.last_err), "no tcp in finish");
             uf.failed++;
             ufNextFile();
+            return;
+        }
+        // Drain any available HTTP response bytes into our buffer.
+        while (uf.tcp->available()) {
+            const int c = uf.tcp->read();
+            if (c < 0) break;
+            if (uf.response_len + 1 < sizeof(uf.response)) {
+                uf.response[uf.response_len++] = (char)c;
+                uf.response[uf.response_len]   = '\0';
+            }
+            uf.last_rx_ms = millis();
+        }
+        // Server should close after the response (Connection: close). Once
+        // disconnected and the buffer is drained, parse + handle.
+        if (!uf.tcp->connected() && !uf.tcp->available()) {
+            char body[140];
+            const int code = ufParseResponse(body, sizeof(body));
+            Serial.printf("DBG,uf_response code=%d body=%s\n", code, body);
+            ufCloseTcp();
+            if (code >= 200 && code < 300) {
+                Serial.printf("Q,DEL,%s\n", uf.files[uf.files_idx].name);
+                Serial.flush();
+                ufEnter(UF_DELETING);
+            } else {
+                if (code > 0 && body[0]) {
+                    snprintf(uf.last_err, sizeof(uf.last_err),
+                             "http %d: %s", code, body);
+                } else if (code > 0) {
+                    snprintf(uf.last_err, sizeof(uf.last_err), "http %d", code);
+                } else {
+                    snprintf(uf.last_err, sizeof(uf.last_err), "no http response");
+                }
+                uf.failed++;
+                ufNextFile();
+            }
         }
         return;
     }
@@ -1686,17 +1813,38 @@ static void uploadTick() {
         return;
     }
 
-    // Timeout watchdogs.
+    // Timeout watchdogs. For wait-for-first-response states the clock starts
+    // when we entered the state. For UF_STREAMING and UF_STREAM_FINISH the
+    // clock is activity-based: we only fail if there's a sustained stall
+    // (last_rx_ms aged out), so a slow but progressing transfer succeeds.
     uint32_t timeout_ms = 0;
+    uint32_t since      = 0;
     switch (uf.state) {
-        case UF_LISTING:      timeout_ms = 6000;   break;
-        case UF_FETCH_HEAD:   timeout_ms = 6000;   break;
-        case UF_FETCH_BODY:   timeout_ms = 60000;  break;
-        case UF_DELETING:     timeout_ms = 6000;   break;
+        case UF_LISTING:        timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
+        case UF_FETCH_HEAD:     timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
+        case UF_STREAMING:      timeout_ms = 20000;  since = now - uf.last_rx_ms;       break;
+        case UF_STREAM_FINISH:  timeout_ms = 30000;  since = now - uf.last_rx_ms;       break;
+        case UF_DELETING:       timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
         default: return;
     }
-    if (now - uf.state_entered_ms > timeout_ms) {
-        snprintf(uf.last_err, sizeof(uf.last_err), "timeout in state %u", (unsigned)uf.state);
+    if (since > timeout_ms) {
+        if (uf.state == UF_STREAMING) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "stalled at %lu/%lu B (no data for %lus)",
+                     (unsigned long)uf.bytes_written,
+                     (unsigned long)uf.expected_size,
+                     (unsigned long)(since / 1000));
+        } else if (uf.state == UF_STREAM_FINISH) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "no server response in %lus", (unsigned long)(since / 1000));
+        } else {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "timeout in state %u after %lus",
+                     (unsigned)uf.state, (unsigned long)(since / 1000));
+        }
+        Serial.printf("DBG,uf_timeout state=%u %s\n",
+                      (unsigned)uf.state, uf.last_err);
+        ufCloseTcp();
         if (uf.state == UF_LISTING) ufEnter(UF_DONE);
         else { uf.failed++; ufNextFile(); }
     }
@@ -6535,7 +6683,11 @@ void setup() {
     // Default ESP32 Serial RX buffer is 256 bytes; at 921 600 baud that's only
     // ~2.7 ms of slack. Bump to 4 KB BEFORE begin() so the bigger buffer is
     // allocated up front — keeps us safe across slow draw frames + WiFi work.
-    Serial.setRxBufferSize(4096);
+    // Big UART RX buffer. At 921 600 baud the line rate is ~100 KB/s; with a
+    // 4 KB buffer any loop spike >40 ms (e.g. a slow draw frame or WiFi work)
+    // dropped bytes mid-stream. 32 KB gives ~320 ms of slack — comfortably
+    // wider than any loop spike the dash should ever take.
+    Serial.setRxBufferSize(32768);
     Serial.begin(921600);
     delay(800);
     Serial.printf("\n=== racecar-35 dash crowpanel boot, firmware v%s ===\n",
