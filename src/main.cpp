@@ -238,6 +238,11 @@ static void handleDashCommand(const String& line) {
         uploads_disabled = true;
         if (upload_in_progress) upload_cancel_pending = true;
         Serial.println(F("[cloud] UPLOAD,CANCEL received — uploads disabled until reboot"));
+    } else if (line == "VER?") {
+        // Dash asked us to re-announce our firmware version. The dash's STATUS
+        // page does this whenever it opens, so a freshly-booted dash that
+        // missed our boot-time emit can catch up immediately.
+        DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
     } else if (line.length() > 0) {
         Serial.printf("[teensy] unknown dash cmd: %s\n", line.c_str());
     }

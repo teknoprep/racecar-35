@@ -23,7 +23,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.3"
+#define FIRMWARE_VERSION "0.1.4"
 
 #include <Preferences.h>
 #include <time.h>
@@ -291,6 +291,11 @@ static char     upload_result_msg[32]    = "";       // brief banner after DONE
 // Cloud state — updated from CLD,<live_ok>,<queue_depth> lines.
 static bool     cloud_live_ok      = false;
 static uint32_t cloud_queue_depth  = 0;
+
+// Firmware version tracking. Dash version is compile-time (FIRMWARE_VERSION).
+// Teensy version arrives via VER,teensy,<ver> on Teensy boot, and on demand
+// when the dash sends "VER?\n" (dash boot + status page entry).
+static char     teensy_fw_version[16] = "?";
 
 // Two-tap arming for the SD format action in settings.
 static bool     sd_format_armed  = false;
@@ -1166,6 +1171,21 @@ static void closeUploadModal() {
     invalidateAll();
 }
 
+static bool parseVerLine(const String& line) {
+    // VER,<who>,<version>   e.g. "VER,teensy,0.1.0"
+    const int c1 = line.indexOf(',');
+    if (c1 < 0) return false;
+    const int c2 = line.indexOf(',', c1 + 1);
+    if (c2 < 0) return false;
+    const String who = line.substring(c1 + 1, c2);
+    const String ver = line.substring(c2 + 1);
+    if (who == "teensy") {
+        ver.toCharArray(teensy_fw_version, sizeof(teensy_fw_version));
+        Serial.printf("[dash] teensy reports v%s\n", teensy_fw_version);
+    }
+    return true;
+}
+
 static bool parseUploadLine(const String& line) {
     // UPLOAD,START,<filename>,<total_bytes>
     // UPLOAD,PROG,<bytes_done>
@@ -1226,6 +1246,7 @@ static bool parseLine(const String& line) {
     if (line.startsWith("CLD,"))  return parseCldLine(line);
     if (line.startsWith("TIME,")) return parseTimeLine(line);
     if (line.startsWith("UPLOAD,")) return parseUploadLine(line);
+    if (line.startsWith("VER,"))    return parseVerLine(line);
     return false;
 }
 static void pumpUart() {
@@ -1291,6 +1312,8 @@ static void otaTick();
 static void otaStart();
 static void drawToolsPage();
 static void handleToolsTap(int x, int y);
+static bool parseVerLine(const String& line);
+static void handleStatusTap(int x, int y);
 
 static void handleTouch() {
     int32_t x, y;
@@ -1448,6 +1471,7 @@ static void handleTouch() {
                 if (currentPage == PAGE_DASH)          handleDashTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_SETTINGS) handleSettingsTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_TOOLS)    handleToolsTap(tt.startX, tt.startY);
+                else if (currentPage == PAGE_STATUS)   handleStatusTap(tt.startX, tt.startY);
             }
         }
         tt.active = false;
@@ -3782,8 +3806,10 @@ static void otaDoDownload() {
             ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
         }
         ota_done_bytes += (uint32_t)got;
-        // ~5 Hz UI redraw during download.
-        if (millis() - last_draw_ms >= 200) {
+        // ~2.5 Hz UI redraw during download. Slower than the human flicker
+        // threshold and reduces the apparent intensity of any small-area
+        // bg-then-text repaint the LCD scan might catch mid-frame.
+        if (millis() - last_draw_ms >= 400) {
             last_draw_ms = millis();
             ota_modal_dirty = true;
             drawOtaModal();
@@ -3918,7 +3944,10 @@ static void drawOtaModal() {
             tft.setTextSize(1);
             tft.setTextColor(TFT_WHITE, TFT_NAVY);
             tft.setTextDatum(textdatum_t::middle_center);
-            tft.setTextPadding(OM_CARD_W - 40);
+            // Tight padding (300 px) instead of card-wide so the bg wipe area
+            // is small — LCD scan-out won't visibly catch a 300 px strip the
+            // way it caught a 600 px one. "4000 / 4000 KB   100%" fits.
+            tft.setTextPadding(300);
             tft.drawString(pbline, OM_CARD_X + OM_CARD_W / 2, OM_BAR_Y + OM_BAR_H + 16);
             tft.setTextPadding(0);
         }
@@ -4344,6 +4373,7 @@ static void drawStatusPage() {
         tft.drawString("LINK",    10,  50);
         tft.drawString("GPS",     10, 116);
         tft.drawString("SESSION", 10, 282);
+        tft.drawString("FIRMWARE",10, 360);
 
         // Section headers (right)
         tft.drawString("ENGINE",  410,  50);
@@ -4364,6 +4394,9 @@ static void drawStatusPage() {
         tft.drawString("TRACK",   15, 298);
         tft.drawString("REC",     15, 318);
         tft.drawString("ELAPSED", 15, 338);
+        tft.drawString("DASH",    15, 380);
+        tft.drawString("TEENSY",  15, 400);
+        tft.drawString("MATCH",   15, 420);
 
         // Labels (right)
         tft.drawString("RPM",   410,  68);
@@ -4381,9 +4414,12 @@ static void drawStatusPage() {
 
         // Footer hint
         tft.setTextColor(TFT_DARKGREY, BG);
-        tft.drawString("swipe right to return to settings", 10, 458);
+        tft.drawString("swipe ← settings    •    → tools", 10, 458);
 
         pageJustEntered = false;
+        // Re-ask Teensy for its version each time the status page opens so the
+        // value can't be silently stale from a UART hiccup hours earlier.
+        Serial.println("VER?");
     }
 
     // Values — repainted every call (5 Hz)
@@ -4551,7 +4587,66 @@ static void drawStatusPage() {
         tft.drawString(buf, RV, 326);
     }
 
+    // FIRMWARE section — dash version, teensy version, mismatch indicator,
+    // and (if mismatched) a resolve button on the right column.
+    tft.setTextPadding(LPAD);
+    {
+        // DASH version (compile-time)
+        tft.setTextColor(VAL, BG);
+        char buf[20]; snprintf(buf, sizeof(buf), "v%s", FIRMWARE_VERSION);
+        tft.drawString(buf, LV, 380);
+    }
+    {
+        // TEENSY version (from VER, line)
+        char buf[20]; snprintf(buf, sizeof(buf), "v%s", teensy_fw_version);
+        const bool known = (strcmp(teensy_fw_version, "?") != 0);
+        tft.setTextColor(known ? VAL : TFT_DARKGREY, BG);
+        tft.drawString(buf, LV, 400);
+    }
+    const bool versions_known = (strcmp(teensy_fw_version, "?") != 0);
+    const bool versions_match = versions_known &&
+                                (strcmp(teensy_fw_version, FIRMWARE_VERSION) == 0);
+    {
+        const char* lbl = !versions_known ? "...waiting"
+                          : versions_match ? "OK" : "MISMATCH";
+        const uint16_t col = !versions_known ? TFT_DARKGREY
+                           : versions_match ? TFT_GREEN : TFT_RED;
+        tft.setTextColor(col, BG);
+        tft.drawString(lbl, LV, 420);
+    }
     tft.setTextPadding(0);
+
+    // Right column: resolve-mismatch button (only when there is a mismatch).
+    // 360 px wide button below the CLOCK block.
+    if (versions_known && !versions_match) {
+        const int bx = 410, by = 380, bw = 360, bh = 60;
+        tft.fillRect(bx, by, bw, bh, TFT_DARKGREEN);
+        tft.drawRect(bx, by, bw, bh, TFT_WHITE);
+        tft.drawRect(bx+1, by+1, bw-2, bh-2, TFT_WHITE);
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("Resolve version mismatch", bx + bw/2, by + bh/2);
+        tft.setTextDatum(textdatum_t::top_left);
+    } else if (pageJustEntered == false) {
+        // No mismatch button — ensure any leftover paint is cleared. Cheap.
+        tft.fillRect(410, 380, 360, 60, BG);
+    }
+}
+
+static void handleStatusTap(int x, int y) {
+    // Only the mismatch button is currently tappable on the status page.
+    const bool versions_known = (strcmp(teensy_fw_version, "?") != 0);
+    const bool versions_match = versions_known &&
+                                (strcmp(teensy_fw_version, FIRMWARE_VERSION) == 0);
+    if (!versions_known || versions_match) return;
+    if (x >= 410 && x <= 770 && y >= 380 && y <= 440) {
+        // Tap on the green button — open the OTA modal. Today that only
+        // updates the CrowPanel; once Phase 2b lands, it'll forward the
+        // Teensy hex over UART so a single update brings both into sync.
+        otaStart();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4618,6 +4713,9 @@ void setup() {
     sendCfgToTeensy();
 
     pageJustEntered = true;
+    // Ask Teensy for its firmware version. If Teensy booted earlier we missed
+    // its VER,teensy,... line on its setup(). This nudge prompts a fresh emit.
+    Serial.println("VER?");
     Serial.println("dash UI ready — listening on UART0");
 }
 
