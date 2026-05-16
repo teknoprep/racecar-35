@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.33"
+#define FIRMWARE_VERSION "0.1.34"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -220,6 +220,9 @@ static void detectSD();                           // SD detect, defined below
 static void emitSdStatus();                       // SD wire emit, defined below
 static void scanQueue();                          // /queue/ walker, defined below
 static void emitCloudStatus();                    // CLD wire emit, defined below
+static void handleQList();                        // dash-initiated upload: list queue
+static void handleQGet(const char* basename);     // dash-initiated upload: stream file
+static void handleQDel(const char* basename);     // dash-initiated upload: delete file
 
 // TimeLib sync provider — reads the Teensy 4.1 built-in RTC.
 static time_t getTeensyTime() { return Teensy3Clock.get(); }
@@ -330,6 +333,12 @@ static void handleDashCommand(const String& line) {
         // DBG,<text> lines through and we forward to our USB CDC console. Use
         // `pio device monitor` on /dev/ttyACM0 to see dash-side state.
         Serial.printf("[dash-dbg] %s\n", line.substring(4).c_str());
+    } else if (line == "Q,LIST") {
+        handleQList();
+    } else if (line.startsWith("Q,GET,")) {
+        handleQGet(line.substring(6).c_str());
+    } else if (line.startsWith("Q,DEL,")) {
+        handleQDel(line.substring(6).c_str());
     } else if (line == "QUEUE,DRAIN") {
         // Dash UPLOAD button: kick the queue walker immediately instead of
         // waiting for the next 10 s cloudTick. Multiple presses are idempotent.
@@ -1077,56 +1086,14 @@ static void closeSession() {
                   (unsigned)g_cfg.inet, (unsigned)g_cfg.stream,
                   g_cfg.host[0] ? g_cfg.host : "<unset>", (unsigned)g_cfg.port);
     if (have_file && g_cfg.rec_cl) {
-        bool tried_now    = false;
-        bool upload_ok    = false;
-        // WiFi mode forces After-Race semantics regardless of cl_strm: live
-        // streaming over UART-to-dash adds back-pressure into the recording
-        // loop and isn't worth it for v1. When the W5500 lands the Ethernet
-        // path can resume offering Live as today.
-        const bool after_race_mode = wifiInetActive() || (g_cfg.stream == 1);
-        if (after_race_mode && !live_failed_session && !uploads_disabled) {
-            File32 f;
-            if (f.open(session_path, O_READ)) {
-                const uint32_t sz = f.fileSize();
-                Serial.printf("[cloud] after-race upload %s (%lu bytes) via %s...\n",
-                              session_path, (unsigned long)sz,
-                              wifiInetActive() ? "WiFi-via-dash" : "Ethernet");
-                const char* base = strrchr(session_path, '/');
-                emitUploadStart(base ? base + 1 : session_path, sz);
-                const int status = cloudUploadFile(session_path, sz, &f);
-                f.close();
-                tried_now = true;
-                upload_ok = (status >= 200 && status < 300);
-                if (status == HTTP_STATUS_CANCELLED) {
-                    emitUploadDone("CANCELLED");
-                    Serial.println(F("[cloud] after-race cancelled by dash"));
-                } else if (upload_ok) {
-                    emitUploadDone("OK");
-                    sdFat.remove(session_path);
-                    Serial.println(F("[cloud] after-race OK — file deleted"));
-                } else {
-                    char reason[96];
-                    if (last_upload_err[0])
-                        snprintf(reason, sizeof(reason), "%s", last_upload_err);
-                    else if (status > 0)
-                        snprintf(reason, sizeof(reason), "http %d", status);
-                    else
-                        snprintf(reason, sizeof(reason), "no route");
-                    emitUploadDone("FAIL", reason);
-                    Serial.printf("[cloud] after-race failed (status=%d reason=%s)\n",
-                                  status, reason);
-                }
-            }
-        }
-        if (!upload_ok && !tried_now) {
-            // Live mode where streaming failed, OR after-race not attempted (no link).
-            // Push the whole file to /queue/ for later retry.
-            moveToQueue(session_path);
-        } else if (!upload_ok && tried_now) {
-            moveToQueue(session_path);
-        }
+        // New protocol (v0.1.34+): closeSession does NOT attempt to upload.
+        // It just parks the file in /queue/. Upload is initiated by the dash
+        // tapping its UPLOAD button, which sends Q,LIST / Q,GET / Q,DEL to
+        // pull files off the SD and POST them via WiFi.
+        moveToQueue(session_path);
         scanQueue();
         emitCloudStatus();
+        Serial.printf("[closeSession] file queued: %s\n", session_path);
     }
 
     // Reset session-scoped state.
@@ -1674,6 +1641,140 @@ static void scanQueue() {
     dir.close();
 }
 
+// ---------------------------------------------------------------------------
+// Dash-initiated upload protocol (Q,LIST / Q,GET / Q,DEL).
+//
+// Replaces the Teensy-initiated WUP protocol. The dash drives the whole flow
+// when its UPLOAD button is tapped: it asks for the list, fetches each file's
+// content line-by-line, POSTs to the cloud, and tells us when to delete. We
+// just respond as a passive file server with no policy of our own.
+//
+// Filename safety: callers may only reference files in /queue/. We sanitize
+// to a single path component (no '/' or '..') to avoid escapes.
+// ---------------------------------------------------------------------------
+static bool qBasenameSafe(const char* name, char* out, size_t out_sz) {
+    if (!name || !*name) return false;
+    for (const char* p = name; *p; ++p) {
+        if (*p == '/' || *p == '\\' || *p == ' ') return false;
+    }
+    if (strstr(name, "..") != nullptr) return false;
+    if (snprintf(out, out_sz, "/queue/%s", name) >= (int)out_sz) return false;
+    return true;
+}
+
+static void handleQList() {
+    if (!sdReady()) {
+        DASH_SERIAL.println(F("Q,END,nosd"));
+        Serial.println(F("[Q] LIST refused: SD not ready"));
+        return;
+    }
+    if (!sdFat.exists("/queue")) {
+        DASH_SERIAL.println(F("Q,END"));
+        return;
+    }
+    File32 dir;
+    if (!dir.open("/queue", O_READ)) {
+        DASH_SERIAL.println(F("Q,END,opendir_failed"));
+        return;
+    }
+    File32 entry;
+    int    count = 0;
+    while (entry.openNext(&dir, O_READ)) {
+        if (!entry.isDir()) {
+            char name[80];
+            entry.getName(name, sizeof(name));
+            DASH_SERIAL.printf("Q,FILE,%s,%lu\n",
+                               name, (unsigned long)entry.fileSize());
+            count++;
+        }
+        entry.close();
+    }
+    dir.close();
+    DASH_SERIAL.println(F("Q,END"));
+    Serial.printf("[Q] LIST: emitted %d file(s)\n", count);
+}
+
+static void handleQGet(const char* basename) {
+    if (!sdReady()) {
+        DASH_SERIAL.println(F("Q,ERR,nosd"));
+        return;
+    }
+    char path[96];
+    if (!qBasenameSafe(basename, path, sizeof(path))) {
+        DASH_SERIAL.println(F("Q,ERR,bad_name"));
+        return;
+    }
+    File32 f;
+    if (!f.open(path, O_READ)) {
+        Serial.printf("[Q] GET %s: open failed\n", path);
+        DASH_SERIAL.println(F("Q,ERR,open_failed"));
+        return;
+    }
+    const uint32_t sz = f.fileSize();
+    DASH_SERIAL.printf("Q,DATA,%s,%lu\n", basename, (unsigned long)sz);
+    DASH_SERIAL.flush();
+    // Stream line-by-line. Each ndjson line is one Q,L,<line>\n message.
+    char     line[320];
+    size_t   line_n = 0;
+    uint32_t lines_sent = 0;
+    while (true) {
+        const int c = f.read();
+        if (c < 0 && line_n == 0) break;          // EOF, no partial
+        if (c == '\r') continue;
+        if (c == '\n' || c < 0) {
+            line[line_n] = '\0';
+            if (line_n > 0) {
+                DASH_SERIAL.print(F("Q,L,"));
+                DASH_SERIAL.write((const uint8_t*)line, line_n);
+                DASH_SERIAL.write('\n');
+                lines_sent++;
+                // Small pacing: the dash's RX buffer is 4 KB; one Q,L line is
+                // ~260 bytes. Without pacing a fast loop could push ~15 lines
+                // (~4 KB) in <1 ms and overrun the dash before its loop
+                // pumps the UART. 200 us between lines = 5000 lines/sec which
+                // is still well above what the dash can possibly process and
+                // gives the dash's pumpUart plenty of time to drain.
+                delayMicroseconds(200);
+            }
+            line_n = 0;
+            if (c < 0) break;
+            continue;
+        }
+        if (line_n + 1 < sizeof(line)) line[line_n++] = (char)c;
+        else line[sizeof(line) - 1] = '\0';
+    }
+    f.close();
+    DASH_SERIAL.printf("Q,EOF,%lu\n", (unsigned long)lines_sent);
+    DASH_SERIAL.flush();
+    Serial.printf("[Q] GET %s: streamed %lu lines, %lu bytes\n",
+                  basename, (unsigned long)lines_sent, (unsigned long)sz);
+}
+
+static void handleQDel(const char* basename) {
+    if (!sdReady()) {
+        DASH_SERIAL.println(F("Q,DEL,FAIL,nosd"));
+        return;
+    }
+    char path[96];
+    if (!qBasenameSafe(basename, path, sizeof(path))) {
+        DASH_SERIAL.println(F("Q,DEL,FAIL,bad_name"));
+        return;
+    }
+    if (!sdFat.exists(path)) {
+        DASH_SERIAL.println(F("Q,DEL,OK"));   // already gone is fine
+        return;
+    }
+    if (sdFat.remove(path)) {
+        DASH_SERIAL.println(F("Q,DEL,OK"));
+        scanQueue();
+        emitCloudStatus();
+        Serial.printf("[Q] DEL %s: removed\n", path);
+    } else {
+        DASH_SERIAL.println(F("Q,DEL,FAIL,remove_failed"));
+        Serial.printf("[Q] DEL %s: remove() failed\n", path);
+    }
+}
+
 // Try to upload one queued file. Returns true on 2xx + delete; false otherwise.
 static bool drainOneQueued() {
     if (sd_card_status != SD_CARD_READY) return false;
@@ -2164,6 +2265,20 @@ void loop() {
                 emitCloudStatus();
             }
         }
+    }
+
+    // Periodic SD + cloud status heartbeat to the dash. Earlier code only
+    // emitted SD,* on CHANGE, so if the dash missed an early SD,READY (UART
+    // buffer race during boot, OR card came up after the initial emit) the
+    // dash would stay stuck on 'no card' on its STATUS page even though the
+    // Teensy was happily writing files to /queue/. Re-emitting every 5 s
+    // costs ~30 bytes of UART traffic and guarantees the dash converges to
+    // ground truth within seconds regardless of any lost transient.
+    static uint32_t last_status_emit_ms = 0;
+    if (millis() - last_status_emit_ms >= 5000) {
+        last_status_emit_ms = millis();
+        emitSdStatus();
+        emitCloudStatus();
     }
 
     // Cloud upload tick — live streamer during recording, queue drainer between.

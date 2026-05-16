@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.33"
+#define FIRMWARE_VERSION "0.1.34"
 
 #include <Preferences.h>
 #include <time.h>
@@ -83,6 +83,16 @@ struct TimeZone;
 // auto-injects function prototypes at the top of the TU — anything used in
 // a function signature must be visible before the first function.
 enum WifiState : uint8_t { WS_OFF = 0, WS_CONNECTING, WS_CONNECTED, WS_FAILED };
+
+// Forward decls for the dash-initiated upload flow. The enum / structs need to
+// be visible to the auto-prototype scanner that runs on the first function in
+// the TU. wifiConnectedNow() is a helper for ufDoPost so it doesn't have to
+// reach into the file-scope `wifi_state` global from above its definition.
+enum UploadFlowState : uint8_t {
+    UF_IDLE = 0, UF_LISTING, UF_FETCH_HEAD, UF_FETCH_BODY,
+    UF_POSTING, UF_DELETING, UF_DONE,
+};
+static bool wifiConnectedNow();
 
 // Single key descriptor for both numeric and text keyboards.
 struct KbKey {
@@ -1276,12 +1286,297 @@ static void openUploadModal(const char* filename, uint32_t total) {
     pageJustEntered = true;
 }
 
+// ---------------------------------------------------------------------------
+// Dash-initiated upload flow (replaces the old Teensy-initiated WUP push).
+//
+// Flow:
+//   user taps UPLOAD button on PAGE_DASH
+//     -> openUploadModal('...', 0)
+//     -> uf state = UF_LISTING; emit 'Q,LIST\n' to Teensy
+//     -> Teensy responds: Q,FILE,<name>,<size> per file, then Q,END
+//     -> for each file:
+//          state = UF_FETCH_HEAD; emit 'Q,GET,<name>\n'
+//          Teensy responds: Q,DATA,<name>,<size> then Q,L,<line>* then Q,EOF
+//          state = UF_FETCH_BODY: accumulate Q,L lines into PSRAM buffer
+//          on Q,EOF: state = UF_POSTING
+//        uploadTick() does the synchronous HTTPS POST to s.cloud_host:port
+//          on 2xx: emit 'Q,DEL,<name>\n'; state = UF_DELETING
+//          on fail: skip; advance to next file (file stays on SD)
+//        on Q,DEL,OK: advance to next file
+//     -> when all files processed: state = UF_DONE; show summary banner
+// ---------------------------------------------------------------------------
+// (UploadFlowState already declared at the top of the file with the other
+// forward decls; full struct layout for the upload flow follows here.)
+struct UfPendingFile {
+    char     name[80];
+    uint32_t size;
+};
+
+struct UploadFlow {
+    UploadFlowState state;
+    uint32_t state_entered_ms;
+    UfPendingFile files[16];
+    int      files_n;
+    int      files_idx;
+    int      uploaded;
+    int      failed;
+    uint8_t* psbuf;
+    size_t   psbuf_size;
+    size_t   psbuf_used;
+    char     last_err[80];
+};
+static UploadFlow uf = {};
+
+static void ufFreeBuf() {
+    if (uf.psbuf) { free(uf.psbuf); uf.psbuf = nullptr; }
+    uf.psbuf_size = uf.psbuf_used = 0;
+}
+
+static void ufReset() {
+    ufFreeBuf();
+    memset(&uf, 0, sizeof(uf));
+    uf.state = UF_IDLE;
+}
+
+static void ufEnter(UploadFlowState s) {
+    uf.state = s;
+    uf.state_entered_ms = millis();
+}
+
+static void ufStartListing() {
+    ufReset();
+    ufEnter(UF_LISTING);
+    Serial.println("Q,LIST");
+    Serial.flush();
+}
+
+static void ufStartCurrentFile() {
+    if (uf.files_idx >= uf.files_n) {
+        ufEnter(UF_DONE);
+        return;
+    }
+    Serial.printf("Q,GET,%s\n", uf.files[uf.files_idx].name);
+    Serial.flush();
+    ufEnter(UF_FETCH_HEAD);
+}
+
+static void ufNextFile() {
+    ufFreeBuf();
+    uf.files_idx++;
+    ufStartCurrentFile();
+}
+
+static bool parseQLine(const String& line) {
+    // Q,FILE,<name>,<size>
+    // Q,END[,<reason>]
+    // Q,DATA,<name>,<size>
+    // Q,L,<ndjson>
+    // Q,EOF,<line_count>
+    // Q,ERR,<reason>
+    // Q,DEL,OK | Q,DEL,FAIL,<reason>
+    const char* p = line.c_str() + 2;   // skip 'Q,'
+    if (strncmp(p, "FILE,", 5) == 0 && uf.state == UF_LISTING) {
+        const char* rest = p + 5;
+        const char* comma = strchr(rest, ',');
+        if (!comma || uf.files_n >= (int)(sizeof(uf.files)/sizeof(uf.files[0]))) return true;
+        const size_t name_len = (size_t)(comma - rest);
+        if (name_len >= sizeof(uf.files[0].name)) return true;
+        memcpy(uf.files[uf.files_n].name, rest, name_len);
+        uf.files[uf.files_n].name[name_len] = '\0';
+        uf.files[uf.files_n].size = (uint32_t)strtoul(comma + 1, nullptr, 10);
+        uf.files_n++;
+        return true;
+    }
+    if (strncmp(p, "END", 3) == 0 && uf.state == UF_LISTING) {
+        if (uf.files_n == 0) {
+            ufEnter(UF_DONE);
+        } else {
+            ufStartCurrentFile();
+        }
+        return true;
+    }
+    if (strncmp(p, "DATA,", 5) == 0 && uf.state == UF_FETCH_HEAD) {
+        const char* rest = p + 5;
+        const char* comma = strchr(rest, ',');
+        if (!comma) return true;
+        const uint32_t sz = (uint32_t)strtoul(comma + 1, nullptr, 10);
+        ufFreeBuf();
+        // Reserve ~5% headroom for any line-length variability.
+        uf.psbuf_size = (size_t)sz + 8192;
+        uf.psbuf = (uint8_t*)ps_malloc(uf.psbuf_size);
+        if (!uf.psbuf) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "PSRAM alloc failed (%lu)", (unsigned long)sz);
+            uf.failed++;
+            ufNextFile();
+            return true;
+        }
+        uf.psbuf_used = 0;
+        ufEnter(UF_FETCH_BODY);
+        return true;
+    }
+    if (strncmp(p, "L,", 2) == 0 && uf.state == UF_FETCH_BODY) {
+        const char* data = p + 2;
+        const size_t n = strlen(data);
+        if (uf.psbuf && uf.psbuf_used + n + 1 <= uf.psbuf_size) {
+            memcpy(uf.psbuf + uf.psbuf_used, data, n);
+            uf.psbuf_used += n;
+            uf.psbuf[uf.psbuf_used++] = '\n';
+        }
+        return true;
+    }
+    if (strncmp(p, "EOF", 3) == 0 && uf.state == UF_FETCH_BODY) {
+        ufEnter(UF_POSTING);
+        return true;
+    }
+    if (strncmp(p, "ERR,", 4) == 0) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "%s", p + 4);
+        uf.failed++;
+        ufNextFile();
+        return true;
+    }
+    if (strncmp(p, "DEL,", 4) == 0 && uf.state == UF_DELETING) {
+        if (strncmp(p + 4, "OK", 2) == 0) {
+            uf.uploaded++;
+        } else {
+            snprintf(uf.last_err, sizeof(uf.last_err), "DEL: %s", p + 4);
+        }
+        ufNextFile();
+        return true;
+    }
+    return false;
+}
+
+static bool ufDoPost() {
+    // Synchronous HTTPS/HTTP POST of uf.psbuf[0..psbuf_used] to the cloud.
+    if (uf.psbuf_used == 0) return false;
+    if (s.cloud_host[0] == '\0' || s.cloud_port == 0) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "cloud host/port unset");
+        return false;
+    }
+    if (s.internet_mode != 1 || !wifiConnectedNow()) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "WiFi not connected");
+        return false;
+    }
+    char url[256];
+    snprintf(url, sizeof(url), "%s://%s:%u/upload",
+             s.cloud_protocol == 1 ? "https" : "http",
+             s.cloud_host, (unsigned)s.cloud_port);
+    Serial.printf("DBG,uf_post url=%s bytes=%u\n", url, (unsigned)uf.psbuf_used);
+
+    WiFiClientSecure secureClient;
+    WiFiClient       plainClient;
+    HTTPClient http;
+    bool ok;
+    if (s.cloud_protocol == 1) {
+        secureClient.setInsecure();
+        ok = http.begin(secureClient, url);
+    } else {
+        ok = http.begin(plainClient, url);
+    }
+    if (!ok) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "http.begin failed");
+        return false;
+    }
+    http.setTimeout(30000);
+    http.addHeader("Content-Type", "application/x-ndjson");
+    http.addHeader("X-API-Key",    s.cloud_auth_pass);
+    http.addHeader("X-User-Email", s.cloud_auth_user);
+    char sid[24];
+    snprintf(sid, sizeof(sid), "%lu", (unsigned long)millis());
+    http.addHeader("X-Session-Id", sid);
+    http.addHeader("X-Track-Name", uf.files[uf.files_idx].name);
+    const int code = http.POST(uf.psbuf, uf.psbuf_used);
+    Serial.printf("DBG,uf_post_code=%d\n", code);
+    http.end();
+    if (code >= 200 && code < 300) return true;
+    if (code <= 0) snprintf(uf.last_err, sizeof(uf.last_err), "http error %d", code);
+    else            snprintf(uf.last_err, sizeof(uf.last_err), "http %d", code);
+    return false;
+}
+
+static void uploadTick() {
+    if (uf.state == UF_IDLE) return;
+    const uint32_t now = millis();
+
+    // Drive modal display whenever state has moved.
+    if (upload_active) {
+        char fname[80] = "";
+        uint32_t total = 1, done = 0;
+        if (uf.files_idx < uf.files_n) {
+            snprintf(fname, sizeof(fname), "%s", uf.files[uf.files_idx].name);
+            total = uf.files[uf.files_idx].size > 0 ? uf.files[uf.files_idx].size : 1;
+            done  = (uint32_t)uf.psbuf_used;
+        }
+        if (strcmp(upload_file, fname) != 0 ||
+            total != upload_total || done != upload_done) {
+            strncpy(upload_file, fname, sizeof(upload_file) - 1);
+            upload_file[sizeof(upload_file) - 1] = '\0';
+            upload_total = total;
+            upload_done  = done;
+            upload_modal_dirty = true;
+        }
+    }
+
+    // Per-state housekeeping.
+    if (uf.state == UF_POSTING) {
+        const bool ok = ufDoPost();
+        if (ok) {
+            Serial.printf("Q,DEL,%s\n", uf.files[uf.files_idx].name);
+            Serial.flush();
+            ufFreeBuf();
+            ufEnter(UF_DELETING);
+        } else {
+            uf.failed++;
+            ufNextFile();
+        }
+        return;
+    }
+    if (uf.state == UF_DONE) {
+        // Build summary banner once.
+        if (upload_result_msg[0] == '\0') {
+            if (uf.failed == 0 && uf.uploaded > 0) {
+                snprintf(upload_result_msg, sizeof(upload_result_msg),
+                         "OK: %d uploaded", uf.uploaded);
+            } else if (uf.uploaded == 0 && uf.failed > 0) {
+                snprintf(upload_result_msg, sizeof(upload_result_msg),
+                         "FAIL: %s", uf.last_err[0] ? uf.last_err : "all uploads failed");
+            } else if (uf.failed > 0) {
+                snprintf(upload_result_msg, sizeof(upload_result_msg),
+                         "OK: %d up, %d failed", uf.uploaded, uf.failed);
+            } else {
+                snprintf(upload_result_msg, sizeof(upload_result_msg), "OK: empty queue");
+            }
+            upload_modal_dirty  = true;
+            upload_last_draw_ms = now;
+        }
+        return;
+    }
+
+    // Timeout watchdogs.
+    uint32_t timeout_ms = 0;
+    switch (uf.state) {
+        case UF_LISTING:      timeout_ms = 6000;   break;
+        case UF_FETCH_HEAD:   timeout_ms = 6000;   break;
+        case UF_FETCH_BODY:   timeout_ms = 60000;  break;
+        case UF_DELETING:     timeout_ms = 6000;   break;
+        default: return;
+    }
+    if (now - uf.state_entered_ms > timeout_ms) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "timeout in state %u", (unsigned)uf.state);
+        if (uf.state == UF_LISTING) ufEnter(UF_DONE);
+        else { uf.failed++; ufNextFile(); }
+    }
+}
+
 static void closeUploadModal() {
     upload_active      = false;
+    upload_result_msg[0] = '\0';
     currentPage        = (Page)upload_return_page;
     pageJustEntered    = true;
     settingsDirty      = true;
     invalidateAll();
+    ufReset();   // ensure UPLOAD button next tap starts a fresh flow
 }
 
 static bool parseVerLine(const String& line) {
@@ -1381,6 +1676,7 @@ static bool parseLine(const String& line) {
     if (line.startsWith("VER,"))    return parseVerLine(line);
     if (line.startsWith("TEST,"))   return parseTestLine(line);
     if (line.startsWith("WUP,"))    return parseWupLine(line);
+    if (line.startsWith("Q,"))     return parseQLine(line);
     return false;
 }
 static void pumpUart() {
@@ -1440,6 +1736,9 @@ static void drawWifiScannerPage();
 static void drawUploadModal();
 static void handleUploadModalTap(int x, int y);
 static bool parseUploadLine(const String& line);
+static bool parseQLine(const String& line);
+static void ufStartListing();
+static void uploadTick();
 static void drawOtaModal();
 static void handleOtaModalTap(int x, int y);
 static void otaTick();
@@ -1624,9 +1923,11 @@ static void handleDashTap(int x, int y) {
     if (x >= UPBTN_X && x < UPBTN_X + UPBTN_W &&
         y >= UPBTN_Y && y < UPBTN_Y + UPBTN_H) {
         if (!recording && cloud_queue_depth > 0) {
-            Serial.println("QUEUE,DRAIN");
-            // Visual tap feedback happens on the next CLD,* update from
-            // Teensy (queue_depth will decrement as each file uploads).
+            // Dash-initiated upload (v0.1.34+). Pop the modal locally and
+            // kick the state machine, which sends Q,LIST to the Teensy and
+            // drives the rest of the upload flow.
+            openUploadModal("", 0);
+            ufStartListing();
         }
         return;
     }
@@ -2600,6 +2901,7 @@ static bool boolValueOnState(SettingId id) {
 // (WifiState enum is forward-declared up top — see auto-prototyper note.)
 // ---------------------------------------------------------------------------
 static WifiState wifi_state          = WS_OFF;
+static bool wifiConnectedNow() { return wifi_state == WS_CONNECTED; }
 
 // ---------------------------------------------------------------------------
 // WiFi-via-dash cloud forwarder (WUP).
@@ -6005,6 +6307,7 @@ void loop() {
     pumpUart();
     handleTouch();
     wifiTick();   // WiFi state machine + one-shot NTP push to Teensy (1 Hz tick)
+    uploadTick(); // Dash-initiated upload state machine (UF_*)
 
     // Expire SD format arm state after 5 s so the button reverts to red.
     if (sd_format_armed && millis() - sd_format_arm_ms >= 5000) {
