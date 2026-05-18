@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.37"
+#define FIRMWARE_VERSION "0.1.38"
 
 #include <Preferences.h>
 #include <time.h>
@@ -6834,10 +6834,19 @@ void loop() {
             lastDraw = now;
             drawUploadModal();
         }
-        // If DONE landed, hold modal for 1 s with the status banner, then close.
-        if (upload_result_msg[0] != '\0' &&
-            (int32_t)(millis() - upload_last_draw_ms) >= 1000) {
-            closeUploadModal();
+        // Hold the result banner long enough to actually read it. OK results
+        // close after 2 s; FAIL / CANCELLED hold for 10 s so the user can
+        // read the failure reason (which can be a long server message like
+        // 'FAIL: http 422: {"detail":[...]}').
+        if (upload_result_msg[0] != '\0') {
+            const bool is_ok = (upload_result_msg[0] == 'O' &&
+                                upload_result_msg[1] == 'K' &&
+                                (upload_result_msg[2] == '\0' ||
+                                 upload_result_msg[2] == ':'));
+            const uint32_t hold_ms = is_ok ? 2000UL : 10000UL;
+            if ((int32_t)(millis() - upload_last_draw_ms) >= (int32_t)hold_ms) {
+                closeUploadModal();
+            }
         }
     }
 }

@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.37"
+#define FIRMWARE_VERSION "0.1.38"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -1694,6 +1694,40 @@ static void handleQList() {
     Serial.printf("[Q] LIST: emitted %d file(s)\n", count);
 }
 
+// Wait for the dash to acknowledge the previous Q,L line. Per-line ACKs are
+// the only thing that prevents Teensy from out-running the dash's TCP write
+// path during streaming uploads: if the dash's WiFi backpressures (sender
+// buffer full, retransmit, etc.) the dash will simply not send Q,A until it
+// catches up, and Teensy will park here instead of blasting more data into
+// a buffer that's about to overflow.
+//
+// Returns true if Q,A arrived within the timeout, false on timeout. Other
+// inbound lines (telemetry/cancel/etc) are intentionally drained and ignored
+// here so a stray telemetry line doesn't get mis-parsed in the middle of a
+// streaming session.
+static bool qWaitForAck(uint32_t timeout_ms) {
+    char line[32];
+    size_t n = 0;
+    const uint32_t end = millis() + timeout_ms;
+    while ((int32_t)(end - millis()) > 0) {
+        while (DASH_SERIAL.available()) {
+            const char c = (char)DASH_SERIAL.read();
+            if (c == '\r') continue;
+            if (c == '\n') {
+                line[n] = '\0';
+                n = 0;
+                if (strncmp(line, "Q,A", 3) == 0) return true;
+                // ignore other lines (telemetry, stray commands)
+                continue;
+            }
+            if (n + 1 < sizeof(line)) line[n++] = c;
+            else n = 0;
+        }
+        delay(0);
+    }
+    return false;
+}
+
 static void handleQGet(const char* basename) {
     if (!sdReady()) {
         DASH_SERIAL.println(F("Q,ERR,nosd"));
@@ -1713,10 +1747,15 @@ static void handleQGet(const char* basename) {
     const uint32_t sz = f.fileSize();
     DASH_SERIAL.printf("Q,DATA,%s,%lu\n", basename, (unsigned long)sz);
     DASH_SERIAL.flush();
-    // Stream line-by-line. Each ndjson line is one Q,L,<line>\n message.
+    // Stream line-by-line with per-line ACK. Each ndjson line goes out as
+    // 'Q,L,<line>\n' and we wait for 'Q,A\n' from the dash before sending the
+    // next one. This keeps Teensy's pace strictly tied to the dash's actual
+    // throughput so we never out-run the dash regardless of UART buffer size
+    // or TCP write speed on the dash's WiFi link.
     char     line[320];
     size_t   line_n = 0;
     uint32_t lines_sent = 0;
+    bool     ack_fail = false;
     while (true) {
         const int c = f.read();
         if (c < 0 && line_n == 0) break;          // EOF, no partial
@@ -1728,13 +1767,15 @@ static void handleQGet(const char* basename) {
                 DASH_SERIAL.write((const uint8_t*)line, line_n);
                 DASH_SERIAL.write('\n');
                 lines_sent++;
-                // Small pacing: the dash's RX buffer is 4 KB; one Q,L line is
-                // ~260 bytes. Without pacing a fast loop could push ~15 lines
-                // (~4 KB) in <1 ms and overrun the dash before its loop
-                // pumps the UART. 200 us between lines = 5000 lines/sec which
-                // is still well above what the dash can possibly process and
-                // gives the dash's pumpUart plenty of time to drain.
-                delayMicroseconds(200);
+                // Wait up to 10 s for the dash to ACK this line before
+                // sending the next. 10 s covers a slow remote HTTPS POST
+                // burst; faster than that on local LAN.
+                if (!qWaitForAck(10000)) {
+                    Serial.printf("[Q] GET %s: ACK timeout after %lu lines\n",
+                                  basename, (unsigned long)lines_sent);
+                    ack_fail = true;
+                    break;
+                }
             }
             line_n = 0;
             if (c < 0) break;
@@ -1744,6 +1785,10 @@ static void handleQGet(const char* basename) {
         else line[sizeof(line) - 1] = '\0';
     }
     f.close();
+    if (ack_fail) {
+        DASH_SERIAL.println(F("Q,ERR,ack_timeout"));
+        return;
+    }
     DASH_SERIAL.printf("Q,EOF,%lu\n", (unsigned long)lines_sent);
     DASH_SERIAL.flush();
     Serial.printf("[Q] GET %s: streamed %lu lines, %lu bytes\n",
