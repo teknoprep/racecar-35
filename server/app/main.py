@@ -1014,11 +1014,11 @@ _INDEX_JS = """
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         const d = data.detail || data;
-        const errors = d.errors ? ('\n' + d.errors.join('\n')) : '';
+        const errors = d.errors ? ('\\n' + d.errors.join('\\n')) : '';
         throw new Error((d.message || data.detail || ('HTTP ' + resp.status)) + errors);
       }
       const v = data.validation || {};
-      showResult('OK: saved ' + data.path + '\n' + (v.samples || '?') + ' samples, '
+      showResult('OK: saved ' + data.path + '\\n' + (v.samples || '?') + ' samples, '
                  + (v.geo_samples || '?') + ' GPS samples', true);
       setTimeout(() => location.reload(), 900);
     } catch(e) {
@@ -1030,7 +1030,7 @@ _INDEX_JS = """
     const btn = ev.target.closest('[data-delete]');
     if (!btn) return;
     const user = btn.dataset.user, file = btn.dataset.file;
-    if (!confirm('Delete session permanently?\n\n' + user + '/' + file)) return;
+    if (!confirm('Delete session permanently?\\n\\n' + user + '/' + file)) return;
     try {
       btn.disabled = true;
       const resp = await fetch('/sessions/' + encodeURIComponent(user) + '/' + encodeURIComponent(file), {
