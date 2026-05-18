@@ -135,6 +135,37 @@ def parse_session_id(filename: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+# Anything before 2000-01-01 or after 2100-01-01 is treated as not-a-real-epoch.
+# Hit when the Teensy RTC was never set: session_start_unix lands on 0 or on a
+# tiny millis()-style number, and the firmware sends X-Session-Id: 0 or 50000
+# (or similar). Without a sanity check the index page rendered those as
+# 1970-01-01 13:53:20 UTC which is useless. Inside this window we trust the
+# value as-is; outside it we fall back to wall-clock time (upload time, or
+# file mtime for pre-existing rows).
+EPOCH_REASONABLE_MIN = 946684800        # 2000-01-01T00:00:00Z
+EPOCH_REASONABLE_MAX = 4102444800       # 2100-01-01T00:00:00Z
+
+
+def reasonable_epoch(value: Optional[int]) -> bool:
+    return value is not None and EPOCH_REASONABLE_MIN <= value <= EPOCH_REASONABLE_MAX
+
+
+def display_epoch_for(p: pathlib.Path) -> int:
+    """Effective "started at" for a saved session file.
+
+    Prefer the session_id encoded in the filename; if that's bogus (RTC not
+    set on the firmware side), fall back to the file's mtime so the listing
+    + review page never show 1970.
+    """
+    sid = parse_session_id(p.name)
+    if reasonable_epoch(sid):
+        return int(sid)  # type: ignore[arg-type]
+    try:
+        return int(p.stat().st_mtime)
+    except OSError:
+        return int(time.time())
+
+
 def oauth_enabled() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
 
@@ -504,7 +535,23 @@ async def _save_body(
     validation = validate_ndjson_body(body)
 
     email = safe_name(x_user_email or (web_user or {}).get("email"))
-    sid = safe_name(x_session_id, default="0")
+
+    # Sanitize + epoch-sanity-check the session id. If the firmware uploads
+    # something we can't interpret as a real epoch (RTC not set, all zeros,
+    # millis()-as-epoch fallback) we substitute the current server time so
+    # the file's display row, filename, and review page header all read as
+    # "right now" rather than 1970-01-01.
+    sid_raw = (x_session_id or "").strip()
+    sid_overridden = False
+    try:
+        sid_int = int(sid_raw) if sid_raw else 0
+    except ValueError:
+        sid_int = 0
+    if not reasonable_epoch(sid_int):
+        sid_int = int(time.time())
+        sid_overridden = True
+    sid = safe_name(str(sid_int), default=str(int(time.time())))
+
     track = safe_name(x_track_name, default="UNKNOWN")
     filename = f"{sid}_{track}.ndjson"
     out_path = session_dir_for(email) / filename
@@ -519,11 +566,12 @@ async def _save_body(
     size = out_path.stat().st_size
 
     log.info(
-        "received %s mode=%s email=%s session=%s track=%s bytes=%d lines=%d -> %s",
+        "received %s mode=%s email=%s session=%s%s track=%s bytes=%d lines=%d -> %s",
         request.client.host if request.client else "?",
         mode,
         email,
         sid,
+        " (server-clock)" if sid_overridden else "",
         track,
         len(body),
         nl,
@@ -540,6 +588,8 @@ async def _save_body(
             "validation": validation,
             "file_size_bytes": size,
             "ts": int(time.time()),
+            "session_id": sid_int,
+            "session_id_overridden": sid_overridden,
         }
     )
 
@@ -599,6 +649,7 @@ async def list_sessions(request: Request) -> dict:
                         "user": user_dir.name,
                         "filename": f.name,
                         "session_id": parse_session_id(f.name),
+                        "display_epoch": display_epoch_for(f),
                         "size_bytes": st.st_size,
                         "mtime": int(st.st_mtime),
                     }
@@ -719,9 +770,8 @@ async def review(request: Request, user: str, filename: str) -> Response:
     if oauth_enabled() and not current_user(request):
         return login_redirect(request)
     p = _resolve_session(user, filename)
-    sid = parse_session_id(p.name)
-    when = (
-        time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(sid)) if sid else "?"
+    when = time.strftime(
+        "%Y-%m-%d %H:%M:%S UTC", time.gmtime(display_epoch_for(p))
     )
     return _REVIEW_HTML.replace("__USER__", safe_name(user)) \
                        .replace("__FILE__", p.name) \
@@ -1108,11 +1158,9 @@ async def index(request: Request) -> Response:
                 if not f.is_file() or not f.name.endswith(".ndjson"):
                     continue
                 st = f.stat()
-                sid = parse_session_id(f.name)
-                when = (
-                    time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(sid))
-                    if sid
-                    else "?"
+                when = time.strftime(
+                    "%Y-%m-%d %H:%M:%S UTC",
+                    time.gmtime(display_epoch_for(f)),
                 )
                 size_str = _human_bytes(st.st_size)
                 # Track name = filename middle bit: <sid>_<track>.ndjson
@@ -1226,6 +1274,33 @@ _REVIEW_HTML = (
 
   .loading { padding: 32px; color: var(--muted); text-align: center; }
   .err { padding: 16px; color: var(--bad); }
+
+  /* ---- G-meter --------------------------------------------------- */
+  .gmeter-wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+    gap: var(--sp-md); align-items: center; }
+  @media (max-width: 720px) { .gmeter-wrap { grid-template-columns: 1fr; } }
+  .gmeter { position: relative; width: 100%; max-width: 280px; aspect-ratio: 1 / 1;
+    margin: 0 auto; background: var(--bg); border: 1px solid var(--line);
+    border-radius: var(--r-md); overflow: hidden; }
+  .gmeter canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .gmeter .gdot { position: absolute; width: 12px; height: 12px;
+    margin: -6px 0 0 -6px; border-radius: var(--r-full);
+    background: var(--primary); box-shadow: 0 0 0 2px var(--bg);
+    transition: left 60ms linear, top 60ms linear; }
+  .gmeter .gaxis { position: absolute; color: var(--muted); font: 600 10px/1 var(--ff-ui);
+    letter-spacing: 0.08em; text-transform: uppercase; pointer-events: none; }
+  .gmeter .gaxis.top    { top: 6px;    left: 50%; transform: translateX(-50%); }
+  .gmeter .gaxis.bot    { bottom: 6px; left: 50%; transform: translateX(-50%); }
+  .gmeter .gaxis.left   { left: 6px;   top: 50%;  transform: translateY(-50%); }
+  .gmeter .gaxis.right  { right: 6px;  top: 50%;  transform: translateY(-50%); }
+  .gstats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .gstat { padding: 10px 12px; background: var(--surface-2); border-radius: var(--r-sm);
+    border: 1px solid var(--line); }
+  .gstat .label { color: var(--muted);
+    font: 600 10px/1 var(--ff-ui); letter-spacing: 0.08em; text-transform: uppercase;
+    margin-bottom: 4px; }
+  .gstat .v { font: 600 18px/1.1 var(--ff-mono); }
+  .gstat .v.accent { color: var(--primary); }
 </style>
 </head><body>
 <header class="app">
@@ -1274,6 +1349,29 @@ _REVIEW_HTML = (
         <div class="tile">
           <div class="label">Altitude</div>
           <div><span class="t-tel-md val" id="v-alt">\u2014</span><span class="unit">m</span></div>
+        </div>
+        <div class="tile full">
+          <div class="label">G-Meter</div>
+          <div class="gmeter-wrap">
+            <div class="gmeter" id="gmeter">
+              <canvas id="gtrail" width="560" height="560"></canvas>
+              <div class="gaxis top">brake</div>
+              <div class="gaxis bot">accel</div>
+              <div class="gaxis left">left</div>
+              <div class="gaxis right">right</div>
+              <div class="gdot" id="gdot" style="left:50%;top:50%"></div>
+            </div>
+            <div class="gstats">
+              <div class="gstat"><div class="label">Lateral</div>
+                <div class="v accent" id="v-glat">\u2014</div></div>
+              <div class="gstat"><div class="label">Long.</div>
+                <div class="v accent" id="v-glong">\u2014</div></div>
+              <div class="gstat"><div class="label">Vertical</div>
+                <div class="v" id="v-gvert">\u2014</div></div>
+              <div class="gstat"><div class="label">Peak |G|</div>
+                <div class="v" id="v-gpeak">\u2014</div></div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -1349,11 +1447,116 @@ _REVIEW_HTML = (
     el('gps-status').textContent = 'no GPS fixes';
   }
 
-  // ---- timestamps -----------------------------------------------------
-  const t0 = S[0].t || 0;
-  const tEnd = S[S.length-1].t || 0;
-  const totalSec = Math.max(0, tEnd - t0);
-  el('t-total').textContent = fmtTime(totalSec);
+  // ---- timestamps (normalize: prefer epoch t, else t_ms, else synthetic) ----
+  // Real timestamps come through as `t` (unix epoch seconds). Bench/test
+  // sessions captured before NTP/RTC sync use `t_ms` (relative ms since
+  // session start). When NEITHER is usable we fall back to synthetic 25 Hz
+  // time so playback still tracks the sampled cadence instead of jumping
+  // to the end in a single frame.
+  const SAMPLE_HZ_DEFAULT = 25;
+  const T = new Array(S.length);
+  let firstT = null;
+  for (let i = 0; i < S.length; i++) {
+    const s = S[i];
+    let v = null;
+    if (typeof s.t === 'number' && isFinite(s.t))         v = s.t;
+    else if (typeof s.t_ms === 'number' && isFinite(s.t_ms)) v = s.t_ms / 1000;
+    if (v != null && firstT == null) firstT = v;
+    T[i] = v;
+  }
+  let usableTime = (firstT != null);
+  if (usableTime) {
+    // anchor to first usable sample, fill gaps by linear interpolation
+    let last = firstT;
+    for (let i = 0; i < S.length; i++) {
+      if (T[i] == null) T[i] = last;
+      else last = T[i];
+    }
+    const span = T[S.length-1] - T[0];
+    if (!(span > 0.5)) usableTime = false;   // single moment / corrupt
+  }
+  if (!usableTime) {
+    for (let i = 0; i < S.length; i++) T[i] = i / SAMPLE_HZ_DEFAULT;
+  }
+  const T0 = T[0];
+  const TEND = T[S.length-1];
+  const totalSec = Math.max(0, TEND - T0);
+  el('t-total').textContent = fmtTime(totalSec) + (usableTime ? '' : ' (est)');
+
+  // ---- G-meter setup -------------------------------------------------
+  // IMU axes (firmware): +ax = forward, +ay = right-positive lateral push,
+  // +az = up. On a g-g plot we want brake-up / accel-down / right-positive
+  // lateral, so we plot (lat=-ay, long=-ax). Vertical (az) subtract 1 g for
+  // gravity to show vertical perturbation only.
+  const gcanv = el('gtrail');
+  const gctx  = gcanv.getContext('2d');
+  const G_MAX = 2.0;   // canvas edges = +/- 2 g
+  const gdot  = el('gdot');
+
+  // pre-compute per-sample g-values once
+  const GLat  = new Array(S.length);
+  const GLong = new Array(S.length);
+  const GVert = new Array(S.length);
+  let peakG = 0;
+  let haveImu = false;
+  for (let i = 0; i < S.length; i++) {
+    const s = S[i];
+    const lat  = (typeof s.ay === 'number' && isFinite(s.ay)) ? -s.ay : null;
+    const lng  = (typeof s.ax === 'number' && isFinite(s.ax)) ? -s.ax : null;
+    const vert = (typeof s.az === 'number' && isFinite(s.az)) ? (s.az - 1) : null;
+    GLat[i]  = lat;
+    GLong[i] = lng;
+    GVert[i] = vert;
+    if (lat != null || lng != null) haveImu = true;
+    if (lat != null && lng != null) {
+      const mag = Math.sqrt(lat*lat + lng*lng);
+      if (mag > peakG) peakG = mag;
+    }
+  }
+  el('v-gpeak').textContent = haveImu ? (peakG.toFixed(2) + ' g') : '\u2014';
+
+  function drawGTrail() {
+    const W = gcanv.width, H = gcanv.height;
+    gctx.clearRect(0, 0, W, H);
+    const cx = W/2, cy = H/2;
+    const r1g = (W/2) / G_MAX;
+    // grid: concentric circles at 0.5g, 1.0g, 1.5g + cross hairs
+    gctx.strokeStyle = 'rgba(255,255,255,0.07)';
+    gctx.lineWidth = 1;
+    for (let g = 0.5; g <= G_MAX - 0.001; g += 0.5) {
+      gctx.beginPath(); gctx.arc(cx, cy, g * r1g, 0, Math.PI*2); gctx.stroke();
+    }
+    gctx.beginPath();
+    gctx.moveTo(0, cy); gctx.lineTo(W, cy);
+    gctx.moveTo(cx, 0); gctx.lineTo(cx, H);
+    gctx.stroke();
+    // 1 g reference ring brighter
+    gctx.strokeStyle = 'rgba(255,176,32,0.25)';
+    gctx.beginPath(); gctx.arc(cx, cy, 1.0 * r1g, 0, Math.PI*2); gctx.stroke();
+    // historical g-g points
+    if (haveImu) {
+      gctx.fillStyle = 'rgba(255,176,32,0.18)';
+      for (let i = 0; i < S.length; i++) {
+        const lat = GLat[i], lng = GLong[i];
+        if (lat == null || lng == null) continue;
+        const px = cx + Math.max(-G_MAX, Math.min(G_MAX, lat)) * r1g;
+        const py = cy - Math.max(-G_MAX, Math.min(G_MAX, lng)) * r1g;
+        gctx.fillRect(px - 1, py - 1, 2, 2);
+      }
+    }
+  }
+  drawGTrail();
+
+  function placeGDot(idx) {
+    const lat = GLat[idx], lng = GLong[idx];
+    if (lat == null || lng == null) { gdot.style.display = 'none'; return; }
+    gdot.style.display = '';
+    // map [-G_MAX, +G_MAX] -> [0%, 100%]
+    const xPct = ((Math.max(-G_MAX, Math.min(G_MAX, lat))) / G_MAX) * 50 + 50;
+    const yPct = 50 - ((Math.max(-G_MAX, Math.min(G_MAX, lng))) / G_MAX) * 50;
+    gdot.style.left = xPct.toFixed(2) + '%';
+    gdot.style.top  = yPct.toFixed(2) + '%';
+  }
 
   // ---- slider + render ------------------------------------------------
   const slider = el('slider');
@@ -1371,32 +1574,42 @@ _REVIEW_HTML = (
     const fix = s.fix, sats = s.sats;
     el('v-fix').textContent   = (fix==null) ? '\u2014'
       : (FIX_NAMES[fix] || ('fix '+fix)) + (sats!=null ? ' \u00b7 ' + sats : '');
-    el('t-now').textContent   = fmtTime((s.t||t0) - t0);
+    el('t-now').textContent   = fmtTime(T[idx] - T0);
     if (dot && typeof s.lat === 'number' && typeof s.lon === 'number' && (s.lat || s.lon)) {
       dot.setLatLng([s.lat, s.lon]);
     }
+    el('v-glat').textContent  = (GLat[idx]  == null) ? '\u2014' : GLat[idx].toFixed(2)  + ' g';
+    el('v-glong').textContent = (GLong[idx] == null) ? '\u2014' : GLong[idx].toFixed(2) + ' g';
+    el('v-gvert').textContent = (GVert[idx] == null) ? '\u2014' : GVert[idx].toFixed(2) + ' g';
+    placeGDot(idx);
   }
   slider.addEventListener('input', () => render(Number(slider.value)));
   render(0);
 
-  // ---- play / pause (real time relative to sample timestamps) ---------
-  let playing = false, lastTick = 0, rafId = 0;
+  // ---- play / pause ---------------------------------------------------
+  // Drives the slider in real time, paced by the normalized T[] array so
+  // both real-clock and synthetic-25Hz files play at the right cadence.
+  let playing = false, playT = 0, lastTick = 0, rafId = 0;
   const playBtn = el('play');
   function tick(now) {
     if (!playing) return;
     const dt = (now - lastTick) / 1000;
     lastTick = now;
-    let idx = Number(slider.value);
-    const cur = S[idx].t || t0;
-    let next = idx;
-    const target = cur + dt;
-    while (next < S.length - 1 && (S[next+1].t || t0) <= target) next++;
-    if (next >= S.length - 1) { stop(); slider.value = String(S.length - 1); render(S.length - 1); return; }
-    if (next !== idx) { slider.value = String(next); render(next); }
+    playT += dt;
+    const target = T0 + playT;
+    let next = Number(slider.value);
+    while (next < S.length - 1 && T[next+1] <= target) next++;
+    if (next >= S.length - 1) {
+      slider.value = String(S.length - 1); render(S.length - 1); stop(); return;
+    }
+    slider.value = String(next);
+    render(next);
     rafId = requestAnimationFrame(tick);
   }
   function start() {
-    if (Number(slider.value) >= S.length - 1) slider.value = '0';
+    let idx = Number(slider.value);
+    if (idx >= S.length - 1) { idx = 0; slider.value = '0'; render(0); }
+    playT = T[idx] - T0;
     playing = true; lastTick = performance.now();
     playBtn.textContent = 'pause';
     rafId = requestAnimationFrame(tick);
