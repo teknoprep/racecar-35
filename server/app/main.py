@@ -254,7 +254,7 @@ def validate_ndjson_body(body: bytes) -> dict:
     firmware's descriptive-key NDJSON serializer:
       - non-empty UTF-8 text
       - one JSON object per non-empty line
-      - every sample must have numeric finite t, lat, lon
+      - every sample must have numeric finite t (or t_ms fallback), lat, lon
       - lat/lon must be in normal WGS84 ranges
       - known telemetry numeric fields, when present, must be finite numbers
     """
@@ -303,10 +303,19 @@ def validate_ndjson_body(body: bytes) -> dict:
         samples += 1
 
         t = obj.get("t")
-        if not _is_json_number(t):
-            errors.append(f"line {lineno}: missing/non-numeric t")
-        else:
+        if _is_json_number(t):
             tf = float(t)
+        else:
+            # If the Teensy's RTC/NTP was not set when recording started, the
+            # firmware logs relative milliseconds as t_ms. Accept that for
+            # upload validation so bench/test sessions are not rejected.
+            t_ms = obj.get("t_ms")
+            if _is_json_number(t_ms):
+                tf = float(t_ms) / 1000.0
+            else:
+                errors.append(f"line {lineno}: missing/non-numeric t or t_ms")
+                tf = None
+        if tf is not None:
             if first_t is None:
                 first_t = tf
             if last_t is not None and tf < last_t:
@@ -327,8 +336,11 @@ def validate_ndjson_body(body: bytes) -> dict:
             geo += 1
 
         for field in _OPTIONAL_NUMERIC_FIELDS:
-            if field in obj and not _is_json_number(obj[field]):
-                errors.append(f"line {lineno}: {field} must be numeric")
+            # Firmware deliberately emits JSON null for faulted/absent analog
+            # sensors (oil pressure, coolant, etc.). Treat null as "missing"
+            # for optional telemetry; if a value is present, it must be finite.
+            if field in obj and obj[field] is not None and not _is_json_number(obj[field]):
+                errors.append(f"line {lineno}: {field} must be numeric or null")
 
         if len(errors) >= 25:
             break

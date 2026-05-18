@@ -24,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.38"
+#define FIRMWARE_VERSION "0.1.39"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1038,6 +1038,11 @@ static uint16_t gpsStatusColor(uint8_t s) {
     }
 }
 
+// Longest UART lines are Q,L/WUP,L upload records: "Q,L," plus one
+// NDJSON sample. The Teensy-side line buffer is 320 bytes, so 256 here was
+// too small and could drop perfectly valid samples mid-upload, leading to
+// Teensy-side ack_timeout failures. Keep this comfortably above that.
+static constexpr size_t UART_LINE_MAX = 512;
 static String rxBuf;
 
 static bool parseGpsLine(const String& line) {
@@ -1419,15 +1424,19 @@ static bool ufOpenStream(uint32_t content_length) {
         return false;
     }
     ufCloseTcp();
+    // Tighter than the Teensy's 10 s per-line ACK wait, so a stalled TCP
+    // write fails fast on this side instead of hanging long enough for the
+    // Teensy to give up and abort the whole transfer with Q,ERR,ack_timeout.
+    constexpr int CLOUD_TCP_TIMEOUT_S = 8;
     if (s.cloud_protocol == 1) {
         WiFiClientSecure* sec = new WiFiClientSecure();
         sec->setInsecure();   // TODO: pin server cert when going public
-        sec->setTimeout(15);   // seconds
+        sec->setTimeout(CLOUD_TCP_TIMEOUT_S);
         uf.tcp = sec;
         uf.tcp_secure = true;
     } else {
         WiFiClient* plain = new WiFiClient();
-        plain->setTimeout(15);
+        plain->setTimeout(CLOUD_TCP_TIMEOUT_S);
         uf.tcp = plain;
         uf.tcp_secure = false;
     }
@@ -1439,6 +1448,11 @@ static bool ufOpenStream(uint32_t content_length) {
         ufCloseTcp();
         return false;
     }
+    // Disable Nagle so per-line writes go out immediately rather than waiting
+    // for the TCP coalescer. The Teensy is paced by Q,A acks anyway, so we
+    // never benefit from coalescing and Nagle just adds latency to each ACK
+    // round trip — which directly slows the upload.
+    uf.tcp->setNoDelay(true);
     const long sid = ufExtractSessionId(uf.files[uf.files_idx].name);
     uf.tcp->printf("POST /upload HTTP/1.1\r\n");
     uf.tcp->printf("Host: %s\r\n",            s.cloud_host);
@@ -1622,19 +1636,44 @@ static bool parseQLine(const String& line) {
             ufNextFile();
             return true;
         }
-        const size_t w = uf.tcp->write((const uint8_t*)data, n);
-        if (w != n) {
+        // Single write per line: stack-build "<line>\n" then write once.
+        // Two writes per line through WiFiClientSecure adds an extra TLS
+        // record header per line — over 4000 lines on a 1 MB upload that's
+        // a measurable overhead and an extra blocking syscall per line.
+        uint8_t tx[576];
+        if (n + 1 > sizeof(tx)) {
             snprintf(uf.last_err, sizeof(uf.last_err),
-                     "TCP short write %u/%u", (unsigned)w, (unsigned)n);
+                     "line too long %u", (unsigned)n);
             ufCloseTcp();
             uf.failed++;
             ufNextFile();
             return true;
         }
-        uf.tcp->write('\n');
-        uf.bytes_written += n + 1;
+        memcpy(tx, data, n);
+        tx[n] = '\n';
+        const size_t need = n + 1;
+        const size_t w = uf.tcp->write(tx, need);
+        if (w != need) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "TCP short write %u/%u at %lu B",
+                     (unsigned)w, (unsigned)need,
+                     (unsigned long)uf.bytes_written);
+            ufCloseTcp();
+            uf.failed++;
+            ufNextFile();
+            return true;
+        }
+        uf.bytes_written += need;
         uf.last_rx_ms     = millis();
         uf.lines_recv++;
+
+        // Pace the Teensy file sender. It waits for Q,A after every Q,L line;
+        // without this ACK, uploads fail as Q,ERR,ack_timeout as soon as the
+        // first data record is sent. ACK only after the bytes are accepted by
+        // the cloud socket so TCP backpressure naturally slows the SD reader.
+        Serial.println("Q,A");
+        Serial.flush();
+
         if ((uf.lines_recv % 500) == 0) {
             Serial.printf("DBG,uf_stream lines=%lu bytes=%lu/%lu\n",
                           (unsigned long)uf.lines_recv,
@@ -1766,9 +1805,14 @@ static void uploadTick() {
             }
             uf.last_rx_ms = millis();
         }
-        // Server should close after the response (Connection: close). Once
-        // disconnected and the buffer is drained, parse + handle.
-        if (!uf.tcp->connected() && !uf.tcp->available()) {
+        // We only need the HTTP status. Do not require the server to close the
+        // socket: some HTTP/1.1 stacks keep it open even when we ask for
+        // Connection: close, which made otherwise-complete uploads look like
+        // response timeouts. Parse as soon as response headers are complete;
+        // otherwise fall back to parsing after disconnect.
+        const bool headers_complete = (strstr(uf.response, "\r\n\r\n") != nullptr);
+        const bool socket_done = (!uf.tcp->connected() && !uf.tcp->available());
+        if (headers_complete || socket_done) {
             char body[140];
             const int code = ufParseResponse(body, sizeof(body));
             Serial.printf("DBG,uf_response code=%d body=%s\n", code, body);
@@ -1965,7 +2009,7 @@ static void pumpUart() {
         char c = (char)Serial.read();
         if (c == '\r') continue;
         if (c == '\n') { parseLine(rxBuf); rxBuf = ""; }
-        else if (rxBuf.length() < 256) { rxBuf += c; }
+        else if (rxBuf.length() < UART_LINE_MAX) { rxBuf += c; }
         else { rxBuf = ""; }
     }
 }
@@ -6689,6 +6733,7 @@ void setup() {
     // wider than any loop spike the dash should ever take.
     Serial.setRxBufferSize(32768);
     Serial.begin(921600);
+    rxBuf.reserve(UART_LINE_MAX);
     delay(800);
     Serial.printf("\n=== racecar-35 dash crowpanel boot, firmware v%s ===\n",
                   FIRMWARE_VERSION);
