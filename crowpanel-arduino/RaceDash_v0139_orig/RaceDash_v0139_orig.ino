@@ -13,7 +13,6 @@
 
 #include <Wire.h>
 #include <PCA9557.h>
-#include <TAMC_GT911.h>   // GT911 touch on Wire/I2C_NUM_0 (vendor V3.0 approach)
 #include <WiFi.h>          // ESP32-S3 built-in WiFi (NTP, OTA HTTPS, future cloud upload)
 #include <WiFiClientSecure.h>   // HTTPS to GitHub for manifest + firmware download
 #include <HTTPClient.h>         // wraps WiFiClientSecure with a simple GET/POST API
@@ -25,7 +24,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.40"
+#define FIRMWARE_VERSION "0.1.39"
 
 #include <Preferences.h>
 #include <time.h>
@@ -118,13 +117,6 @@ struct KbKey {
 PCA9557 Out;
 Preferences prefs;
 
-// GT911 capacitive touch — driven on Wire (I2C_NUM_0), exactly like the
-// proven vendor V3.0 demo. We do NOT use LovyanGFX's built-in Touch_GT911:
-// that runs on I2C_NUM_1 and its init steals the GPIO 19/20 matrix routing
-// from Wire, killing all I2C reads. INT=-1, RST=-1 (board handles reset),
-// address auto-detected (0x5D or 0x14) in setup().
-static TAMC_GT911 ts(19, 20, (uint8_t)-1, (uint8_t)-1, 800, 480);
-
 // ---------------------------------------------------------------------------
 // LovyanGFX driver — V3.0 panel timings + GT911 capacitive touch on I2C 0x14.
 // ---------------------------------------------------------------------------
@@ -133,8 +125,7 @@ public:
     lgfx::Bus_RGB     _bus_instance;
     lgfx::Panel_RGB   _panel_instance;
     lgfx::Light_PWM   _light_instance;
-    // No Touch_GT911 here — touch is handled separately by TAMC on Wire so
-    // LovyanGFX never initialises I2C_NUM_1 and never steals the touch pins.
+    lgfx::Touch_GT911 _touch_instance;
 
     LGFX(void) {
         {
@@ -177,6 +168,22 @@ public:
             cfg.pin_bl = GPIO_NUM_2;
             _light_instance.config(cfg);
             _panel_instance.light(&_light_instance);
+        }
+        {
+            auto cfg = _touch_instance.config();
+            cfg.x_min      = 0;   cfg.x_max = 799;
+            cfg.y_min      = 0;   cfg.y_max = 479;
+            cfg.pin_int    = -1;
+            cfg.pin_rst    = -1;
+            cfg.bus_shared = true;
+            cfg.offset_rotation = 0;
+            cfg.i2c_port   = I2C_NUM_1;
+            cfg.pin_sda    = GPIO_NUM_19;
+            cfg.pin_scl    = GPIO_NUM_20;
+            cfg.freq       = 400000;
+            cfg.i2c_addr   = 0x14;
+            _touch_instance.config(cfg);
+            _panel_instance.setTouch(&_touch_instance);
         }
         setPanel(&_panel_instance);
     }
@@ -325,12 +332,6 @@ static char     sd_err_hex[8]    = "";   // last SdFat err code (hex from SD,NON
 static bool     sd_session_active  = false;
 static char     sd_session_file[80] = "";
 static uint32_t sd_session_samples = 0;
-
-// CAN sniffer state — updated from CANSNIFF,<0|1>,<file>,<frames> lines.
-// Toggled from the Tools page; the Teensy logs raw frames to SD.
-static bool     cansniff_active    = false;
-static char     cansniff_file[80]  = "";
-static uint32_t cansniff_frames    = 0;
 
 // ---------------------------------------------------------------------------
 // OTA state — driven by tapping "Check for updates" in settings.
@@ -956,7 +957,6 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,rec_sd,%d\n",    (int)s.record_sd);
     Serial.printf("CFG,rec_cl,%d\n",    (int)s.record_cloud);
     Serial.printf("CFG,inet,%u\n",      (unsigned)s.internet_mode);
-    Serial.printf("CFG,srctyp,%u\n",    (unsigned)s.sensor_type);
 }
 
 static void saveLastTrack(int idx, const char* display_name = nullptr) {
@@ -1281,24 +1281,6 @@ static bool parseSdLine(const String& line) {
         return false;
     }
     if (sd_card_status != prev) settingsDirty = true;
-    return true;
-}
-
-// CANSNIFF,<0|1>,<filename>,<frames> — CAN sniffer status from the Teensy.
-static bool parseCanSniffLine(const String& line) {
-    const int c1 = line.indexOf(',');
-    if (c1 < 0) return false;
-    const int c2 = line.indexOf(',', c1 + 1);
-    const int c3 = (c2 >= 0) ? line.indexOf(',', c2 + 1) : -1;
-    cansniff_active = (line.substring(c1 + 1, c2 >= 0 ? c2 : (int)line.length()).toInt() != 0);
-    if (c2 >= 0) {
-        const int end = (c3 >= 0) ? c3 : (int)line.length();
-        line.substring(c2 + 1, end).toCharArray(cansniff_file, sizeof(cansniff_file));
-    } else {
-        cansniff_file[0] = '\0';
-    }
-    cansniff_frames = (c3 >= 0) ? line.substring(c3 + 1).toInt() : 0;
-    if (currentPage == PAGE_TOOLS) pageJustEntered = true;   // repaint tools button
     return true;
 }
 
@@ -2013,7 +1995,6 @@ static bool parseLine(const String& line) {
     if (line.startsWith("IMU,")) return parseImuLine(line);
     if (line.startsWith("ETH,"))  return parseEthLine(line);
     if (line.startsWith("SD,"))   return parseSdLine(line);
-    if (line.startsWith("CANSNIFF,")) return parseCanSniffLine(line);
     if (line.startsWith("CLD,"))  return parseCldLine(line);
     if (line.startsWith("TIME,")) return parseTimeLine(line);
     if (line.startsWith("UPLOAD,")) return parseUploadLine(line);
@@ -2096,26 +2077,8 @@ static bool parseVerLine(const String& line);
 static void handleStatusTap(int x, int y);
 
 static void handleTouch() {
-    ts.read();
-    const bool raw = ts.isTouched;
-
-    // GT911 release debounce. TAMC clears the GT911 data-ready flag after each
-    // read, so isTouched flickers false between the controller's sample periods
-    // (~5-10 ms) even while a finger is held down. Without this, every flicker
-    // looks like a release and the swipe/drag state machine never accumulates
-    // movement (taps work, swipes don't). We hold the touch "down" for up to
-    // TOUCH_RELEASE_MS after the last real sample, retaining the last position.
-    static int32_t  heldX = 0, heldY = 0;
-    static uint32_t lastTouchMs = 0;
-    constexpr uint32_t TOUCH_RELEASE_MS = 80;
-    if (raw) {
-        heldX = (int32_t)ts.points[0].x;
-        heldY = (int32_t)ts.points[0].y;
-        lastTouchMs = millis();
-    }
-    const bool    now = raw || (tt.active && (millis() - lastTouchMs) < TOUCH_RELEASE_MS);
-    const int32_t x   = heldX;
-    const int32_t y   = heldY;
+    int32_t x, y;
+    const bool now = tft.getTouch(&x, &y);
 
     // Keyboard + track picker pages use a tap-only model (with vertical
     // drag for picker scrolling). No swipe-back; CANCEL is the way out.
@@ -4360,19 +4323,6 @@ static void confirmTrackAndStart() {
         if (idx != TP_UNKNOWN_IDX) {
             trackName = TRACKS[idx].name;
             saveLastTrack((int)idx, trackName);
-        } else {
-            // Unlisted track: make the selection STICK so a later START honours
-            // it directly (instead of re-opening the picker), and so the TRACK
-            // button can pre-select it. We persist it as the active track with
-            // last_track_idx = -1 (no known TRACKS[] entry). Wire name stays the
-            // documented "UNKNOWN" sentinel.
-            strncpy(active_track_name, "UNKNOWN", sizeof(active_track_name) - 1);
-            active_track_name[sizeof(active_track_name) - 1] = '\0';
-            last_track_idx = -1;
-            prefs.begin("dash", false);
-            prefs.putString("last_trk",   "UNKNOWN");   // matches no TRACKS[] -> idx=-1 on reload
-            prefs.putString("last_trk_d", "UNKNOWN");
-            prefs.end();
         }
     }
     Serial.printf("TRACK,%s\n", trackName);
@@ -4442,7 +4392,7 @@ static void drawTrackPicker() {
         // Label
         tft.setTextColor(TFT_WHITE, isSelected ? TFT_DARKGREEN : TFT_BLACK);
         if (idx == TP_UNKNOWN_IDX) {
-            tft.drawString("Unlisted track  (record here anyway)", 20, y + 6);
+            tft.drawString("(no track / unknown)", 20, y + 6);
         } else {
             tft.drawString(TRACKS[idx].name, 20, y + 6);
 
@@ -5948,11 +5898,10 @@ static void handleOtaModalTap(int x, int y) {
 // ---------------------------------------------------------------------------
 namespace {
     constexpr int TOOLS_BTN_X = 40,  TOOLS_BTN_W = 720;
-    constexpr int TOOLS_BTN_H = 80,  TOOLS_GAP   = 16;
-    constexpr int TOOLS_BTN1_Y = 50;
+    constexpr int TOOLS_BTN_H = 90,  TOOLS_GAP   = 24;
+    constexpr int TOOLS_BTN1_Y = 60;
     constexpr int TOOLS_BTN2_Y = TOOLS_BTN1_Y + TOOLS_BTN_H + TOOLS_GAP;
     constexpr int TOOLS_BTN3_Y = TOOLS_BTN2_Y + TOOLS_BTN_H + TOOLS_GAP;
-    constexpr int TOOLS_BTN4_Y = TOOLS_BTN3_Y + TOOLS_BTN_H + TOOLS_GAP;
 }
 
 static const char* sdStatusText() {
@@ -6058,33 +6007,6 @@ static void drawToolsPage() {
         ? "recording synthetic data — tap to stop + upload"
         : "record synthetic session for cloud upload test";
     tft.drawString(b3sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 65);
-
-    // ---- Button 4: CAN sniffer ----
-    // Records every raw CAN frame to /cansniff/ on the SD card so the MS3Pro
-    // broadcast layout can be reverse-engineered offline. Needs SD ready.
-    const bool sd_ok = (sd_card_status == 2);
-    const uint16_t b4_fill = cansniff_active ? TFT_DARKGREEN
-                            : sd_ok          ? TFT_NAVY
-                                              : TFT_DARKGREY;
-    tft.fillRect(TOOLS_BTN_X, TOOLS_BTN4_Y, TOOLS_BTN_W, TOOLS_BTN_H, b4_fill);
-    tft.drawRect(TOOLS_BTN_X, TOOLS_BTN4_Y, TOOLS_BTN_W, TOOLS_BTN_H, TFT_WHITE);
-    tft.drawRect(TOOLS_BTN_X+1, TOOLS_BTN4_Y+1, TOOLS_BTN_W-2, TOOLS_BTN_H-2, TFT_WHITE);
-    tft.setFont(&fonts::Font4);
-    tft.setTextColor(TFT_WHITE, b4_fill);
-    tft.drawString(cansniff_active ? "Stop CAN capture" : "Start CAN capture",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 30);
-    tft.setFont(&fonts::Font2);
-    tft.setTextColor(TFT_LIGHTGREY, b4_fill);
-    char b4sub[80];
-    if (cansniff_active) {
-        snprintf(b4sub, sizeof(b4sub), "capturing — %lu frames — tap to stop",
-                 (unsigned long)cansniff_frames);
-    } else if (!sd_ok) {
-        snprintf(b4sub, sizeof(b4sub), "needs SD card (currently %s)", sdStatusText());
-    } else {
-        snprintf(b4sub, sizeof(b4sub), "record raw CAN frames to SD for analysis");
-    }
-    tft.drawString(b4sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 65);
     tft.setTextDatum(textdatum_t::top_left);
 }
 
@@ -6121,17 +6043,6 @@ static void handleToolsTap(int x, int y) {
         // Optimistically flip the local state so the button re-paints
         // immediately; the Teensy TEST,<0|1> reply will reconcile.
         test_mode_active = !test_mode_active;
-        return;
-    }
-    // Button 4: CAN sniffer toggle
-    if (x >= TOOLS_BTN_X && x <= TOOLS_BTN_X + TOOLS_BTN_W &&
-        y >= TOOLS_BTN4_Y && y <= TOOLS_BTN4_Y + TOOLS_BTN_H) {
-        if (!cansniff_active && sd_card_status != 2) return;  // need SD to start
-        Serial.printf(cansniff_active ? "CANSNIFF,0\n" : "CANSNIFF,1\n");
-        // Teensy replies with CANSNIFF,<state>,... to reconcile; flip locally
-        // for instant button feedback.
-        cansniff_active = !cansniff_active;
-        pageJustEntered = true;
         return;
     }
 }
@@ -6834,12 +6745,10 @@ void setup() {
     esp_log_level_set("wifi",    ESP_LOG_NONE);
     esp_log_level_set("wifi_init", ESP_LOG_NONE);
 
-    // GPIO 38 = GT911 RST. Hold LOW during PCA9557 bring-up.
     pinMode(38, OUTPUT);
     digitalWrite(38, LOW);
     Wire.begin(19, 20);
 
-    // PCA9557 — releases LCD from reset via IO0.
     Out.reset();
     Out.setMode(IO_OUTPUT);
     Out.setState(IO0, IO_LOW);
@@ -6850,23 +6759,8 @@ void setup() {
     Out.setMode(IO1, IO_INPUT);
     Serial.println("PCA9557 init ok");
 
-    // RGB display only — LovyanGFX does NOT touch I2C.
     tft.begin();
     tft.fillScreen(TFT_BLACK);
-
-    // GT911 touch via TAMC on Wire (I2C_NUM_0) — vendor V3.0 proven path.
-    // Auto-detect address: probe 0x5D then 0x14, init at whichever answers.
-    {
-        uint8_t a = 0;
-        for (uint8_t cand : { (uint8_t)0x5D, (uint8_t)0x14 }) {
-            Wire.beginTransmission(cand);
-            if (Wire.endTransmission() == 0) { a = cand; break; }
-        }
-        ts.begin(a ? a : GT911_ADDR1);
-        ts.setRotation(ROTATION_INVERTED);   // raw coords; switch if mirrored
-        Serial.printf("GT911 touch (TAMC/Wire) init at 0x%02X\n", a ? a : GT911_ADDR1);
-    }
-
     tft.setTextSize(1);                 // explicit default; PanelTest's old size-3 leak made
                                          // the dash's first frame draw labels at size 3.
     delay(200);

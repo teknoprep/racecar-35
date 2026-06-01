@@ -1,8 +1,8 @@
-// racecar-35 dash firmware — GPS + tach + IMU to dash bridge
+// racecar-35 dash firmware — GPS + MS3Pro CAN + IMU to dash bridge
 //
-// Reads u-blox GNSS over Serial2 (pin 7=RX2, pin 8=TX2), an opto-
-// isolated tach pulse on pin 9 (FlexPWM input capture / FreqMeasure),
-// and an MPU-6050 IMU over Wire (pin 18=SDA, pin 19=SCL),
+// Reads u-blox GNSS over Serial2 (pin 7=RX2, pin 8=TX2), the MS3Pro
+// MegaSquirt ECU over CAN1 (pin 22=TX, pin 23=RX, via SN65HVD230
+// 3.3V transceiver), and an MPU-6050 IMU over Wire (pin 18=SDA, 19=SCL),
 // then forwards all three to the CrowPanel ESP32 dash over Serial3 (pin
 // 14=TX3, pin 15=RX3 -> CrowPanel UART0).
 //
@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.39"
+#define FIRMWARE_VERSION "0.1.40"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -75,6 +75,7 @@ extern "C" {
 #include <TimeLib.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 #include <FreqMeasure.h>
+#include <FlexCAN_T4.h>
 
 namespace {
   HardwareSerial& GPS_SERIAL  = Serial2;            // pins 7 (RX2), 8 (TX2)
@@ -99,6 +100,14 @@ namespace {
   //   0.5  = once-per-2-revs cam-position pulse
   constexpr float    RPM_PULSES_PER_REV = 2.0f;
   constexpr uint32_t RPM_TIMEOUT_MS     = 750;      // no pulses in this window -> RPM = 0
+
+  // CAN bus — MS3Pro broadcasts on 0x5F0 base ID at 500 kbps (TunerStudio default).
+  // Transceiver: SN65HVD230 (3.3V). CAN1 TX=pin 22, RX=pin 23.
+  // Add a 120Ω termination resistor across CAN H/L at the Teensy end;
+  // MS3Pro already has one built-in at the ECU end.
+  constexpr uint32_t CAN_BAUD           = 500000;
+  constexpr uint32_t CAN_STALE_MS       = 2000;     // no frames → reset fields to -1
+  constexpr uint32_t CAN_BASE_ID        = 0x5F0;    // MS3Pro broadcast base
 
   // ---- Oil pressure: generic 5V 0.5-4.5V transducer, 150 PSI full scale ----
   // Wired through a 10k / 20k voltage divider so the 0.5-4.5V sensor output
@@ -159,7 +168,8 @@ static struct {
     char     api_key[64] = "";
     bool     rec_sd     = true;
     bool     rec_cl     = false;
-    uint8_t  inet       = 0;     // 0=Ethernet, 1=WiFi (mirror of dash setting)
+    uint8_t  inet        = 0;     // 0=Ethernet, 1=WiFi (mirror of dash setting)
+    uint8_t  sensor_type = 0;     // 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN)
 } g_cfg;
 
 // Set when the dash sends UPLOAD,CANCEL. Volatile across reboot — deliberately
@@ -223,6 +233,14 @@ static void emitCloudStatus();                    // CLD wire emit, defined belo
 static void handleQList();                        // dash-initiated upload: list queue
 static void handleQGet(const char* basename);     // dash-initiated upload: stream file
 static void handleQDel(const char* basename);     // dash-initiated upload: delete file
+static void openCanSniff();                       // CAN sniffer: open /cansniff/ file
+static void closeCanSniff();                      // CAN sniffer: flush + close
+static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf);
+static void emitCanSniffStatus();                 // CANSNIFF wire emit to dash
+// CAN sniffer state — declared early so handleDashCommand() (above pumpCAN)
+// can toggle it. Defined/used by the CAN + SD sections below.
+static bool     cansniff_active = false;
+static uint32_t cansniff_frames = 0;
 
 // TimeLib sync provider — reads the Teensy 4.1 built-in RTC.
 static time_t getTeensyTime() { return Teensy3Clock.get(); }
@@ -277,6 +295,13 @@ static void handleDashCommand(const String& line) {
     } else if (line == "SDFORMAT") {
         Serial.println(F("[teensy] SD format requested by dash"));
         formatSDCard();
+    } else if (line.startsWith("CANSNIFF,")) {
+        // Dash CAN-sniffer toggle. CANSNIFF,1 opens a capture file and logs
+        // every raw CAN frame; CANSNIFF,0 closes it.
+        const bool want = (line.substring(9).toInt() != 0);
+        if (want && !cansniff_active)      openCanSniff();
+        else if (!want && cansniff_active) closeCanSniff();
+        else                                emitCanSniffStatus();
     } else if (line.startsWith("SETTIME,")) {
         const unsigned long t = strtoul(line.c_str() + 8, nullptr, 10);
         Teensy3Clock.set((time_t)t);
@@ -435,19 +460,106 @@ static uint8_t gpsStatus() {
     return 0; // OFF — never seen a byte
 }
 
-// Tach state — averaged over whatever pulses arrived in the last sampling
-// window. FreqMeasure is interrupt-driven on pin 9 input capture; we just
-// drain its FIFO in loop().
-static double   rpm_pulse_sum   = 0.0;     // sum of period-counter ticks
-static uint32_t rpm_pulse_count = 0;       // number of periods accumulated
-static uint16_t rpm_current     = 0;       // last computed RPM
-static uint32_t rpm_last_pulse_ms = 0;     // millis() of most recent pulse
+// ---------------------------------------------------------------------------
+// Tach state — FreqMeasure on pin 9. Used in Direct sensor mode only.
+// Interrupt-driven; we drain the FIFO in loop().
+// ---------------------------------------------------------------------------
+static double   rpm_pulse_sum     = 0.0;
+static uint32_t rpm_pulse_count   = 0;
+static uint16_t rpm_current       = 0;
+static uint32_t rpm_last_pulse_ms = 0;
 
 static void pumpTach() {
     while (FreqMeasure.available()) {
         rpm_pulse_sum   += FreqMeasure.read();
         rpm_pulse_count += 1;
         rpm_last_pulse_ms = millis();
+    }
+}
+
+static uint16_t computeRpmAndReset() {
+    if (millis() - rpm_last_pulse_ms > RPM_TIMEOUT_MS) {
+        rpm_pulse_sum = 0; rpm_pulse_count = 0;
+        rpm_current = 0;
+        return 0;
+    }
+    if (rpm_pulse_count > 0) {
+        const double freq_hz = FreqMeasure.countToFrequency(rpm_pulse_sum / rpm_pulse_count);
+        const double rpm = (freq_hz * 60.0) / RPM_PULSES_PER_REV;
+        rpm_pulse_sum = 0; rpm_pulse_count = 0;
+        if (rpm < 0)          rpm_current = 0;
+        else if (rpm > 65535) rpm_current = 65535;
+        else                  rpm_current = (uint16_t)(rpm + 0.5);
+    }
+    return rpm_current;
+}
+
+// ---------------------------------------------------------------------------
+// MS3Pro CAN bus — FlexCAN_T4 on CAN1 (TX=22, RX=23).
+//
+// The MS3Pro broadcasts up to 4 frames at CAN_BASE_ID + 0..3, 8 bytes each,
+// big-endian. We parse only the frames we need:
+//
+//   0x5F0  bytes 6-7  rpm        (uint16, 1 RPM/bit)
+//   0x5F2  bytes 2-3  map_x10    (int16, kPa × 10)
+//          bytes 4-5  iat_f_x10  (int16, °F × 10 — assumes TunerStudio in °F)
+//          bytes 6-7  clt_f_x10  (int16, °F × 10 — assumes TunerStudio in °F)
+//   0x5F3  bytes 0-1  tps_x10    (int16, % × 10)
+//          bytes 2-3  bat_x10    (int16, V × 10)
+//          bytes 4-5  afr_x10    (int16, AFR × 10, e.g. 145 = 14.5:1)
+//
+// All fields default to -1 until a valid frame arrives. If no frames arrive
+// for CAN_STALE_MS the struct resets to -1 so the dash shows '---'.
+// ---------------------------------------------------------------------------
+static FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
+
+static struct CanEcu {
+    uint16_t rpm        = 0;
+    int16_t  clt_f_x10  = -1;
+    int16_t  map_x10    = -1;
+    int16_t  tps_x10    = -1;
+    int16_t  afr_x10    = -1;
+    int16_t  iat_f_x10  = -1;
+    int16_t  bat_x10    = -1;
+    uint32_t last_ms    = 0;   // millis() of most recent valid frame (any ID)
+} can_ecu;
+
+// CAN sniffer: when cansniff_active (declared near the top), EVERY frame on
+// the bus (any ID) is logged to /cansniff/cansniff_<unix>.csv on the SD card
+// so the real MS3Pro broadcast layout can be analysed offline.
+static void pumpCAN() {
+    CAN_message_t msg;
+    const uint32_t now = millis();
+    while (Can1.read(msg)) {
+        // Sniffer: capture the raw frame (any ID) before our targeted parse.
+        if (cansniff_active) {
+            cansniffLog(msg.id, msg.flags.extended, msg.len, msg.buf);
+        }
+        switch (msg.id) {
+            case CAN_BASE_ID + 0:   // 0x5F0: seconds, pw1, pw2, rpm
+                can_ecu.rpm     = ((uint16_t)msg.buf[6] << 8) | msg.buf[7];
+                can_ecu.last_ms = now;
+                break;
+            case CAN_BASE_ID + 2:   // 0x5F2: baro, map, IAT, CLT
+                can_ecu.map_x10    = (int16_t)(((uint16_t)msg.buf[2] << 8) | msg.buf[3]);
+                can_ecu.iat_f_x10  = (int16_t)(((uint16_t)msg.buf[4] << 8) | msg.buf[5]);
+                can_ecu.clt_f_x10  = (int16_t)(((uint16_t)msg.buf[6] << 8) | msg.buf[7]);
+                can_ecu.last_ms    = now;
+                break;
+            case CAN_BASE_ID + 3:   // 0x5F3: TPS, battery, AFR1, AFR2
+                can_ecu.tps_x10    = (int16_t)(((uint16_t)msg.buf[0] << 8) | msg.buf[1]);
+                can_ecu.bat_x10    = (int16_t)(((uint16_t)msg.buf[2] << 8) | msg.buf[3]);
+                can_ecu.afr_x10    = (int16_t)(((uint16_t)msg.buf[4] << 8) | msg.buf[5]);
+                can_ecu.last_ms    = now;
+                break;
+            default:
+                break;
+        }
+    }
+    // Staleness guard — if the MS3Pro goes silent, reset all fields to -1
+    // so the dash shows '---' instead of frozen last-known values.
+    if (can_ecu.last_ms != 0 && now - can_ecu.last_ms > CAN_STALE_MS) {
+        can_ecu = CanEcu{};
     }
 }
 
@@ -967,6 +1079,114 @@ static void formatSDCard() {
 }
 
 // ---------------------------------------------------------------------------
+// CAN sniffer — dumps every raw CAN frame to /cansniff/cansniff_<unix>.csv
+// so the actual MS3Pro broadcast layout can be reverse-engineered offline.
+//
+// CSV columns: t_ms,id,ext,dlc,d0,d1,d2,d3,d4,d5,d6,d7  (data bytes in hex)
+//   t_ms : millis() since sniff start (monotonic, per-capture)
+//   id   : CAN identifier in hex (e.g. 0x05F0)
+//   ext  : 1 if 29-bit extended ID, 0 if 11-bit standard
+//   dlc  : data length (0-8)
+// Flushed every ~1 s so a power loss costs at most ~1 s of frames.
+// ---------------------------------------------------------------------------
+static File32   cansniff_file;
+static bool     cansniff_file_open    = false;
+static uint32_t cansniff_start_ms     = 0;
+static uint32_t cansniff_last_flush_ms = 0;
+static char     cansniff_path[80]     = "";
+
+static void emitCanSniffStatus() {
+    const char* fname = cansniff_path[0] ? cansniff_path : "";
+    DASH_SERIAL.printf("CANSNIFF,%u,%s,%lu\n",
+                       cansniff_active ? 1 : 0, fname,
+                       (unsigned long)cansniff_frames);
+    Serial.printf("[cansniff] %s file=%s frames=%lu\n",
+                  cansniff_active ? "ACTIVE" : "STOPPED",
+                  fname, (unsigned long)cansniff_frames);
+}
+
+static void openCanSniff() {
+    cansniff_file_open     = false;
+    cansniff_frames        = 0;
+    cansniff_start_ms      = millis();
+    cansniff_last_flush_ms = millis();
+    cansniff_path[0]       = '\0';
+
+    if (sd_card_status != SD_CARD_READY) {
+        Serial.println(F("[cansniff] SD not ready — cannot start"));
+        cansniff_active = false;
+        emitCanSniffStatus();
+        return;
+    }
+    if (!sdFat.exists("/cansniff") && !sdFat.mkdir("/cansniff")) {
+        Serial.println(F("[cansniff] mkdir /cansniff failed"));
+        cansniff_active = false;
+        emitCanSniffStatus();
+        return;
+    }
+
+    const uint32_t unix = (uint32_t)::now();
+    if (unix > 1000000000UL) {
+        snprintf(cansniff_path, sizeof(cansniff_path),
+                 "/cansniff/cansniff_%lu.csv", (unsigned long)unix);
+    } else {
+        snprintf(cansniff_path, sizeof(cansniff_path),
+                 "/cansniff/cansniff_nortc_%lu.csv", (unsigned long)millis());
+    }
+    if (!cansniff_file.open(cansniff_path, O_WRITE | O_CREAT | O_TRUNC)) {
+        Serial.printf("[cansniff] open %s FAILED\n", cansniff_path);
+        cansniff_path[0] = '\0';
+        cansniff_active  = false;
+        emitCanSniffStatus();
+        return;
+    }
+    cansniff_file.print(F("t_ms,id,ext,dlc,d0,d1,d2,d3,d4,d5,d6,d7\n"));
+    cansniff_file_open = true;
+    cansniff_active    = true;
+    Serial.printf("[cansniff] opened %s\n", cansniff_path);
+    emitCanSniffStatus();
+}
+
+static void closeCanSniff() {
+    cansniff_active = false;
+    if (cansniff_file_open) {
+        cansniff_file.sync();
+        cansniff_file.close();
+        cansniff_file_open = false;
+    }
+    emitCanSniffStatus();
+    // Refresh free-MB so the dash's SD readout updates after a capture.
+    if (sd_card_status == SD_CARD_READY) {
+        const uint64_t freeSects = (uint64_t)sdFat.vol()->freeClusterCount()
+                                 * sdFat.vol()->sectorsPerCluster();
+        sd_free_mb = (uint32_t)(freeSects / 2048ULL);
+    }
+}
+
+static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf) {
+    if (!cansniff_file_open) return;
+    if (len > 8) len = 8;
+    char line[80];
+    int n = snprintf(line, sizeof(line),
+                     "%lu,0x%03lX,%u,%u",
+                     (unsigned long)(millis() - cansniff_start_ms),
+                     (unsigned long)id, ext ? 1 : 0, len);
+    for (uint8_t i = 0; i < 8; ++i) {
+        if (i < len) n += snprintf(line + n, sizeof(line) - n, ",%02X", buf[i]);
+        else         n += snprintf(line + n, sizeof(line) - n, ",");
+    }
+    n += snprintf(line + n, sizeof(line) - n, "\n");
+    cansniff_file.write((const uint8_t*)line, (size_t)n);
+    cansniff_frames++;
+
+    if (millis() - cansniff_last_flush_ms >= 1000) {
+        cansniff_last_flush_ms = millis();
+        cansniff_file.sync();
+        emitCanSniffStatus();   // 1 Hz heartbeat with live frame count
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session writer — NDJSON sample log on the SD card.
 //
 // File path: /sessions/session_<unix>_<track>.ndjson  (or session_nortc_<ms>_<track>.
@@ -1224,11 +1444,14 @@ static void handleCfgLine(const String& line) {
     else if (key == "rec_sd")   { g_cfg.rec_sd = (val.toInt() != 0); }
     else if (key == "rec_cl")   { g_cfg.rec_cl = (val.toInt() != 0); }
     else if (key == "inet") {
-        // Internet routing mode. 0=Ethernet (Teensy owns the network),
-        // 1=WiFi (CrowPanel owns it). Phase 1: only relevant for NTP — in
-        // WiFi mode the dash pushes SETTIME and we skip our own NTP retries.
-        // Phase 3 will route cloud uploads accordingly.
         g_cfg.inet = (uint8_t)val.toInt();
+    } else if (key == "srctyp") {
+        // Sensor source: 0=Direct (opto tach + ADC sensors), 1=MegaSquirt (CAN).
+        // Controls which RPM source emitToDash() uses and which coolant/AFR
+        // values are put into the ENG line.
+        g_cfg.sensor_type = (uint8_t)val.toInt();
+        Serial.printf("[cfg] sensor_type = %s\n",
+                      g_cfg.sensor_type == 0 ? "Direct" : "MegaSquirt");
     }
     else {
         Serial.printf("[cfg] unknown key %s\n", key.c_str());
@@ -1915,26 +2138,7 @@ static void cloudTick() {
     }
 }
 
-// Compute current RPM from accumulated samples, then reset the accumulator.
-// Call from emitToDash() so each emit reflects fresh data.
-static uint16_t computeRpmAndReset() {
-    if (millis() - rpm_last_pulse_ms > RPM_TIMEOUT_MS) {
-        // No pulses in a while — engine off, or wire disconnected.
-        rpm_pulse_sum = 0; rpm_pulse_count = 0;
-        rpm_current = 0;
-        return 0;
-    }
-    if (rpm_pulse_count > 0) {
-        const double freq_hz = FreqMeasure.countToFrequency(rpm_pulse_sum / rpm_pulse_count);
-        // RPM = (Hz * 60) / pulses_per_rev
-        const double rpm = (freq_hz * 60.0) / RPM_PULSES_PER_REV;
-        rpm_pulse_sum = 0; rpm_pulse_count = 0;
-        if (rpm < 0)        rpm_current = 0;
-        else if (rpm > 65535) rpm_current = 65535;
-        else                  rpm_current = (uint16_t)(rpm + 0.5);
-    }
-    return rpm_current;
-}
+
 
 void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
@@ -1968,9 +2172,18 @@ void setup() {
     DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
 
     // Tach input on pin 9 (FreqMeasure uses FlexPWM input capture on T4.x).
-    // Must be called after Serial.begin to avoid weird interactions.
+    // Active in Direct sensor mode; CAN takes over in MegaSquirt mode.
+    // Both are always initialised so switching modes at runtime is seamless.
     FreqMeasure.begin();
-    Serial.println(F("FreqMeasure on pin 9: armed"));
+    Serial.println(F("FreqMeasure on pin 9: armed (Direct RPM source)"));
+
+    // MS3Pro CAN bus on CAN1 (TX=pin 22, RX=pin 23 via SN65HVD230 transceiver).
+    Can1.begin();
+    Can1.setBaudRate(CAN_BAUD);
+    Can1.setMaxMB(16);
+    Can1.enableFIFO();
+    Serial.printf("CAN1 ready at %lu bps (MS3Pro base ID 0x%03lX)\n",
+                  (unsigned long)CAN_BAUD, (unsigned long)CAN_BASE_ID);
 
     // ADC for oil pressure (A2) and coolant temp (A3). 12-bit + 16-sample
     // hardware averaging gives a stable, noise-floor-free reading at 25 Hz.
@@ -2199,12 +2412,15 @@ static void emitToDash() {
     float   hdg_deg = have_pvt ? myGNSS.getHeading()     * 1e-5f      : 0.0f;
     uint8_t status  = gpsStatus();
 
-    // Engine RPM + analog sensors (oil PSI, coolant degF). All emitted as
-    // integers scaled x10 except RPM. -1 on the analog values signals a
-    // sensor fault to the dash (it shows '---' rather than zero).
-    uint16_t rpm          = computeRpmAndReset();
-    int16_t  oil_psi_x10  = readOilPsiX10();
-    int16_t  cool_f_x10   = readCoolantFx10();
+    // Engine data — source selected by g_cfg.sensor_type:
+    //   0 = Direct:      RPM from opto tach (FreqMeasure pin 9),
+    //                    coolant from NTC thermistor (A3)
+    //   1 = MegaSquirt:  RPM + coolant from MS3Pro CAN broadcast
+    // Oil PSI is always from the direct ADC (A2) — MS3Pro has no oil input.
+    const bool     ms3_mode    = (g_cfg.sensor_type == 1);
+    uint16_t       rpm         = ms3_mode ? can_ecu.rpm : computeRpmAndReset();
+    int16_t        oil_psi_x10 = readOilPsiX10();
+    int16_t        cool_f_x10  = ms3_mode ? can_ecu.clt_f_x10 : readCoolantFx10();
 
     // IMU — flush averaged samples and emit even when absent (zeroes keep the
     // dash parser's field count stable and make it easy to detect a missing IMU).
@@ -2226,8 +2442,21 @@ static void emitToDash() {
                   fix, sats, lat_deg, lon_deg, mph, hdg_deg, status,
                   (unsigned long)gnss_raw_bytes);
 
+    // ENG line: RPM + oil PSI + coolant — all sourced per sensor_type above.
+    // The dash RPM bar always reads eng.rpm from this line.
     DASH_SERIAL.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
-    Serial.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
+    Serial.printf("ENG,%u,%d,%d  [src=%s]\n", rpm, oil_psi_x10, cool_f_x10,
+                  ms3_mode ? "CAN" : "direct");
+    // ECU line: full MS3Pro CAN dataset. Dash uses these when sensor_type==1
+    // (MegaSquirt) for coolant temp, AFR, MAP, TPS, IAT, and battery.
+    DASH_SERIAL.printf("ECU,%u,%d,%d,%d,%d,%d,%d\n",
+                       rpm, can_ecu.clt_f_x10, can_ecu.map_x10,
+                       can_ecu.tps_x10, can_ecu.afr_x10,
+                       can_ecu.iat_f_x10, can_ecu.bat_x10);
+    Serial.printf("ECU,%u,%d,%d,%d,%d,%d,%d\n",
+                  rpm, can_ecu.clt_f_x10, can_ecu.map_x10,
+                  can_ecu.tps_x10, can_ecu.afr_x10,
+                  can_ecu.iat_f_x10, can_ecu.bat_x10);
     DASH_SERIAL.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                        ax, ay, az, gx, gy, gz);
     Serial.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
@@ -2286,8 +2515,9 @@ void loop() {
                       ntp_status);
     }
 
-    // Tach FIFO drain — interrupt-driven; we just pull samples off.
+    // Drain both RPM sources every loop; emitToDash() picks the active one.
     pumpTach();
+    pumpCAN();
 
     // Periodic SD card recheck. SDIO occasionally misses a card on boot —
     // particularly if the card was inserted while the Teensy was already
