@@ -13,8 +13,11 @@ services:
     container_name: racecar35-cloud
     restart: unless-stopped
     ports:
-      # Host:container. Change the host side if 8089 is already taken.
-      - "8089:8089"
+      # Host:container. Change the HOST side via RACECAR_HOST_PORT in .env
+      # (e.g. RACECAR_HOST_PORT=9000) — no rebuild needed, just:
+      #   docker compose up -d        (recreates the container with the new port)
+      # The container always listens on 8089 internally.
+      - "${RACECAR_HOST_PORT:-8089}:8089"
     environment:
       # If set, requests must send X-API-Key: <this value>. Leave empty during
       # initial bring-up so a fresh dash without credentials can still upload.
