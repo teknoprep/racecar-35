@@ -552,7 +552,19 @@ async def _save_body(
         sid_overridden = True
     sid = safe_name(str(sid_int), default=str(int(time.time())))
 
-    track = safe_name(x_track_name, default="UNKNOWN")
+    # Defensive cleanup so filenames stay tidy even if a client sends a
+    # filename-ish track (older firmware sent the whole SD basename here):
+    #   - drop a trailing ".ndjson" so we don't double the extension
+    #   - strip a leading "session_" prefix
+    #   - if the track still begins with "<sid>_", drop that duplicate id
+    raw_track = (x_track_name or "").strip()
+    if raw_track.lower().endswith(".ndjson"):
+        raw_track = raw_track[: -len(".ndjson")]
+    if raw_track.startswith("session_"):
+        raw_track = raw_track[len("session_"):]
+    if raw_track.startswith(f"{sid}_"):
+        raw_track = raw_track[len(sid) + 1:]
+    track = safe_name(raw_track, default="UNKNOWN")
     filename = f"{sid}_{track}.ndjson"
     out_path = session_dir_for(email) / filename
 

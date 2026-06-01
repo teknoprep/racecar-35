@@ -1428,6 +1428,34 @@ static long ufExtractSessionId(const char* filename) {
     return (long)millis();
 }
 
+// Extract the clean track name from a session filename. Files are named
+//   session_<unix>_<track>.ndjson      (or session_nortc_<ms>_<track>.ndjson)
+// so we skip the "session_" prefix + the numeric id, take what's between the
+// next '_' and the trailing ".ndjson". Writes into out (always NUL-terminated).
+// Falls back to "UNKNOWN" if the name doesn't match the expected shape.
+static void ufExtractTrack(const char* filename, char* out, size_t outsize) {
+    if (outsize == 0) return;
+    out[0] = '\0';
+    if (!filename) { strncpy(out, "UNKNOWN", outsize); out[outsize-1] = '\0'; return; }
+
+    const char* p = filename;
+    if (strncmp(p, "session_", 8) == 0) p += 8;        // skip "session_"
+    if (strncmp(p, "nortc_", 6) == 0)  p += 6;         // skip "nortc_" if present
+    // p now points at the numeric id; skip digits, then the separating '_'.
+    while (*p >= '0' && *p <= '9') ++p;
+    if (*p == '_') ++p;
+    // p now points at the track portion. Copy until ".ndjson" / end.
+    size_t n = 0;
+    while (p[n] && n + 1 < outsize) {
+        // stop at the ".ndjson" extension
+        if (p[n] == '.' && strcmp(p + n, ".ndjson") == 0) break;
+        out[n] = p[n];
+        ++n;
+    }
+    out[n] = '\0';
+    if (n == 0) { strncpy(out, "UNKNOWN", outsize); out[outsize-1] = '\0'; }
+}
+
 // Open the TCP/TLS socket to the cloud and write the HTTP request headers.
 // Body bytes are written incrementally as Q,L lines arrive. Returns true on
 // success; on failure, last_err is set and the caller should advance to the
@@ -1472,6 +1500,8 @@ static bool ufOpenStream(uint32_t content_length) {
     // round trip — which directly slows the upload.
     uf.tcp->setNoDelay(true);
     const long sid = ufExtractSessionId(uf.files[uf.files_idx].name);
+    char track[52];
+    ufExtractTrack(uf.files[uf.files_idx].name, track, sizeof(track));
     uf.tcp->printf("POST /upload HTTP/1.1\r\n");
     uf.tcp->printf("Host: %s\r\n",            s.cloud_host);
     uf.tcp->printf("Content-Type: application/x-ndjson\r\n");
@@ -1479,7 +1509,7 @@ static bool ufOpenStream(uint32_t content_length) {
     uf.tcp->printf("X-API-Key: %s\r\n",       s.cloud_auth_pass);
     uf.tcp->printf("X-User-Email: %s\r\n",    s.cloud_auth_user);
     uf.tcp->printf("X-Session-Id: %ld\r\n",   sid);
-    uf.tcp->printf("X-Track-Name: %s\r\n",    uf.files[uf.files_idx].name);
+    uf.tcp->printf("X-Track-Name: %s\r\n",    track);
     uf.tcp->printf("Connection: close\r\n");
     uf.tcp->printf("\r\n");
     uf.expected_size = content_length;
