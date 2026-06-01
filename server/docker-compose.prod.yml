@@ -1,0 +1,73 @@
+# racecar-35 cloud — PRODUCTION stack (app + Caddy auto-HTTPS).
+#
+# Use this on an internet-facing server with a real domain. Caddy terminates
+# TLS (automatic Let's Encrypt certs) and reverse-proxies to the FastAPI app,
+# which stays on the internal docker network only.
+#
+# Prereqs on the server:
+#   1. Docker + the compose plugin installed.
+#   2. DNS: RACECAR_DOMAIN -> this server's public IP.
+#   3. Firewall: TCP 80 and 443 open to the internet.
+#   4. cp .env.example .env  and fill in RACECAR_DOMAIN, ACME_EMAIL, secrets.
+#
+# Bring up:   docker compose -f docker-compose.prod.yml up -d --build
+# Logs:       docker compose -f docker-compose.prod.yml logs -f
+# Tear down:  docker compose -f docker-compose.prod.yml down
+#
+# The dash then points at:  host = RACECAR_DOMAIN, port = 443, protocol = HTTPS.
+services:
+  cloud:
+    build: .
+    container_name: racecar35-cloud
+    restart: unless-stopped
+    # No host port mapping in prod — only Caddy reaches it, over the internal
+    # docker network. (Use the dev docker-compose.yml if you want :8089 on the host.)
+    expose:
+      - "8089"
+    environment:
+      RACECAR_API_KEY: "${RACECAR_API_KEY:-}"
+      RACECAR_DATA_DIR: "/data"
+      RACECAR_SERVICE_NAME: "racecar-35 cloud"
+      RACECAR_MAX_BODY_BYTES: "67108864"
+      # OAuth for the browser UI. Behind HTTPS the redirect URI must be https://
+      GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-}"
+      GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-}"
+      GOOGLE_REDIRECT_URI: "${GOOGLE_REDIRECT_URI:-}"
+      RACECAR_SESSION_SECRET: "${RACECAR_SESSION_SECRET:-}"
+      RACECAR_ALLOWED_EMAILS: "${RACECAR_ALLOWED_EMAILS:-}"
+      # Behind HTTPS, mark session cookies Secure.
+      RACECAR_COOKIE_SECURE: "${RACECAR_COOKIE_SECURE:-1}"
+      RACECAR_SESSION_TTL_SECONDS: "${RACECAR_SESSION_TTL_SECONDS:-604800}"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request, sys; \
+              sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8089/health').status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2
+    container_name: racecar35-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"          # HTTP/3 (QUIC)
+    environment:
+      # Consumed by Caddyfile via {$RACECAR_DOMAIN} / {$ACME_EMAIL}.
+      RACECAR_DOMAIN: "${RACECAR_DOMAIN:?set RACECAR_DOMAIN in .env (e.g. racecar.api.blueuc.com)}"
+      ACME_EMAIL: "${ACME_EMAIL:-}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # persists issued certs across restarts
+      - caddy_config:/config
+    depends_on:
+      - cloud
+
+volumes:
+  caddy_data:
+  caddy_config:

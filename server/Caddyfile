@@ -1,0 +1,34 @@
+# racecar-35 cloud — Caddy reverse proxy with automatic HTTPS.
+#
+# Caddy provisions + renews a Let's Encrypt certificate for RACECAR_DOMAIN
+# automatically. Requirements on the server:
+#   - RACECAR_DOMAIN's DNS A/AAAA record points at this server's public IP
+#   - TCP ports 80 AND 443 are open to the internet (80 is needed for the
+#     ACME HTTP challenge + HTTP->HTTPS redirect; 443 serves traffic)
+#
+# The domain + ACME email come from environment variables set in the compose
+# file (which reads them from .env).
+
+{
+	# Email for Let's Encrypt expiry/security notices. Optional but recommended.
+	email {$ACME_EMAIL}
+}
+
+{$RACECAR_DOMAIN} {
+	# gzip responses (the JSON listings + HTML UI compress well).
+	encode gzip
+
+	# Allow long session uploads (matches RACECAR_MAX_BODY_BYTES on the app,
+	# 64 MB, with headroom). Reject anything larger before it hits the app.
+	request_body {
+		max_size 96MB
+	}
+
+	# Proxy everything to the FastAPI app on the internal docker network.
+	# Caddy sets X-Forwarded-* automatically; uvicorn is started with
+	# --proxy-headers so the app sees the real client IP + https scheme.
+	reverse_proxy cloud:8089
+
+	# Slightly longer read timeout for big AfterRace uploads.
+	# (Caddy streams the body; this guards against slow LTE links stalling.)
+}

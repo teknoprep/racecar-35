@@ -230,7 +230,8 @@ static void detectSD();                           // SD detect, defined below
 static void emitSdStatus();                       // SD wire emit, defined below
 static void scanQueue();                          // /queue/ walker, defined below
 static void emitCloudStatus();                    // CLD wire emit, defined below
-static void handleQList();                        // dash-initiated upload: list queue
+static void listSdContents();                     // SDLS diagnostic: dump /sessions,/queue,/cansniff
+static void handleQList();                         // dash-initiated upload: list queue
 static void handleQGet(const char* basename);     // dash-initiated upload: stream file
 static void handleQDel(const char* basename);     // dash-initiated upload: delete file
 static void openCanSniff();                       // CAN sniffer: open /cansniff/ file
@@ -415,6 +416,8 @@ static void handleUsbCommand(const String& line) {
             scanQueue();
             emitCloudStatus();
         }
+    } else if (line == "SDLS") {
+        listSdContents();   // defined after sdFat in the SD section
     } else if (line == "USBFWUPDATE") {
         // Developer/test path: push local firmware.hex directly over Teensy's
         // native USB CDC port. This bypasses GitHub + CrowPanel WiFi + UART0
@@ -1058,6 +1061,28 @@ static void emitSdStatus() {
                   sd_card_status == SD_CARD_FORMATTING ? "FORMATTING"   :
                   sd_card_status == SD_CARD_ERROR      ? "ERROR"        : "NONE",
                   (unsigned long)sd_total_mb, (unsigned long)sd_free_mb);
+}
+
+// Diagnostic: list SD directories with file sizes (triggered by USB "SDLS").
+static void listSdContents() {
+    if (!sdReady()) { Serial.println(F("[sdls] SD not ready")); return; }
+    const char* dirs[] = { "/sessions", "/queue", "/cansniff" };
+    for (const char* d : dirs) {
+        File32 dir = sdFat.open(d);
+        if (!dir || !dir.isDir()) { Serial.printf("[sdls] %s: (none)\n", d); continue; }
+        Serial.printf("[sdls] %s:\n", d);
+        File32 f;
+        int n = 0;
+        while ((f = dir.openNextFile())) {
+            char nm[80]; f.getName(nm, sizeof(nm));
+            Serial.printf("[sdls]    %-44s %10llu bytes\n", nm,
+                          (unsigned long long)f.fileSize());
+            f.close(); n++;
+        }
+        if (n == 0) Serial.println(F("[sdls]    (empty)"));
+        dir.close();
+    }
+    Serial.println(F("[sdls] done"));
 }
 
 static void formatSDCard() {
