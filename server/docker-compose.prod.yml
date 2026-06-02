@@ -20,8 +20,14 @@ services:
     build: .
     container_name: racecar35-cloud
     restart: unless-stopped
-    # No host port mapping in prod — only Caddy reaches it, over the internal
-    # docker network. (Use the dev docker-compose.yml if you want :8089 on the host.)
+    # Publish a stable HOST port (default 9000, override with RACECAR_HOST_PORT
+    # in .env) so an EXTERNAL reverse proxy (e.g. bluecloud-proxy nginx) can
+    # point at host:<port> instead of chasing the container's internal IP
+    # (which changes on every recreate -> 502 "Host is unreachable").
+    # The bundled Caddy still reaches it as cloud:8089 over the docker network,
+    # so leaving this in place is harmless even if you also run Caddy.
+    ports:
+      - "${RACECAR_HOST_PORT:-9000}:8089"
     expose:
       - "8089"
     environment:
@@ -51,10 +57,15 @@ services:
       start_period: 5s
       retries: 3
 
+  # OPTIONAL bundled reverse proxy. Only start this if you are NOT fronting the
+  # app with your own external proxy (e.g. an org nginx). It binds host 80/443,
+  # which will crash-loop if those ports are already taken. Opt in with:
+  #   docker compose -f docker-compose.prod.yml --profile caddy up -d
   caddy:
     image: caddy:2
     container_name: racecar35-caddy
     restart: unless-stopped
+    profiles: ["caddy"]
     ports:
       - "80:80"
       - "443:443"

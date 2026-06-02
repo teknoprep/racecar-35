@@ -13,11 +13,12 @@ services:
     container_name: racecar35-cloud
     restart: unless-stopped
     ports:
-      # Host:container. Change the HOST side via RACECAR_HOST_PORT in .env
-      # (e.g. RACECAR_HOST_PORT=9000) — no rebuild needed, just:
+      # Host:container. Defaults to host port 9000. Override via
+      # RACECAR_HOST_PORT in .env (e.g. RACECAR_HOST_PORT=8089) — no rebuild
+      # needed, just:
       #   docker compose up -d        (recreates the container with the new port)
       # The container always listens on 8089 internally.
-      - "${RACECAR_HOST_PORT:-8089}:8089"
+      - "${RACECAR_HOST_PORT:-9000}:8089"
     environment:
       # If set, requests must send X-API-Key: <this value>. Leave empty during
       # initial bring-up so a fresh dash without credentials can still upload.

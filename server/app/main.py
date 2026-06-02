@@ -215,8 +215,78 @@ def load_managed_users() -> dict:
             "is_admin": bool(u.get("is_admin")),
             "added_by": str(u.get("added_by") or ""),
             "added_at": int(u.get("added_at") or 0),
+            "api_key": str(u.get("api_key") or ""),
         }
     return out
+
+
+# Per-user API key for the dash firmware. 12 chars from an unambiguous-ish
+# alphanumeric alphabet (62^12 keyspace). Each allowed account gets one on
+# first login; it can be regenerated from the account page at any time.
+_API_KEY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def generate_api_key(n: int = 12) -> str:
+    return "".join(secrets.choice(_API_KEY_ALPHABET) for _ in range(n))
+
+
+def email_for_api_key(key: str) -> Optional[str]:
+    """Return the owner email for a per-user API key, or None."""
+    key = (key or "").strip()
+    if not key:
+        return None
+    for email, u in load_managed_users().items():
+        stored = str(u.get("api_key") or "")
+        if stored and hmac.compare_digest(stored, key):
+            return email
+    return None
+
+
+def ensure_user_record(email: str) -> dict:
+    """Guarantee an allowed account has a persisted record + API key.
+
+    Called on every successful login so a brand-new (or pre-existing env)
+    account always has a 12-char key ready the first time it signs in.
+    """
+    email = (email or "").strip().lower()
+    if not email:
+        return {}
+    users = load_managed_users()
+    u = users.get(email)
+    changed = False
+    if u is None:
+        u = {
+            "email": email,
+            "is_admin": False,
+            "added_by": "auto (first login)",
+            "added_at": int(time.time()),
+            "api_key": generate_api_key(),
+        }
+        users[email] = u
+        changed = True
+    elif not u.get("api_key"):
+        u["api_key"] = generate_api_key()
+        users[email] = u
+        changed = True
+    if changed:
+        save_managed_users(users)
+    return u
+
+
+def refresh_user_api_key(email: str) -> str:
+    """Regenerate (or create) the API key for an account and persist it."""
+    email = (email or "").strip().lower()
+    users = load_managed_users()
+    u = users.get(email) or {
+        "email": email,
+        "is_admin": False,
+        "added_by": "auto (first login)",
+        "added_at": int(time.time()),
+    }
+    u["api_key"] = generate_api_key()
+    users[email] = u
+    save_managed_users(users)
+    return u["api_key"]
 
 
 def save_managed_users(users: dict) -> None:
