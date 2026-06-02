@@ -31,6 +31,8 @@ services:
       GOOGLE_REDIRECT_URI: "${GOOGLE_REDIRECT_URI:-}"
       RACECAR_SESSION_SECRET: "${RACECAR_SESSION_SECRET:-}"
       RACECAR_ALLOWED_EMAILS: "${RACECAR_ALLOWED_EMAILS:-}"
+      # Bootstrap admin(s) for the /admin portal. Always allowed + always admin.
+      RACECAR_ADMIN_EMAILS: "${RACECAR_ADMIN_EMAILS:-}"
       RACECAR_COOKIE_SECURE: "${RACECAR_COOKIE_SECURE:-0}"
       RACECAR_SESSION_TTL_SECONDS: "${RACECAR_SESSION_TTL_SECONDS:-604800}"
       # Reject any body larger than this many bytes. 64 MB is generous for an

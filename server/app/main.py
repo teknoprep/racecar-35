@@ -72,6 +72,15 @@ ALLOWED_EMAILS = {
     for e in os.environ.get("RACECAR_ALLOWED_EMAILS", "").split(",")
     if e.strip()
 }
+# Bootstrap admins. These accounts can always sign in and always have admin
+# rights, even before the on-disk users file exists. The admin portal lets
+# them add more authorized accounts and grant/revoke admin to those accounts.
+# Bootstrap admins themselves can only be changed by editing this env var.
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("RACECAR_ADMIN_EMAILS", "").split(",")
+    if e.strip()
+}
 SESSION_COOKIE = "racecar_session"
 OAUTH_STATE_COOKIE = "racecar_oauth_state"
 OAUTH_NEXT_COOKIE = "racecar_oauth_next"
@@ -81,6 +90,9 @@ SESSION_SECRET = os.environ.get("RACECAR_SESSION_SECRET", "").strip() or API_KEY
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 (DATA_DIR / "sessions").mkdir(parents=True, exist_ok=True)
+# Persistent allowlist managed from the admin portal (separate from the static
+# env vars above). Stored next to the session data so it survives rebuilds.
+USERS_FILE = DATA_DIR / "users.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -168,6 +180,91 @@ def display_epoch_for(p: pathlib.Path) -> int:
 
 def oauth_enabled() -> bool:
     return bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+
+# ---------------------------------------------------------------------------
+# Managed allowlist + admin model
+#
+# Two layers stack on top of each other:
+#   1. Static env vars (RACECAR_ADMIN_EMAILS, RACECAR_ALLOWED_EMAILS) — these
+#      are the bootstrap set and can only be changed by editing .env.
+#   2. A JSON file (USERS_FILE) the admin portal reads + writes at runtime so
+#      admins can add/remove authorized Google accounts without a redeploy.
+#
+# An account may sign in if the allowlist is "active" (any of the above is
+# populated) and its email is in the union of all three sources. If nothing is
+# configured, the server stays in open dev mode (any verified Google account).
+# ---------------------------------------------------------------------------
+def load_managed_users() -> dict:
+    """Return {email: {email, is_admin, added_by, added_at}} from USERS_FILE."""
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    users = data.get("users", []) if isinstance(data, dict) else []
+    out: dict = {}
+    for u in users:
+        if not isinstance(u, dict):
+            continue
+        email = str(u.get("email", "")).strip().lower()
+        if not email:
+            continue
+        out[email] = {
+            "email": email,
+            "is_admin": bool(u.get("is_admin")),
+            "added_by": str(u.get("added_by") or ""),
+            "added_at": int(u.get("added_at") or 0),
+        }
+    return out
+
+
+def save_managed_users(users: dict) -> None:
+    """Atomically persist the managed users dict back to USERS_FILE."""
+    payload = {"users": sorted(users.values(), key=lambda u: u["email"])}
+    tmp = USERS_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    tmp.replace(USERS_FILE)
+
+
+def allowlist_active() -> bool:
+    """True when sign-in is restricted to an explicit allowlist."""
+    return bool(ADMIN_EMAILS or ALLOWED_EMAILS or load_managed_users())
+
+
+def allowed_emails() -> set:
+    """Union of every email permitted to sign in."""
+    return set(ADMIN_EMAILS) | set(ALLOWED_EMAILS) | set(load_managed_users().keys())
+
+
+def is_allowed_email(email: str) -> bool:
+    email = (email or "").lower()
+    if not allowlist_active():
+        return True  # open dev mode
+    return email in allowed_emails()
+
+
+def is_admin_email(email: str) -> bool:
+    email = (email or "").lower()
+    if not email:
+        return False
+    if email in ADMIN_EMAILS:
+        return True
+    u = load_managed_users().get(email)
+    return bool(u and u["is_admin"])
+
+
+def require_admin(request: Request) -> dict:
+    """Gate admin-portal routes: must be a logged-in admin Google account."""
+    if not oauth_enabled():
+        raise HTTPException(status_code=403, detail="admin portal requires Google OAuth to be configured")
+    user = current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="login required")
+    if not is_admin_email(str(user.get("email", ""))):
+        raise HTTPException(status_code=403, detail="admin access required")
+    return user
 
 
 def _b64url(data: bytes) -> str:
@@ -475,8 +572,8 @@ async def auth_google_callback(
     verified = user.get("email_verified") in (True, "true", "True", "1", 1)
     if not email or not verified:
         return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", "Google account email is not verified"), status_code=403)
-    if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
-        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", f"{html.escape(email)} is not allowed"), status_code=403)
+    if not is_allowed_email(email):
+        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", f"{html.escape(email)} is not authorized. Ask an admin to add your account."), status_code=403)
 
     next_url = request.cookies.get(OAUTH_NEXT_COOKIE, "/")
     if not next_url.startswith("/") or next_url.startswith("//"):
@@ -500,7 +597,144 @@ async def logout() -> RedirectResponse:
 @app.get("/me")
 async def me(request: Request) -> dict:
     user = current_user(request)
-    return {"oauth_enabled": oauth_enabled(), "user": user}
+    return {
+        "oauth_enabled": oauth_enabled(),
+        "user": user,
+        "is_admin": is_admin_email(str((user or {}).get("email", ""))),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Admin portal
+# ---------------------------------------------------------------------------
+def _admin_rows_html(self_email: str) -> str:
+    self_email = (self_email or "").lower()
+
+    def you_badge(em: str) -> str:
+        return ' <span class="badge env">you</span>' if em == self_email else ''
+
+    def env_row(em: str, is_admin: bool) -> str:
+        em_h = html.escape(em)
+        role = ('<span class="badge admin">admin</span>' if is_admin
+                else '<span class="badge">user</span>')
+        return (f"<tr><td class=mono>{em_h}{you_badge(em)}</td>"
+                f"<td>{role} <span class='badge env'>env</span></td>"
+                f"<td class=mono>.env</td>"
+                f"<td><span style='color:var(--muted)'>locked</span></td></tr>")
+
+    def managed_row(em: str, u: dict) -> str:
+        em_h = html.escape(em)
+        is_admin = u["is_admin"]
+        role = ('<span class="badge admin">admin</span>' if is_admin
+                else '<span class="badge">user</span>')
+        added_by = html.escape(u.get("added_by") or "")
+        toggle_label = 'revoke admin' if is_admin else 'make admin'
+        return (f"<tr><td class=mono>{em_h}{you_badge(em)}</td>"
+                f"<td>{role}</td>"
+                f"<td class=mono>{added_by}</td>"
+                f"<td><div class='row-actions'>"
+                f"<button class='btn' data-act='toggle' data-admin='{1 if is_admin else 0}' data-email='{em_h}'>{toggle_label}</button>"
+                f"<button class='btn danger' data-act='remove' data-email='{em_h}'>remove</button>"
+                f"</div></td></tr>")
+
+    rows: list[str] = []
+    seen: set = set()
+    for em in sorted(ADMIN_EMAILS):
+        rows.append(env_row(em, True))
+        seen.add(em)
+    for em in sorted(ALLOWED_EMAILS):
+        if em in seen:
+            continue
+        rows.append(env_row(em, False))
+        seen.add(em)
+    for em, u in sorted(load_managed_users().items()):
+        if em in seen:  # bootstrap env entry wins; don't double-list
+            continue
+        rows.append(managed_row(em, u))
+    if not rows:
+        return ('<tr><td colspan="4" class="empty" '
+                'style="color:var(--muted);font-style:italic;text-align:center">'
+                'no authorized accounts yet</td></tr>')
+    return "\n".join(rows)
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request) -> Response:
+    if not oauth_enabled():
+        return HTMLResponse(_ADMIN_DISABLED_HTML, status_code=400)
+    user = current_user(request)
+    if not user:
+        return login_redirect(request)
+    self_email = str(user.get("email", ""))
+    if not is_admin_email(self_email):
+        return HTMLResponse(
+            _LOGIN_ERROR_HTML.replace("__ERROR__", "Admin access is required for this page."),
+            status_code=403,
+        )
+    page = (_ADMIN_HTML
+            .replace("__USER_CHIP__", _user_chip_html(user))
+            .replace("__ROWS__", _admin_rows_html(self_email))
+            .replace("__SELF__", html.escape(self_email.lower())))
+    return HTMLResponse(page)
+
+
+@app.get("/admin/users")
+async def admin_list_users(request: Request) -> dict:
+    """JSON view of the access model (for tooling / debugging)."""
+    require_admin(request)
+    return {
+        "bootstrap_admins": sorted(ADMIN_EMAILS),
+        "env_allowed": sorted(ALLOWED_EMAILS),
+        "managed": sorted(load_managed_users().values(), key=lambda u: u["email"]),
+        "allowlist_active": allowlist_active(),
+    }
+
+
+@app.post("/admin/users")
+async def admin_upsert_user(request: Request) -> JSONResponse:
+    """Add an authorized account, or change its admin flag (idempotent upsert)."""
+    admin = require_admin(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    email = str(body.get("email", "")).strip().lower()
+    is_admin = bool(body.get("is_admin"))
+    if not email or "@" not in email or " " in email:
+        raise HTTPException(status_code=422, detail="a valid email is required")
+    if email in ADMIN_EMAILS:
+        raise HTTPException(status_code=409, detail="that account is a bootstrap admin (set in .env) and can't be edited here")
+    users = load_managed_users()
+    existing = users.get(email)
+    users[email] = {
+        "email": email,
+        "is_admin": is_admin,
+        "added_by": (existing or {}).get("added_by") or str(admin.get("email", "")).lower(),
+        "added_at": (existing or {}).get("added_at") or int(time.time()),
+    }
+    save_managed_users(users)
+    log.info("admin %s %s user %s (admin=%s)", admin.get("email"),
+             "updated" if existing else "added", email, is_admin)
+    return JSONResponse({"ok": True, "email": email, "is_admin": is_admin})
+
+
+@app.post("/admin/users/delete")
+async def admin_delete_user(request: Request) -> JSONResponse:
+    admin = require_admin(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    email = str(body.get("email", "")).strip().lower()
+    if email in ADMIN_EMAILS:
+        raise HTTPException(status_code=409, detail="bootstrap admins can't be removed here (edit .env)")
+    users = load_managed_users()
+    if email not in users:
+        raise HTTPException(status_code=404, detail="no such managed account")
+    del users[email]
+    save_managed_users(users)
+    log.info("admin %s removed user %s", admin.get("email"), email)
+    return JSONResponse({"ok": True, "removed": email})
 
 
 @app.get("/health")
@@ -947,6 +1181,114 @@ _LOGIN_ERROR_HTML = f"""<!doctype html>
   </section>
 </body></html>"""
 
+_ADMIN_EXTRA_CSS = """
+  main { padding: var(--sp-lg); max-width: 1100px; margin: 0 auto; }
+  table { width:100%; border-collapse:separate; border-spacing:0;
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); overflow:hidden; }
+  th,td { padding:12px 14px; font-size:13px; text-align:left;
+    border-bottom:1px solid var(--line); }
+  th { background:var(--surface-2); color:var(--muted); font-weight:600;
+    text-transform:uppercase; letter-spacing:0.08em; font-size:11px; }
+  tbody tr:last-child td { border-bottom:none; }
+  tbody tr:hover { background: rgba(255,176,32,0.05); }
+  .row-actions { display:flex; gap:var(--sp-sm); }
+  .panel { background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); padding:var(--sp-md); margin-bottom:var(--sp-lg); }
+  .add-grid { display:grid; grid-template-columns:1fr auto auto; gap:var(--sp-md);
+    align-items:center; }
+  @media (max-width:640px){ .add-grid { grid-template-columns:1fr; } }
+  .chk { display:inline-flex; align-items:center; gap:8px; color:var(--muted);
+    font:600 11px/1 var(--ff-ui); letter-spacing:0.08em; text-transform:uppercase;
+    white-space:nowrap; cursor:pointer; }
+  .badge { display:inline-flex; padding:3px 9px; border-radius:var(--r-full);
+    font:600 10px/1.4 var(--ff-ui); letter-spacing:0.06em; text-transform:uppercase;
+    background:var(--surface-2); color:var(--muted); }
+  .badge.admin { background:rgba(255,176,32,0.15); color:var(--primary); }
+  .badge.env { background:var(--surface-3); color:var(--muted); }
+  .btn.danger { color:var(--bad); }
+  .msg { display:none; margin-bottom:var(--sp-md); padding:10px var(--sp-md);
+    border-radius:var(--r-sm); font-size:13px; }
+  .msg.bad { display:block; background:rgba(255,93,93,0.1); color:var(--bad);
+    border:1px solid rgba(255,93,93,0.3); }
+"""
+
+_ADMIN_HTML = (
+    """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>admin \u00b7 racecar-35</title>
+""" + _FONTS_LINK + "<style>" + _BASE_CSS + _ADMIN_EXTRA_CSS + """</style></head><body>
+<header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
+  <span class="crumbs"><a href="/">sessions</a> &rsaquo; admin</span>
+  <span style="flex:1"></span>__USER_CHIP__</header>
+<main>
+  <div id="msg" class="msg"></div>
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:var(--sp-md)">Add authorized account</div>
+    <div class="add-grid">
+      <input id="newEmail" type="text" placeholder="name@gmail.com" autocomplete="off" spellcheck="false">
+      <label class="chk"><input id="newAdmin" type="checkbox"> grant admin</label>
+      <button class="btn primary" id="addBtn">add account</button>
+    </div>
+  </section>
+  <table><thead><tr><th>email</th><th>role</th><th>added by</th><th>actions</th></tr></thead>
+  <tbody id="rows">__ROWS__</tbody></table>
+  <p class="summary" style="color:var(--muted);margin-top:var(--sp-md);font-size:12px">
+    Bootstrap admins come from <span class="mono">RACECAR_ADMIN_EMAILS</span> in
+    <span class="mono">.env</span> and can't be edited from here. Everyone else
+    listed below can sign in with Google; "admin" accounts can also open this page.</p>
+</main>
+<script>
+(function(){
+  var self = "__SELF__";
+  var msg = document.getElementById('msg');
+  function show(t){ msg.className='msg bad'; msg.textContent=t; }
+  async function post(url, payload){
+    var r = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    var d = await r.json().catch(function(){return {};});
+    if(!r.ok) throw new Error((d && d.detail) || ('HTTP '+r.status));
+    return d;
+  }
+  document.getElementById('addBtn').addEventListener('click', async function(){
+    var email=(document.getElementById('newEmail').value||'').trim().toLowerCase();
+    var is_admin=document.getElementById('newAdmin').checked;
+    if(!email || email.indexOf('@')<0){ show('Enter a valid email address.'); return; }
+    try{ await post('/admin/users',{email:email,is_admin:is_admin}); location.reload(); }
+    catch(e){ show('Add failed: '+e.message); }
+  });
+  document.getElementById('newEmail').addEventListener('keydown', function(e){
+    if(e.key==='Enter') document.getElementById('addBtn').click();
+  });
+  document.addEventListener('click', async function(ev){
+    var t=ev.target.closest('[data-act]'); if(!t) return;
+    var email=t.dataset.email, act=t.dataset.act;
+    try{
+      if(act==='remove'){
+        if(!confirm('Remove '+email+'?\\n\\nThey will no longer be able to sign in.')) return;
+        await post('/admin/users/delete',{email:email});
+      } else if(act==='toggle'){
+        await post('/admin/users',{email:email, is_admin: t.dataset.admin!=='1'});
+      }
+      location.reload();
+    }catch(e){ show('Action failed: '+e.message); }
+  });
+})();
+</script>
+</body></html>"""
+)
+
+_ADMIN_DISABLED_HTML = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>admin unavailable</title>
+{_FONTS_LINK}<style>{_BASE_CSS}{_LOGIN_EXTRA_CSS}</style></head><body>
+  <section class="login-card">
+    <div class="pill">dev open</div>
+    <h1 class="t-display" style="margin-top:14px">Admin portal is unavailable</h1>
+    <p>The admin portal needs Google OAuth configured. Set <code>GOOGLE_CLIENT_ID</code>,
+       <code>GOOGLE_CLIENT_SECRET</code>, and at least one
+       <code>RACECAR_ADMIN_EMAILS</code> entry in <code>server/.env</code>, then restart.</p>
+    <a class="btn primary" href="/">back to sessions</a>
+  </section>
+</body></html>"""
+
 _INDEX_HEAD = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -1150,7 +1492,10 @@ def _user_chip_html(user: Optional[dict]) -> str:
     if not user:
         return '<a class="btn primary" href="/login">sign in</a>'
     email = html.escape(str(user.get("email", "")))
-    return f'<span class="pill good">{email}</span><a class="btn" href="/logout">logout</a>'
+    admin_link = ''
+    if is_admin_email(str(user.get("email", ""))):
+        admin_link = '<a class="btn" href="/admin">admin</a>'
+    return f'<span class="pill good">{email}</span>{admin_link}<a class="btn" href="/logout">logout</a>'
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -19,7 +19,31 @@ LAN IP of the host running the container.
 | GET    | `/sessions`                 | JSON listing of all saved sessions.            |
 | GET    | `/sessions/<user>/<file>`   | Download one session file.                     |
 | GET    | `/health`                   | Healthcheck for Docker / nginx. Returns `{"ok":true}`. |
+| GET    | `/admin`                    | Admin portal (admins only): add authorized Gmail accounts, grant/revoke admin. |
+| POST   | `/admin/users`              | Add an account or change its admin flag (JSON `{email, is_admin}`). Admins only. |
+| POST   | `/admin/users/delete`       | Remove a managed account (JSON `{email}`). Admins only. |
 | GET    | `/docs`                     | OpenAPI / Swagger UI for poking around.        |
+
+## Access control / admin portal
+
+There are three layers, lowest to highest precedence for *display*, but all
+additive for *who may sign in*:
+
+1. `RACECAR_ADMIN_EMAILS` (env) — **bootstrap admins**. Always allowed to sign
+   in, always admin, and the only accounts that can use `/admin` on a fresh
+   deploy. Editable only by changing `.env` + restarting.
+2. `RACECAR_ALLOWED_EMAILS` (env) — optional legacy static allowlist (non-admin).
+3. **Managed accounts** added from the `/admin` portal at runtime, persisted to
+   `/data/users.json` (survives rebuilds; no redeploy needed to add a driver).
+
+If **none** of the three are set, the server stays in open dev mode (any
+verified Google account can sign in). Setting `RACECAR_ADMIN_EMAILS` activates
+the allowlist: only listed/managed accounts can sign in from then on.
+
+The `/admin` link appears in the header for admin accounts. From there an admin
+can add a Gmail address (optionally as admin) and toggle/remove any
+portal-managed account. Bootstrap admins show as `locked` and can't be edited
+from the UI.
 
 ## Request headers honored
 
