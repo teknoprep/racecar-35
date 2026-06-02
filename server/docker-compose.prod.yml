@@ -1,35 +1,29 @@
-# racecar-35 cloud — PRODUCTION stack (app + Caddy auto-HTTPS).
+# racecar-35 cloud — PRODUCTION stack (app only).
 #
-# Use this on an internet-facing server with a real domain. Caddy terminates
-# TLS (automatic Let's Encrypt certs) and reverse-proxies to the FastAPI app,
-# which stays on the internal docker network only.
+# The app listens on the host port (default 9000) and is fronted by an
+# EXTERNAL reverse proxy (e.g. nginx) that terminates TLS for RACECAR_DOMAIN
+# and proxies to http://<host>:<port>.
 #
 # Prereqs on the server:
 #   1. Docker + the compose plugin installed.
-#   2. DNS: RACECAR_DOMAIN -> this server's public IP.
-#   3. Firewall: TCP 80 and 443 open to the internet.
-#   4. cp .env.example .env  and fill in RACECAR_DOMAIN, ACME_EMAIL, secrets.
+#   2. DNS: RACECAR_DOMAIN -> the reverse proxy's public IP.
+#   3. The external proxy forwards RACECAR_DOMAIN -> http://<this-host>:<RACECAR_HOST_PORT>.
+#   4. cp .env.example .env  and fill in secrets (+ RACECAR_HOST_PORT if not 9000).
 #
 # Bring up:   docker compose -f docker-compose.prod.yml up -d --build
 # Logs:       docker compose -f docker-compose.prod.yml logs -f
 # Tear down:  docker compose -f docker-compose.prod.yml down
-#
-# The dash then points at:  host = RACECAR_DOMAIN, port = 443, protocol = HTTPS.
 services:
   cloud:
     build: .
     container_name: racecar35-cloud
     restart: unless-stopped
     # Publish a stable HOST port (default 9000, override with RACECAR_HOST_PORT
-    # in .env) so an EXTERNAL reverse proxy (e.g. bluecloud-proxy nginx) can
-    # point at host:<port> instead of chasing the container's internal IP
-    # (which changes on every recreate -> 502 "Host is unreachable").
-    # The bundled Caddy still reaches it as cloud:8089 over the docker network,
-    # so leaving this in place is harmless even if you also run Caddy.
+    # in .env) so the external reverse proxy can point at host:<port> instead of
+    # chasing the container's internal IP (which changes on every recreate ->
+    # 502 "Host is unreachable").
     ports:
       - "${RACECAR_HOST_PORT:-9000}:8089"
-    expose:
-      - "8089"
     environment:
       RACECAR_API_KEY: "${RACECAR_API_KEY:-}"
       RACECAR_DATA_DIR: "/data"
@@ -43,7 +37,7 @@ services:
       RACECAR_ALLOWED_EMAILS: "${RACECAR_ALLOWED_EMAILS:-}"
       # Bootstrap admin(s) for the /admin portal. Always allowed + always admin.
       RACECAR_ADMIN_EMAILS: "${RACECAR_ADMIN_EMAILS:-}"
-      # Behind HTTPS, mark session cookies Secure.
+      # Behind HTTPS (TLS terminated at the external proxy), mark cookies Secure.
       RACECAR_COOKIE_SECURE: "${RACECAR_COOKIE_SECURE:-1}"
       RACECAR_SESSION_TTL_SECONDS: "${RACECAR_SESSION_TTL_SECONDS:-604800}"
     volumes:
@@ -56,31 +50,3 @@ services:
       timeout: 5s
       start_period: 5s
       retries: 3
-
-  # OPTIONAL bundled reverse proxy. Only start this if you are NOT fronting the
-  # app with your own external proxy (e.g. an org nginx). It binds host 80/443,
-  # which will crash-loop if those ports are already taken. Opt in with:
-  #   docker compose -f docker-compose.prod.yml --profile caddy up -d
-  caddy:
-    image: caddy:2
-    container_name: racecar35-caddy
-    restart: unless-stopped
-    profiles: ["caddy"]
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"          # HTTP/3 (QUIC)
-    environment:
-      # Consumed by Caddyfile via {$RACECAR_DOMAIN} / {$ACME_EMAIL}.
-      RACECAR_DOMAIN: "${RACECAR_DOMAIN:?set RACECAR_DOMAIN in .env (e.g. racecar.api.blueuc.com)}"
-      ACME_EMAIL: "${ACME_EMAIL:-}"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data        # persists issued certs across restarts
-      - caddy_config:/config
-    depends_on:
-      - cloud
-
-volumes:
-  caddy_data:
-  caddy_config:
