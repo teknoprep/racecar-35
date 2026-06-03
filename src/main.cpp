@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.43"
+#define FIRMWARE_VERSION "0.1.44"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2502,15 +2502,26 @@ static void emitToDash() {
     float   hdg_deg = have_pvt ? myGNSS.getHeading()     * 1e-5f      : 0.0f;
     uint8_t status  = gpsStatus();
 
-    // Engine data — source selected by g_cfg.sensor_type:
+    // Engine data — source selected by g_cfg.sensor_type, with an AUTO override:
     //   0 = Direct:      RPM from opto tach (FreqMeasure pin 9),
     //                    coolant from NTC thermistor (A3)
     //   1 = MegaSquirt:  RPM + coolant from MS3Pro CAN broadcast
     // Oil PSI is always from the direct ADC (A2) — MS3Pro has no oil input.
-    const bool     ms3_mode    = (g_cfg.sensor_type == 1);
-    uint16_t       rpm         = ms3_mode ? can_ecu.rpm : computeRpmAndReset();
+    //
+    // AUTO-PREFER-CAN: if live MS3 CAN frames are arriving (0x5E8 fresh within
+    // CAN_STALE_MS), use the CAN RPM/coolant for the ENG line EVEN in Direct
+    // mode. This makes RPM/coolant "just work" the moment the transceiver sees
+    // the bus, without the user having to flip Settings -> Sensor Type. If CAN
+    // goes silent we fall straight back to the direct opto-tach / NTC sources.
+    // We always drain both sources every cycle so the fallback is seamless.
+    const bool can_live = (can_ecu.last_ms != 0)
+                          && (millis() - can_ecu.last_ms <= CAN_STALE_MS);
+    const bool use_can  = (g_cfg.sensor_type == 1) || can_live;
+    const uint16_t directRpm  = computeRpmAndReset();   // always drain FreqMeasure
+    const int16_t  directCool = readCoolantFx10();       // always keep EMA warm
+    uint16_t       rpm         = use_can ? can_ecu.rpm       : directRpm;
     int16_t        oil_psi_x10 = readOilPsiX10();
-    int16_t        cool_f_x10  = ms3_mode ? can_ecu.clt_f_x10 : readCoolantFx10();
+    int16_t        cool_f_x10  = use_can ? can_ecu.clt_f_x10 : directCool;
 
     // IMU — flush averaged samples and emit even when absent (zeroes keep the
     // dash parser's field count stable and make it easy to detect a missing IMU).
@@ -2536,7 +2547,7 @@ static void emitToDash() {
     // The dash RPM bar always reads eng.rpm from this line.
     DASH_SERIAL.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
     Serial.printf("ENG,%u,%d,%d  [src=%s]\n", rpm, oil_psi_x10, cool_f_x10,
-                  ms3_mode ? "CAN" : "direct");
+                  use_can ? (g_cfg.sensor_type == 1 ? "CAN" : "CAN(auto)") : "direct");
     // ECU line: full MS3Pro CAN dataset. Dash uses these when sensor_type==1
     // (MegaSquirt) for coolant temp, AFR, MAP, TPS, IAT, and battery.
     DASH_SERIAL.printf("ECU,%u,%d,%d,%d,%d,%d,%d\n",
