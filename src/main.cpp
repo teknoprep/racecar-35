@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.54"
+#define FIRMWARE_VERSION "0.1.55"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -615,23 +615,15 @@ static void canDiagReport() {
     CAN_error_t err;
     const bool have_err = Can1.error(err, false);
 
-    // --- One-time TX/ACK self-test ------------------------------------------
-    // Decisive: can the Teensy actually transmit a frame and get it ACKed? On a
-    // healthy 2-node bus the MS3 will ACK our frame. If our TX path is dead the
-    // transmit can't complete -> TX_ERR pegs / bus-off within ~1s; we detect
-    // that and re-init so RX resumes. Evaluate BEFORE (re)sending so the two
-    // phases never collide in one report cycle.
-    if (can_tx_test_state == 1) {
-        const bool failed = have_err && (err.TX_ERR_COUNTER >= 96 ||
-                            strstr((char*)err.FLT_CONF, "Bus off") != NULL);
-        can_tx_test_result = failed ? 2 : 1;
-        can_tx_test_state  = 2;
-        if (failed) canBegin();   // clear bus-off so reception continues
-    } else if (can_tx_test_state == 0 && can_diag.rx_total > 20) {
-        CAN_message_t t; t.id = 0x100; t.len = 1; t.buf[0] = 0x5A;
-        Can1.write(t);           // unused ID, harmless to the ECU
-        can_tx_test_state = 1;
-    }
+    // TX/ACK self-test REMOVED (v0.1.55). v0.1.54 transmitted a probe frame to
+    // test the ACK path; on this bus the transmit can't complete, so the node
+    // bus-offed and reception died ("now I'm getting nothing"). That outcome is
+    // itself the proof: a working TX path would have sent one frame, gotten
+    // ACKed, and kept running. Since transmitting kills the bus, the Teensy's
+    // transmit/transceiver path is dead. There is NO firmware fix for that, so
+    // we go back to STRICTLY PASSIVE listening and never transmit again — that
+    // restores reception of whatever the MS3 puts on the wire.
+    (void)can_tx_test_state; (void)can_tx_test_result;
 
     const uint32_t dpct = can_diag.rx_window ? (can_diag.dup_window * 100UL / can_diag.rx_window) : 0;
     Serial.printf("CANDIAG frames/s=%lu dup=%lu%% total=%lu base_hits=%u ids=[%s] "
@@ -643,9 +635,6 @@ static void canDiagReport() {
                   have_err ? err.FRM_ERR : 0, have_err ? err.STF_ERR : 0,
                   have_err ? err.TX_ERR_COUNTER : 0, have_err ? err.RX_ERR_COUNTER : 0,
                   have_err ? (char*)err.FLT_CONF : "?");
-    Serial.printf("CANDIAG txtest=%s\n",
-                  can_tx_test_result == 1 ? "PASS" :
-                  can_tx_test_result == 2 ? "FAIL" : "...");
     // Also surface it on the dash link so it can be shown without a USB cable.
     // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>,<RXerr>,<txtest>
     DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u,%u,%u\n",
