@@ -18,6 +18,7 @@ LAN IP of the host running the container.
 | GET    | `/`                         | HTML index of the sessions you're allowed to see (see *Session visibility*). |
 | GET    | `/sessions`                 | JSON listing of the sessions you're allowed to see. |
 | GET    | `/sessions/<user>/<file>`   | Download one session file.                     |
+| GET    | `/sessions/<user>/<file>/laps` | Auto-detected lap list + times for the review UI (JSON). Start/finish is detected from the GPS trace — no track table needed. |
 | GET    | `/health`                   | Healthcheck for Docker / nginx. Returns `{"ok":true}`. |
 | GET    | `/account`                  | Per-user account page (any signed-in user): view + copy + refresh your upload API key. |
 | GET    | `/account/apikey`           | JSON `{email, api_key}` for the signed-in user (creates a key if missing). |
@@ -151,6 +152,32 @@ INFO racecar.cloud: received 192.168.1.123 mode=w email=anon session=1714... tra
 ```
 
 And opening `http://<host>:8089/` in a browser shows the new session in the table.
+
+## Lap detection + review page
+
+The review page (`/review/<user>/<file>`) shows a **lap table** and a
+**delta-vs-best trace** in addition to the map / playback / G-meter.
+
+Laps are detected server-side (`/sessions/<user>/<file>/laps`) straight from
+the GPS trace — the cloud has no track table, so it **auto-detects the
+start/finish line**: it anchors on the first moving fix, then closes a lap
+each time the car returns within 40 m of that anchor (after leaving by >80 m),
+guarded by a 20 s minimum lap time. Lap boundaries come back as
+seconds-from-start so the browser can map them onto its sample array at any
+stride. Constants live at the top of `_detect_laps()` in `app/main.py`
+(`_LAP_RADIUS_KM`, `_LAP_MIN_SEC`, `_LAP_MOVING_MPH`).
+
+On the page:
+- the **lap table** lists every lap with its time, gap to best, and max speed;
+  the fastest lap is highlighted.
+- clicking a lap highlights it on the map (best lap overlaid as a dashed green
+  ghost), jumps playback to the lap start, and redraws the **delta trace** —
+  a distance-aligned time delta of the selected lap vs the best lap (below
+  zero / green = faster, above / red = slower).
+
+The dash firmware does its own on-car lap timing (predictive lap time + live
+delta vs the session best, shown in the middle column of the dash). The cloud
+view is the post-session analysis counterpart.
 
 ## Behind nginx (production)
 

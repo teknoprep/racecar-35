@@ -216,6 +216,7 @@ namespace {
     LGFX_Sprite spr_gps(&tft);         // GPS status value (right column)
     LGFX_Sprite spr_pred(&tft);        // predictive lap time (middle column)
     LGFX_Sprite spr_lap(&tft);         // last lap time (middle column)
+    LGFX_Sprite spr_delta(&tft);       // predictive delta vs best lap (middle column)
     LGFX_Sprite spr_track_name(&tft);  // active track name under TRACK btn
     LGFX_Sprite spr_recbtn(&tft);      // START/STOP button face
     LGFX_Sprite spr_upbtn(&tft);       // manual queue-upload button
@@ -243,6 +244,7 @@ static void setupDashSprites() {
         mk(spr_gps,        110, 24)  &&
         mk(spr_pred,       110, 24)  &&
         mk(spr_lap,        110, 24)  &&
+        mk(spr_delta,      110, 24)  &&
         mk(spr_track_name, 320, 22)  &&
         mk(spr_recbtn,     160, 70)  &&
         mk(spr_upbtn,      180, 70);
@@ -436,6 +438,8 @@ struct LapTimer {
 
     uint32_t last_lap_ms     = 0;     // most recent completed lap time (0 = none)
     float    last_lap_dist   = 0.0f;  // distance of last completed lap (miles)
+    uint32_t best_lap_ms     = 0;     // fastest completed lap this session (0 = none)
+    float    best_lap_dist   = 0.0f;  // distance of the best lap (miles)
 };
 static LapTimer lapTimer;
 
@@ -1144,6 +1148,12 @@ static void updateLapTimer() {
             // Clean completed lap — record it.
             lapTimer.last_lap_ms   = elapsed;
             lapTimer.last_lap_dist = lapTimer.dist_miles;
+            // Track the session's fastest lap so the predictive delta has a
+            // reference to compare against.
+            if (lapTimer.best_lap_ms == 0 || elapsed < lapTimer.best_lap_ms) {
+                lapTimer.best_lap_ms   = elapsed;
+                lapTimer.best_lap_dist = lapTimer.dist_miles;
+            }
         }
         // First crossing just arms the timer; subsequent ones record lap times.
         lapTimer.timing_started = true;
@@ -1164,6 +1174,17 @@ static uint32_t predictiveLapMs() {
     const uint32_t elapsed = millis() - lapTimer.lap_start_ms;
     const float ratio = lapTimer.last_lap_dist / lapTimer.dist_miles;
     return (uint32_t)((float)elapsed * ratio);
+}
+
+// Signed predictive lap delta vs the session's BEST lap, in milliseconds.
+// Negative = on pace to beat the best lap, positive = slower. Returns
+// INT32_MIN when there's no best lap yet or not enough of the current lap
+// has been driven to extrapolate.
+static int32_t predictiveDeltaMs() {
+    if (lapTimer.best_lap_ms == 0) return INT32_MIN;
+    const uint32_t pred = predictiveLapMs();
+    if (pred == 0) return INT32_MIN;
+    return (int32_t)pred - (int32_t)lapTimer.best_lap_ms;
 }
 
 // ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>
@@ -2443,6 +2464,7 @@ struct LastDrawn {
     int8_t   recording   = -1;       // -1=never drawn; 0=stopped; 1=recording
     uint32_t pred_lap_cs = UINT32_MAX;   // predictive lap time in centiseconds
     uint32_t last_lap_cs = UINT32_MAX;   // last completed lap time in centiseconds
+    int32_t  delta_cs    = INT32_MIN;    // predictive delta vs best (centiseconds, signed; INT32_MIN=redraw)
     uint32_t track_tag   = UINT32_MAX;   // first 4 bytes of active_track_name; UINT32_MAX = needs redraw
     // Coolant temp / oil PSI cached state — value is x10 fixed-point (INT32_MIN
     // = redraw on next paint). The col_tag composes the current show flag,
@@ -2471,6 +2493,7 @@ static void invalidateAll() {
     ld.rec_badge_tag = 0xFF; ld.rec_samples = UINT32_MAX; ld.cld_queue = UINT32_MAX;
     ld.upbtn_tag = UINT32_MAX;
     ld.pred_lap_cs = UINT32_MAX; ld.last_lap_cs = UINT32_MAX;
+    ld.delta_cs    = INT32_MIN;
     ld.track_tag   = UINT32_MAX;
     ld.temp_x10 = INT32_MIN; ld.temp_col_tag = UINT32_MAX;
     ld.psi_x10  = INT32_MIN; ld.psi_col_tag  = UINT32_MAX;
@@ -2560,6 +2583,7 @@ static void drawDashPage() {
         tft.setTextColor(TFT_DARKGREY, bg);
         tft.drawString("PRED", 255, 380);    // middle column — predictive lap time
         tft.drawString("LAP",  255, 405);    // middle column — last completed lap time
+        tft.drawString("DELTA",255, 430);    // middle column — predictive delta vs best lap
         tft.drawString("FIX",  620, 355);
         tft.drawString("SATS", 620, 380);
         tft.drawString("GPS",  620, 405);
@@ -3025,8 +3049,9 @@ static void drawDashPage() {
                 col = TFT_DARKGREY;
             } else {
                 formatLapTime(predMs, buf, sizeof(buf));
-                col = (lapTimer.last_lap_ms > 0 && predMs < lapTimer.last_lap_ms)
-                      ? TFT_GREEN : TFT_RED;
+                const uint32_t ref = lapTimer.best_lap_ms ? lapTimer.best_lap_ms
+                                                          : lapTimer.last_lap_ms;
+                col = (ref > 0 && predMs < ref) ? TFT_GREEN : TFT_RED;
             }
             if (dash_sprites_ready) {
                 spr_pred.fillSprite(bg);
@@ -3035,13 +3060,13 @@ static void drawDashPage() {
                 spr_pred.setTextDatum(textdatum_t::top_left);
                 spr_pred.setTextColor(col);
                 spr_pred.drawString(buf, 0, 0);
-                spr_pred.pushSprite(305, 380);
+                spr_pred.pushSprite(325, 380);
             } else {
                 tft.setFont(&fonts::Font2);
                 tft.setTextDatum(textdatum_t::top_left);
                 tft.setTextPadding(100);
                 tft.setTextColor(col, bg);
-                tft.drawString(buf, 305, 380);
+                tft.drawString(buf, 325, 380);
                 tft.setTextPadding(0);
             }
             ld.pred_lap_cs = cs;
@@ -3060,16 +3085,55 @@ static void drawDashPage() {
                 spr_lap.setTextDatum(textdatum_t::top_left);
                 spr_lap.setTextColor(TFT_WHITE);
                 spr_lap.drawString(buf, 0, 0);
-                spr_lap.pushSprite(305, 405);
+                spr_lap.pushSprite(325, 405);
             } else {
                 tft.setFont(&fonts::Font2);
                 tft.setTextDatum(textdatum_t::top_left);
                 tft.setTextPadding(100);
                 tft.setTextColor(TFT_WHITE, bg);
-                tft.drawString(buf, 305, 405);
+                tft.drawString(buf, 325, 405);
                 tft.setTextPadding(0);
             }
             ld.last_lap_cs = cs;
+        }
+    }
+
+    // DELTA — predictive lap delta vs the session's best lap. Green when we're
+    // on pace to beat the best lap, red when slower, grey until there's a best
+    // lap recorded and enough of the current lap is done to extrapolate.
+    {
+        const int32_t deltaMs = predictiveDeltaMs();
+        const int32_t cs = (deltaMs == INT32_MIN) ? INT32_MIN : deltaMs / 10;
+        if (cs != ld.delta_cs) {
+            char buf[12];
+            uint16_t col;
+            if (deltaMs == INT32_MIN) {
+                snprintf(buf, sizeof(buf), "--.--");
+                col = TFT_DARKGREY;
+            } else {
+                const int32_t a = deltaMs < 0 ? -deltaMs : deltaMs;
+                snprintf(buf, sizeof(buf), "%c%u.%02u",
+                         deltaMs < 0 ? '-' : '+',
+                         (unsigned)(a / 1000), (unsigned)((a % 1000) / 10));
+                col = deltaMs < 0 ? TFT_GREEN : TFT_RED;
+            }
+            if (dash_sprites_ready) {
+                spr_delta.fillSprite(bg);
+                spr_delta.setFont(&fonts::Font2);
+                spr_delta.setTextSize(1);
+                spr_delta.setTextDatum(textdatum_t::top_left);
+                spr_delta.setTextColor(col);
+                spr_delta.drawString(buf, 0, 0);
+                spr_delta.pushSprite(325, 430);
+            } else {
+                tft.setFont(&fonts::Font2);
+                tft.setTextDatum(textdatum_t::top_left);
+                tft.setTextPadding(100);
+                tft.setTextColor(col, bg);
+                tft.drawString(buf, 325, 430);
+                tft.setTextPadding(0);
+            }
+            ld.delta_cs = cs;
         }
     }
 

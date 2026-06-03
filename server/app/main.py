@@ -1253,6 +1253,143 @@ def _resolve_session(user: str, filename: str) -> pathlib.Path:
     return p
 
 
+# ---------------------------------------------------------------------------
+# Lap detection.
+#
+# The dash already knows each circuit's start/finish line, but the cloud has
+# no track table — so we AUTO-DETECT the start/finish from the GPS trace
+# itself (the user's "don't make me enter S/F by hand" ask). The method is
+# the same family the dash firmware uses: pick an anchor point on track, then
+# count each return to within R metres of it (after the car has left by >2R),
+# guarded by a minimum lap time. Every crossing closes a lap.
+# ---------------------------------------------------------------------------
+_LAP_RADIUS_KM = 0.040       # 40 m start/finish detection radius
+_LAP_MIN_SEC = 20.0          # ignore "crossings" sooner than this (pit crawl, noise)
+_LAP_MOVING_MPH = 12.0       # anchor must be a point where the car is actually driving
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    d2r = math.pi / 180.0
+    dlat = (lat2 - lat1) * d2r
+    dlon = (lon2 - lon1) * d2r
+    a = (math.sin(dlat / 2.0) ** 2
+         + math.cos(lat1 * d2r) * math.cos(lat2 * d2r) * math.sin(dlon / 2.0) ** 2)
+    return 6371.0 * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
+def _relative_seconds(samples: list) -> tuple:
+    """Seconds-from-start for each sample, mirroring the review page's T[] logic
+    (prefer epoch `t`, else `t_ms`/1000, else synthetic 25 Hz). Returns
+    (rel_list, basis)."""
+    raw: list = []
+    first = None
+    for s in samples:
+        v = None
+        t = s.get("t")
+        if isinstance(t, (int, float)) and math.isfinite(t):
+            v = float(t)
+        else:
+            tms = s.get("t_ms")
+            if isinstance(tms, (int, float)) and math.isfinite(tms):
+                v = float(tms) / 1000.0
+        if v is not None and first is None:
+            first = v
+        raw.append(v)
+    usable = first is not None
+    if usable:
+        last = first
+        for i in range(len(raw)):
+            if raw[i] is None:
+                raw[i] = last
+            else:
+                last = raw[i]
+        if not (raw and (raw[-1] - raw[0]) > 0.5):
+            usable = False
+    if not usable:
+        raw = [i / 25.0 for i in range(len(samples))]
+    t0 = raw[0] if raw else 0.0
+    return [r - t0 for r in raw], ("epoch" if usable else "synthetic")
+
+
+def _detect_laps(samples: list) -> dict:
+    rel, basis = _relative_seconds(samples)
+    n = len(samples)
+
+    def geo(i):
+        s = samples[i]
+        lat, lon = s.get("lat"), s.get("lon")
+        if (isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+                and (lat or lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+            return lat, lon
+        return None
+
+    # Anchor = first moving sample with a valid fix; fall back to first fix.
+    anchor = None
+    for i in range(n):
+        g = geo(i)
+        if g is None:
+            continue
+        mph = samples[i].get("speed_mph")
+        if isinstance(mph, (int, float)) and mph > _LAP_MOVING_MPH:
+            anchor = (g[0], g[1], i)
+            break
+    if anchor is None:
+        for i in range(n):
+            g = geo(i)
+            if g is not None:
+                anchor = (g[0], g[1], i)
+                break
+    if anchor is None:
+        return {"laps": [], "best_lap": None, "sf": None, "time_basis": basis}
+
+    alat, alon, ai = anchor
+    crossings = [ai]
+    left = False
+    last_cross_t = rel[ai]
+    for i in range(ai + 1, n):
+        g = geo(i)
+        if g is None:
+            continue
+        d = _haversine_km(g[0], g[1], alat, alon)
+        if not left and d > _LAP_RADIUS_KM * 2.0:
+            left = True
+        if left and d <= _LAP_RADIUS_KM and (rel[i] - last_cross_t) >= _LAP_MIN_SEC:
+            crossings.append(i)
+            left = False
+            last_cross_t = rel[i]
+
+    laps = []
+    for k in range(len(crossings) - 1):
+        i0, i1 = crossings[k], crossings[k + 1]
+        secs = rel[i1] - rel[i0]
+        max_mph = 0.0
+        for j in range(i0, i1 + 1):
+            mph = samples[j].get("speed_mph")
+            if isinstance(mph, (int, float)) and mph > max_mph:
+                max_mph = mph
+        laps.append({
+            "lap": k + 1,
+            "t_start": round(rel[i0], 3),
+            "t_end": round(rel[i1], 3),
+            "seconds": round(secs, 3),
+            "ms": int(secs * 1000),
+            "max_mph": round(max_mph, 1),
+        })
+
+    best = None
+    best_secs = float("inf")
+    for lp in laps:
+        if lp["seconds"] < best_secs:
+            best_secs = lp["seconds"]
+            best = lp["lap"]
+    return {
+        "laps": laps,
+        "best_lap": best,
+        "sf": {"lat": alat, "lon": alon, "radius_m": int(_LAP_RADIUS_KM * 1000)},
+        "time_basis": basis,
+    }
+
+
 @app.get("/sessions/{user}/{filename}")
 async def download_session(request: Request, user: str, filename: str) -> FileResponse:
     require_web_user(request)
@@ -1356,6 +1493,32 @@ async def session_data(
     return JSONResponse(
         {"count": len(samples), "stride": stride, "bounds": bounds, "samples": samples}
     )
+
+
+@app.get("/sessions/{user}/{filename}/laps")
+async def session_laps(request: Request, user: str, filename: str) -> JSONResponse:
+    """Auto-detected laps for the review UI.
+
+    Reads the session at full resolution (lap timing wants every fix, not the
+    strided set the chart uses), auto-detects the start/finish line from the
+    GPS trace, and returns per-lap times + the fastest lap. Lap boundaries are
+    given as seconds-from-session-start so the client can map them onto its
+    own sample array regardless of stride.
+    """
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    samples: list = []
+    with open(p, "rb") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                samples.append(json.loads(raw))
+            except Exception:
+                continue
+    return JSONResponse(_detect_laps(samples))
 
 
 @app.get("/review/{user}/{filename}", response_class=HTMLResponse)
@@ -2140,6 +2303,28 @@ _REVIEW_HTML = (
     margin-bottom: 4px; }
   .gstat .v { font: 600 18px/1.1 var(--ff-mono); }
   .gstat .v.accent { color: var(--primary); }
+
+  /* ---- laps + delta ---------------------------------------------- */
+  .lapcard { margin-top: var(--sp-md); }
+  .lap-body { display: grid; grid-template-columns: 340px 1fr; gap: var(--sp-md); }
+  @media (max-width: 820px) { .lap-body { grid-template-columns: 1fr; } }
+  .lap-table-wrap { max-height: 300px; overflow-y: auto;
+    border: 1px solid var(--line); border-radius: var(--r-sm); }
+  table.laptable { width: 100%; border-collapse: collapse; font: 13px var(--ff-mono); }
+  table.laptable th { position: sticky; top: 0; background: var(--surface-2);
+    color: var(--muted); text-align: right; padding: 8px 12px;
+    font: 600 10px/1 var(--ff-ui); letter-spacing: 0.07em; text-transform: uppercase; }
+  table.laptable th:first-child { text-align: left; }
+  table.laptable td { padding: 7px 12px; border-top: 1px solid var(--line); text-align: right; }
+  table.laptable td:first-child { text-align: left; color: var(--muted); }
+  table.laptable tbody tr { cursor: pointer; }
+  table.laptable tbody tr:hover { background: var(--surface-2); }
+  table.laptable tbody tr.sel { background: rgba(255,176,32,0.14); }
+  table.laptable tbody tr.best td { color: var(--good); }
+  table.laptable td.gap { color: var(--muted); }
+  .lap-delta { display: flex; flex-direction: column; }
+  .lap-delta canvas { width: 100%; height: auto; background: var(--bg);
+    border: 1px solid var(--line); border-radius: var(--r-sm); }
 </style>
 </head><body>
 <header class="app">
@@ -2220,6 +2405,24 @@ _REVIEW_HTML = (
         <button id="play" class="btn primary">play</button>
         <input id="slider" class="slider" type="range" min="0" max="0" value="0" step="1">
         <div class="time mono"><span class="now" id="t-now">0:00.0</span> / <span id="t-total">0:00.0</span></div>
+      </div>
+    </div>
+
+    <div class="card lapcard" id="lapcard" style="display:none">
+      <div class="card-head"><span class="t-label">Laps</span>
+        <span class="t-label" id="lap-sub">—</span></div>
+      <div class="card-body lap-body">
+        <div class="lap-table-wrap">
+          <table class="laptable">
+            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th>Max</th></tr></thead>
+            <tbody id="lap-rows"></tbody>
+          </table>
+        </div>
+        <div class="lap-delta">
+          <div class="t-label" style="margin-bottom:8px">Delta vs best lap
+            <span id="delta-sel" style="color:var(--muted)"></span></div>
+          <canvas id="deltacanv" width="760" height="200"></canvas>
+        </div>
       </div>
     </div>
   </div>
@@ -2458,6 +2661,152 @@ _REVIEW_HTML = (
     if (rafId) cancelAnimationFrame(rafId);
   }
   playBtn.addEventListener('click', () => playing ? stop() : start());
+
+  // ---- laps + delta vs best -------------------------------------------
+  // relT[i] = seconds-from-start, the same basis the /laps endpoint returns
+  // its t_start/t_end in, so we can map a lap window onto our sample array.
+  const relT = T.map(t => t - T0);
+  function hav(a, b){
+    const R = 6371000, d2r = Math.PI/180;
+    const dLat = (b[0]-a[0])*d2r, dLon = (b[1]-a[1])*d2r;
+    const s = Math.sin(dLat/2)**2 +
+              Math.cos(a[0]*d2r)*Math.cos(b[0]*d2r)*Math.sin(dLon/2)**2;
+    return R*2*Math.atan2(Math.sqrt(s), Math.sqrt(1-s));
+  }
+  function idxAt(relSec){
+    if (relSec <= relT[0]) return 0;
+    const last = S.length-1;
+    if (relSec >= relT[last]) return last;
+    let lo=0, hi=last;
+    while (lo<hi){ const m=(lo+hi)>>1; if (relT[m]<relSec) lo=m+1; else hi=m; }
+    return lo;
+  }
+  function lapFmt(sec){
+    if (!isFinite(sec)) return '\u2014';
+    const m = Math.floor(sec/60), r = sec - m*60;
+    return m + ':' + r.toFixed(2).padStart(5,'0');
+  }
+  function lapSeg(lap){
+    const seg=[];
+    for (let i=idxAt(lap.t_start); i<=idxAt(lap.t_end); i++){
+      const s=S[i];
+      if (typeof s.lat==='number' && typeof s.lon==='number' && (s.lat||s.lon))
+        seg.push([s.lat, s.lon]);
+    }
+    return seg;
+  }
+  // cumulative-distance vs time-into-lap, for the distance-aligned delta
+  function lapSeries(lap){
+    const i0=idxAt(lap.t_start), i1=idxAt(lap.t_end);
+    const dist=[], tm=[]; let d=0, prev=null;
+    for (let i=i0; i<=i1; i++){
+      const s=S[i];
+      if (typeof s.lat==='number' && typeof s.lon==='number' && (s.lat||s.lon)){
+        const cur=[s.lat, s.lon];
+        if (prev) d += hav(prev, cur);
+        prev = cur;
+      }
+      dist.push(d); tm.push(relT[i] - lap.t_start);
+    }
+    return {dist, tm};
+  }
+  function interpTime(series, dq){
+    const {dist, tm} = series, last = dist.length-1;
+    if (last < 0) return 0;
+    if (dq <= dist[0]) return tm[0];
+    if (dq >= dist[last]) return tm[last];
+    let lo=0, hi=last;
+    while (lo<hi){ const m=(lo+hi)>>1; if (dist[m]<dq) lo=m+1; else hi=m; }
+    const i=Math.max(1, lo);
+    const d0=dist[i-1], d1=dist[i];
+    if (d1===d0) return tm[i-1];
+    return tm[i-1] + (tm[i]-tm[i-1]) * (dq-d0)/(d1-d0);
+  }
+  let selLine=null, refLine=null;
+  const dcanv = el('deltacanv');
+  function highlightLap(lap, ref){
+    if (selLine) map.removeLayer(selLine);
+    if (refLine) map.removeLayer(refLine);
+    if (ref && ref.lap !== lap.lap){
+      refLine = L.polyline(lapSeg(ref),
+        {color:'#6CD07A', weight:2, opacity:0.5, dashArray:'4 5'}).addTo(map);
+    }
+    const seg = lapSeg(lap);
+    selLine = L.polyline(seg, {color:'#FFB020', weight:4, opacity:0.95}).addTo(map);
+    if (seg.length) map.fitBounds(selLine.getBounds(), {padding:[20,20]});
+  }
+  function drawDelta(lap, ref){
+    const ctx=dcanv.getContext('2d'), W=dcanv.width, H=dcanv.height;
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle='#0E1014'; ctx.fillRect(0,0,W,H);
+    const sa=lapSeries(lap), sb=lapSeries(ref);
+    const maxD=Math.min(sa.dist[sa.dist.length-1]||0, sb.dist[sb.dist.length-1]||0);
+    const N=240, dv=[]; let dmin=Infinity, dmax=-Infinity;
+    if (maxD > 0){
+      for (let k=0;k<N;k++){
+        const dq=maxD*k/(N-1);
+        const v=interpTime(sa,dq)-interpTime(sb,dq);
+        dv.push(v); if (v<dmin)dmin=v; if (v>dmax)dmax=v;
+      }
+    }
+    if (!isFinite(dmin)){ dmin=-0.1; dmax=0.1; }
+    const pad=Math.max(0.15,(dmax-dmin)*0.15);
+    const lo=Math.min(dmin,-0.05)-pad, hi=Math.max(dmax,0.05)+pad;
+    const X=k=>34+(W-44)*k/(N-1);
+    const Y=v=>10+(H-28)*(1-(v-lo)/(hi-lo));
+    ctx.strokeStyle='rgba(255,255,255,0.22)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(34,Y(0)); ctx.lineTo(W-10,Y(0)); ctx.stroke();
+    if (maxD > 0){
+      ctx.lineWidth=2; ctx.strokeStyle='#FFB020'; ctx.beginPath();
+      for (let k=0;k<N;k++){ const px=X(k), py=Y(dv[k]); k?ctx.lineTo(px,py):ctx.moveTo(px,py); }
+      ctx.stroke();
+    }
+    ctx.fillStyle='#8A92A3'; ctx.font='11px monospace'; ctx.textAlign='left';
+    ctx.fillText('+'+hi.toFixed(2), 2, 14);
+    ctx.fillText(lo.toFixed(2), 2, H-6);
+    if (maxD > 0){
+      const fin=dv[N-1];
+      ctx.fillStyle = fin<=0 ? '#6CD07A' : '#FF5D5D';
+      ctx.font='600 14px monospace'; ctx.textAlign='right';
+      ctx.fillText((fin<=0?'':'+')+fin.toFixed(2)+'s', W-12, 18);
+    }
+  }
+  (async function loadLaps(){
+    let lr;
+    try {
+      const r=await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/laps');
+      if (!r.ok) return;
+      lr=await r.json();
+    } catch(e){ return; }
+    const laps=lr.laps||[];
+    if (!laps.length) return;
+    const bestLap=laps.find(l=>l.lap===lr.best_lap) || laps[0];
+    el('lapcard').style.display='';
+    el('lap-sub').textContent=laps.length+' laps \u00b7 best '+lapFmt(bestLap.seconds);
+    const rows=el('lap-rows'); rows.innerHTML='';
+    function select(lap){
+      [...rows.children].forEach(tr =>
+        tr.classList.toggle('sel', Number(tr.dataset.lap)===lap.lap));
+      el('delta-sel').textContent='\u00b7 lap '+lap.lap+' vs best (lap '+bestLap.lap+')';
+      highlightLap(lap, bestLap);
+      drawDelta(lap, bestLap);
+      const i0=idxAt(lap.t_start);
+      slider.value=String(i0); render(i0);
+    }
+    for (const lap of laps){
+      const tr=document.createElement('tr');
+      tr.dataset.lap=lap.lap;
+      if (lap.lap===bestLap.lap) tr.classList.add('best');
+      const gap=lap.seconds-bestLap.seconds;
+      const gapTxt=(lap.lap===bestLap.lap) ? 'best' : '+'+gap.toFixed(2);
+      tr.innerHTML='<td>'+lap.lap+'</td><td>'+lapFmt(lap.seconds)+
+        '</td><td class="gap">'+gapTxt+'</td><td>'+
+        (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>';
+      tr.addEventListener('click', ()=>select(lap));
+      rows.appendChild(tr);
+    }
+    select(bestLap);
+  })();
 })();
 </script>
 </body></html>
