@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.52"
+#define FIRMWARE_VERSION "0.1.53"
 
 #include <Preferences.h>
 #include <time.h>
@@ -6246,9 +6246,12 @@ static void drawToolsPage() {
                     "STORM %lu fps - TEENSY ACK NOT REACHING BUS (RXe%u). Check pin22->transceiver TX + Rs->GND",
                     (unsigned long)candiag_fps, candiag_rx_err);
             } else {
+                // RXe~0 + storm = no ACK but Teensy isn't erroring = classic
+                // LISTEN-ONLY signature. Show the Teensy fw version: normal-mode
+                // ACK arrived in v0.1.50 - if the Teensy is older it never updated.
                 snprintf(line, sizeof(line),
-                    "STORM %lu fps - Teensy NOT erroring (RXe%u) -> MS3 CAN config / no-ACK on MS3 side",
-                    (unsigned long)candiag_fps, candiag_rx_err);
+                    "STORM %lu fps - no ACK, Teensy clean (RXe%u). TEENSY fw=%s (need >=0.1.50 for ACK)",
+                    (unsigned long)candiag_fps, candiag_rx_err, teensy_fw_version);
             }
         } else {
             col = TFT_GREEN;
