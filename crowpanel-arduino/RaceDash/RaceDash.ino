@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.53"
+#define FIRMWARE_VERSION "0.1.54"
 
 #include <Preferences.h>
 #include <time.h>
@@ -346,6 +346,7 @@ static uint8_t  candiag_dup_pct = 0;
 static bool     candiag_ack_err = false;
 static uint8_t  candiag_tx_err  = 0;   // Teensy CAN TX error counter (128+ = TX dead)
 static uint8_t  candiag_rx_err  = 0;   // Teensy CAN RX error counter
+static uint8_t  candiag_txtest  = 0;   // TX self-test: 0=untested,1=PASS,2=FAIL
 static uint32_t candiag_ms      = 0;   // millis() of last CANDIAG line
 
 // ---------------------------------------------------------------------------
@@ -1352,6 +1353,7 @@ static bool parseCanDiagLine(const String& line) {
     if (n >= 5) candiag_ack_err = (field(4).toInt() != 0);
     if (n >= 6) candiag_tx_err  = (uint8_t)field(5).toInt();
     if (n >= 7) candiag_rx_err  = (uint8_t)field(6).toInt();
+    if (n >= 8) candiag_txtest  = (uint8_t)field(7).toInt();
     candiag_ms = millis();
     return true;
 }
@@ -6246,12 +6248,22 @@ static void drawToolsPage() {
                     "STORM %lu fps - TEENSY ACK NOT REACHING BUS (RXe%u). Check pin22->transceiver TX + Rs->GND",
                     (unsigned long)candiag_fps, candiag_rx_err);
             } else {
-                // RXe~0 + storm = no ACK but Teensy isn't erroring = classic
-                // LISTEN-ONLY signature. Show the Teensy fw version: normal-mode
-                // ACK arrived in v0.1.50 - if the Teensy is older it never updated.
-                snprintf(line, sizeof(line),
-                    "STORM %lu fps - no ACK, Teensy clean (RXe%u). TEENSY fw=%s (need >=0.1.50 for ACK)",
-                    (unsigned long)candiag_fps, candiag_rx_err, teensy_fw_version);
+                // RXe~0 + storm. Use the Teensy TX self-test result to say
+                // definitively whether OUR transmit/ACK path is alive:
+                //   TX FAIL -> Teensy literally can't put a frame on the bus
+                //              (transceiver TX / pin22 / Rs) - hardware, not fw
+                //   TX PASS -> our TX works yet MS3 still storms -> MS3 side
+                const char* tx = candiag_txtest == 1 ? "TXtest=PASS"
+                               : candiag_txtest == 2 ? "TXtest=FAIL" : "TXtest...";
+                if (candiag_txtest == 2) {
+                    snprintf(line, sizeof(line),
+                        "STORM %lu fps - %s: Teensy CANNOT TRANSMIT -> transceiver TX/pin22/Rs (HW)",
+                        (unsigned long)candiag_fps, tx);
+                } else {
+                    snprintf(line, sizeof(line),
+                        "STORM %lu fps - %s  RXe%u  Tfw=%s",
+                        (unsigned long)candiag_fps, tx, candiag_rx_err, teensy_fw_version);
+                }
             }
         } else {
             col = TFT_GREEN;

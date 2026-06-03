@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.53"
+#define FIRMWARE_VERSION "0.1.54"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -577,6 +577,22 @@ static void canDiagNote(uint32_t id, uint8_t len, const uint8_t* buf) {
 
 // Call at ~1 Hz from emitToDash(). Prints a one-line CAN health summary to the
 // USB serial monitor and resets the window counters.
+
+// CAN (re)init sequence, factored out so the TX self-test can recover the
+// controller from a bus-off without rebooting.
+static void canBegin() {
+    Can1.begin();
+    Can1.setBaudRate(CAN_BAUD);   // normal mode -> FlexCAN auto-ACKs
+    Can1.setMaxMB(16);
+    Can1.enableFIFO();
+}
+
+// One-shot TX/ACK self-test state. Proves whether the Teensy can actually put
+// a frame on the bus and get it ACKed (i.e. is the transmit/transceiver path
+// alive). 0=waiting, 1=frame sent (awaiting evaluation next report), 2=done.
+static uint8_t  can_tx_test_state  = 0;
+static uint8_t  can_tx_test_result = 0;   // 0=untested, 1=PASS, 2=FAIL
+
 static void canDiagReport() {
     const uint32_t now = millis();
     if (now - can_diag.last_report_ms < 1000) return;
@@ -598,6 +614,25 @@ static void canDiagReport() {
     Can1.events();
     CAN_error_t err;
     const bool have_err = Can1.error(err, false);
+
+    // --- One-time TX/ACK self-test ------------------------------------------
+    // Decisive: can the Teensy actually transmit a frame and get it ACKed? On a
+    // healthy 2-node bus the MS3 will ACK our frame. If our TX path is dead the
+    // transmit can't complete -> TX_ERR pegs / bus-off within ~1s; we detect
+    // that and re-init so RX resumes. Evaluate BEFORE (re)sending so the two
+    // phases never collide in one report cycle.
+    if (can_tx_test_state == 1) {
+        const bool failed = have_err && (err.TX_ERR_COUNTER >= 96 ||
+                            strstr((char*)err.FLT_CONF, "Bus off") != NULL);
+        can_tx_test_result = failed ? 2 : 1;
+        can_tx_test_state  = 2;
+        if (failed) canBegin();   // clear bus-off so reception continues
+    } else if (can_tx_test_state == 0 && can_diag.rx_total > 20) {
+        CAN_message_t t; t.id = 0x100; t.len = 1; t.buf[0] = 0x5A;
+        Can1.write(t);           // unused ID, harmless to the ECU
+        can_tx_test_state = 1;
+    }
+
     const uint32_t dpct = can_diag.rx_window ? (can_diag.dup_window * 100UL / can_diag.rx_window) : 0;
     Serial.printf("CANDIAG frames/s=%lu dup=%lu%% total=%lu base_hits=%u ids=[%s] "
                   "state=%s ACK_ERR=%d CRC_ERR=%d FRM=%d STF=%d TXerr=%u RXerr=%u flt=%s\n",
@@ -608,14 +643,18 @@ static void canDiagReport() {
                   have_err ? err.FRM_ERR : 0, have_err ? err.STF_ERR : 0,
                   have_err ? err.TX_ERR_COUNTER : 0, have_err ? err.RX_ERR_COUNTER : 0,
                   have_err ? (char*)err.FLT_CONF : "?");
+    Serial.printf("CANDIAG txtest=%s\n",
+                  can_tx_test_result == 1 ? "PASS" :
+                  can_tx_test_result == 2 ? "FAIL" : "...");
     // Also surface it on the dash link so it can be shown without a USB cable.
-    // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>,<RXerr>
-    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u,%u\n",
+    // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>,<RXerr>,<txtest>
+    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u,%u,%u\n",
                        (unsigned long)can_diag.rx_window,
                        (unsigned long)can_diag.rx_total, can_diag.base_hits,
                        (unsigned long)dpct, have_err ? err.ACK_ERR : 0,
                        have_err ? err.TX_ERR_COUNTER : 0,
-                       have_err ? err.RX_ERR_COUNTER : 0);
+                       have_err ? err.RX_ERR_COUNTER : 0,
+                       can_tx_test_result);
     can_diag.rx_window = 0;
     can_diag.dup_window = 0;
     can_diag.ids_count = 0;
@@ -2318,10 +2357,7 @@ void setup() {
     // We never originate a transmit here (the v0.1.47 TX test is gone), and
     // auto-ACK is a receive activity (caps at error-passive, keeps receiving).
     // So: proper ACK to the MS3 + structurally immune to bus-off.
-    Can1.begin();
-    Can1.setBaudRate(CAN_BAUD);   // normal mode → FlexCAN auto-ACKs received frames
-    Can1.setMaxMB(16);
-    Can1.enableFIFO();
+    canBegin();
     Serial.printf("CAN1 ready at %lu bps NORMAL/auto-ACK (MS3Pro base ID 0x%03lX)\n",
                   (unsigned long)CAN_BAUD, (unsigned long)CAN_BASE_ID);
 
