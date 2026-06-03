@@ -328,6 +328,19 @@ This session built/flashed on Linux, not the Windows paths below:
 - Teensy enumerates as HID/HalfKay for flashing (auto-detected by teensy-cli; press the
   button if "Error opening USB device").
 
+### git push — `$HOME` is UNSET in this shell (the gotcha that bites every push)
+The GitHub token is already stored at `/root/.git-credentials` with `helper = store` in
+`/root/.gitconfig`. **But this shell starts with `$HOME` empty**, so git can't find either
+file and you get `fatal: could not read Username for 'https://github.com'`. The fix is just
+to set HOME for the git command:
+```bash
+HOME=/root git push origin main        # works — store helper supplies the token
+HOME=/root git pull / fetch / etc.     # same for any auth'd git op
+```
+Remote is `https://github.com/teknoprep/racecar-35.git` (HTTPS, token auth). Don't bother
+re-pasting the token or rewriting the remote URL — it's all configured; you only ever need
+the `HOME=/root` prefix. (Or `export HOME=/root` once at the top of a session.)
+
 ## Arduino IDE auto-prototype gotcha when editing RaceDash.ino
 
 Arduino IDE injects auto-generated function prototypes at the top of the translation unit, immediately after `#include` lines. Any type used in a function signature must be **declared above the first function**, or compilation fails with "X was not declared in this scope" on the auto-prototypes.
