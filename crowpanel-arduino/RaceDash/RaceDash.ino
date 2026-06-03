@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.50"
+#define FIRMWARE_VERSION "0.1.51"
 
 #include <Preferences.h>
 #include <time.h>
@@ -345,6 +345,7 @@ static uint8_t  candiag_base    = 0;
 static uint8_t  candiag_dup_pct = 0;
 static bool     candiag_ack_err = false;
 static uint8_t  candiag_tx_err  = 0;   // Teensy CAN TX error counter (128+ = TX dead)
+static uint8_t  candiag_rx_err  = 0;   // Teensy CAN RX error counter
 static uint32_t candiag_ms      = 0;   // millis() of last CANDIAG line
 
 // ---------------------------------------------------------------------------
@@ -1350,6 +1351,7 @@ static bool parseCanDiagLine(const String& line) {
     if (n >= 4) candiag_dup_pct = (uint8_t)field(3).toInt();
     if (n >= 5) candiag_ack_err = (field(4).toInt() != 0);
     if (n >= 6) candiag_tx_err  = (uint8_t)field(5).toInt();
+    if (n >= 7) candiag_rx_err  = (uint8_t)field(6).toInt();
     candiag_ms = millis();
     return true;
 }
@@ -6222,23 +6224,27 @@ static void drawToolsPage() {
         tft.fillRect(0, CAN_Y - 2, 800, 28, TFT_BLACK);
         const bool fresh = (candiag_ms != 0) && (millis() - candiag_ms < 3000);
         char line[96]; uint16_t col;
+        // Classify by FRAME RATE, not dup%. A real no-ACK retransmit storm runs
+        // the bus flat-out (~3000+ fps). A HEALTHY 50 Hz broadcast at idle also
+        // shows ~100% dup (engine state barely changes in 20 ms) — that is NOT a
+        // storm, so dup% must never trigger the storm label on its own.
+        //   0 fps / stale         -> NO BUS
+        //   > 600 fps             -> STORM (genuine retransmit; ACK not reaching MS3)
+        //   1..600 fps            -> OK (normal broadcast; 50/sec per enabled group)
         if (!fresh || candiag_fps == 0) {
             col = TFT_DARKGREY;
-            snprintf(line, sizeof(line), "CAN: NO BUS  \xB7  0 frames/s  \xB7  check wiring / termination / broadcast");
-        } else if (candiag_tx_err >= 96) {
-            // Our own transmit path can't ACK -> the MS3 storms. The decisive case.
+            snprintf(line, sizeof(line), "CAN: NO BUS  \xB7  0 fps  TXe%u RXe%u  \xB7  no frames arriving",
+                     candiag_tx_err, candiag_rx_err);
+        } else if (candiag_fps > 600) {
             col = TFT_RED;
-            snprintf(line, sizeof(line), "CAN: TX DEAD  \xB7  %lu fps  TXerr %u  \xB7  check SN65HVD230 Rs\xB7GND + pin22",
-                     (unsigned long)candiag_fps, candiag_tx_err);
-        } else if (candiag_ack_err || candiag_dup_pct >= 80) {
-            col = TFT_RED;
-            snprintf(line, sizeof(line), "CAN: STORM  \xB7  %lu fps  dup %u%%  TXerr %u %s  \xB7  ACK problem",
-                     (unsigned long)candiag_fps, candiag_dup_pct, candiag_tx_err,
-                     candiag_ack_err ? "ACK_ERR" : "");
+            snprintf(line, sizeof(line), "CAN: STORM  \xB7  %lu fps  dup%u%%  TXe%u RXe%u  \xB7  MS3 not getting ACK",
+                     (unsigned long)candiag_fps, candiag_dup_pct,
+                     candiag_tx_err, candiag_rx_err);
         } else {
             col = TFT_GREEN;
-            snprintf(line, sizeof(line), "CAN: OK  \xB7  %lu fps  dup %u%%  base %u  \xB7  link healthy",
-                     (unsigned long)candiag_fps, candiag_dup_pct, candiag_base);
+            snprintf(line, sizeof(line), "CAN: OK  \xB7  %lu fps  dup%u%%  base%u  TXe%u RXe%u",
+                     (unsigned long)candiag_fps, candiag_dup_pct, candiag_base,
+                     candiag_tx_err, candiag_rx_err);
         }
         tft.setFont(&fonts::Font2);
         tft.setTextColor(col, TFT_BLACK);

@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.50"
+#define FIRMWARE_VERSION "0.1.51"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -609,12 +609,13 @@ static void canDiagReport() {
                   have_err ? err.TX_ERR_COUNTER : 0, have_err ? err.RX_ERR_COUNTER : 0,
                   have_err ? (char*)err.FLT_CONF : "?");
     // Also surface it on the dash link so it can be shown without a USB cable.
-    // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>
-    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u\n",
+    // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>,<RXerr>
+    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u,%u\n",
                        (unsigned long)can_diag.rx_window,
                        (unsigned long)can_diag.rx_total, can_diag.base_hits,
                        (unsigned long)dpct, have_err ? err.ACK_ERR : 0,
-                       have_err ? err.TX_ERR_COUNTER : 0);
+                       have_err ? err.TX_ERR_COUNTER : 0,
+                       have_err ? err.RX_ERR_COUNTER : 0);
     can_diag.rx_window = 0;
     can_diag.dup_window = 0;
     can_diag.ids_count = 0;
