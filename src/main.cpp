@@ -101,13 +101,18 @@ namespace {
   constexpr float    RPM_PULSES_PER_REV = 2.0f;
   constexpr uint32_t RPM_TIMEOUT_MS     = 750;      // no pulses in this window -> RPM = 0
 
-  // CAN bus — MS3Pro broadcasts on 0x5F0 base ID at 500 kbps (TunerStudio default).
+  // CAN bus — MS3Pro "Simplified Dash Broadcasting" on 0x5E8 (1512 dec) base
+  // ID at 500 kbps. Verified against the official MegaSquirt CAN Broadcast spec
+  // (msextra.com) AND a real capture: frame 0x5E8 = 03 FD 00 00 05 62 FF FF
+  // decoded to MAP 102.1kPa / RPM 0 / CLT 137.8F / TPS 0 (key-on, engine off).
+  // TunerStudio: CAN-Bus/Testmodes -> Dash Broadcasting, Enable=On, Automatic
+  // (locks base to 1512, 50 Hz). All fields big-endian.
   // Transceiver: SN65HVD230 (3.3V). CAN1 TX=pin 22, RX=pin 23.
   // Add a 120Ω termination resistor across CAN H/L at the Teensy end;
   // MS3Pro already has one built-in at the ECU end.
   constexpr uint32_t CAN_BAUD           = 500000;
   constexpr uint32_t CAN_STALE_MS       = 2000;     // no frames → reset fields to -1
-  constexpr uint32_t CAN_BASE_ID        = 0x5F0;    // MS3Pro broadcast base
+  constexpr uint32_t CAN_BASE_ID        = 0x5E8;    // MS3Pro Simplified Dash base (1512)
 
   // ---- Oil pressure: generic 5V 0.5-4.5V transducer, 150 PSI full scale ----
   // Wired through a 10k / 20k voltage divider so the 0.5-4.5V sensor output
@@ -500,17 +505,21 @@ static uint16_t computeRpmAndReset() {
 // ---------------------------------------------------------------------------
 // MS3Pro CAN bus — FlexCAN_T4 on CAN1 (TX=22, RX=23).
 //
-// The MS3Pro broadcasts up to 4 frames at CAN_BASE_ID + 0..3, 8 bytes each,
-// big-endian. We parse only the frames we need:
+// MS3Pro "Simplified Dash Broadcasting": frames at CAN_BASE_ID (0x5E8/1512)
+// + 0..4, 8 bytes each, big-endian. Layout per the official spec (and the
+// captured 0x5E8 frame confirms it). We parse the frames carrying what the
+// dash shows:
 //
-//   0x5F0  bytes 6-7  rpm        (uint16, 1 RPM/bit)
-//   0x5F2  bytes 2-3  map_x10    (int16, kPa × 10)
-//          bytes 4-5  iat_f_x10  (int16, °F × 10 — assumes TunerStudio in °F)
-//          bytes 6-7  clt_f_x10  (int16, °F × 10 — assumes TunerStudio in °F)
-//   0x5F3  bytes 0-1  tps_x10    (int16, % × 10)
-//          bytes 2-3  bat_x10    (int16, V × 10)
-//          bytes 4-5  afr_x10    (int16, AFR × 10, e.g. 145 = 14.5:1)
+//   0x5E8  bytes 0-1  map_x10    (int16,  kPa × 10)
+//          bytes 2-3  rpm        (uint16, 1 RPM/bit)
+//          bytes 4-5  clt_f_x10  (int16,  °F  × 10  — TunerStudio units assumed °F)
+//          bytes 6-7  tps_x10    (int16,  %   × 10)
+//   0x5E9  bytes 4-5  iat_f_x10  (int16,  °F  × 10, field "mat")
+//   0x5EA  byte  0    afrtgt_x10 (uint8,  AFR × 10  — target, not stored)
+//          byte  1    afr_x10    (uint8,  AFR × 10, field "AFR1", e.g. 147 = 14.7)
+//   0x5EB  bytes 0-1  bat_x10    (int16,  V   × 10)
 //
+// Note: afr/afrtgt are SINGLE bytes (0-255 = 0.0-25.5 AFR), the rest are 16-bit.
 // All fields default to -1 until a valid frame arrives. If no frames arrive
 // for CAN_STALE_MS the struct resets to -1 so the dash shows '---'.
 // ---------------------------------------------------------------------------
@@ -539,20 +548,24 @@ static void pumpCAN() {
             cansniffLog(msg.id, msg.flags.extended, msg.len, msg.buf);
         }
         switch (msg.id) {
-            case CAN_BASE_ID + 0:   // 0x5F0: seconds, pw1, pw2, rpm
-                can_ecu.rpm     = ((uint16_t)msg.buf[6] << 8) | msg.buf[7];
-                can_ecu.last_ms = now;
-                break;
-            case CAN_BASE_ID + 2:   // 0x5F2: baro, map, IAT, CLT
-                can_ecu.map_x10    = (int16_t)(((uint16_t)msg.buf[2] << 8) | msg.buf[3]);
-                can_ecu.iat_f_x10  = (int16_t)(((uint16_t)msg.buf[4] << 8) | msg.buf[5]);
-                can_ecu.clt_f_x10  = (int16_t)(((uint16_t)msg.buf[6] << 8) | msg.buf[7]);
+            case CAN_BASE_ID + 0:   // 0x5E8: map, rpm, clt, tps
+                can_ecu.map_x10    = (int16_t)(((uint16_t)msg.buf[0] << 8) | msg.buf[1]);
+                can_ecu.rpm        =          (((uint16_t)msg.buf[2] << 8) | msg.buf[3]);
+                can_ecu.clt_f_x10  = (int16_t)(((uint16_t)msg.buf[4] << 8) | msg.buf[5]);
+                can_ecu.tps_x10    = (int16_t)(((uint16_t)msg.buf[6] << 8) | msg.buf[7]);
                 can_ecu.last_ms    = now;
                 break;
-            case CAN_BASE_ID + 3:   // 0x5F3: TPS, battery, AFR1, AFR2
-                can_ecu.tps_x10    = (int16_t)(((uint16_t)msg.buf[0] << 8) | msg.buf[1]);
-                can_ecu.bat_x10    = (int16_t)(((uint16_t)msg.buf[2] << 8) | msg.buf[3]);
-                can_ecu.afr_x10    = (int16_t)(((uint16_t)msg.buf[4] << 8) | msg.buf[5]);
+            case CAN_BASE_ID + 1:   // 0x5E9: pw1, pw2, mat(IAT), adv_deg
+                can_ecu.iat_f_x10  = (int16_t)(((uint16_t)msg.buf[4] << 8) | msg.buf[5]);
+                can_ecu.last_ms    = now;
+                break;
+            case CAN_BASE_ID + 2:   // 0x5EA: afrtgt1, AFR1, EGOcor1, egt1, pwseq1
+                // afrtgt1 (byte 0) and AFR1 (byte 1) are single bytes = AFR * 10.
+                can_ecu.afr_x10    = (int16_t)msg.buf[1];   // AFR1 (cyl#1), e.g. 147 = 14.7
+                can_ecu.last_ms    = now;
+                break;
+            case CAN_BASE_ID + 3:   // 0x5EB: batt, sensors1, sensors2, knk_rtd
+                can_ecu.bat_x10    = (int16_t)(((uint16_t)msg.buf[0] << 8) | msg.buf[1]);
                 can_ecu.last_ms    = now;
                 break;
             default:

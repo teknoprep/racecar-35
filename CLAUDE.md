@@ -263,7 +263,7 @@ Wiring: `3V3→3.3V, GND→GND, CTX(TXD)→pin 22, CRX(RXD)→pin 23, CANH→MS3
 CANL→MS3Pro CAN-L`.
 
 Software (`src/main.cpp`): `FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;` at
-`CAN_BAUD = 500000`, `CAN_BASE_ID = 0x5F0`. `pumpCAN()` parses frames and `CAN_STALE_MS = 2000`
+`CAN_BAUD = 500000`, `CAN_BASE_ID = 0x5E8` (1512, MS3 "Simplified Dash" base). `pumpCAN()` parses frames and `CAN_STALE_MS = 2000`
 resets fields to `-1` if the bus goes silent. **FreqMeasure (opto tach) is kept alongside CAN**
 — both RPM sources are always running; `emitToDash()` picks one based on `sensor_type`.
 
@@ -274,12 +274,32 @@ resets fields to `-1` if the bus goes silent. **FreqMeasure (opto tach) is kept 
 - **1 = MegaSquirt**: RPM + coolant + AFR + MAP + TPS + IAT + battery from CAN. AFR is only
   shown in MS3 mode. Oil PSI still from A2 (MS3Pro typically has no oil-pressure input).
 
-### ⚠️ The broadcast byte offsets are UNVERIFIED
-The frame layout in `pumpCAN()` (0x5F0 bytes 6-7 = RPM, 0x5F2 = baro/MAP/IAT/CLT,
-0x5F3 = TPS/batt/AFR) is the **assumed standard MS3 broadcast** — but the MS3Pro broadcast is
-**configurable in TunerStudio**, so it may differ. **Verify with the CAN sniffer before
-trusting the parse** (see next section). TunerStudio setup: `CAN Parameters → broadcasting On`,
-base ID **1520** (0x5F0), rate **20 Hz**. Temps assumed °F × 10 (depends on TunerStudio units).
+### ✅ Broadcast byte offsets — VERIFIED (2026-06-03)
+Layout confirmed against the **official MegaSquirt CAN Broadcast spec**
+(`msextra.com/doc/pdf/Megasquirt_CAN_Broadcast.pdf`, "Simplified Dash Broadcasting") AND a
+real sniffer capture: frame `0x5E8 = 03 FD 00 00 05 62 FF FF` decoded cleanly to MAP 102.1 kPa
+/ RPM 0 / CLT 137.8 °F / TPS ~0 (a key-on, engine-off snapshot — that's why the payload was
+static across the whole capture). Base ID is **1512 (0x5E8)**, NOT 1520/0x5F0 — sequential
+addressing, big-endian, 500 kbps. `pumpCAN()` now parses:
+
+| ID | bytes | field | scale |
+|---|---|---|---|
+| `0x5E8` | 0-1 | map | ÷10 kPa (int16) |
+| `0x5E8` | 2-3 | **rpm** | ×1 (uint16) |
+| `0x5E8` | 4-5 | **clt** | ÷10 °F (int16) |
+| `0x5E8` | 6-7 | tps | ÷10 % (int16) |
+| `0x5E9` | 4-5 | mat (IAT) | ÷10 °F (int16) |
+| `0x5EA` | 1 | **AFR1** | ÷10 (uint8! 0-255 = 0.0-25.5) |
+| `0x5EB` | 0-1 | batt | ÷10 V (int16) |
+
+**AFR + AFR-target are single bytes**, not 16-bit (byte 0 = afrtgt1, byte 1 = AFR1). The rest
+are 16-bit big-endian. TunerStudio setup: `CAN-Bus/Testmodes → Dash Broadcasting → Enable=On`,
+`Automatic` mode (locks base to 1512, broadcasts 50 Hz). Temps assumed °F × 10 (depends on
+TunerStudio units — re-verify if it's ever switched to °C).
+
+> Note: only `0x5E8` was seen in the engine-off capture. The 1513-1516 (`0x5E9`-`0x5EC`)
+> frames (IAT/AFR/batt) still want a **running-engine capture** to fully confirm, but they
+> follow the same authoritative spec table above.
 
 ## CAN sniffer (Tools page → "Start CAN capture")
 
