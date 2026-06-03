@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.44"
+#define FIRMWARE_VERSION "0.1.45"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -547,15 +547,28 @@ static struct CanEcu {
 static struct CanDiag {
     uint32_t rx_total      = 0;    // every frame ever read (any ID)
     uint32_t rx_window     = 0;    // frames since last 1 Hz report
+    uint32_t dup_window    = 0;    // frames byte-identical to the previous one
     uint32_t ids_seen[8]   = {0};  // distinct IDs in this window (ring, dropped if >8)
     uint8_t  ids_count     = 0;
     uint8_t  base_hits     = 0;    // frames matching CAN_BASE_ID+0..3 this window
     uint32_t last_report_ms = 0;
+    uint8_t  last_buf[8]   = {0};  // payload of previous frame (for dup detection)
+    uint8_t  last_len      = 0xFF;
+    uint32_t last_id       = 0xFFFFFFFF;
 } can_diag;
 
-static void canDiagNote(uint32_t id) {
+static void canDiagNote(uint32_t id, uint8_t len, const uint8_t* buf) {
     can_diag.rx_total++;
     can_diag.rx_window++;
+    // Duplicate detection: a healthy bus carries CHANGING data; a saturated
+    // ACK-error retransmit storm repeats one frozen frame. If ~100% of frames
+    // are byte-identical to the previous one at ~3000+ fps, it's a storm.
+    if (id == can_diag.last_id && len == can_diag.last_len &&
+        memcmp(buf, can_diag.last_buf, len > 8 ? 8 : len) == 0) {
+        can_diag.dup_window++;
+    }
+    can_diag.last_id = id; can_diag.last_len = len;
+    memcpy(can_diag.last_buf, buf, len > 8 ? 8 : len);
     for (uint8_t i = 0; i < can_diag.ids_count; i++)
         if (can_diag.ids_seen[i] == id) return;     // already recorded
     if (can_diag.ids_count < 8)
@@ -572,15 +585,30 @@ static void canDiagReport() {
     for (uint8_t i = 0; i < can_diag.ids_count && n < (int)sizeof(ids) - 8; i++)
         n += snprintf(ids + n, sizeof(ids) - n, "%s0x%lX",
                       i ? "," : "", (unsigned long)can_diag.ids_seen[i]);
-    Serial.printf("CANDIAG frames/s=%lu total=%lu base_hits=%u ids=[%s]\n",
-                  (unsigned long)can_diag.rx_window,
-                  (unsigned long)can_diag.rx_total,
-                  can_diag.base_hits, ids);
+    // Pull FlexCAN's error/bus state. events() populates the ESR1 capture buffer
+    // without draining the FIFO (FIFO interrupt isn't enabled), so it's safe to
+    // call alongside our read()-polling in pumpCAN().
+    Can1.events();
+    CAN_error_t err;
+    const bool have_err = Can1.error(err, false);
+    const uint32_t dpct = can_diag.rx_window ? (can_diag.dup_window * 100UL / can_diag.rx_window) : 0;
+    Serial.printf("CANDIAG frames/s=%lu dup=%lu%% total=%lu base_hits=%u ids=[%s] "
+                  "state=%s ACK_ERR=%d CRC_ERR=%d FRM=%d STF=%d TXerr=%u RXerr=%u flt=%s\n",
+                  (unsigned long)can_diag.rx_window, (unsigned long)dpct,
+                  (unsigned long)can_diag.rx_total, can_diag.base_hits, ids,
+                  have_err ? (char*)err.state : "?",
+                  have_err ? err.ACK_ERR : 0, have_err ? err.CRC_ERR : 0,
+                  have_err ? err.FRM_ERR : 0, have_err ? err.STF_ERR : 0,
+                  have_err ? err.TX_ERR_COUNTER : 0, have_err ? err.RX_ERR_COUNTER : 0,
+                  have_err ? (char*)err.FLT_CONF : "?");
     // Also surface it on the dash link so it can be shown without a USB cable.
-    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u\n",
+    // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>
+    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d\n",
                        (unsigned long)can_diag.rx_window,
-                       (unsigned long)can_diag.rx_total, can_diag.base_hits);
+                       (unsigned long)can_diag.rx_total, can_diag.base_hits,
+                       (unsigned long)dpct, have_err ? err.ACK_ERR : 0);
     can_diag.rx_window = 0;
+    can_diag.dup_window = 0;
     can_diag.ids_count = 0;
     can_diag.base_hits = 0;
 }
@@ -592,8 +620,8 @@ static void pumpCAN() {
     CAN_message_t msg;
     const uint32_t now = millis();
     while (Can1.read(msg)) {
-        // Diagnostics: count EVERY frame + record its ID, regardless of match.
-        canDiagNote(msg.id);
+        // Diagnostics: count EVERY frame + record its ID/payload, regardless of match.
+        canDiagNote(msg.id, msg.len, msg.buf);
         if (msg.id >= CAN_BASE_ID && msg.id <= CAN_BASE_ID + 3) can_diag.base_hits++;
         // Sniffer: capture the raw frame (any ID) before our targeted parse.
         if (cansniff_active) {
