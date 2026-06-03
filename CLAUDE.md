@@ -64,6 +64,49 @@ $cli = "C:\Users\ChrisRawlings\AppData\Local\Programs\Arduino IDE\resources\app\
 
 **Always disconnect the Teensy↔CrowPanel UART jumpers before flashing the CrowPanel.** UART0 (GPIO 43/44) is shared with the CH340 used for upload — Teensy contention silently corrupts the flash, or you get `The serial TX path seems to be down` from esptool.
 
+## OTA release — ⚠️ ALWAYS bump BOTH MCUs to the SAME version
+
+The dash OTA pulls `firmware/manifest.json` from GitHub raw and flashes whichever MCU's
+manifest `version` is newer than what's installed. **The two firmwares MUST always be released
+at the SAME version number, even if only one side's code changed.** Shipping e.g. Teensy
+`0.1.42` while leaving CrowPanel at `0.1.41` produces a **version mismatch** in the field — do
+not do this. If you touch *either* `src/main.cpp` or `RaceDash.ino`, you rebuild *both*, bump
+*both* `FIRMWARE_VERSION` defines to the same number, and republish *both* artifacts.
+
+Full publish procedure (Linux host, `export HOME=/root` first so git + arduino-cli configs load):
+```bash
+export HOME=/root
+NEW=0.1.43   # pick the next version
+
+# 1. bump BOTH version defines to the same number
+sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" src/main.cpp
+sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" crowpanel-arduino/RaceDash/RaceDash.ino
+
+# 2. build Teensy -> firmware/teensy41-dash.hex
+~/.local/bin/pio run
+cp .pio/build/teensy41/firmware.hex firmware/teensy41-dash.hex
+
+# 3. build CrowPanel -> firmware/crowpanel-dash.bin  (use the APP bin: RaceDash.ino.bin,
+#    NOT .bootloader.bin / .partitions.bin)
+cli=~/.local/bin/arduino-cli
+fqbn="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none"
+$cli compile --fqbn "$fqbn" --output-dir /tmp/rd_build crowpanel-arduino/RaceDash
+cp /tmp/rd_build/RaceDash.ino.bin firmware/crowpanel-dash.bin
+
+# 4. update firmware/manifest.json: set BOTH version fields to $NEW, and recompute BOTH
+#    sha256 + size (the CrowPanel verifies sha256 before flashing — a stale hash aborts OTA)
+sha256sum firmware/teensy41-dash.hex firmware/crowpanel-dash.bin
+stat -c%s firmware/teensy41-dash.hex firmware/crowpanel-dash.bin
+
+# 5. commit + push, then verify GitHub raw serves the new manifest + matching hashes
+git add src/main.cpp crowpanel-arduino/RaceDash/RaceDash.ino firmware/
+git commit -m "Release v$NEW: <what changed>"
+git push origin main
+curl -s https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/manifest.json
+```
+The manifest's two version checks are independent in code, but **operationally they are
+lockstep** — keep them equal.
+
 ## Hardware constants that bit us repeatedly
 
 - **CrowPanel rev:** V3.0 (silkscreened on the back). V3.0 has a **PCA9557 I²C IO expander at 0x18** that holds the LCD in reset until IO0 is driven high. V1.X / V2.X don't. Source per rev lives at `_vendor/CrowPanel-ESP32-Display-Course-File/CrowPanel_ESP32_Tutorial/Code/{V1.X,V2.X,7.0 v3.0 touch new code}/`. **V3.0 uses 15 MHz pclk** (V2.X uses 12 MHz — the configs look interchangeable but are not).

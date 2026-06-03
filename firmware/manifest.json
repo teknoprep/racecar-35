@@ -1,8 +1,8 @@
 {
   "crowpanel": {
-    "version": "0.1.41",
+    "version": "0.1.42",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel-dash.bin",
-    "sha256":  "a9e54cfa5f7894b0de163de264836512c718f2c0e539361e435295e4550bd50b",
+    "sha256":  "8d8043fea1d31a0fb46b003e4fc83fb61a177f0300f7f672d847bacd00e85b51",
     "size":    1035216
   },
   "teensy": {
