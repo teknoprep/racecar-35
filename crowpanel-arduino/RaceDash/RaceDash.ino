@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.51"
+#define FIRMWARE_VERSION "0.1.52"
 
 #include <Preferences.h>
 #include <time.h>
@@ -6231,20 +6231,29 @@ static void drawToolsPage() {
         //   0 fps / stale         -> NO BUS
         //   > 600 fps             -> STORM (genuine retransmit; ACK not reaching MS3)
         //   1..600 fps            -> OK (normal broadcast; 50/sec per enabled group)
+        // PLAIN-ENGLISH VERDICT. Classify by frame RATE (real storm ~3000+ fps;
+        // healthy ~50 fps) and use the Teensy's RX error counter to say WHO is at
+        // fault, so nobody has to interpret raw numbers:
+        //   storm + RXe high  -> our ACK isn't reaching the bus (Teensy TX path)
+        //   storm + RXe ~0    -> we're not erroring; the MS3/bus side is the issue
         if (!fresh || candiag_fps == 0) {
             col = TFT_DARKGREY;
-            snprintf(line, sizeof(line), "CAN: NO BUS  \xB7  0 fps  TXe%u RXe%u  \xB7  no frames arriving",
-                     candiag_tx_err, candiag_rx_err);
+            snprintf(line, sizeof(line), "CAN: NO FRAMES (0 fps) - transceiver power/wiring or MS3 broadcast off");
         } else if (candiag_fps > 600) {
             col = TFT_RED;
-            snprintf(line, sizeof(line), "CAN: STORM  \xB7  %lu fps  dup%u%%  TXe%u RXe%u  \xB7  MS3 not getting ACK",
-                     (unsigned long)candiag_fps, candiag_dup_pct,
-                     candiag_tx_err, candiag_rx_err);
+            if (candiag_rx_err > 64) {
+                snprintf(line, sizeof(line),
+                    "STORM %lu fps - TEENSY ACK NOT REACHING BUS (RXe%u). Check pin22->transceiver TX + Rs->GND",
+                    (unsigned long)candiag_fps, candiag_rx_err);
+            } else {
+                snprintf(line, sizeof(line),
+                    "STORM %lu fps - Teensy NOT erroring (RXe%u) -> MS3 CAN config / no-ACK on MS3 side",
+                    (unsigned long)candiag_fps, candiag_rx_err);
+            }
         } else {
             col = TFT_GREEN;
-            snprintf(line, sizeof(line), "CAN: OK  \xB7  %lu fps  dup%u%%  base%u  TXe%u RXe%u",
-                     (unsigned long)candiag_fps, candiag_dup_pct, candiag_base,
-                     candiag_tx_err, candiag_rx_err);
+            snprintf(line, sizeof(line), "CAN OK - %lu fps live  (TXe%u RXe%u)",
+                     (unsigned long)candiag_fps, candiag_tx_err, candiag_rx_err);
         }
         tft.setFont(&fonts::Font2);
         tft.setTextColor(col, TFT_BLACK);
