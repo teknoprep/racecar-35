@@ -27,6 +27,12 @@ LAN IP of the host running the container.
 | POST   | `/admin/users`              | Add an account or change its admin flag (JSON `{email, is_admin}`). Admins only. |
 | POST   | `/admin/users/delete`       | Remove a managed account (JSON `{email}`). Admins only. |
 | GET    | `/admin/user/<email>`       | Per-user screen: ALL USERS toggle + manage who this account can see. Admins only. |
+| GET    | `/admin/canbus`             | CAN-capture portal: upload + list captures, links to review. Admins only. |
+| POST   | `/admin/canbus/upload?name=` | Upload a CAN sniffer CSV (raw body). Admins only. |
+| GET    | `/admin/canbus/<file>`      | Review a capture: per-ID stats + byte/word signal inspector. Admins only. |
+| GET    | `/admin/canbus/<file>/data` | Parsed JSON (per-ID frame counts, byte ranges, downsampled series). Admins only. |
+| GET    | `/admin/canbus/<file>/raw`  | Download the raw CSV. Admins only. |
+| POST   | `/admin/canbus/<file>/delete` | Delete a capture. Admins only. |
 | POST   | `/admin/users/visibility`   | Set the ALL USERS flag (JSON `{email, view_all}`). Admins only. |
 | POST   | `/admin/users/grant`        | Let an account see another's sessions (JSON `{email, target}`). Admins only. |
 | POST   | `/admin/users/revoke`       | Remove a granted account (JSON `{email, target}`). Admins only. |
@@ -211,6 +217,30 @@ primary lap during playback:
 The dash firmware does its own on-car lap timing (predictive lap time + live
 delta vs the session best, shown in the middle column of the dash). The cloud
 view is the post-session analysis counterpart.
+
+## CAN-bus captures (admin)
+
+The dash's CAN sniffer (Tools → Start CAN capture) writes a CSV per run
+(`t_ms,id,ext,dlc,d0..d7`, data bytes in hex) to reverse-engineer the MS3Pro
+broadcast byte layout. Instead of pulling the SD card, you can now upload that
+CSV straight into the **admin → CAN captures** portal and analyse it in the
+browser:
+
+- **Upload** is a plain file picker (sent as a raw POST body — no extra deps).
+  Files land in `RACECAR_DATA_DIR/canbus/<name>.csv`.
+- The **review page** parses the capture server-side and shows, per CAN ID,
+  the frame count + rate and each data byte's min/max/range. Pick an ID and:
+  - the **bytes plot** draws d0–d7 over time (the changing bytes are enabled by
+    default — a flat line means that byte never moved, a ramp means it carries
+    a live signal);
+  - the **16-bit word inspector** combines an adjacent byte pair (selectable
+    start byte + big/little-endian) into a single value and plots it, so you
+    can confirm e.g. "0x5F0 bytes 6–7 BE" ramps cleanly with RPM.
+
+Capture while sweeping the throttle: the byte/word that tracks engine speed is
+your RPM field. Note the ID + start byte + endianness and lock them into
+`pumpCAN()` in `src/main.cpp`. Everything here is **admin-only** and the
+filename is sanitised (no path traversal, single `.csv` on disk).
 
 ## Behind nginx (production)
 

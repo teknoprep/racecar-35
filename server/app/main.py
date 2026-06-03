@@ -1072,6 +1072,238 @@ async def admin_user_detail(request: Request, email: str) -> Response:
     return HTMLResponse(page)
 
 
+# ---------------------------------------------------------------------------
+# CAN-bus captures (admin only).
+#
+# The dash's CAN sniffer writes CSV files (t_ms,id,ext,dlc,d0..d7) to reverse-
+# engineer the MS3Pro broadcast byte layout. These endpoints let an admin
+# upload one straight from the browser and inspect it: per-ID frame counts +
+# rates, per-byte min/max/range, and downsampled byte time-series so you can
+# eyeball which byte (or 16-bit word) tracks RPM/CLT/AFR.
+# ---------------------------------------------------------------------------
+def _canbus_dir() -> pathlib.Path:
+    p = DATA_DIR / "canbus"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _canbus_save_name(raw_name: Optional[str]) -> str:
+    raw = (raw_name or "capture").strip()
+    for ext in (".csv", ".txt", ".log"):
+        if raw.lower().endswith(ext):
+            raw = raw[: -len(ext)]
+            break
+    return safe_name(raw, default="capture", maxlen=110) + ".csv"
+
+
+def _resolve_can(file: str) -> pathlib.Path:
+    f = re.sub(r"[^A-Za-z0-9._-]", "_", (file or "").strip()).lstrip(".")
+    if not f.endswith(".csv"):
+        f += ".csv"
+    base = _canbus_dir().resolve()
+    p = (base / f).resolve()
+    if p.parent != base or not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return p
+
+
+def _canbus_listing() -> list:
+    out = []
+    for f in _canbus_dir().iterdir():
+        if not f.is_file() or not f.name.endswith(".csv"):
+            continue
+        st = f.stat()
+        out.append({"filename": f.name, "size_bytes": st.st_size, "mtime": int(st.st_mtime)})
+    out.sort(key=lambda c: c["mtime"], reverse=True)
+    return out
+
+
+def _canbus_rows_html() -> str:
+    rows = []
+    for c in _canbus_listing():
+        fn = html.escape(c["filename"])
+        when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(c["mtime"]))
+        kb = f"{c['size_bytes'] / 1024:.0f} KB"
+        rows.append(
+            f"<tr><td class=mono><a href='/admin/canbus/{fn}'>{fn}</a></td>"
+            f"<td class=mono>{when} UTC</td><td class=mono>{kb}</td>"
+            f"<td><div class='row-actions'>"
+            f"<a class='btn' href='/admin/canbus/{fn}'>review</a>"
+            f"<a class='btn' href='/admin/canbus/{fn}/raw'>download</a>"
+            f"<button class='btn danger' data-act='del' data-file='{fn}'>delete</button>"
+            f"</div></td></tr>"
+        )
+    if not rows:
+        return ("<tr><td colspan=4 class=empty style='color:var(--muted);"
+                "font-style:italic;text-align:center'>no CAN captures uploaded yet</td></tr>")
+    return "\n".join(rows)
+
+
+def _parse_can_id(tok: str):
+    tok = (tok or "").strip()
+    if not tok:
+        return None
+    try:
+        if tok.lower().startswith("0x"):
+            return int(tok, 16)
+        return int(tok, 10)
+    except ValueError:
+        try:
+            return int(tok, 16)
+        except ValueError:
+            return None
+
+
+def _parse_can_csv(raw: bytes, max_points: int = 2000) -> dict:
+    text = raw.decode("utf-8", "replace")
+    ids: dict = {}
+    total = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if parts[0].lower() in ("t_ms", "t", "time", "timestamp"):
+            continue  # header
+        if len(parts) < 4:
+            continue
+        try:
+            t_ms = int(float(parts[0]))
+        except ValueError:
+            continue
+        idv = _parse_can_id(parts[1])
+        if idv is None:
+            continue
+        try:
+            dlc = int(parts[3])
+        except ValueError:
+            dlc = len(parts) - 4
+        databytes = []
+        for b in parts[4:12]:
+            try:
+                databytes.append(int(b, 16) & 0xFF)
+            except ValueError:
+                databytes.append(None)
+        rec = ids.get(idv)
+        if rec is None:
+            rec = {"count": 0, "t": [], "b": [[] for _ in range(8)],
+                   "dlc": dlc, "first": t_ms, "last": t_ms}
+            ids[idv] = rec
+        rec["count"] += 1
+        rec["last"] = t_ms
+        rec["t"].append(t_ms)
+        for i in range(8):
+            rec["b"][i].append(databytes[i] if i < len(databytes) else None)
+        total += 1
+
+    out_ids = []
+    for idv, rec in ids.items():
+        n = rec["count"]
+        span_ms = rec["last"] - rec["first"]
+        hz = round(n / (span_ms / 1000.0), 1) if span_ms > 0 else 0.0
+        bytestats = []
+        for i in range(8):
+            vals = [v for v in rec["b"][i] if v is not None]
+            if vals:
+                bytestats.append({"i": i, "min": min(vals), "max": max(vals),
+                                  "range": max(vals) - min(vals)})
+            else:
+                bytestats.append({"i": i, "min": None, "max": None, "range": 0})
+        stride = max(1, n // max_points)
+        out_ids.append({
+            "id": idv, "id_hex": "0x%X" % idv, "count": n, "hz": hz, "dlc": rec["dlc"],
+            "first_ms": rec["first"], "last_ms": rec["last"], "stride": stride,
+            "bytes": bytestats,
+            "t": rec["t"][::stride],
+            "b": [rec["b"][i][::stride] for i in range(8)],
+        })
+    out_ids.sort(key=lambda r: r["count"], reverse=True)
+    return {"frames": total, "n_ids": len(out_ids), "ids": out_ids}
+
+
+def _require_admin_page(request: Request):
+    """Admin gate that returns an HTML response (not JSON) for browser routes.
+    Returns (user, None) when OK, or (None, Response) to short-circuit."""
+    if not oauth_enabled():
+        return None, HTMLResponse(_ADMIN_DISABLED_HTML, status_code=400)
+    user = current_user(request)
+    if not user:
+        return None, login_redirect(request)
+    if not is_admin_email(str(user.get("email", ""))):
+        return None, HTMLResponse(
+            _LOGIN_ERROR_HTML.replace("__ERROR__", "Admin access is required for this page."),
+            status_code=403,
+        )
+    return user, None
+
+
+@app.get("/admin/canbus", response_class=HTMLResponse)
+async def canbus_page(request: Request) -> Response:
+    user, resp = _require_admin_page(request)
+    if resp:
+        return resp
+    return HTMLResponse(_CANBUS_HTML
+                        .replace("__USER_CHIP__", _user_chip_html(user))
+                        .replace("__ROWS__", _canbus_rows_html()))
+
+
+@app.get("/admin/canbus/list")
+async def canbus_list(request: Request) -> dict:
+    require_admin(request)
+    return {"captures": _canbus_listing()}
+
+
+@app.post("/admin/canbus/upload")
+async def canbus_upload(request: Request, name: str = Query("capture")) -> JSONResponse:
+    require_admin(request)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty body")
+    if len(body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="body too large")
+    fn = _canbus_save_name(name)
+    out = _canbus_dir() / fn
+    if out.exists():
+        out = _canbus_dir() / f"{out.stem}_{int(time.time())}.csv"
+    out.write_bytes(body)
+    log.info("canbus upload %s bytes=%d -> %s", request.client.host if request.client else "?",
+             len(body), out.name)
+    return JSONResponse({"ok": True, "filename": out.name, "bytes": len(body)})
+
+
+@app.get("/admin/canbus/{file}/data")
+async def canbus_data(request: Request, file: str) -> JSONResponse:
+    require_admin(request)
+    p = _resolve_can(file)
+    return JSONResponse(_parse_can_csv(p.read_bytes()))
+
+
+@app.get("/admin/canbus/{file}/raw")
+async def canbus_raw(request: Request, file: str) -> FileResponse:
+    require_admin(request)
+    p = _resolve_can(file)
+    return FileResponse(p, media_type="text/csv", filename=p.name)
+
+
+@app.post("/admin/canbus/{file}/delete")
+async def canbus_delete(request: Request, file: str) -> JSONResponse:
+    require_admin(request)
+    p = _resolve_can(file)
+    p.unlink()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/admin/canbus/{file}", response_class=HTMLResponse)
+async def canbus_review(request: Request, file: str) -> Response:
+    user, resp = _require_admin_page(request)
+    if resp:
+        return resp
+    p = _resolve_can(file)
+    return HTMLResponse(_CAN_REVIEW_HTML
+                        .replace("__USER_CHIP__", _user_chip_html(user))
+                        .replace("__FILE__", html.escape(p.name)))
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": SERVICE_NAME, "data_dir": str(DATA_DIR)}
@@ -1730,7 +1962,8 @@ _ADMIN_HTML = (
 """ + _FONTS_LINK + "<style>" + _BASE_CSS + _ADMIN_EXTRA_CSS + """</style></head><body>
 <header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
   <span class="crumbs"><a href="/">sessions</a> &rsaquo; admin</span>
-  <span style="flex:1"></span>__USER_CHIP__</header>
+  <span style="flex:1"></span>
+  <a class="btn" href="/admin/canbus" style="margin-right:var(--sp-md)">CAN captures</a>__USER_CHIP__</header>
 <main>
   <div id="msg" class="msg"></div>
   <section class="panel">
@@ -2219,6 +2452,239 @@ async def index(request: Request) -> Response:
 # Leaflet is loaded from a CDN. We use CartoDB "dark matter" tiles which
 # already match the dark surface palette without a custom tile server.
 # ---------------------------------------------------------------------------
+_CANBUS_HTML = (
+    """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>CAN captures \u00b7 racecar-35</title>
+""" + _FONTS_LINK + "<style>" + _BASE_CSS + _ADMIN_EXTRA_CSS + """
+  .msg.good { display:block; background:rgba(108,208,122,0.1); color:var(--good);
+    border:1px solid rgba(108,208,122,0.3); }
+  input[type=file] { color:var(--muted); font:13px var(--ff-ui); }
+</style></head><body>
+<header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
+  <span class="crumbs"><a href="/">sessions</a> &rsaquo; <a href="/admin">admin</a> &rsaquo; CAN</span>
+  <span style="flex:1"></span>__USER_CHIP__</header>
+<main>
+  <div id="msg" class="msg"></div>
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:var(--sp-md)">Upload a CAN sniffer capture (.csv)</div>
+    <div class="add-grid">
+      <input id="canFile" type="file" accept=".csv,.txt,.log,text/csv">
+      <button class="btn primary" id="upBtn">upload</button>
+    </div>
+    <p class="summary" style="color:var(--muted);margin-top:var(--sp-md);font-size:12px">
+      Expected format from the dash sniffer (Tools \u2192 Start CAN capture):
+      <span class="mono">t_ms,id,ext,dlc,d0..d7</span> \u2014 one CAN frame per line,
+      data bytes in hex. Open a capture's <b>review</b> to find which byte/word tracks RPM.</p>
+  </section>
+  <table><thead><tr><th>capture</th><th>uploaded</th><th>size</th><th>actions</th></tr></thead>
+  <tbody id="rows">__ROWS__</tbody></table>
+</main>
+<script>
+(function(){
+  var msg=document.getElementById('msg');
+  function show(t,ok){ msg.className='msg '+(ok?'good':'bad'); msg.textContent=t; }
+  document.getElementById('upBtn').addEventListener('click', async function(){
+    var f=document.getElementById('canFile').files[0];
+    if(!f){ show('Choose a .csv capture first.'); return; }
+    show('Uploading '+f.name+'\u2026', true);
+    try{
+      var buf=await f.arrayBuffer();
+      var r=await fetch('/admin/canbus/upload?name='+encodeURIComponent(f.name),
+        {method:'POST', headers:{'Content-Type':'text/csv'}, body:buf});
+      var d=await r.json().catch(function(){return {};});
+      if(!r.ok) throw new Error((d&&d.detail)||('HTTP '+r.status));
+      location.reload();
+    }catch(e){ show('Upload failed: '+e.message); }
+  });
+  document.addEventListener('click', async function(ev){
+    var t=ev.target.closest('[data-act=del]'); if(!t) return;
+    var file=t.dataset.file;
+    if(!confirm('Delete '+file+'?')) return;
+    try{
+      var r=await fetch('/admin/canbus/'+encodeURIComponent(file)+'/delete',{method:'POST'});
+      if(!r.ok){ var d=await r.json().catch(function(){return {};}); throw new Error((d&&d.detail)||('HTTP '+r.status)); }
+      location.reload();
+    }catch(e){ show('Delete failed: '+e.message); }
+  });
+})();
+</script>
+</body></html>"""
+)
+
+_CAN_REVIEW_HTML = (
+    """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>CAN \u00b7 __FILE__</title>
+""" + _FONTS_LINK + "<style>" + _BASE_CSS + _ADMIN_EXTRA_CSS + """
+  main { max-width: 1280px; }
+  .can-grid { display:grid; grid-template-columns: 320px 1fr; gap:var(--sp-md); align-items:start; }
+  @media (max-width:980px){ .can-grid { grid-template-columns:1fr; } }
+  .card { background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); overflow:hidden; }
+  .card-head { display:flex; justify-content:space-between; align-items:center;
+    padding:10px var(--sp-md); border-bottom:1px solid var(--line); }
+  .card-body { padding:var(--sp-md); }
+  table.idt { border:none; border-radius:0; }
+  table.idt td, table.idt th { padding:9px 14px; }
+  table.idt tbody tr { cursor:pointer; }
+  table.idt tbody tr.sel { background:rgba(255,176,32,0.14); }
+  .bytechips { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 12px; }
+  .bchip { display:inline-flex; align-items:center; gap:6px; cursor:pointer;
+    padding:4px 9px; border-radius:var(--r-full); border:1px solid var(--line);
+    background:var(--surface-2); color:var(--muted); font:600 11px var(--ff-mono);
+    opacity:0.45; }
+  .bchip.on { opacity:1; color:var(--text); }
+  .bchip i { width:9px; height:9px; border-radius:2px; display:inline-block; }
+  .bchip small { color:var(--muted); font-weight:400; }
+  canvas.plot { width:100%; height:auto; background:var(--bg);
+    border:1px solid var(--line); border-radius:var(--r-sm); display:block; }
+  .wctl { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:8px 0; }
+  .wctl label { color:var(--muted); font:600 11px/1 var(--ff-ui);
+    letter-spacing:0.06em; text-transform:uppercase; display:flex; align-items:center; gap:6px; }
+  .wctl select { background:var(--surface-2); color:var(--text);
+    border:1px solid var(--line); border-radius:var(--r-sm); padding:6px 8px; font:13px var(--ff-ui); }
+  .loading { padding:32px; color:var(--muted); text-align:center; }
+  .err { padding:16px; color:var(--bad); }
+</style></head><body>
+<header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
+  <span class="crumbs"><a href="/">sessions</a> &rsaquo; <a href="/admin">admin</a> &rsaquo;
+    <a href="/admin/canbus">CAN</a> &rsaquo; <span class="mono">__FILE__</span></span>
+  <span style="flex:1"></span>
+  <a class="btn" href="/admin/canbus/__FILE__/raw" style="margin-right:var(--sp-md)">download</a>__USER_CHIP__</header>
+<main>
+  <div id="loading" class="loading">parsing capture\u2026</div>
+  <div id="app" style="display:none">
+    <div class="can-grid">
+      <div class="card">
+        <div class="card-head"><span class="t-label">CAN IDs</span>
+          <span class="t-label" id="sum">\u2014</span></div>
+        <table class="idt"><thead><tr><th>ID</th><th>frames</th><th>Hz</th><th>dlc</th></tr></thead>
+          <tbody id="idrows"></tbody></table>
+      </div>
+      <div class="card">
+        <div class="card-head"><span class="t-label">Signal inspector</span>
+          <span class="t-label" id="sel">\u2014</span></div>
+        <div class="card-body">
+          <div class="t-label" style="margin-bottom:4px">Bytes d0\u2013d7 over time \u2014 click a chip to toggle (changing bytes on by default)</div>
+          <div class="bytechips" id="chips"></div>
+          <canvas id="bytes" class="plot" width="900" height="280"></canvas>
+          <div style="height:16px"></div>
+          <div class="t-label">16-bit word inspector \u2014 find RPM / CLT / AFR</div>
+          <div class="wctl">
+            <label>start byte <select id="wstart"></select></label>
+            <label>order <select id="worder">
+              <option value="be">big-endian</option>
+              <option value="le">little-endian</option></select></label>
+            <span id="wstat" class="mono" style="color:var(--muted)"></span>
+          </div>
+          <canvas id="word" class="plot" width="900" height="220"></canvas>
+        </div>
+      </div>
+    </div>
+    <p class="summary" style="color:var(--muted);margin-top:var(--sp-md);font-size:12px">
+      Tip: capture while sweeping RPM. The byte (or 16-bit word) whose line ramps with
+      engine speed is your RPM field \u2014 note the <b>ID</b>, <b>start byte</b>, and
+      <b>endianness</b>, then lock them into <span class="mono">pumpCAN()</span> in
+      <span class="mono">src/main.cpp</span>. The standard MS3 guess is 0x5F0 bytes 6\u20137 BE.</p>
+  </div>
+  <div id="err" class="err" style="display:none"></div>
+</main>
+<script>
+(async function(){
+  const FILE='__FILE__'; const el=id=>document.getElementById(id);
+  let data;
+  try{
+    const r=await fetch('/admin/canbus/'+encodeURIComponent(FILE)+'/data');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    data=await r.json();
+  }catch(e){ el('loading').style.display='none'; el('err').style.display='block';
+    el('err').textContent='failed to load: '+e.message; return; }
+  el('loading').style.display='none'; el('app').style.display='block';
+  el('sum').textContent=data.frames+' frames \u00b7 '+data.n_ids+' IDs';
+  if(!data.ids.length){ el('sel').textContent='no frames parsed'; return; }
+  const COLORS=['#FFB020','#6CD07A','#5AC8FA','#FF5D5D','#C792EA','#FFD166','#1ABC9C','#EF476F'];
+  const idrows=el('idrows');
+  let sel=null, enabled=[true,true,true,true,true,true,true,true];
+  const fmtHz=h=>h?h.toFixed(0):'\u2014';
+  function axes(ctx,W,H,pad){ ctx.fillStyle='#0E1014'; ctx.fillRect(0,0,W,H);
+    ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(pad,H-18); ctx.lineTo(W-6,H-18); ctx.stroke(); }
+  function drawBytes(){
+    const cv=el('bytes'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height,pad=30;
+    axes(ctx,W,H,pad); if(!sel) return;
+    const t=sel.t,n=t.length; if(!n) return;
+    const t0=t[0],t1=t[n-1]||t0+1;
+    const X=k=>pad+(W-pad-6)*(t[k]-t0)/Math.max(1,(t1-t0));
+    const Y=v=>10+(H-28)*(1-v/255);
+    ctx.fillStyle='#8A92A3'; ctx.font='10px monospace'; ctx.textAlign='left';
+    [0,128,255].forEach(v=>{ const y=Y(v); ctx.strokeStyle='rgba(255,255,255,0.06)';
+      ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(W-6,y); ctx.stroke();
+      ctx.fillStyle='#8A92A3'; ctx.fillText(String(v),2,y+3); });
+    for(let i=0;i<8;i++){ if(!enabled[i])continue; const b=sel.b[i];
+      ctx.strokeStyle=COLORS[i]; ctx.lineWidth=1.5; ctx.beginPath(); let started=false;
+      for(let k=0;k<n;k++){ const v=b[k]; if(v==null){started=false;continue;}
+        const px=X(k),py=Y(v); if(started)ctx.lineTo(px,py); else {ctx.moveTo(px,py);started=true;} }
+      ctx.stroke(); }
+  }
+  function drawWord(){
+    const cv=el('word'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height,pad=46;
+    axes(ctx,W,H,pad); if(!sel) return;
+    const s=Number(el('wstart').value), be=el('worder').value==='be';
+    const t=sel.t,n=t.length, hi=sel.b[s], lo=sel.b[s+1];
+    const vals=new Array(n); let mn=Infinity,mx=-Infinity;
+    for(let k=0;k<n;k++){ const a=hi[k],c=lo[k];
+      if(a==null||c==null){vals[k]=null;continue;}
+      const v= be ? (a*256+c) : (c*256+a); vals[k]=v;
+      if(v<mn)mn=v; if(v>mx)mx=v; }
+    if(mn===Infinity){ el('wstat').textContent='d'+s+'\u00b7d'+(s+1)+': no data'; return; }
+    el('wstat').textContent='d'+s+'\u00b7d'+(s+1)+' '+(be?'BE':'LE')+'  \u00b7  range '+mn+'\u2013'+mx;
+    const t0=t[0],t1=t[n-1]||t0+1, span=Math.max(1,mx-mn);
+    const X=k=>pad+(W-pad-6)*(t[k]-t0)/Math.max(1,(t1-t0));
+    const Y=v=>10+(H-28)*(1-(v-mn)/span);
+    ctx.fillStyle='#8A92A3'; ctx.font='10px monospace'; ctx.textAlign='left';
+    ctx.fillText(String(mx),2,14); ctx.fillText(String(mn),2,H-22);
+    ctx.strokeStyle='#FFB020'; ctx.lineWidth=1.8; ctx.beginPath(); let started=false;
+    for(let k=0;k<n;k++){ const v=vals[k]; if(v==null){started=false;continue;}
+      const px=X(k),py=Y(v); if(started)ctx.lineTo(px,py); else {ctx.moveTo(px,py);started=true;} }
+    ctx.stroke();
+  }
+  function selectId(rec){
+    sel=rec;
+    [...idrows.children].forEach(tr=>tr.classList.toggle('sel', tr.dataset.id===rec.id_hex));
+    el('sel').textContent=rec.id_hex+' \u00b7 dlc '+rec.dlc+' \u00b7 '+rec.count+' frames \u00b7 '+fmtHz(rec.hz)+' Hz';
+    enabled=rec.bytes.map(b=>b.range>0);
+    if(!enabled.some(x=>x)) enabled=enabled.map(()=>true);
+    const chips=el('chips'); chips.innerHTML='';
+    rec.bytes.forEach((b,i)=>{
+      const c=document.createElement('span'); c.className='bchip'+(enabled[i]?' on':'');
+      c.innerHTML='<i style="background:'+COLORS[i]+'"></i>d'+i+' <small>'+
+        (b.min==null?'\u2014':b.min+'\u2013'+b.max)+'</small>';
+      c.addEventListener('click',()=>{ enabled[i]=!enabled[i]; c.classList.toggle('on',enabled[i]); drawBytes(); });
+      chips.appendChild(c);
+    });
+    const ws=el('wstart'); ws.innerHTML='';
+    for(let s=0;s<7;s++){ const o=document.createElement('option'); o.value=String(s);
+      o.textContent='d'+s+'\u00b7d'+(s+1); ws.appendChild(o); }
+    let bestS=0,bestR=-1;
+    for(let s=0;s<7;s++){ const rr=(rec.bytes[s].range||0)+(rec.bytes[s+1].range||0);
+      if(rr>bestR){bestR=rr;bestS=s;} }
+    ws.value=String(bestS);
+    drawBytes(); drawWord();
+  }
+  el('wstart').addEventListener('change', drawWord);
+  el('worder').addEventListener('change', drawWord);
+  for(const rec of data.ids){
+    const tr=document.createElement('tr'); tr.dataset.id=rec.id_hex;
+    tr.innerHTML='<td class=mono>'+rec.id_hex+'</td><td class=mono>'+rec.count+
+      '</td><td class=mono>'+fmtHz(rec.hz)+'</td><td class=mono>'+rec.dlc+'</td>';
+    tr.addEventListener('click',()=>selectId(rec));
+    idrows.appendChild(tr);
+  }
+  selectId(data.ids[0]);
+})();
+</script>
+</body></html>"""
+)
+
 _REVIEW_HTML = (
     """<!doctype html>
 <html lang="en"><head>
