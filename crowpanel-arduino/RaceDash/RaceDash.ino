@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.45"
+#define FIRMWARE_VERSION "0.1.46"
 
 #include <Preferences.h>
 #include <time.h>
@@ -333,6 +333,18 @@ static uint32_t sd_session_samples = 0;
 static bool     cansniff_active    = false;
 static char     cansniff_file[80]  = "";
 static uint32_t cansniff_frames    = 0;
+
+// CAN health — updated from CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>
+// emitted by the Teensy at 1 Hz. Shown live on the Tools page so the CAN bus
+// can be diagnosed in the car without a laptop. A healthy MS3 link reads
+// ~50 fps, dup~0%, ACK_ERR=0; a retransmit storm reads ~3600 fps, dup~100%,
+// ACK_ERR=1; a dead bus reads 0 fps.
+static uint32_t candiag_fps     = 0;
+static uint32_t candiag_total   = 0;
+static uint8_t  candiag_base    = 0;
+static uint8_t  candiag_dup_pct = 0;
+static bool     candiag_ack_err = false;
+static uint32_t candiag_ms      = 0;   // millis() of last CANDIAG line
 
 // ---------------------------------------------------------------------------
 // OTA state — driven by tapping "Check for updates" in settings.
@@ -1323,6 +1335,23 @@ static bool parseCanSniffLine(const String& line) {
     return true;
 }
 
+// CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR> — CAN health, 1 Hz.
+static bool parseCanDiagLine(const String& line) {
+    int idx[6], n = 0;
+    for (int i = 0; i < (int)line.length() && n < 6; ++i)
+        if (line[i] == ',') idx[n++] = i;
+    if (n < 1) return false;
+    idx[n] = line.length();
+    auto field = [&](int k) { return line.substring(idx[k] + 1, idx[k + 1]); };
+    candiag_fps   = (uint32_t)field(0).toInt();
+    if (n >= 2) candiag_total   = (uint32_t)field(1).toInt();
+    if (n >= 3) candiag_base    = (uint8_t)field(2).toInt();
+    if (n >= 4) candiag_dup_pct = (uint8_t)field(3).toInt();
+    if (n >= 5) candiag_ack_err = (field(4).toInt() != 0);
+    candiag_ms = millis();
+    return true;
+}
+
 // Pop the modal full-screen, save the current page so we can restore it after.
 static void openUploadModal(const char* filename, uint32_t total) {
     strncpy(upload_file, filename, sizeof(upload_file) - 1);
@@ -2065,6 +2094,7 @@ static bool parseLine(const String& line) {
     if (line.startsWith("ETH,"))  return parseEthLine(line);
     if (line.startsWith("SD,"))   return parseSdLine(line);
     if (line.startsWith("CANSNIFF,")) return parseCanSniffLine(line);
+    if (line.startsWith("CANDIAG,"))  return parseCanDiagLine(line);
     if (line.startsWith("CLD,"))  return parseCldLine(line);
     if (line.startsWith("TIME,")) return parseTimeLine(line);
     if (line.startsWith("UPLOAD,")) return parseUploadLine(line);
@@ -6179,6 +6209,35 @@ static void drawToolsPage() {
         snprintf(b4sub, sizeof(b4sub), "record raw CAN frames to SD for analysis");
     }
     tft.drawString(b4sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 65);
+
+    // ---- CAN health readout (live, from CANDIAG lines) ----
+    // One line that tells you at a glance which CAN failure mode you're in:
+    //   fresh + ~50fps + dup<10% + no ACK err  -> HEALTHY (green)
+    //   fresh + high dup% / ACK err             -> STORM   (red) — termination/ACK
+    //   0 fps / stale                           -> NO BUS  (grey) — wiring/broadcast
+    {
+        const int CAN_Y = TOOLS_BTN4_Y + TOOLS_BTN_H + 6;   // ~424
+        tft.fillRect(0, CAN_Y - 2, 800, 28, TFT_BLACK);
+        const bool fresh = (candiag_ms != 0) && (millis() - candiag_ms < 3000);
+        char line[96]; uint16_t col;
+        if (!fresh || candiag_fps == 0) {
+            col = TFT_DARKGREY;
+            snprintf(line, sizeof(line), "CAN: NO BUS  \xB7  0 frames/s  \xB7  check wiring / termination / broadcast");
+        } else if (candiag_ack_err || candiag_dup_pct >= 80) {
+            col = TFT_RED;
+            snprintf(line, sizeof(line), "CAN: STORM  \xB7  %lu fps  dup %u%%  %s  \xB7  bad termination/ACK",
+                     (unsigned long)candiag_fps, candiag_dup_pct,
+                     candiag_ack_err ? "ACK_ERR" : "");
+        } else {
+            col = TFT_GREEN;
+            snprintf(line, sizeof(line), "CAN: OK  \xB7  %lu fps  dup %u%%  base %u  \xB7  link healthy",
+                     (unsigned long)candiag_fps, candiag_dup_pct, candiag_base);
+        }
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(col, TFT_BLACK);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString(line, 400, CAN_Y + 10);
+    }
     tft.setTextDatum(textdatum_t::top_left);
 }
 
