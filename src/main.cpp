@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.47"
+#define FIRMWARE_VERSION "0.1.48"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -585,27 +585,16 @@ static void canDiagReport() {
     for (uint8_t i = 0; i < can_diag.ids_count && n < (int)sizeof(ids) - 8; i++)
         n += snprintf(ids + n, sizeof(ids) - n, "%s0x%lX",
                       i ? "," : "", (unsigned long)can_diag.ids_seen[i]);
-    // DECISIVE TX/ACK TEST. The dumps prove the Teensy RECEIVES live data
-    // (coolant tracked a warming engine) yet the bus is pinned at ~3200 fps of
-    // one frozen frame — the classic no-ACK retransmit storm. The open question
-    // is which node can't ACK. So we actively transmit one benign heartbeat
-    // frame per second on an unused ID and watch our own TX error counter:
-    //   TX_ERR stays 0          -> our TX/ACK path works (someone ACKs us)
-    //   TX_ERR climbs to 128 +  -> our transmit path is DEAD. We receive but
-    //      flt goes Error-Passive   cannot drive the bus, so we never ACK the
-    //      / Bus off                MS3 either -> it storms. Cause: SN65HVD230
-    //                               Rs(mode) pin high/floating (standby = RX on,
-    //                               TX off), or Teensy pin22(CTX) not reaching
-    //                               the transceiver D/TXD input.
-    // A single frame/sec on an unused ID is harmless to the ECU bus.
-    CAN_message_t tx;
-    tx.id = 0x100;          // unused by MS3 Simplified Dash (0x5E8..0x5EC)
-    tx.len = 1;
-    tx.buf[0] = 0xA5;
-    Can1.write(tx);
+    // NOTE: v0.1.47 added an ACTIVE TX heartbeat here to test the ACK path. That
+    // was a mistake — on a bus where the node can't get an ACK, repeated failed
+    // transmits drive TX_ERR to 256 -> BUS-OFF, which kills RX too ("now we have
+    // nothing"). REMOVED. Diagnostics are now strictly PASSIVE: we only listen,
+    // never transmit, so we can never push the node off the bus ourselves.
+    //
     // Pull FlexCAN's error/bus state. events() populates the ESR1 capture buffer
     // without draining the FIFO (FIFO interrupt isn't enabled), so it's safe to
-    // call alongside our read()-polling in pumpCAN().
+    // call alongside our read()-polling in pumpCAN(). A receiver that gets frames
+    // with no ACK still registers ACK_ERR passively — no transmit needed.
     Can1.events();
     CAN_error_t err;
     const bool have_err = Can1.error(err, false);
