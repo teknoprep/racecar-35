@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.49"
+#define FIRMWARE_VERSION "0.1.50"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2305,22 +2305,23 @@ void setup() {
 
     // MS3Pro CAN bus on CAN1 (TX=pin 22, RX=pin 23 via SN65HVD230 transceiver).
     //
-    // LISTEN-ONLY (LOM). The dash is a pure CONSUMER of the MS3 broadcast — it
-    // never needs to talk back. In CAN, the ACK bit is mandatory at the protocol
-    // level (no MS setting can disable it), and a node that tries to ACK/transmit
-    // but can't get through climbs its error counter to 256 and goes BUS-OFF,
-    // which kills RX too (the "first packets work then everything stops" symptom).
-    // Listen-only mode sets CTRL1.LOM: the controller only receives — it never
-    // transmits, never drives ACK, never emits error frames — so it CANNOT go
-    // bus-off. It receives every frame the MS3 puts on the wire regardless of
-    // ACK. Tradeoff: with nothing ACKing on a 2-node bus the MS3 retransmits
-    // (high frame rate), but the data is valid and live; we dedup in canDiagNote.
-    // The IDs are already standard 11-bit per the MS3 Simplified Dash spec.
+    // NORMAL mode (the default, NOT listen-only). This is correct for a 2-node
+    // bus: the SN65HVD230 transceiver has no protocol intelligence and cannot
+    // ACK — the Teensy's FlexCAN controller drives the mandatory ACK bit
+    // automatically, in hardware, for every valid frame it receives. The MS3
+    // needs that ACK or it retransmits forever (the "storm"). v0.1.49's
+    // listen-only build SUPPRESSED that ACK, which is why the bus broke worse.
+    //
+    // Why this can't bus-off: bus-off only happens when a node's TRANSMIT error
+    // counter hits 256, and that only accrues from frames the node ORIGINATES.
+    // We never originate a transmit here (the v0.1.47 TX test is gone), and
+    // auto-ACK is a receive activity (caps at error-passive, keeps receiving).
+    // So: proper ACK to the MS3 + structurally immune to bus-off.
     Can1.begin();
-    Can1.setBaudRate(CAN_BAUD, LISTEN_ONLY);
+    Can1.setBaudRate(CAN_BAUD);   // normal mode → FlexCAN auto-ACKs received frames
     Can1.setMaxMB(16);
     Can1.enableFIFO();
-    Serial.printf("CAN1 ready at %lu bps LISTEN-ONLY (MS3Pro base ID 0x%03lX)\n",
+    Serial.printf("CAN1 ready at %lu bps NORMAL/auto-ACK (MS3Pro base ID 0x%03lX)\n",
                   (unsigned long)CAN_BAUD, (unsigned long)CAN_BASE_ID);
 
     // ADC for oil pressure (A2) and coolant temp (A3). 12-bit + 16-sample
