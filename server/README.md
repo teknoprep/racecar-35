@@ -170,10 +170,43 @@ stride. Constants live at the top of `_detect_laps()` in `app/main.py`
 On the page:
 - the **lap table** lists every lap with its time, gap to best, and max speed;
   the fastest lap is highlighted.
-- clicking a lap highlights it on the map (best lap overlaid as a dashed green
-  ghost), jumps playback to the lap start, and redraws the **delta trace** —
-  a distance-aligned time delta of the selected lap vs the best lap (below
+- clicking a lap makes it the **primary lap**: it's highlighted on the map
+  (the reference/ghost lap overlaid as a dashed green line), playback is
+  scoped to just that lap, and the **delta trace** redraws — a
+  distance-aligned time delta of the primary lap vs the reference lap (below
   zero / green = faster, above / red = slower).
+- a **follow-dot** rides the delta trace in sync with playback (and with the
+  map marker), so you can scrub to any corner and read whether you were up or
+  down there. The live delta at the cursor is shown to the right of the chart.
+
+### Comparison mode (incl. across sessions)
+
+By default the reference lap is **this session's best lap**. You can instead
+compare against **any lap from any session you're allowed to see** — e.g. an
+admin diffing their own quick lap against another driver's lap in the same car:
+
+- a **filterable session picker** (type to filter; backed by `/sessions`)
+  chooses the comparison session;
+- a **lap picker** then lists that session's laps, each labelled with its time
+  and either `(fastest)` or the gap from that session's fastest lap;
+- **best lap** resets back to this session's best.
+
+Cross-session laps are fetched on demand (`/data` + `/laps`) and cached. The
+delta is distance-aligned, so it only makes sense for laps of the **same
+track**.
+
+### Sync mode
+
+A **sync** toggle controls how the comparison lap is sampled against the
+primary lap during playback:
+
+- **time** — the comparison car is shown at the **same elapsed time** into the
+  lap, which is generally a *different* place on track, so it gets its own
+  **red map dot** alongside the amber primary dot. Watch the gap open/close.
+- **location** — the comparison is sampled at the **same place** on track (one
+  dot), and its telemetry (speed / RPM / heading) is shown in **red** beneath
+  the primary values so you can read "here I was 112 vs 118 mph" corner by
+  corner.
 
 The dash firmware does its own on-car lap timing (predictive lap time + live
 delta vs the session best, shown in the middle column of the dash). The cloud

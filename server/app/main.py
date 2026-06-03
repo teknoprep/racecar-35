@@ -2324,7 +2324,24 @@ _REVIEW_HTML = (
   table.laptable td.gap { color: var(--muted); }
   .lap-delta { display: flex; flex-direction: column; }
   .lap-delta canvas { width: 100%; height: auto; background: var(--bg);
-    border: 1px solid var(--line); border-radius: var(--r-sm); }
+    border: 1px solid var(--line); border-radius: var(--r-sm); display: block; }
+  .cmp-row { display: grid; grid-template-columns: 1fr 170px; gap: 8px;
+    margin-bottom: 8px; }
+  .cmp-row2 { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .cmp-syncl { color: var(--muted); font: 600 11px/1 var(--ff-ui);
+    letter-spacing: 0.06em; text-transform: uppercase;
+    display: flex; align-items: center; gap: 6px; }
+  @media (max-width: 560px) { .cmp-row { grid-template-columns: 1fr; } }
+  .cmp-input { background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: var(--r-sm);
+    padding: 7px 9px; font: 13px var(--ff-ui); min-width: 0; }
+  .cmp-sub { color: var(--bad); font: 600 12px/1 var(--ff-mono);
+    margin-top: 5px; min-height: 13px; }
+  .delta-wrap { position: relative; }
+  .delta-cursor { position: absolute; width: 11px; height: 11px;
+    margin: -6px 0 0 -6px; border-radius: var(--r-full);
+    background: var(--good); box-shadow: 0 0 0 2px var(--bg);
+    pointer-events: none; transition: left 60ms linear, top 60ms linear; }
 </style>
 </head><body>
 <header class="app">
@@ -2349,14 +2366,17 @@ _REVIEW_HTML = (
         <div class="tile full">
           <div class="label">Speed</div>
           <div><span class="t-tel-lg val accent" id="v-speed">\u2014</span><span class="unit">mph</span></div>
+          <div class="cmp-sub" id="c-speed"></div>
         </div>
         <div class="tile">
           <div class="label">RPM</div>
           <div><span class="t-tel-md val accent" id="v-rpm">\u2014</span></div>
+          <div class="cmp-sub" id="c-rpm"></div>
         </div>
         <div class="tile">
           <div class="label">Heading</div>
           <div><span class="t-tel-md val" id="v-hdg">\u2014</span><span class="unit">\u00b0</span></div>
+          <div class="cmp-sub" id="c-hdg"></div>
         </div>
         <div class="tile">
           <div class="label">Latitude</div>
@@ -2419,9 +2439,29 @@ _REVIEW_HTML = (
           </table>
         </div>
         <div class="lap-delta">
-          <div class="t-label" style="margin-bottom:8px">Delta vs best lap
-            <span id="delta-sel" style="color:var(--muted)"></span></div>
-          <canvas id="deltacanv" width="760" height="200"></canvas>
+          <div class="cmp-row">
+            <input id="cmp-session" class="cmp-input" list="cmp-sessions"
+                   placeholder="compare vs another session (type to filter)">
+            <datalist id="cmp-sessions"></datalist>
+            <select id="cmp-lap" class="cmp-input"></select>
+          </div>
+          <div class="cmp-row2">
+            <label class="cmp-syncl">sync
+              <select id="sync-mode" class="cmp-input">
+                <option value="time">time</option>
+                <option value="loc">location</option>
+              </select>
+            </label>
+            <span style="flex:1"></span>
+            <button id="cmp-reset" class="btn">best lap</button>
+          </div>
+          <div class="t-label" style="margin:2px 0 6px">Delta
+            <span id="delta-sel" style="color:var(--muted)"></span>
+            <span id="delta-live" class="mono" style="float:right"></span></div>
+          <div class="delta-wrap">
+            <canvas id="deltacanv" width="760" height="200"></canvas>
+            <div class="delta-cursor" id="delta-cursor" style="display:none"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -2604,6 +2644,12 @@ _REVIEW_HTML = (
   const slider = el('slider');
   slider.max = String(S.length - 1);
 
+  // shared lap / comparison state, declared before render() so the playback
+  // path can touch it without a temporal-dead-zone error (it is null until
+  // laps load, and every consumer guards on that).
+  let deltaState = null, lapWindow = null, currentRef = null, primLap = null;
+  let syncMode = 'time', compDot = null, compDotOn = false;
+
   function render(idx) {
     const s = S[idx];
     el('v-speed').textContent = (typeof s.speed_mph === 'number')
@@ -2624,6 +2670,8 @@ _REVIEW_HTML = (
     el('v-glong').textContent = (GLong[idx] == null) ? '\u2014' : GLong[idx].toFixed(2) + ' g';
     el('v-gvert').textContent = (GVert[idx] == null) ? '\u2014' : GVert[idx].toFixed(2) + ' g';
     placeGDot(idx);
+    placeDeltaCursor(idx);
+    updateCompReadouts(idx);
   }
   slider.addEventListener('input', () => render(Number(slider.value)));
   render(0);
@@ -2639,18 +2687,23 @@ _REVIEW_HTML = (
     lastTick = now;
     playT += dt;
     const target = T0 + playT;
+    // when a lap is selected, playback is scoped to that lap so the
+    // follow-dot sweeps exactly one lap; otherwise it runs the whole session.
+    const endIdx = lapWindow ? lapWindow.i1 : S.length - 1;
     let next = Number(slider.value);
-    while (next < S.length - 1 && T[next+1] <= target) next++;
-    if (next >= S.length - 1) {
-      slider.value = String(S.length - 1); render(S.length - 1); stop(); return;
+    while (next < endIdx && T[next+1] <= target) next++;
+    if (next >= endIdx) {
+      slider.value = String(endIdx); render(endIdx); stop(); return;
     }
     slider.value = String(next);
     render(next);
     rafId = requestAnimationFrame(tick);
   }
   function start() {
+    const endIdx = lapWindow ? lapWindow.i1 : S.length - 1;
+    const startIdx = lapWindow ? lapWindow.i0 : 0;
     let idx = Number(slider.value);
-    if (idx >= S.length - 1) { idx = 0; slider.value = '0'; render(0); }
+    if (idx >= endIdx) { idx = startIdx; slider.value = String(startIdx); render(startIdx); }
     playT = T[idx] - T0;
     playing = true; lastTick = performance.now();
     playBtn.textContent = 'pause';
@@ -2662,10 +2715,13 @@ _REVIEW_HTML = (
   }
   playBtn.addEventListener('click', () => playing ? stop() : start());
 
-  // ---- laps + delta vs best -------------------------------------------
-  // relT[i] = seconds-from-start, the same basis the /laps endpoint returns
-  // its t_start/t_end in, so we can map a lap window onto our sample array.
+  // ---- laps + comparison + delta --------------------------------------
+  // relT[i] = seconds-from-start, the basis /laps returns t_start/t_end in,
+  // so a lap window maps straight onto a sample array. selfCtx wraps THIS
+  // session; comparison laps from OTHER sessions get their own ctx, fetched
+  // on demand and cached, so we can diff against another driver's lap.
   const relT = T.map(t => t - T0);
+  const selfCtx = { S: S, relT: relT };
   function hav(a, b){
     const R = 6371000, d2r = Math.PI/180;
     const dLat = (b[0]-a[0])*d2r, dLon = (b[1]-a[1])*d2r;
@@ -2673,76 +2729,121 @@ _REVIEW_HTML = (
               Math.cos(a[0]*d2r)*Math.cos(b[0]*d2r)*Math.sin(dLon/2)**2;
     return R*2*Math.atan2(Math.sqrt(s), Math.sqrt(1-s));
   }
-  function idxAt(relSec){
-    if (relSec <= relT[0]) return 0;
-    const last = S.length-1;
-    if (relSec >= relT[last]) return last;
+  function buildRelT(samples){
+    const arr = new Array(samples.length); let first=null;
+    for (let i=0;i<samples.length;i++){
+      const s=samples[i]; let v=null;
+      if (typeof s.t==='number' && isFinite(s.t)) v=s.t;
+      else if (typeof s.t_ms==='number' && isFinite(s.t_ms)) v=s.t_ms/1000;
+      if (v!=null && first==null) first=v; arr[i]=v;
+    }
+    let usable = first!=null;
+    if (usable){ let last=first;
+      for (let i=0;i<arr.length;i++){ if (arr[i]==null) arr[i]=last; else last=arr[i]; }
+      if (!(arr.length && arr[arr.length-1]-arr[0] > 0.5)) usable=false;
+    }
+    if (!usable) for (let i=0;i<arr.length;i++) arr[i]=i/25;
+    const t0 = arr.length ? arr[0] : 0;
+    return arr.map(t=>t-t0);
+  }
+  function ctxIdxAt(ctx, relSec){
+    const r=ctx.relT, last=ctx.S.length-1;
+    if (last<0) return 0;
+    if (relSec<=r[0]) return 0;
+    if (relSec>=r[last]) return last;
     let lo=0, hi=last;
-    while (lo<hi){ const m=(lo+hi)>>1; if (relT[m]<relSec) lo=m+1; else hi=m; }
+    while (lo<hi){ const m=(lo+hi)>>1; if (r[m]<relSec) lo=m+1; else hi=m; }
     return lo;
   }
   function lapFmt(sec){
     if (!isFinite(sec)) return '\u2014';
-    const m = Math.floor(sec/60), r = sec - m*60;
-    return m + ':' + r.toFixed(2).padStart(5,'0');
+    const m=Math.floor(sec/60), r=sec-m*60;
+    return m+':'+r.toFixed(2).padStart(5,'0');
   }
-  function lapSeg(lap){
-    const seg=[];
-    for (let i=idxAt(lap.t_start); i<=idxAt(lap.t_end); i++){
-      const s=S[i];
-      if (typeof s.lat==='number' && typeof s.lon==='number' && (s.lat||s.lon))
-        seg.push([s.lat, s.lon]);
-    }
+  function ctxSeg(ctx, lap){
+    const seg=[]; const i0=ctxIdxAt(ctx,lap.t_start), i1=ctxIdxAt(ctx,lap.t_end);
+    for (let i=i0;i<=i1;i++){ const s=ctx.S[i];
+      if (typeof s.lat==='number' && typeof s.lon==='number' && (s.lat||s.lon)) seg.push([s.lat,s.lon]); }
     return seg;
   }
-  // cumulative-distance vs time-into-lap, for the distance-aligned delta
-  function lapSeries(lap){
-    const i0=idxAt(lap.t_start), i1=idxAt(lap.t_end);
+  // cumulative distance + time-into-lap, sample-aligned to i0..i1
+  function ctxSeries(ctx, lap){
+    const i0=ctxIdxAt(ctx,lap.t_start), i1=ctxIdxAt(ctx,lap.t_end);
     const dist=[], tm=[]; let d=0, prev=null;
-    for (let i=i0; i<=i1; i++){
-      const s=S[i];
+    for (let i=i0;i<=i1;i++){ const s=ctx.S[i];
       if (typeof s.lat==='number' && typeof s.lon==='number' && (s.lat||s.lon)){
-        const cur=[s.lat, s.lon];
-        if (prev) d += hav(prev, cur);
-        prev = cur;
-      }
-      dist.push(d); tm.push(relT[i] - lap.t_start);
+        const cur=[s.lat,s.lon]; if (prev) d+=hav(prev,cur); prev=cur; }
+      dist.push(d); tm.push(ctx.relT[i]-lap.t_start);
     }
     return {dist, tm};
   }
   function interpTime(series, dq){
-    const {dist, tm} = series, last = dist.length-1;
-    if (last < 0) return 0;
-    if (dq <= dist[0]) return tm[0];
-    if (dq >= dist[last]) return tm[last];
+    const {dist, tm}=series, last=dist.length-1;
+    if (last<0) return 0;
+    if (dq<=dist[0]) return tm[0];
+    if (dq>=dist[last]) return tm[last];
     let lo=0, hi=last;
     while (lo<hi){ const m=(lo+hi)>>1; if (dist[m]<dq) lo=m+1; else hi=m; }
-    const i=Math.max(1, lo);
-    const d0=dist[i-1], d1=dist[i];
+    const i=Math.max(1,lo); const d0=dist[i-1], d1=dist[i];
     if (d1===d0) return tm[i-1];
-    return tm[i-1] + (tm[i]-tm[i-1]) * (dq-d0)/(d1-d0);
+    return tm[i-1]+(tm[i]-tm[i-1])*(dq-d0)/(d1-d0);
   }
+  // a reference (ghost) lap, with its sample window + series precomputed
+  function makeRef(ctx, lap, label){
+    return { ctx, lap, label,
+             i0: ctxIdxAt(ctx, lap.t_start), i1: ctxIdxAt(ctx, lap.t_end),
+             series: ctxSeries(ctx, lap) };
+  }
+  function refIdxByTime(ref, tInto){
+    const tm=ref.series.tm, last=tm.length-1;
+    if (last<0) return 0;
+    if (tInto<=tm[0]) return 0; if (tInto>=tm[last]) return last;
+    let lo=0, hi=last;
+    while (lo<hi){ const m=(lo+hi)>>1; if (tm[m]<tInto) lo=m+1; else hi=m; }
+    return lo;
+  }
+  function refIdxByDist(ref, dq){
+    const dist=ref.series.dist, last=dist.length-1;
+    if (last<0) return 0;
+    if (dq<=dist[0]) return 0; if (dq>=dist[last]) return last;
+    let lo=0, hi=last;
+    while (lo<hi){ const m=(lo+hi)>>1; if (dist[m]<dq) lo=m+1; else hi=m; }
+    return lo;
+  }
+
+  // ---- map ghost lines + comparison dot ------------------------------
   let selLine=null, refLine=null;
   const dcanv = el('deltacanv');
-  function highlightLap(lap, ref){
+  function showCompDot(pos){
+    if (!compDot) compDot=L.circleMarker(pos,
+      {radius:6, color:'#3a0d0d', weight:2, fillColor:'#FF5D5D', fillOpacity:1});
+    if (!compDotOn){ compDot.addTo(map); compDotOn=true; }
+    compDot.setLatLng(pos);
+  }
+  function hideCompDot(){ if (compDot && compDotOn){ map.removeLayer(compDot); compDotOn=false; } }
+  function highlight(primLapArg, ref){
     if (selLine) map.removeLayer(selLine);
     if (refLine) map.removeLayer(refLine);
-    if (ref && ref.lap !== lap.lap){
-      refLine = L.polyline(lapSeg(ref),
-        {color:'#6CD07A', weight:2, opacity:0.5, dashArray:'4 5'}).addTo(map);
+    const sameLap = ref && ref.ctx===selfCtx && ref.lap.lap===primLapArg.lap;
+    if (ref && !sameLap){
+      refLine=L.polyline(ctxSeg(ref.ctx, ref.lap),
+        {color:'#6CD07A', weight:2, opacity:0.55, dashArray:'4 5'}).addTo(map);
     }
-    const seg = lapSeg(lap);
-    selLine = L.polyline(seg, {color:'#FFB020', weight:4, opacity:0.95}).addTo(map);
+    const seg=ctxSeg(selfCtx, primLapArg);
+    selLine=L.polyline(seg, {color:'#FFB020', weight:4, opacity:0.95}).addTo(map);
     if (seg.length) map.fitBounds(selLine.getBounds(), {padding:[20,20]});
   }
-  function drawDelta(lap, ref){
+
+  // ---- delta chart + follow-cursor -----------------------------------
+  function drawDelta(primLapArg, ref){
     const ctx=dcanv.getContext('2d'), W=dcanv.width, H=dcanv.height;
     ctx.clearRect(0,0,W,H);
     ctx.fillStyle='#0E1014'; ctx.fillRect(0,0,W,H);
-    const sa=lapSeries(lap), sb=lapSeries(ref);
+    const sa=ctxSeries(selfCtx, primLapArg);
+    const sb=ref ? ctxSeries(ref.ctx, ref.lap) : sa;
     const maxD=Math.min(sa.dist[sa.dist.length-1]||0, sb.dist[sb.dist.length-1]||0);
     const N=240, dv=[]; let dmin=Infinity, dmax=-Infinity;
-    if (maxD > 0){
+    if (maxD>0){
       for (let k=0;k<N;k++){
         const dq=maxD*k/(N-1);
         const v=interpTime(sa,dq)-interpTime(sb,dq);
@@ -2756,7 +2857,7 @@ _REVIEW_HTML = (
     const Y=v=>10+(H-28)*(1-(v-lo)/(hi-lo));
     ctx.strokeStyle='rgba(255,255,255,0.22)'; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(34,Y(0)); ctx.lineTo(W-10,Y(0)); ctx.stroke();
-    if (maxD > 0){
+    if (maxD>0){
       ctx.lineWidth=2; ctx.strokeStyle='#FFB020'; ctx.beginPath();
       for (let k=0;k<N;k++){ const px=X(k), py=Y(dv[k]); k?ctx.lineTo(px,py):ctx.moveTo(px,py); }
       ctx.stroke();
@@ -2764,48 +2865,195 @@ _REVIEW_HTML = (
     ctx.fillStyle='#8A92A3'; ctx.font='11px monospace'; ctx.textAlign='left';
     ctx.fillText('+'+hi.toFixed(2), 2, 14);
     ctx.fillText(lo.toFixed(2), 2, H-6);
-    if (maxD > 0){
+    if (maxD>0){
       const fin=dv[N-1];
       ctx.fillStyle = fin<=0 ? '#6CD07A' : '#FF5D5D';
       ctx.font='600 14px monospace'; ctx.textAlign='right';
       ctx.fillText((fin<=0?'':'+')+fin.toFixed(2)+'s', W-12, 18);
     }
+    deltaState={ i0:ctxIdxAt(selfCtx,primLapArg.t_start), i1:ctxIdxAt(selfCtx,primLapArg.t_end),
+                 primSeries:sa, refSeries:sb, maxD, lo, hi };
+    placeDeltaCursor(Number(slider.value));
   }
+  function placeDeltaCursor(idx){
+    const cur=el('delta-cursor'); const live=el('delta-live');
+    if (!cur) return;
+    if (!deltaState || idx<deltaState.i0 || idx>deltaState.i1 || !(deltaState.maxD>0)){
+      cur.style.display='none'; if (live) live.textContent=''; return;
+    }
+    const k=idx-deltaState.i0;
+    const dq=deltaState.primSeries.dist[k];
+    const v=deltaState.primSeries.tm[k]-interpTime(deltaState.refSeries, dq);
+    const W=dcanv.width, H=dcanv.height;
+    const px=34+(W-44)*Math.min(1, dq/deltaState.maxD);
+    const py=10+(H-28)*(1-(v-deltaState.lo)/(deltaState.hi-deltaState.lo));
+    cur.style.display='';
+    cur.style.left=(px/W*100).toFixed(2)+'%';
+    cur.style.top=(py/H*100).toFixed(2)+'%';
+    cur.style.background = v<=0 ? '#6CD07A' : '#FF5D5D';
+    if (live){ live.textContent=(v<=0?'':'+')+v.toFixed(2)+'s';
+      live.style.color = v<=0 ? '#6CD07A' : '#FF5D5D'; }
+  }
+
+  // ---- comparison telemetry (red sub-values) + sync mode -------------
+  function setCompTiles(s){
+    const set=(id,txt)=>{ const e=el(id); if (e) e.textContent = txt||''; };
+    if (!s){ set('c-speed',''); set('c-rpm',''); set('c-hdg',''); return; }
+    set('c-speed', (s.speed_mph!=null) ?
+      ('vs '+(s.speed_mph>=100?fmtInt(s.speed_mph):fmt(s.speed_mph,1))+' mph') : '');
+    set('c-rpm', (s.rpm!=null) ? ('vs '+fmtInt(s.rpm)) : '');
+    set('c-hdg', (s.heading_deg!=null) ? ('vs '+fmt(s.heading_deg,0)+'\u00b0') : '');
+  }
+  function updateCompReadouts(idx){
+    const active = currentRef && primLap && lapWindow && deltaState
+      && idx>=lapWindow.i0 && idx<=lapWindow.i1
+      && !(currentRef.ctx===selfCtx && currentRef.lap.lap===primLap.lap);
+    if (!active){ hideCompDot(); setCompTiles(null); return; }
+    const k=idx-lapWindow.i0;
+    const tInto=deltaState.primSeries.tm[k];
+    const dq=deltaState.primSeries.dist[k];
+    let rk;
+    if (syncMode==='time'){
+      // same elapsed time into the lap -> generally a DIFFERENT place; show
+      // where the comparison car was at this instant with its own red dot.
+      rk=refIdxByTime(currentRef, tInto);
+      const gs=currentRef.ctx.S[currentRef.i0+rk];
+      if (gs && typeof gs.lat==='number' && typeof gs.lon==='number' && (gs.lat||gs.lon))
+        showCompDot([gs.lat, gs.lon]);
+      else hideCompDot();
+    } else {
+      // same place on track -> one dot; compare the telemetry at this spot.
+      rk=refIdxByDist(currentRef, dq);
+      hideCompDot();
+    }
+    setCompTiles(currentRef.ctx.S[currentRef.i0+rk]);
+  }
+
+  // ---- selection state ------------------------------------------------
+  let defaultRef=null, selfLaps=[], selfBest=null;
+  function setRef(ref){
+    currentRef=ref;
+    if (!primLap) return;
+    el('delta-sel').textContent='\u00b7 lap '+primLap.lap+' vs '+(ref?ref.label:'\u2014');
+    highlight(primLap, ref);
+    drawDelta(primLap, ref);
+    render(Number(slider.value));
+  }
+  function selectPrimary(lap, rowsEl){
+    primLap=lap;
+    if (rowsEl) [...rowsEl.children].forEach(tr =>
+      tr.classList.toggle('sel', Number(tr.dataset.lap)===lap.lap));
+    lapWindow={ i0:ctxIdxAt(selfCtx, lap.t_start), i1:ctxIdxAt(selfCtx, lap.t_end) };
+    el('delta-sel').textContent='\u00b7 lap '+lap.lap+' vs '+(currentRef?currentRef.label:'\u2014');
+    highlight(lap, currentRef);
+    drawDelta(lap, currentRef);
+    slider.value=String(lapWindow.i0); render(lapWindow.i0);
+  }
+
+  // ---- comparison session / lap pickers ------------------------------
+  const compCache={}; let compSessions={}, cmpEntry=null, cmpSess=null;
+  function enc(s){ return encodeURIComponent(s); }
+  async function loadCompSession(user, file){
+    if (user===USER && file===FILE) return {ctx:selfCtx, laps:selfLaps, best:selfBest};
+    const key=user+'/'+file;
+    if (compCache[key]) return compCache[key];
+    const [dr, lr]=await Promise.all([
+      fetch('/sessions/'+enc(user)+'/'+enc(file)+'/data').then(r=>r.json()),
+      fetch('/sessions/'+enc(user)+'/'+enc(file)+'/laps').then(r=>r.json())
+    ]);
+    const cs=dr.samples||[];
+    const ctx={ S:cs, relT:buildRelT(cs) };
+    const laps=lr.laps||[];
+    const best=laps.find(l=>l.lap===lr.best_lap) || laps[0] || null;
+    const entry={ ctx, laps, best };
+    compCache[key]=entry; return entry;
+  }
+  function fillLapPicker(entry){
+    const sel=el('cmp-lap'); sel.innerHTML='';
+    if (!entry || !entry.laps.length) return;
+    const best=entry.best;
+    for (const lap of entry.laps){
+      const o=document.createElement('option'); o.value=String(lap.lap);
+      const gap=lap.seconds-(best?best.seconds:lap.seconds);
+      o.textContent='Lap '+lap.lap+' \u2014 '+lapFmt(lap.seconds)+
+        (best && lap.lap===best.lap ? ' (fastest)' : ' (+'+gap.toFixed(2)+')');
+      sel.appendChild(o);
+    }
+    if (best) sel.value=String(best.lap);
+  }
+  function applyCompLap(){
+    if (!cmpEntry) return;
+    const lapNo=Number(el('cmp-lap').value);
+    const lap=cmpEntry.laps.find(l=>l.lap===lapNo); if (!lap) return;
+    const sameSelf=(cmpSess.user===USER && cmpSess.file===FILE);
+    const who=cmpSess.user.split('@')[0].split('_')[0];
+    const label=sameSelf ? ('lap '+lap.lap) : (who+' lap '+lap.lap);
+    setRef(makeRef(cmpEntry.ctx, lap, label));
+  }
+  async function loadCompList(){
+    let j;
+    try { const r=await fetch('/sessions'); if (!r.ok) return; j=await r.json(); }
+    catch(e){ return; }
+    const dl=el('cmp-sessions'); dl.innerHTML=''; compSessions={};
+    for (const s of (j.sessions||[])){
+      const ep=(s.display_epoch||s.mtime||0)*1000;
+      const date=ep ? new Date(ep).toISOString().slice(0,16).replace('T',' ') : '';
+      const label=s.user+' \u00b7 '+date+' \u00b7 '+s.filename.replace(/\\.ndjson$/,'');
+      compSessions[label]={ user:s.user, file:s.filename };
+      const o=document.createElement('option'); o.value=label; dl.appendChild(o);
+    }
+  }
+  el('cmp-session').addEventListener('change', async ()=>{
+    const val=el('cmp-session').value.trim();
+    const sess=compSessions[val];
+    el('cmp-lap').innerHTML='';
+    if (!sess) return;
+    try { cmpEntry=await loadCompSession(sess.user, sess.file); cmpSess=sess; }
+    catch(e){ return; }
+    fillLapPicker(cmpEntry);
+    applyCompLap();
+  });
+  el('cmp-lap').addEventListener('change', applyCompLap);
+  el('cmp-reset').addEventListener('click', ()=>{
+    el('cmp-session').value=''; el('cmp-lap').innerHTML='';
+    cmpEntry=null; cmpSess=null;
+    setRef(defaultRef);
+  });
+  el('sync-mode').addEventListener('change', ()=>{
+    syncMode=el('sync-mode').value;
+    render(Number(slider.value));
+  });
+
+  // ---- load this session's laps + wire the table ---------------------
   (async function loadLaps(){
     let lr;
     try {
-      const r=await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/laps');
-      if (!r.ok) return;
-      lr=await r.json();
+      const r=await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/laps');
+      if (!r.ok) return; lr=await r.json();
     } catch(e){ return; }
     const laps=lr.laps||[];
     if (!laps.length) return;
+    selfLaps=laps;
     const bestLap=laps.find(l=>l.lap===lr.best_lap) || laps[0];
+    selfBest=bestLap;
+    defaultRef=makeRef(selfCtx, bestLap, 'best lap (lap '+bestLap.lap+')');
+    currentRef=defaultRef;
     el('lapcard').style.display='';
     el('lap-sub').textContent=laps.length+' laps \u00b7 best '+lapFmt(bestLap.seconds);
     const rows=el('lap-rows'); rows.innerHTML='';
-    function select(lap){
-      [...rows.children].forEach(tr =>
-        tr.classList.toggle('sel', Number(tr.dataset.lap)===lap.lap));
-      el('delta-sel').textContent='\u00b7 lap '+lap.lap+' vs best (lap '+bestLap.lap+')';
-      highlightLap(lap, bestLap);
-      drawDelta(lap, bestLap);
-      const i0=idxAt(lap.t_start);
-      slider.value=String(i0); render(i0);
-    }
     for (const lap of laps){
-      const tr=document.createElement('tr');
-      tr.dataset.lap=lap.lap;
+      const tr=document.createElement('tr'); tr.dataset.lap=lap.lap;
       if (lap.lap===bestLap.lap) tr.classList.add('best');
       const gap=lap.seconds-bestLap.seconds;
       const gapTxt=(lap.lap===bestLap.lap) ? 'best' : '+'+gap.toFixed(2);
       tr.innerHTML='<td>'+lap.lap+'</td><td>'+lapFmt(lap.seconds)+
         '</td><td class="gap">'+gapTxt+'</td><td>'+
         (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>';
-      tr.addEventListener('click', ()=>select(lap));
+      tr.addEventListener('click', ()=>selectPrimary(lap, rows));
       rows.appendChild(tr);
     }
-    select(bestLap);
+    selectPrimary(bestLap, rows);
+    loadCompList();
   })();
 })();
 </script>
