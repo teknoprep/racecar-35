@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.46"
+#define FIRMWARE_VERSION "0.1.47"
 
 #include <Preferences.h>
 #include <time.h>
@@ -344,6 +344,7 @@ static uint32_t candiag_total   = 0;
 static uint8_t  candiag_base    = 0;
 static uint8_t  candiag_dup_pct = 0;
 static bool     candiag_ack_err = false;
+static uint8_t  candiag_tx_err  = 0;   // Teensy CAN TX error counter (128+ = TX dead)
 static uint32_t candiag_ms      = 0;   // millis() of last CANDIAG line
 
 // ---------------------------------------------------------------------------
@@ -1348,6 +1349,7 @@ static bool parseCanDiagLine(const String& line) {
     if (n >= 3) candiag_base    = (uint8_t)field(2).toInt();
     if (n >= 4) candiag_dup_pct = (uint8_t)field(3).toInt();
     if (n >= 5) candiag_ack_err = (field(4).toInt() != 0);
+    if (n >= 6) candiag_tx_err  = (uint8_t)field(5).toInt();
     candiag_ms = millis();
     return true;
 }
@@ -6223,10 +6225,15 @@ static void drawToolsPage() {
         if (!fresh || candiag_fps == 0) {
             col = TFT_DARKGREY;
             snprintf(line, sizeof(line), "CAN: NO BUS  \xB7  0 frames/s  \xB7  check wiring / termination / broadcast");
+        } else if (candiag_tx_err >= 96) {
+            // Our own transmit path can't ACK -> the MS3 storms. The decisive case.
+            col = TFT_RED;
+            snprintf(line, sizeof(line), "CAN: TX DEAD  \xB7  %lu fps  TXerr %u  \xB7  check SN65HVD230 Rs\xB7GND + pin22",
+                     (unsigned long)candiag_fps, candiag_tx_err);
         } else if (candiag_ack_err || candiag_dup_pct >= 80) {
             col = TFT_RED;
-            snprintf(line, sizeof(line), "CAN: STORM  \xB7  %lu fps  dup %u%%  %s  \xB7  bad termination/ACK",
-                     (unsigned long)candiag_fps, candiag_dup_pct,
+            snprintf(line, sizeof(line), "CAN: STORM  \xB7  %lu fps  dup %u%%  TXerr %u %s  \xB7  ACK problem",
+                     (unsigned long)candiag_fps, candiag_dup_pct, candiag_tx_err,
                      candiag_ack_err ? "ACK_ERR" : "");
         } else {
             col = TFT_GREEN;

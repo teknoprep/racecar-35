@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.46"
+#define FIRMWARE_VERSION "0.1.47"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -585,6 +585,24 @@ static void canDiagReport() {
     for (uint8_t i = 0; i < can_diag.ids_count && n < (int)sizeof(ids) - 8; i++)
         n += snprintf(ids + n, sizeof(ids) - n, "%s0x%lX",
                       i ? "," : "", (unsigned long)can_diag.ids_seen[i]);
+    // DECISIVE TX/ACK TEST. The dumps prove the Teensy RECEIVES live data
+    // (coolant tracked a warming engine) yet the bus is pinned at ~3200 fps of
+    // one frozen frame — the classic no-ACK retransmit storm. The open question
+    // is which node can't ACK. So we actively transmit one benign heartbeat
+    // frame per second on an unused ID and watch our own TX error counter:
+    //   TX_ERR stays 0          -> our TX/ACK path works (someone ACKs us)
+    //   TX_ERR climbs to 128 +  -> our transmit path is DEAD. We receive but
+    //      flt goes Error-Passive   cannot drive the bus, so we never ACK the
+    //      / Bus off                MS3 either -> it storms. Cause: SN65HVD230
+    //                               Rs(mode) pin high/floating (standby = RX on,
+    //                               TX off), or Teensy pin22(CTX) not reaching
+    //                               the transceiver D/TXD input.
+    // A single frame/sec on an unused ID is harmless to the ECU bus.
+    CAN_message_t tx;
+    tx.id = 0x100;          // unused by MS3 Simplified Dash (0x5E8..0x5EC)
+    tx.len = 1;
+    tx.buf[0] = 0xA5;
+    Can1.write(tx);
     // Pull FlexCAN's error/bus state. events() populates the ESR1 capture buffer
     // without draining the FIFO (FIFO interrupt isn't enabled), so it's safe to
     // call alongside our read()-polling in pumpCAN().
@@ -602,11 +620,12 @@ static void canDiagReport() {
                   have_err ? err.TX_ERR_COUNTER : 0, have_err ? err.RX_ERR_COUNTER : 0,
                   have_err ? (char*)err.FLT_CONF : "?");
     // Also surface it on the dash link so it can be shown without a USB cable.
-    // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>
-    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d\n",
+    // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>
+    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u\n",
                        (unsigned long)can_diag.rx_window,
                        (unsigned long)can_diag.rx_total, can_diag.base_hits,
-                       (unsigned long)dpct, have_err ? err.ACK_ERR : 0);
+                       (unsigned long)dpct, have_err ? err.ACK_ERR : 0,
+                       have_err ? err.TX_ERR_COUNTER : 0);
     can_diag.rx_window = 0;
     can_diag.dup_window = 0;
     can_diag.ids_count = 0;
