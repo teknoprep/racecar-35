@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.42"
+#define FIRMWARE_VERSION "0.1.43"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -536,6 +536,55 @@ static struct CanEcu {
     uint32_t last_ms    = 0;   // millis() of most recent valid frame (any ID)
 } can_ecu;
 
+// CAN RX diagnostics — independent of whether any frame ID matched our parser.
+// can_rx_total counts EVERY frame seen on the bus since boot; the seen-ID ring
+// records the distinct IDs observed in the last report window. This is what
+// tells us, over USB serial, which link in the chain is broken:
+//   total stays 0          -> nothing on the bus (wiring / transceiver / broadcast off)
+//   total climbs, no 0x5E8 -> wrong broadcast mode/base (e.g. Advanced 0x5F0, not
+//                             Simplified Dash 0x5E8) — reconfigure TunerStudio
+//   total climbs, 0x5E8 ok -> data is arriving + parsed; check dash sensor_type
+static struct CanDiag {
+    uint32_t rx_total      = 0;    // every frame ever read (any ID)
+    uint32_t rx_window     = 0;    // frames since last 1 Hz report
+    uint32_t ids_seen[8]   = {0};  // distinct IDs in this window (ring, dropped if >8)
+    uint8_t  ids_count     = 0;
+    uint8_t  base_hits     = 0;    // frames matching CAN_BASE_ID+0..3 this window
+    uint32_t last_report_ms = 0;
+} can_diag;
+
+static void canDiagNote(uint32_t id) {
+    can_diag.rx_total++;
+    can_diag.rx_window++;
+    for (uint8_t i = 0; i < can_diag.ids_count; i++)
+        if (can_diag.ids_seen[i] == id) return;     // already recorded
+    if (can_diag.ids_count < 8)
+        can_diag.ids_seen[can_diag.ids_count++] = id;
+}
+
+// Call at ~1 Hz from emitToDash(). Prints a one-line CAN health summary to the
+// USB serial monitor and resets the window counters.
+static void canDiagReport() {
+    const uint32_t now = millis();
+    if (now - can_diag.last_report_ms < 1000) return;
+    can_diag.last_report_ms = now;
+    char ids[64]; int n = 0; ids[0] = 0;
+    for (uint8_t i = 0; i < can_diag.ids_count && n < (int)sizeof(ids) - 8; i++)
+        n += snprintf(ids + n, sizeof(ids) - n, "%s0x%lX",
+                      i ? "," : "", (unsigned long)can_diag.ids_seen[i]);
+    Serial.printf("CANDIAG frames/s=%lu total=%lu base_hits=%u ids=[%s]\n",
+                  (unsigned long)can_diag.rx_window,
+                  (unsigned long)can_diag.rx_total,
+                  can_diag.base_hits, ids);
+    // Also surface it on the dash link so it can be shown without a USB cable.
+    DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u\n",
+                       (unsigned long)can_diag.rx_window,
+                       (unsigned long)can_diag.rx_total, can_diag.base_hits);
+    can_diag.rx_window = 0;
+    can_diag.ids_count = 0;
+    can_diag.base_hits = 0;
+}
+
 // CAN sniffer: when cansniff_active (declared near the top), EVERY frame on
 // the bus (any ID) is logged to /cansniff/cansniff_<unix>.csv on the SD card
 // so the real MS3Pro broadcast layout can be analysed offline.
@@ -543,6 +592,9 @@ static void pumpCAN() {
     CAN_message_t msg;
     const uint32_t now = millis();
     while (Can1.read(msg)) {
+        // Diagnostics: count EVERY frame + record its ID, regardless of match.
+        canDiagNote(msg.id);
+        if (msg.id >= CAN_BASE_ID && msg.id <= CAN_BASE_ID + 3) can_diag.base_hits++;
         // Sniffer: capture the raw frame (any ID) before our targeted parse.
         if (cansniff_active) {
             cansniffLog(msg.id, msg.flags.extended, msg.len, msg.buf);
@@ -2556,6 +2608,7 @@ void loop() {
     // Drain both RPM sources every loop; emitToDash() picks the active one.
     pumpTach();
     pumpCAN();
+    canDiagReport();   // 1 Hz CAN health line to USB serial + dash (self-throttled)
 
     // Periodic SD card recheck. SDIO occasionally misses a card on boot —
     // particularly if the card was inserted while the Teensy was already
