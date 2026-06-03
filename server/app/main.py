@@ -210,12 +210,21 @@ def load_managed_users() -> dict:
         email = str(u.get("email", "")).strip().lower()
         if not email:
             continue
+        can_view = u.get("can_view") or []
+        if not isinstance(can_view, list):
+            can_view = []
         out[email] = {
             "email": email,
             "is_admin": bool(u.get("is_admin")),
             "added_by": str(u.get("added_by") or ""),
             "added_at": int(u.get("added_at") or 0),
             "api_key": str(u.get("api_key") or ""),
+            # Session-visibility scope:
+            #   view_all  -> this account sees EVERY user's sessions.
+            #   can_view  -> extra emails whose sessions this account may see
+            #                (on top of its own). Admins implicitly see all.
+            "view_all": bool(u.get("view_all")),
+            "can_view": sorted({str(e).strip().lower() for e in can_view if str(e).strip()}),
         }
     return out
 
@@ -323,6 +332,53 @@ def is_admin_email(email: str) -> bool:
         return True
     u = load_managed_users().get(email)
     return bool(u and u["is_admin"])
+
+
+def user_sees_all(email: str) -> bool:
+    """True if this account may see EVERY user's sessions (admin or view_all)."""
+    email = (email or "").lower()
+    if not email:
+        return False
+    if email in ADMIN_EMAILS:
+        return True
+    u = load_managed_users().get(email)
+    return bool(u and (u["is_admin"] or u.get("view_all")))
+
+
+def visible_dirnames_for(email: str) -> Optional[set]:
+    """Sanitized session-dir names this account may view, or None for ALL.
+
+    Always includes the account's own directory, plus every email in its
+    can_view grant list. Admins / view_all accounts get None (= unrestricted).
+    """
+    if user_sees_all(email):
+        return None
+    email = (email or "").lower()
+    names = {safe_name(email)} if email else set()
+    u = load_managed_users().get(email)
+    if u:
+        for e in u.get("can_view") or []:
+            names.add(safe_name(e))
+    return names
+
+
+def can_view_dir(email: str, dirname: str) -> bool:
+    vis = visible_dirnames_for(email)
+    return vis is None or dirname in vis
+
+
+def gate_view_dir(request: Request, dirname: str) -> None:
+    """Raise unless the signed-in user may view sessions under dirname.
+
+    No-op in dev mode (OAuth off) so bench testing still sees everything.
+    """
+    if not oauth_enabled():
+        return
+    user = current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="login required")
+    if not can_view_dir(str(user.get("email", "")), dirname):
+        raise HTTPException(status_code=403, detail="you don't have access to that user's sessions")
 
 
 def require_admin(request: Request) -> dict:
@@ -645,6 +701,10 @@ async def auth_google_callback(
     if not is_allowed_email(email):
         return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", f"{html.escape(email)} is not authorized. Ask an admin to add your account."), status_code=403)
 
+    # Guarantee this account has a persisted record + per-user API key the
+    # first time it signs in (bootstrap admins included).
+    ensure_user_record(email)
+
     next_url = request.cookies.get(OAUTH_NEXT_COOKIE, "/")
     if not next_url.startswith("/") or next_url.startswith("//"):
         next_url = "/"
@@ -675,6 +735,55 @@ async def me(request: Request) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Per-user account page: view + refresh your own upload API key.
+# Any signed-in account (not just admins) may use these.
+# ---------------------------------------------------------------------------
+def _require_account_user(request: Request) -> dict:
+    """Signed-in user for account/API-key routes; 400 in dev (no OAuth)."""
+    if not oauth_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="per-user API keys require Google OAuth to be configured",
+        )
+    user = current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="login required")
+    return user
+
+
+@app.get("/account", response_class=HTMLResponse)
+async def account_page(request: Request) -> Response:
+    if not oauth_enabled():
+        return HTMLResponse(_ADMIN_DISABLED_HTML, status_code=400)
+    user = current_user(request)
+    if not user:
+        return login_redirect(request)
+    email = str(user.get("email", ""))
+    rec = ensure_user_record(email)
+    page = (_ACCOUNT_HTML
+            .replace("__USER_CHIP__", _user_chip_html(user))
+            .replace("__EMAIL__", html.escape(email))
+            .replace("__APIKEY__", html.escape(str(rec.get("api_key") or ""))))
+    return HTMLResponse(page)
+
+
+@app.get("/account/apikey")
+async def account_apikey(request: Request) -> dict:
+    user = _require_account_user(request)
+    rec = ensure_user_record(str(user.get("email", "")))
+    return {"email": rec.get("email"), "api_key": rec.get("api_key")}
+
+
+@app.post("/account/apikey/refresh")
+async def account_apikey_refresh(request: Request) -> JSONResponse:
+    user = _require_account_user(request)
+    email = str(user.get("email", "")).lower()
+    new_key = refresh_user_api_key(email)
+    log.info("user %s refreshed their API key", email)
+    return JSONResponse({"ok": True, "email": email, "api_key": new_key})
+
+
+# ---------------------------------------------------------------------------
 # Admin portal
 # ---------------------------------------------------------------------------
 def _admin_rows_html(self_email: str) -> str:
@@ -683,12 +792,21 @@ def _admin_rows_html(self_email: str) -> str:
     def you_badge(em: str) -> str:
         return ' <span class="badge env">you</span>' if em == self_email else ''
 
+    def vis_badge(view_all: bool, n: int) -> str:
+        if view_all:
+            return " <span class='badge admin'>sees all</span>"
+        if n:
+            return f" <span class='badge env'>sees {n}</span>"
+        return ""
+
     def env_row(em: str, is_admin: bool) -> str:
         em_h = html.escape(em)
         role = ('<span class="badge admin">admin</span>' if is_admin
                 else '<span class="badge">user</span>')
+        # Admins implicitly see all; mark it.
+        sees = " <span class='badge admin'>sees all</span>" if is_admin else ""
         return (f"<tr><td class=mono>{em_h}{you_badge(em)}</td>"
-                f"<td>{role} <span class='badge env'>env</span></td>"
+                f"<td>{role} <span class='badge env'>env</span>{sees}</td>"
                 f"<td class=mono>.env</td>"
                 f"<td><span style='color:var(--muted)'>locked</span></td></tr>")
 
@@ -697,12 +815,15 @@ def _admin_rows_html(self_email: str) -> str:
         is_admin = u["is_admin"]
         role = ('<span class="badge admin">admin</span>' if is_admin
                 else '<span class="badge">user</span>')
+        sees = (" <span class='badge admin'>sees all</span>" if is_admin
+                else vis_badge(bool(u.get("view_all")), len(u.get("can_view") or [])))
         added_by = html.escape(u.get("added_by") or "")
         toggle_label = 'revoke admin' if is_admin else 'make admin'
-        return (f"<tr><td class=mono>{em_h}{you_badge(em)}</td>"
-                f"<td>{role}</td>"
+        return (f"<tr><td class=mono><a href='/admin/user/{em_h}'>{em_h}</a>{you_badge(em)}</td>"
+                f"<td>{role}{sees}</td>"
                 f"<td class=mono>{added_by}</td>"
                 f"<td><div class='row-actions'>"
+                f"<a class='btn' href='/admin/user/{em_h}'>manage</a>"
                 f"<button class='btn' data-act='toggle' data-admin='{1 if is_admin else 0}' data-email='{em_h}'>{toggle_label}</button>"
                 f"<button class='btn danger' data-act='remove' data-email='{em_h}'>remove</button>"
                 f"</div></td></tr>")
@@ -781,6 +902,9 @@ async def admin_upsert_user(request: Request) -> JSONResponse:
         "is_admin": is_admin,
         "added_by": (existing or {}).get("added_by") or str(admin.get("email", "")).lower(),
         "added_at": (existing or {}).get("added_at") or int(time.time()),
+        # Preserve any existing per-user key; mint one for brand-new accounts
+        # so a driver added here has a usable key before their first login.
+        "api_key": (existing or {}).get("api_key") or generate_api_key(),
     }
     save_managed_users(users)
     log.info("admin %s %s user %s (admin=%s)", admin.get("email"),
@@ -805,6 +929,147 @@ async def admin_delete_user(request: Request) -> JSONResponse:
     save_managed_users(users)
     log.info("admin %s removed user %s", admin.get("email"), email)
     return JSONResponse({"ok": True, "removed": email})
+
+
+# ---------------------------------------------------------------------------
+# Per-user visibility management (admin only).
+#   - view_all: ALL USERS checkbox -> this account sees every user's sessions.
+#   - can_view: explicit list of other accounts whose sessions it may see.
+# ---------------------------------------------------------------------------
+def _upsert_managed_for_visibility(email: str, admin_email: str) -> dict:
+    """Fetch (or create) a managed record so visibility can be stored on it."""
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=422, detail="a valid email is required")
+    if email in ADMIN_EMAILS:
+        raise HTTPException(status_code=409, detail="that account is a bootstrap admin and already sees every user")
+    users = load_managed_users()
+    u = users.get(email)
+    if u is None:
+        u = {
+            "email": email, "is_admin": False,
+            "added_by": (admin_email or "").lower(), "added_at": int(time.time()),
+            "api_key": generate_api_key(), "view_all": False, "can_view": [],
+        }
+        users[email] = u
+    return u
+
+
+@app.post("/admin/users/visibility")
+async def admin_set_visibility(request: Request) -> JSONResponse:
+    """Toggle the ALL USERS (view_all) flag for a managed account."""
+    admin = require_admin(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    email = str(body.get("email", "")).strip().lower()
+    view_all = bool(body.get("view_all"))
+    users = load_managed_users()
+    u = _upsert_managed_for_visibility(email, str(admin.get("email", "")))
+    users[email] = u
+    u["view_all"] = view_all
+    save_managed_users(users)
+    log.info("admin %s set view_all=%s for %s", admin.get("email"), view_all, email)
+    return JSONResponse({"ok": True, "email": email, "view_all": view_all})
+
+
+@app.post("/admin/users/grant")
+async def admin_grant_view(request: Request) -> JSONResponse:
+    """Add one account to another account's can_view list."""
+    admin = require_admin(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    email = str(body.get("email", "")).strip().lower()
+    target = str(body.get("target", "")).strip().lower()
+    if not target or "@" not in target:
+        raise HTTPException(status_code=422, detail="a valid target email is required")
+    if target == email:
+        raise HTTPException(status_code=422, detail="an account already sees its own sessions")
+    users = load_managed_users()
+    u = _upsert_managed_for_visibility(email, str(admin.get("email", "")))
+    users[email] = u
+    cv = set(u.get("can_view") or [])
+    cv.add(target)
+    u["can_view"] = sorted(cv)
+    save_managed_users(users)
+    log.info("admin %s granted %s view of %s", admin.get("email"), email, target)
+    return JSONResponse({"ok": True, "email": email, "can_view": u["can_view"]})
+
+
+@app.post("/admin/users/revoke")
+async def admin_revoke_view(request: Request) -> JSONResponse:
+    """Remove one account from another account's can_view list."""
+    admin = require_admin(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    email = str(body.get("email", "")).strip().lower()
+    target = str(body.get("target", "")).strip().lower()
+    users = load_managed_users()
+    u = users.get(email)
+    if u is None:
+        raise HTTPException(status_code=404, detail="no such managed account")
+    cv = [e for e in (u.get("can_view") or []) if e != target]
+    u["can_view"] = cv
+    users[email] = u
+    save_managed_users(users)
+    log.info("admin %s revoked %s view of %s", admin.get("email"), email, target)
+    return JSONResponse({"ok": True, "email": email, "can_view": cv})
+
+
+@app.get("/admin/user/{email}", response_class=HTMLResponse)
+async def admin_user_detail(request: Request, email: str) -> Response:
+    """Per-user screen: ALL USERS toggle + dynamic can_view grant list."""
+    if not oauth_enabled():
+        return HTMLResponse(_ADMIN_DISABLED_HTML, status_code=400)
+    viewer = current_user(request)
+    if not viewer:
+        return login_redirect(request)
+    if not is_admin_email(str(viewer.get("email", ""))):
+        return HTMLResponse(
+            _LOGIN_ERROR_HTML.replace("__ERROR__", "Admin access is required for this page."),
+            status_code=403,
+        )
+    target = (email or "").strip().lower()
+    is_boot_admin = target in ADMIN_EMAILS
+    u = load_managed_users().get(target)
+    is_admin = is_boot_admin or bool(u and u["is_admin"])
+    view_all = bool(u and u.get("view_all"))
+    can_view = list(u.get("can_view")) if u else []
+    sees_all = is_admin or view_all
+
+    # All known accounts (minus the target itself) for the picker.
+    others = sorted(allowed_emails() - {target})
+    options = "".join(f'<option value="{html.escape(e)}">' for e in others)
+
+    if can_view:
+        chips = "".join(
+            f"<li class='mono'>{html.escape(e)}"
+            f"<button class='btn danger' data-revoke='{html.escape(e)}'>remove</button></li>"
+            for e in sorted(can_view)
+        )
+    else:
+        chips = "<li class='empty' style='color:var(--muted);font-style:italic'>no extra users yet</li>"
+
+    locked_note = ""
+    if is_admin:
+        locked_note = ("<p class='summary' style='color:var(--muted)'>This is an "
+                       "admin account &mdash; it already sees every user's sessions.</p>")
+
+    page = (_ADMIN_USER_HTML
+            .replace("__USER_CHIP__", _user_chip_html(viewer))
+            .replace("__EMAIL__", html.escape(target))
+            .replace("__CHECKED__", "checked" if sees_all else "")
+            .replace("__DISABLED__", "disabled" if is_admin else "")
+            .replace("__GRANT_DISABLED__", "disabled" if sees_all else "")
+            .replace("__OPTIONS__", options)
+            .replace("__CHIPS__", chips)
+            .replace("__LOCKED_NOTE__", locked_note))
+    return HTMLResponse(page)
 
 
 @app.get("/health")
@@ -838,7 +1103,10 @@ async def _save_body(
 
     validation = validate_ndjson_body(body)
 
-    email = safe_name(x_user_email or (web_user or {}).get("email"))
+    # A per-user API key (X-API-Key) namespaces the upload under its owner
+    # when no explicit X-User-Email is supplied.
+    key_email = email_for_api_key(x_api_key) if x_api_key else None
+    email = safe_name(x_user_email or (web_user or {}).get("email") or key_email)
 
     # Sanitize + epoch-sanity-check the session id. If the firmware uploads
     # something we can't interpret as a real epoch (RTC not set, all zeros,
@@ -949,12 +1217,15 @@ async def stream(
 @app.get("/sessions")
 async def list_sessions(request: Request) -> dict:
     """JSON listing of saved sessions. Useful for tooling/cli inspection."""
-    require_web_user(request)
+    web_user = require_web_user(request)
+    viewer_email = str((web_user or {}).get("email", ""))
     out = []
     sessions_root = DATA_DIR / "sessions"
     if sessions_root.exists():
         for user_dir in sorted(sessions_root.iterdir()):
             if not user_dir.is_dir():
+                continue
+            if oauth_enabled() and not can_view_dir(viewer_email, user_dir.name):
                 continue
             for f in sorted(user_dir.iterdir()):
                 if not f.is_file() or not f.name.endswith(".ndjson"):
@@ -985,6 +1256,7 @@ def _resolve_session(user: str, filename: str) -> pathlib.Path:
 @app.get("/sessions/{user}/{filename}")
 async def download_session(request: Request, user: str, filename: str) -> FileResponse:
     require_web_user(request)
+    gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
     return FileResponse(
         p,
@@ -1001,6 +1273,10 @@ async def delete_session(
     x_api_key: Optional[str] = Header(None),
 ) -> JSONResponse:
     authorize_api_or_user(request, x_api_key)
+    # Web users may only delete sessions they can see; device/API-key callers
+    # (the dash) are exempt from the visibility gate.
+    if not (x_api_key and (x_api_key == API_KEY or email_for_api_key(x_api_key))):
+        gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
     size = p.stat().st_size
     rel = str(p.relative_to(DATA_DIR))
@@ -1042,6 +1318,7 @@ async def session_data(
           "bounds": [[minLat,minLon],[maxLat,maxLon]] | null }
     """
     require_web_user(request)
+    gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
     samples: list[dict] = []
     min_lat = min_lon = float("inf")
@@ -1085,6 +1362,7 @@ async def session_data(
 async def review(request: Request, user: str, filename: str) -> Response:
     if oauth_enabled() and not current_user(request):
         return login_redirect(request)
+    gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
     when = time.strftime(
         "%Y-%m-%d %H:%M:%S UTC", time.gmtime(display_epoch_for(p))
@@ -1359,6 +1637,137 @@ _ADMIN_DISABLED_HTML = f"""<!doctype html>
   </section>
 </body></html>"""
 
+_ACCOUNT_HTML = (
+    """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>account \u00b7 racecar-35</title>
+""" + _FONTS_LINK + "<style>" + _BASE_CSS + _ADMIN_EXTRA_CSS + """
+.key-row{display:flex;gap:var(--sp-sm);align-items:center;flex-wrap:wrap}
+.key-row input{flex:1;min-width:220px;font-family:var(--mono,monospace);letter-spacing:1px}
+</style></head><body>
+<header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
+  <span class="crumbs"><a href="/">sessions</a> &rsaquo; account</span>
+  <span style="flex:1"></span>__USER_CHIP__</header>
+<main>
+  <div id="msg" class="msg"></div>
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:var(--sp-md)">Signed in as</div>
+    <p class="mono" style="margin:0 0 var(--sp-lg)">__EMAIL__</p>
+    <div class="t-label" style="margin-bottom:var(--sp-md)">Your upload API key</div>
+    <div class="key-row">
+      <input id="apiKey" type="text" readonly value="__APIKEY__">
+      <button class="btn" id="copyBtn">copy</button>
+      <button class="btn danger" id="refreshBtn">refresh key</button>
+    </div>
+    <p class="summary" style="color:var(--muted);margin-top:var(--sp-md);font-size:12px">
+      Send this as the <span class="mono">X-API-Key</span> header (or put it in the
+      dash's <span class="mono">api key</span> field). Uploads with this key are filed
+      under your account automatically. <b>Refreshing replaces the old key immediately</b>
+      \u2014 any device still using the old value must be updated.</p>
+  </section>
+</main>
+<script>
+(function(){
+  var msg=document.getElementById('msg');
+  var input=document.getElementById('apiKey');
+  function show(t,ok){ msg.className='msg '+(ok?'good':'bad'); msg.textContent=t; }
+  async function post(url){
+    var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    var d=await r.json().catch(function(){return {};});
+    if(!r.ok) throw new Error((d&&d.detail)||('HTTP '+r.status));
+    return d;
+  }
+  document.getElementById('copyBtn').addEventListener('click',function(){
+    input.select(); input.setSelectionRange(0,99999);
+    navigator.clipboard.writeText(input.value).then(function(){show('Copied to clipboard.',true);},
+      function(){ try{document.execCommand('copy'); show('Copied to clipboard.',true);}catch(e){show('Copy failed \u2014 select and copy manually.');} });
+  });
+  document.getElementById('refreshBtn').addEventListener('click',async function(){
+    if(!confirm('Refresh your API key?\\n\\nThe current key stops working immediately and any device using it must be updated.')) return;
+    try{ var d=await post('/account/apikey/refresh'); input.value=d.api_key; show('New API key generated.',true); }
+    catch(e){ show('Refresh failed: '+e.message); }
+  });
+})();
+</script>
+</body></html>"""
+)
+
+_ADMIN_USER_HTML = (
+    """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>manage user \u00b7 racecar-35</title>
+""" + _FONTS_LINK + "<style>" + _BASE_CSS + _ADMIN_EXTRA_CSS + """
+.chk-big{display:flex;align-items:center;gap:var(--sp-sm);font-size:15px}
+.grant-grid{display:flex;gap:var(--sp-sm);align-items:center;flex-wrap:wrap}
+.grant-grid input{flex:1;min-width:220px}
+ul.grants{list-style:none;padding:0;margin:var(--sp-md) 0 0}
+ul.grants li{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-sm);padding:8px 0;border-bottom:1px solid var(--surface-3)}
+</style></head><body>
+<header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
+  <span class="crumbs"><a href="/">sessions</a> &rsaquo; <a href="/admin">admin</a> &rsaquo; manage user</span>
+  <span style="flex:1"></span>__USER_CHIP__</header>
+<main>
+  <div id="msg" class="msg"></div>
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:var(--sp-md)">Managing</div>
+    <p class="mono" style="margin:0 0 var(--sp-lg)">__EMAIL__</p>
+    <label class="chk-big">
+      <input type="checkbox" id="viewAll" __CHECKED__ __DISABLED__>
+      <span><b>ALL USERS</b> &mdash; this account sees every user's sessions
+      (no need to add anyone).</span>
+    </label>
+    __LOCKED_NOTE__
+  </section>
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:var(--sp-md)">Users this account can see</div>
+    <div class="grant-grid">
+      <input id="target" list="known" type="text" placeholder="name@gmail.com" autocomplete="off" spellcheck="false" __GRANT_DISABLED__>
+      <datalist id="known">__OPTIONS__</datalist>
+      <button class="btn primary" id="grantBtn" __GRANT_DISABLED__>add user</button>
+    </div>
+    <ul class="grants" id="grants">__CHIPS__</ul>
+    <p class="summary" style="color:var(--muted);margin-top:var(--sp-md);font-size:12px">
+      An account always sees its own sessions. Add others here to share their
+      sessions with this account, or tick <b>ALL USERS</b> above to skip the
+      list entirely.</p>
+  </section>
+</main>
+<script>
+(function(){
+  var EMAIL="__EMAIL__";
+  var msg=document.getElementById('msg');
+  function show(t,ok){ msg.className='msg '+(ok?'good':'bad'); msg.textContent=t; }
+  async function post(url,payload){
+    var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    var d=await r.json().catch(function(){return {};});
+    if(!r.ok) throw new Error((d&&d.detail)||('HTTP '+r.status));
+    return d;
+  }
+  var va=document.getElementById('viewAll');
+  if(va && !va.disabled){
+    va.addEventListener('change', async function(){
+      try{ await post('/admin/users/visibility',{email:EMAIL,view_all:va.checked}); location.reload(); }
+      catch(e){ show('Update failed: '+e.message); va.checked=!va.checked; }
+    });
+  }
+  var grantBtn=document.getElementById('grantBtn');
+  if(grantBtn && !grantBtn.disabled){
+    grantBtn.addEventListener('click', async function(){
+      var t=(document.getElementById('target').value||'').trim().toLowerCase();
+      if(!t || t.indexOf('@')<0){ show('Enter a valid email address.'); return; }
+      try{ await post('/admin/users/grant',{email:EMAIL,target:t}); location.reload(); }
+      catch(e){ show('Add failed: '+e.message); }
+    });
+    document.getElementById('target').addEventListener('keydown',function(e){ if(e.key==='Enter') grantBtn.click(); });
+  }
+  document.addEventListener('click', async function(ev){
+    var t=ev.target.closest('[data-revoke]'); if(!t) return;
+    try{ await post('/admin/users/revoke',{email:EMAIL,target:t.dataset.revoke}); location.reload(); }
+    catch(e){ show('Remove failed: '+e.message); }
+  });
+})();
+</script>
+</body></html>"""
+)
+
 _INDEX_HEAD = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -1565,7 +1974,7 @@ def _user_chip_html(user: Optional[dict]) -> str:
     admin_link = ''
     if is_admin_email(str(user.get("email", ""))):
         admin_link = '<a class="btn" href="/admin">admin</a>'
-    return f'<span class="pill good">{email}</span>{admin_link}<a class="btn" href="/logout">logout</a>'
+    return f'<span class="pill good">{email}</span><a class="btn" href="/account">account</a>{admin_link}<a class="btn" href="/logout">logout</a>'
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1573,6 +1982,7 @@ async def index(request: Request) -> Response:
     user = current_user(request)
     if oauth_enabled() and not user:
         return login_redirect(request)
+    viewer_email = str((user or {}).get("email", ""))
     sessions_root = DATA_DIR / "sessions"
     rows: list[str] = []
     total = 0
@@ -1580,6 +1990,8 @@ async def index(request: Request) -> Response:
     if sessions_root.exists():
         for user_dir in sorted(sessions_root.iterdir()):
             if not user_dir.is_dir():
+                continue
+            if oauth_enabled() and not can_view_dir(viewer_email, user_dir.name):
                 continue
             for f in sorted(user_dir.iterdir(), reverse=True):
                 if not f.is_file() or not f.name.endswith(".ndjson"):

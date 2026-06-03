@@ -15,13 +15,20 @@ LAN IP of the host running the container.
 | ------ | --------------------------- | ---------------------------------------------- |
 | POST   | `/upload`                   | Whole-file AfterRace upload (NDJSON). Overwrites by `X-Session-Id` so retries are idempotent. |
 | POST   | `/stream`                   | Live-stream append (NDJSON). Reserved for the future Ethernet-mode live path. |
-| GET    | `/`                         | HTML index of all saved sessions.              |
-| GET    | `/sessions`                 | JSON listing of all saved sessions.            |
+| GET    | `/`                         | HTML index of the sessions you're allowed to see (see *Session visibility*). |
+| GET    | `/sessions`                 | JSON listing of the sessions you're allowed to see. |
 | GET    | `/sessions/<user>/<file>`   | Download one session file.                     |
 | GET    | `/health`                   | Healthcheck for Docker / nginx. Returns `{"ok":true}`. |
+| GET    | `/account`                  | Per-user account page (any signed-in user): view + copy + refresh your upload API key. |
+| GET    | `/account/apikey`           | JSON `{email, api_key}` for the signed-in user (creates a key if missing). |
+| POST   | `/account/apikey/refresh`   | Regenerate the signed-in user's API key. Old key stops working immediately. |
 | GET    | `/admin`                    | Admin portal (admins only): add authorized Gmail accounts, grant/revoke admin. |
 | POST   | `/admin/users`              | Add an account or change its admin flag (JSON `{email, is_admin}`). Admins only. |
 | POST   | `/admin/users/delete`       | Remove a managed account (JSON `{email}`). Admins only. |
+| GET    | `/admin/user/<email>`       | Per-user screen: ALL USERS toggle + manage who this account can see. Admins only. |
+| POST   | `/admin/users/visibility`   | Set the ALL USERS flag (JSON `{email, view_all}`). Admins only. |
+| POST   | `/admin/users/grant`        | Let an account see another's sessions (JSON `{email, target}`). Admins only. |
+| POST   | `/admin/users/revoke`       | Remove a granted account (JSON `{email, target}`). Admins only. |
 | GET    | `/docs`                     | OpenAPI / Swagger UI for poking around.        |
 
 ## Access control / admin portal
@@ -44,6 +51,40 @@ The `/admin` link appears in the header for admin accounts. From there an admin
 can add a Gmail address (optionally as admin) and toggle/remove any
 portal-managed account. Bootstrap admins show as `locked` and can't be edited
 from the UI.
+
+## Session visibility
+
+The sessions index (`/` and `/sessions`) is **scoped per account**:
+
+- Every account always sees **its own** uploaded sessions.
+- **Admins** (bootstrap or portal-granted) see **everyone's** sessions.
+- A non-admin account can be granted visibility of specific other accounts, or
+  of **everyone**, from the admin portal.
+
+In `/admin`, click a managed user (or its **manage** button) to open
+`/admin/user/<email>`. That screen has:
+
+- an **ALL USERS** checkbox — tick it and the account sees every user's
+  sessions, with no list to maintain (`view_all` on the account record);
+- a **can-view list** — type/pick another account's email and **add user** to
+  share just that account's sessions; **remove** revokes it.
+
+Visibility is enforced on the index, the JSON listing, downloads, the review
+page, the parsed-data endpoint, and web deletes. Device uploads via `X-API-Key`
+are unaffected. Settings persist in `/data/users.json` (fields `view_all` and
+`can_view`).
+
+## Per-user API keys
+
+Every authorized account gets a unique 12-char API key, minted on first Google
+login (or when an admin adds the account) and persisted in `/data/users.json`.
+A user views/refreshes their own key from the **account** link in the header
+(`/account`). Refreshing replaces the old key immediately.
+
+Send the key as `X-API-Key` on uploads. When no `X-User-Email` header is
+supplied, the upload is filed under the key owner's email automatically. This
+is independent of the global `RACECAR_API_KEY` env var (which, when set, gates
+all ingestion with a single shared secret).
 
 ## Request headers honored
 

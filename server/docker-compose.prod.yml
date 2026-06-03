@@ -42,6 +42,9 @@ services:
       RACECAR_SESSION_TTL_SECONDS: "${RACECAR_SESSION_TTL_SECONDS:-604800}"
     volumes:
       - ./data:/data
+    networks:
+      # nginx (bluecloud-proxy) reaches this container by name on proxy_default.
+      - proxy
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request, sys; \
@@ -50,3 +53,10 @@ services:
       timeout: 5s
       start_period: 5s
       retries: 3
+
+networks:
+  # The /docker/proxy/ nginx (bluecloud-proxy) lives on `proxy_default`.
+  # Joining it lets nginx proxy_pass to http://racecar35-cloud:8089 by name.
+  proxy:
+    external: true
+    name: proxy_default
