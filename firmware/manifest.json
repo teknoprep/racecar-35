@@ -6,9 +6,9 @@
     "size":    1035216
   },
   "teensy": {
-    "version": "0.1.41",
+    "version": "0.1.42",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/teensy41-dash.hex",
-    "sha256":  "a51bc04b9378d0f60c54e6c579a217d82e48ed1dca26e79e111210447be4b8e2",
+    "sha256":  "50eba79f57dc7d3f64cb41cecfc35f3a9b015b08ff21f799be8d39cc016f7dbb",
     "size":    579034
   }
 }
