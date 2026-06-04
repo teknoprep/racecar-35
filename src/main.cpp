@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.56"
+#define FIRMWARE_VERSION "0.1.57"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -486,36 +486,72 @@ static uint8_t gpsStatus() {
 // Interrupt-driven; we drain the FIFO in loop().
 // ---------------------------------------------------------------------------
 static FreqMeasureMulti tach;          // FlexPWM2_2_B input capture on pin 9
-static double   rpm_pulse_sum     = 0.0;
-static uint32_t rpm_pulse_count   = 0;
-static uint16_t rpm_current       = 0;
+
+// Noisy opto-tach conditioning. The raw signal has spurious edges (ringing,
+// EMI, opto not pulling fully low) that show up as very short pulse periods =
+// implausibly high instantaneous RPM. The old "average every period in the
+// window" math let a SINGLE glitch tank the average period and spike RPM all
+// over the place. We now run a two-stage filter on a PER-PULSE basis:
+//   1. Glitch gate  — drop any pulse whose instantaneous RPM is outside a
+//                      plausible band (kills the high-frequency noise spikes).
+//   2. Median-of-5  — kills isolated outliers that slip past the gate.
+//   3. EMA          — smooths the median so the displayed value doesn't twitch.
+// Tune RPM_EMA_ALPHA for responsiveness vs. smoothness (lower = smoother).
+static constexpr uint16_t RPM_MAX_PLAUSIBLE = 12000;   // reject pulses implying > this RPM (noise)
+static constexpr float    RPM_EMA_ALPHA     = 0.25f;   // 0..1; lower = smoother but laggier
+static constexpr uint8_t  RPM_MEDIAN_N      = 5;        // median window over recent good pulses
+
+static double   rpm_inst_ring[RPM_MEDIAN_N] = {0};      // recent good instantaneous RPM
+static uint8_t  rpm_ring_head     = 0;
+static uint8_t  rpm_ring_fill     = 0;
+static float    rpm_ema           = 0.0f;
 static uint32_t rpm_last_pulse_ms = 0;
+
+static double rpmRingMedian() {
+    if (rpm_ring_fill == 0) return 0.0;
+    double tmp[RPM_MEDIAN_N];
+    for (uint8_t i = 0; i < rpm_ring_fill; i++) tmp[i] = rpm_inst_ring[i];
+    // insertion sort (tiny N)
+    for (uint8_t i = 1; i < rpm_ring_fill; i++) {
+        double v = tmp[i]; int8_t j = i - 1;
+        while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; }
+        tmp[j + 1] = v;
+    }
+    return tmp[rpm_ring_fill / 2];
+}
 
 static void pumpTach() {
     while (tach.available()) {
-        rpm_pulse_sum   += tach.read();
-        rpm_pulse_count += 1;
+        const double period = tach.read();
+        if (period <= 0) continue;
+        const double freq_hz = FreqMeasureMulti::countToFrequency(period);
+        const double ppr = (g_cfg.rpm_ppr_x10 > 0) ? (g_cfg.rpm_ppr_x10 / 10.0)
+                                                    : (double)RPM_PULSES_PER_REV;
+        const double inst = (freq_hz * 60.0) / ppr;
+        // Stage 1: glitch gate — drop noise spikes / nonsense periods outright.
+        if (inst <= 0.0 || inst > (double)RPM_MAX_PLAUSIBLE) continue;
+        // Stage 2: feed the median ring.
+        rpm_inst_ring[rpm_ring_head] = inst;
+        rpm_ring_head = (rpm_ring_head + 1) % RPM_MEDIAN_N;
+        if (rpm_ring_fill < RPM_MEDIAN_N) rpm_ring_fill++;
+        const double med = rpmRingMedian();
+        // Stage 3: EMA smoothing (seed on first good sample so it ramps fast).
+        if (rpm_ema <= 0.0f) rpm_ema = (float)med;
+        else                 rpm_ema += RPM_EMA_ALPHA * ((float)med - rpm_ema);
         rpm_last_pulse_ms = millis();
     }
 }
 
 static uint16_t computeRpmAndReset() {
     if (millis() - rpm_last_pulse_ms > RPM_TIMEOUT_MS) {
-        rpm_pulse_sum = 0; rpm_pulse_count = 0;
-        rpm_current = 0;
+        // Engine stopped / signal lost — reset the filter so it ramps cleanly
+        // from zero on the next pulse rather than EMA-decaying from a stale value.
+        rpm_ring_head = 0; rpm_ring_fill = 0; rpm_ema = 0.0f;
         return 0;
     }
-    if (rpm_pulse_count > 0) {
-        const double freq_hz = FreqMeasureMulti::countToFrequency(rpm_pulse_sum / rpm_pulse_count);
-        const double ppr = (g_cfg.rpm_ppr_x10 > 0) ? (g_cfg.rpm_ppr_x10 / 10.0)
-                                                    : (double)RPM_PULSES_PER_REV;
-        const double rpm = (freq_hz * 60.0) / ppr;
-        rpm_pulse_sum = 0; rpm_pulse_count = 0;
-        if (rpm < 0)          rpm_current = 0;
-        else if (rpm > 65535) rpm_current = 65535;
-        else                  rpm_current = (uint16_t)(rpm + 0.5);
-    }
-    return rpm_current;
+    if (rpm_ema < 0.0f)         return 0;
+    if (rpm_ema > 65535.0f)     return 65535;
+    return (uint16_t)(rpm_ema + 0.5f);
 }
 
 // ---------------------------------------------------------------------------
