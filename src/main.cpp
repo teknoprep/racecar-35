@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.55"
+#define FIRMWARE_VERSION "0.1.56"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -74,7 +74,7 @@ extern "C" {
 #include <SdFat.h>
 #include <TimeLib.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
-#include <FreqMeasure.h>
+#include <FreqMeasureMulti.h>
 #include <FlexCAN_T4.h>
 
 namespace {
@@ -91,13 +91,24 @@ namespace {
   // to 18 if you ever swap chips.
   constexpr uint8_t  NAV_RATE_HZ       = 25;
 
-  // Tach input: opto-isolated pulse on pin 9 (FreqMeasure-capable on T4.x).
+  // Tach input: opto-isolated pulse on pin 9.
+  //
+  // IMPORTANT (T4.x): the plain `FreqMeasure` library is HARD-WIRED to pin 22
+  // on the IMXRT1062 (FlexPWM4 CH0-A) and ignores any pin choice — pin 22 is
+  // also our CAN1 TX, so it could never work for the opto tach. We use
+  // `FreqMeasureMulti` instead, which takes a pin argument; pin 9 maps to
+  // FlexPWM2_2_B and is input-capture capable. See RPM_TACH_PIN below.
+  constexpr uint8_t  RPM_TACH_PIN       = 9;
   // PULSES_PER_REV depends on where the tap is taken — calibrate by reading
   // the dash at a known idle (e.g. 800 RPM should display ~800). Common
   // values for a 4-cyl 4-stroke:
   //   2.0  = wasted-spark coil-negative, distributor coil-neg, most ECU tach
   //   1.0  = single COP coil trigger
   //   0.5  = once-per-2-revs cam-position pulse
+  // This is only the COMPILE-TIME DEFAULT now — the live value is set from the
+  // dash (Settings -> "Tach pulses/rev") via `CFG,rpmppr,<value_x10>` and held
+  // in g_cfg.rpm_ppr_x10. Think of it as the divider: a tach reading 2x too
+  // high needs pulses/rev = 2, 4x too high needs 4, etc.
   constexpr float    RPM_PULSES_PER_REV = 2.0f;
   constexpr uint32_t RPM_TIMEOUT_MS     = 750;      // no pulses in this window -> RPM = 0
 
@@ -175,6 +186,8 @@ static struct {
     bool     rec_cl     = false;
     uint8_t  inet        = 0;     // 0=Ethernet, 1=WiFi (mirror of dash setting)
     uint8_t  sensor_type = 0;     // 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN)
+    uint16_t rpm_ppr_x10 = 20;    // tach pulses/rev x10 (20 = 2.0). Divides the
+                                  // opto-tach frequency into RPM in Direct mode.
 } g_cfg;
 
 // Set when the dash sends UPLOAD,CANCEL. Volatile across reboot — deliberately
@@ -469,17 +482,18 @@ static uint8_t gpsStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// Tach state — FreqMeasure on pin 9. Used in Direct sensor mode only.
+// Tach state — FreqMeasureMulti on pin 9. Used in Direct sensor mode only.
 // Interrupt-driven; we drain the FIFO in loop().
 // ---------------------------------------------------------------------------
+static FreqMeasureMulti tach;          // FlexPWM2_2_B input capture on pin 9
 static double   rpm_pulse_sum     = 0.0;
 static uint32_t rpm_pulse_count   = 0;
 static uint16_t rpm_current       = 0;
 static uint32_t rpm_last_pulse_ms = 0;
 
 static void pumpTach() {
-    while (FreqMeasure.available()) {
-        rpm_pulse_sum   += FreqMeasure.read();
+    while (tach.available()) {
+        rpm_pulse_sum   += tach.read();
         rpm_pulse_count += 1;
         rpm_last_pulse_ms = millis();
     }
@@ -492,8 +506,10 @@ static uint16_t computeRpmAndReset() {
         return 0;
     }
     if (rpm_pulse_count > 0) {
-        const double freq_hz = FreqMeasure.countToFrequency(rpm_pulse_sum / rpm_pulse_count);
-        const double rpm = (freq_hz * 60.0) / RPM_PULSES_PER_REV;
+        const double freq_hz = FreqMeasureMulti::countToFrequency(rpm_pulse_sum / rpm_pulse_count);
+        const double ppr = (g_cfg.rpm_ppr_x10 > 0) ? (g_cfg.rpm_ppr_x10 / 10.0)
+                                                    : (double)RPM_PULSES_PER_REV;
+        const double rpm = (freq_hz * 60.0) / ppr;
         rpm_pulse_sum = 0; rpm_pulse_count = 0;
         if (rpm < 0)          rpm_current = 0;
         else if (rpm > 65535) rpm_current = 65535;
@@ -1608,6 +1624,13 @@ static void handleCfgLine(const String& line) {
         Serial.printf("[cfg] sensor_type = %s\n",
                       g_cfg.sensor_type == 0 ? "Direct" : "MegaSquirt");
     }
+    else if (key == "rpmppr") {
+        // Tach pulses/rev x10 (the Direct-mode RPM divider). 0 is invalid —
+        // fall back to the compile-time default so we never divide by zero.
+        g_cfg.rpm_ppr_x10 = (uint16_t)val.toInt();
+        if (g_cfg.rpm_ppr_x10 == 0) g_cfg.rpm_ppr_x10 = 20;
+        Serial.printf("[cfg] tach pulses/rev = %.1f\n", g_cfg.rpm_ppr_x10 / 10.0);
+    }
     else {
         Serial.printf("[cfg] unknown key %s\n", key.c_str());
         return;
@@ -2326,11 +2349,16 @@ void setup() {
     // and compare against GitHub's manifest.json when "Check for updates" runs.
     DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
 
-    // Tach input on pin 9 (FreqMeasure uses FlexPWM input capture on T4.x).
+    // Tach input on pin 9 via FreqMeasureMulti (FlexPWM2_2_B input capture).
     // Active in Direct sensor mode; CAN takes over in MegaSquirt mode.
     // Both are always initialised so switching modes at runtime is seamless.
-    FreqMeasure.begin();
-    Serial.println(F("FreqMeasure on pin 9: armed (Direct RPM source)"));
+    // NOTE: do NOT switch back to the plain FreqMeasure lib — on T4.x it is
+    // hard-wired to pin 22 (= CAN1 TX) and can never read pin 9.
+    if (tach.begin(RPM_TACH_PIN)) {
+        Serial.println(F("FreqMeasureMulti on pin 9: armed (Direct RPM source)"));
+    } else {
+        Serial.println(F("FreqMeasureMulti on pin 9: BEGIN FAILED (pin not capture-capable?)"));
+    }
 
     // MS3Pro CAN bus on CAN1 (TX=pin 22, RX=pin 23 via SN65HVD230 transceiver).
     //
@@ -2578,7 +2606,7 @@ static void emitToDash() {
     uint8_t status  = gpsStatus();
 
     // Engine data — source selected by g_cfg.sensor_type, with an AUTO override:
-    //   0 = Direct:      RPM from opto tach (FreqMeasure pin 9),
+    //   0 = Direct:      RPM from opto tach (FreqMeasureMulti pin 9),
     //                    coolant from NTC thermistor (A3)
     //   1 = MegaSquirt:  RPM + coolant from MS3Pro CAN broadcast
     // Oil PSI is always from the direct ADC (A2) — MS3Pro has no oil input.
@@ -2592,7 +2620,7 @@ static void emitToDash() {
     const bool can_live = (can_ecu.last_ms != 0)
                           && (millis() - can_ecu.last_ms <= CAN_STALE_MS);
     const bool use_can  = (g_cfg.sensor_type == 1) || can_live;
-    const uint16_t directRpm  = computeRpmAndReset();   // always drain FreqMeasure
+    const uint16_t directRpm  = computeRpmAndReset();   // always drain the tach FIFO
     const int16_t  directCool = readCoolantFx10();       // always keep EMA warm
     uint16_t       rpm         = use_can ? can_ecu.rpm       : directRpm;
     int16_t        oil_psi_x10 = readOilPsiX10();

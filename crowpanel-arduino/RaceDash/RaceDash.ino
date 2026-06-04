@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.55"
+#define FIRMWARE_VERSION "0.1.56"
 
 #include <Preferences.h>
 #include <time.h>
@@ -46,7 +46,7 @@ enum SettingId : uint8_t {
     // SSID/pass/status rows are hidden when Mode=Ethernet.
     ST_INET_MODE = 0,
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
-    ST_RPM_MIN, ST_RPM_MAX, ST_ALERTS,
+    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_ALERTS,
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
     ST_AM_RPM, ST_AM_COL, ST_AM_HZ,
     // Coolant temp warn-color + oil PSI warn-color. Each has a master
@@ -553,6 +553,13 @@ struct Settings {
     // pressure input wired). AFR is only available in MegaSquirt mode.
     uint8_t  sensor_type        = 0;       // default Direct
 
+    // Tach pulses/rev (the Direct-mode RPM divider), stored x10 so 0.5 is
+    // representable. The number = how many tach pulses per crank revolution =
+    // how much the raw opto-tach frequency is divided to get RPM. 20 = 2.0
+    // (typical wasted-spark / most ECU tach outputs). MegaSquirt mode ignores
+    // this (RPM comes straight from CAN).
+    uint16_t rpm_ppr_x10        = 20;
+
     // AFR (Air/Fuel Ratio) — only meaningful in MegaSquirt sensor mode.
     // Two-sided warn band: too rich (< afr_warn_lo) and too lean (> afr_warn_hi)
     // both flip the value to the warn colour. Values are AFR × 10 (so 145 = 14.5).
@@ -577,6 +584,15 @@ const char* const STREAM_NAMES[]   = { "Live Stream", "After Race" };
 constexpr int N_STREAM   = 2;
 const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt" };
 constexpr int N_SENSOR_TYPE = 2;
+// Tach pulses/rev choices (the Direct-mode RPM divider). Value shown = pulses
+// per crank rev = divider. Stored x10 so 0.5 works. Sent as CFG,rpmppr,<x10>.
+const char* const RPM_PPR_NAMES[] = { "0.5", "1", "2", "3", "4", "6", "8" };
+const uint16_t    RPM_PPR_X10[]   = {   5,   10,  20,  30,  40,  60,  80 };
+constexpr int N_RPM_PPR = 7;
+static int rpmPprIndex() {
+    for (int i = 0; i < N_RPM_PPR; ++i) if (RPM_PPR_X10[i] == s.rpm_ppr_x10) return i;
+    return 2;  // default to "2"
+}
 const char* const INET_MODE_NAMES[]   = { "Ethernet", "WiFi" };
 constexpr int N_INET_MODE   = 2;
 
@@ -895,6 +911,7 @@ static void loadSettings() {
     s.oil_warn_psi       = prefs.getUShort("p_warn",   s.oil_warn_psi);
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
+    s.rpm_ppr_x10        = prefs.getUShort("rpmppr",   s.rpm_ppr_x10);
     s.show_afr           = prefs.getBool  ("s_afr",    s.show_afr);
     s.afr_warn_lo_x10    = prefs.getUShort("afr_lo",   s.afr_warn_lo_x10);
     s.afr_warn_hi_x10    = prefs.getUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -953,6 +970,7 @@ static void saveSettings() {
     prefs.putUShort("p_warn",   s.oil_warn_psi);
     prefs.putUChar ("p_col",    s.oil_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
+    prefs.putUShort("rpmppr",   s.rpm_ppr_x10);
     prefs.putBool  ("s_afr",    s.show_afr);
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
     prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -976,6 +994,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,rec_cl,%d\n",    (int)s.record_cloud);
     Serial.printf("CFG,inet,%u\n",      (unsigned)s.internet_mode);
     Serial.printf("CFG,srctyp,%u\n",    (unsigned)s.sensor_type);
+    Serial.printf("CFG,rpmppr,%u\n",    (unsigned)s.rpm_ppr_x10);
 }
 
 static void saveLastTrack(int idx, const char* display_name = nullptr) {
@@ -3228,6 +3247,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_WIFI_STATUS,  "WiFi status",           SettingRow::INFO    },
     { ST_RPM_MIN,    "Min RPM display",      SettingRow::NUMERIC },
     { ST_RPM_MAX,    "Max RPM display",      SettingRow::NUMERIC },
+    { ST_RPM_DIV,    "Tach pulses/rev",      SettingRow::ENUM    },
     { ST_ALERTS,     "Enable RPM alerts",    SettingRow::TOGGLE  },
     { ST_A1_RPM,     "Alert 1 RPM",          SettingRow::NUMERIC },
     { ST_A1_COL,     "Alert 1 color",        SettingRow::COLOR   },
@@ -3786,6 +3806,7 @@ static const char* enumValue(SettingId id) {
         case ST_CL_STREAM:   return STREAM_NAMES[s.cloud_stream % N_STREAM];
         case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
+        case ST_RPM_DIV:     return RPM_PPR_NAMES[rpmPprIndex()];
         default:             return "?";
     }
 }
@@ -4095,6 +4116,8 @@ static void handleSettingsTap(int x, int y) {
                     s.internet_mode = (s.internet_mode + 1) % N_INET_MODE;
                     wifiForceReconfigure();
                     Serial.printf("CFG,inet,%u\n", (unsigned)s.internet_mode);
+                } else if (r.id == ST_RPM_DIV) {
+                    s.rpm_ppr_x10 = RPM_PPR_X10[(rpmPprIndex() + 1) % N_RPM_PPR];
                 } else if (r.id == ST_SENSOR_TYPE) {
                     s.sensor_type = (s.sensor_type + 1) % N_SENSOR_TYPE;
                     // Reset stale ECU state on a source flip so the dash

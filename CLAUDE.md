@@ -119,7 +119,7 @@ lockstep** — keep them equal.
 - **Teensy 4.1 pin assignments in use** — keep these straight before claiming a "free" pin:
   - **Serial2** (RX 7, TX 8): u-blox GNSS UART
   - **Serial3** (TX 14, RX 15): bidirectional dash link to CrowPanel UART0
-  - **Pin 9**: tach input via opto (FreqMeasure input capture — *the only pin FreqMeasure works on for T4.x*). Used only when `sensor_type == 0` (Direct); MS3Pro CAN supplies RPM when `== 1`.
+  - **Pin 9**: tach input via opto (`FreqMeasureMulti` FlexPWM2_2_B input capture). Used only when `sensor_type == 0` (Direct); MS3Pro CAN supplies RPM when `== 1`. **⚠️ Do NOT use the plain `FreqMeasure` lib here** — on T4.x (`__IMXRT1062__`) it is hard-wired to **pin 22** (FlexPWM4 CH0-A, = our CAN1 TX) and silently ignores pin 9, so it reads 0 forever. `FreqMeasureMulti.begin(9)` is the only thing that actually captures on pin 9. (This bit us hard: looked like a wiring problem for ages.)
   - **CAN1** (TX 22, RX 23): **MS3Pro MegaSquirt CAN bus** via SN65HVD230 transceiver. See "MS3Pro CAN" section.
   - **Wire / I²C** (SDA 18, SCL 19): MPU-6050 IMU (AD0→GND ⇒ addr 0x68)
   - **A2** (pin 16): oil-pressure transducer (0.5–4.5 V via 10k/20k divider). **A3** (pin 17): coolant NTC thermistor (150 Ω pull-up). Used in Direct sensor mode.
@@ -127,7 +127,7 @@ lockstep** — keep them equal.
   - **Pin 5**: W5500 `/INT` (planned)
   - **Pin 6**: W5500 `/RESET` (planned)
   - **SDIO (built-in)**: SD card (pins are dedicated, not on the header)
-- **Optocoupler tach front-end** — PC817-class is fine for typical 4-cyl × 2-pulse-per-rev (≤ 270 Hz at 8 k RPM). The Teensy side needs a 4.7–10 kΩ pull-up from `3V3` to pin 9. Output is *inverted* but FreqMeasure counts edges either way.
+- **Optocoupler tach front-end** — PC817-class is fine for typical 4-cyl × 2-pulse-per-rev (≤ 270 Hz at 8 k RPM). The Teensy side needs a 4.7–10 kΩ pull-up from `3V3` to pin 9. Output is *inverted* but `FreqMeasureMulti` counts edges either way. **The signal at pin 9 must be a clean 0→3.3 V logic swing referenced to Teensy GND**: LOW must drop below ~0.8 V (opto transistor fully saturating) and HIGH above ~2.3 V, and it must never go negative. A symptom we hit: the opto not pulling fully low (line sitting ~1.5 V), which reads as a constant HIGH and RPM=0 even though a scope shows a waveform — verify the LOW level and a common ground, not just "there's a signal."
 
 ## Wire protocol (Teensy ↔ CrowPanel UART)
 
@@ -193,6 +193,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `s_temp` / `t_warn` / `t_col` | bool/uint16/uint8 | Coolant show / warn-°F / warn-colour |
 | `s_psi` / `p_warn` / `p_col` | bool/uint16/uint8 | Oil-PSI show / warn-PSI / warn-colour |
 | `srctyp` | uint8 | **Sensor source: 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN)** |
+| `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
 
@@ -204,7 +205,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | Page | Entered via | Purpose |
 | --- | --- | --- |
 | `PAGE_DASH` | swipe ←-direction from settings | RPM bar (top), HUGE Font7 speed (right side at x=600), HDG/LAT/LON left column, FIX/SATS/GPS right column, START/STOP button left of speed |
-| `PAGE_SETTINGS` | swipe →-direction from dash | Scrollable list of 18 settings rows |
+| `PAGE_SETTINGS` | swipe →-direction from dash | Scrollable list of settings rows |
 | `PAGE_NUM_KB` | tap on cloud port value | Numeric keypad (3 cols × 4 rows + DONE/CANCEL) |
 | `PAGE_TEXT_KB` | tap on cloud host / auth user / auth pass | Full lowercase keyboard (10 × 4 letters/digits + .-_/ + BACK/SPACE/DONE/CANCEL) |
 | `PAGE_TRACK_PICKER` | tap START button (when not auto-confirming) | Modal list of tracks; closest GPS match auto-bumped to top with distance label |
@@ -307,7 +308,7 @@ CANL→MS3Pro CAN-L`.
 
 Software (`src/main.cpp`): `FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;` at
 `CAN_BAUD = 500000`, `CAN_BASE_ID = 0x5E8` (1512, MS3 "Simplified Dash" base). `pumpCAN()` parses frames and `CAN_STALE_MS = 2000`
-resets fields to `-1` if the bus goes silent. **FreqMeasure (opto tach) is kept alongside CAN**
+resets fields to `-1` if the bus goes silent. **FreqMeasureMulti (opto tach) is kept alongside CAN**
 — both RPM sources are always running; `emitToDash()` picks one based on `sensor_type`.
 
 ### sensor_type switch (Direct vs MegaSquirt)
@@ -360,7 +361,7 @@ the real offsets in `pumpCAN()`.
 ## Libraries added this cycle
 - **`TAMC_GT911`** (Arduino registry) — GT911 touch on Wire. Installed via
   `arduino-cli lib install "TAMC_GT911"`.
-- **`FlexCAN_T4`** — ships with the Teensy core (no `lib_deps` entry needed). `FreqMeasure`
+- **`FlexCAN_T4`** — ships with the Teensy core (no `lib_deps` entry needed). `FreqMeasureMulti`
   is also a Teensy-core lib.
 
 ## Toolchain note (Linux build host)
