@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.58"
+#define FIRMWARE_VERSION "0.1.59"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -498,7 +498,7 @@ static FreqMeasureMulti tach;          // FlexPWM2_2_B input capture on pin 9
 //   3. EMA          — smooths the median so the displayed value doesn't twitch.
 // Tune RPM_EMA_ALPHA for responsiveness vs. smoothness (lower = smoother).
 static constexpr uint16_t RPM_MAX_PLAUSIBLE = 12000;   // reject pulses implying > this RPM (noise)
-static constexpr float    RPM_EMA_ALPHA     = 0.5f;    // 0..1; lower = smoother but laggier
+static constexpr float    RPM_EMA_ALPHA     = 1.0f;    // 0..1; 1.0 = EMA off (snappiest), lower = smoother/laggier
 static constexpr uint8_t  RPM_MEDIAN_N      = 3;        // median window over recent good pulses (odd; >=3 kills single spikes)
 
 static double   rpm_inst_ring[RPM_MEDIAN_N] = {0};      // recent good instantaneous RPM
