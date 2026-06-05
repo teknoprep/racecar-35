@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.59"
+#define FIRMWARE_VERSION "0.1.60"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -1453,9 +1453,18 @@ static void openSession() {
         return;
     }
 
-    if (!sdFat.exists("/sessions")) {
-        if (!sdFat.mkdir("/sessions")) {
-            Serial.println(F("[sd] mkdir /sessions failed"));
+    // When cloud recording is enabled, write the live session STRAIGHT INTO
+    // /queue/ (not /sessions/). This is the kill-switch insurance: if we get
+    // hot-pitted and the master cut kills all power mid-session, closeSession()
+    // never runs to move the file — but because it's already living in /queue/,
+    // the boot-time scanQueue() picks it up and the dash can upload it later.
+    // We flush every ~1 s, so at worst the final <1 s of samples is lost; the
+    // rest of the file is intact, valid NDJSON. SD-only sessions (no cloud) go
+    // to /sessions/ as before — they're never auto-uploaded.
+    const char* dir = g_cfg.rec_cl ? "/queue" : "/sessions";
+    if (!sdFat.exists(dir)) {
+        if (!sdFat.mkdir(dir)) {
+            Serial.printf("[sd] mkdir %s failed\n", dir);
             emitSessionStatus(false);
             return;
         }
@@ -1466,12 +1475,12 @@ static void openSession() {
 
     if (session_start_unix > 0) {
         snprintf(session_path, sizeof(session_path),
-                 "/sessions/session_%lu_%s.ndjson",
-                 (unsigned long)session_start_unix, trackSafe);
+                 "%s/session_%lu_%s.ndjson",
+                 dir, (unsigned long)session_start_unix, trackSafe);
     } else {
         snprintf(session_path, sizeof(session_path),
-                 "/sessions/session_nortc_%lu_%s.ndjson",
-                 (unsigned long)session_start_ms, trackSafe);
+                 "%s/session_nortc_%lu_%s.ndjson",
+                 dir, (unsigned long)session_start_ms, trackSafe);
     }
 
     if (!session_file.open(session_path, O_WRITE | O_CREAT | O_TRUNC)) {
@@ -1513,11 +1522,15 @@ static void closeSession() {
                   (unsigned)g_cfg.inet, (unsigned)g_cfg.stream,
                   g_cfg.host[0] ? g_cfg.host : "<unset>", (unsigned)g_cfg.port);
     if (have_file && g_cfg.rec_cl) {
-        // New protocol (v0.1.34+): closeSession does NOT attempt to upload.
-        // It just parks the file in /queue/. Upload is initiated by the dash
-        // tapping its UPLOAD button, which sends Q,LIST / Q,GET / Q,DEL to
-        // pull files off the SD and POST them via WiFi.
-        moveToQueue(session_path);
+        // The session is normally already in /queue/ (openSession writes there
+        // directly when cloud recording is on — see the kill-switch note). The
+        // only time it isn't is if rec_cl got toggled ON mid-session, in which
+        // case the file is still in /sessions/ and we move it now. closeSession
+        // never auto-uploads (v0.1.34+ protocol); the dash drives uploads via
+        // Q,LIST / Q,GET / Q,DEL when its UPLOAD button is tapped.
+        if (strncmp(session_path, "/queue/", 7) != 0) {
+            moveToQueue(session_path);
+        }
         scanQueue();
         emitCloudStatus();
         Serial.printf("[closeSession] file queued: %s\n", session_path);
