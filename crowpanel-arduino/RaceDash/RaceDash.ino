@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.60"
+#define FIRMWARE_VERSION "0.1.61"
 
 #include <Preferences.h>
 #include <time.h>
@@ -34,6 +34,7 @@
 #include <LovyanGFX.hpp>
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
+#include "board_config.h"   // per-panel RGB pin map + timing (DASH_BOARD 7|5)
 
 // ---------------------------------------------------------------------------
 // Forward type decls — Arduino IDE auto-injects function prototypes at the
@@ -113,7 +114,7 @@ struct KbKey {
     char action;
 };
 
-#define TFT_BL 2
+#define TFT_BL DASH_PIN_BL   // backlight pin from board_config.h (GPIO 2 on all sizes)
 
 PCA9557 Out;
 Preferences prefs;
@@ -126,7 +127,9 @@ Preferences prefs;
 static TAMC_GT911 ts(19, 20, (uint8_t)-1, (uint8_t)-1, 800, 480);
 
 // ---------------------------------------------------------------------------
-// LovyanGFX driver — V3.0 panel timings + GT911 capacitive touch on I2C 0x14.
+// LovyanGFX driver — RGB display only. Panel pin map + timing come from
+// board_config.h (selected by DASH_BOARD). Touch is GT911 on Wire, set up
+// separately in setup() so LovyanGFX never initialises I2C_NUM_1.
 // ---------------------------------------------------------------------------
 class LGFX : public lgfx::LGFX_Device {
 public:
@@ -147,25 +150,25 @@ public:
         {
             auto cfg = _bus_instance.config();
             cfg.panel = &_panel_instance;
-            cfg.pin_d0  = GPIO_NUM_15; cfg.pin_d1  = GPIO_NUM_7;  cfg.pin_d2  = GPIO_NUM_6;
-            cfg.pin_d3  = GPIO_NUM_5;  cfg.pin_d4  = GPIO_NUM_4;
-            cfg.pin_d5  = GPIO_NUM_9;  cfg.pin_d6  = GPIO_NUM_46; cfg.pin_d7  = GPIO_NUM_3;
-            cfg.pin_d8  = GPIO_NUM_8;  cfg.pin_d9  = GPIO_NUM_16; cfg.pin_d10 = GPIO_NUM_1;
-            cfg.pin_d11 = GPIO_NUM_14; cfg.pin_d12 = GPIO_NUM_21; cfg.pin_d13 = GPIO_NUM_47;
-            cfg.pin_d14 = GPIO_NUM_48; cfg.pin_d15 = GPIO_NUM_45;
-            cfg.pin_henable = GPIO_NUM_41;
-            cfg.pin_vsync   = GPIO_NUM_40;
-            cfg.pin_hsync   = GPIO_NUM_39;
-            cfg.pin_pclk    = GPIO_NUM_0;
-            cfg.freq_write  = 15000000;
+            cfg.pin_d0  = DASH_PIN_D0;  cfg.pin_d1  = DASH_PIN_D1;  cfg.pin_d2  = DASH_PIN_D2;
+            cfg.pin_d3  = DASH_PIN_D3;  cfg.pin_d4  = DASH_PIN_D4;
+            cfg.pin_d5  = DASH_PIN_D5;  cfg.pin_d6  = DASH_PIN_D6;  cfg.pin_d7  = DASH_PIN_D7;
+            cfg.pin_d8  = DASH_PIN_D8;  cfg.pin_d9  = DASH_PIN_D9;  cfg.pin_d10 = DASH_PIN_D10;
+            cfg.pin_d11 = DASH_PIN_D11; cfg.pin_d12 = DASH_PIN_D12; cfg.pin_d13 = DASH_PIN_D13;
+            cfg.pin_d14 = DASH_PIN_D14; cfg.pin_d15 = DASH_PIN_D15;
+            cfg.pin_henable = DASH_PIN_HENABLE;
+            cfg.pin_vsync   = DASH_PIN_VSYNC;
+            cfg.pin_hsync   = DASH_PIN_HSYNC;
+            cfg.pin_pclk    = DASH_PIN_PCLK;
+            cfg.freq_write  = DASH_FREQ_WRITE;
             cfg.hsync_polarity    = 0;
-            cfg.hsync_front_porch = 40;
-            cfg.hsync_pulse_width = 48;
-            cfg.hsync_back_porch  = 40;
+            cfg.hsync_front_porch = DASH_HSYNC_FRONT_PORCH;
+            cfg.hsync_pulse_width = DASH_HSYNC_PULSE_WIDTH;
+            cfg.hsync_back_porch  = DASH_HSYNC_BACK_PORCH;
             cfg.vsync_polarity    = 0;
-            cfg.vsync_front_porch = 1;
-            cfg.vsync_pulse_width = 31;
-            cfg.vsync_back_porch  = 13;
+            cfg.vsync_front_porch = DASH_VSYNC_FRONT_PORCH;
+            cfg.vsync_pulse_width = DASH_VSYNC_PULSE_WIDTH;
+            cfg.vsync_back_porch  = DASH_VSYNC_BACK_PORCH;
             cfg.pclk_active_neg = 1;
             cfg.de_idle_high    = 0;
             cfg.pclk_idle_high  = 0;
@@ -174,7 +177,7 @@ public:
         }
         {
             auto cfg = _light_instance.config();
-            cfg.pin_bl = GPIO_NUM_2;
+            cfg.pin_bl = DASH_PIN_BL;
             _light_instance.config(cfg);
             _panel_instance.light(&_light_instance);
         }
@@ -5235,15 +5238,30 @@ static void otaDoCheck() {
     const String body = http.getString();
     http.end();
 
-    if (!jsonStr(body, "\"crowpanel\"", "\"version\"",
+    // This board only ever consumes the manifest entry keyed by its own
+    // compile-time DASH_BOARD_ID (e.g. "crowpanel5"), so a 5" can never pull a
+    // 7" image (mismatched RGB timing = black screen) and vice-versa.
+    if (!jsonStr(body, DASH_OTA_KEY, "\"version\"",
                  ota_latest_version, sizeof(ota_latest_version)) ||
-        !jsonStr(body, "\"crowpanel\"", "\"url\"",
+        !jsonStr(body, DASH_OTA_KEY, "\"url\"",
                  ota_url, sizeof(ota_url))) {
-        snprintf(ota_err_msg, sizeof(ota_err_msg), "manifest parse failed");
+        snprintf(ota_err_msg, sizeof(ota_err_msg), "no %s entry in manifest", DASH_BOARD_ID);
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
     ota_sha256[0] = '\0';
-    jsonStr(body, "\"crowpanel\"", "\"sha256\"", ota_sha256, sizeof(ota_sha256));
+    jsonStr(body, DASH_OTA_KEY, "\"sha256\"", ota_sha256, sizeof(ota_sha256));
+    // Belt-and-suspenders: each manifest entry also carries a "board" field.
+    // If a publish error ever points our entry at the wrong-board binary,
+    // refuse rather than brick the panel. Recovery is always a USB reflash.
+    {
+        char mboard[24] = "";
+        if (jsonStr(body, DASH_OTA_KEY, "\"board\"", mboard, sizeof(mboard)) &&
+            strcmp(mboard, DASH_BOARD_ID) != 0) {
+            snprintf(ota_err_msg, sizeof(ota_err_msg),
+                     "board mismatch: %s vs %s", mboard, DASH_BOARD_ID);
+            ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
+        }
+    }
     // Parse teensy entry too (optional — if missing, only crowpanel update considered)
     ota_teensy_version[0] = '\0';
     ota_teensy_url[0]     = '\0';
@@ -7037,8 +7055,8 @@ void setup() {
     Serial.begin(921600);
     rxBuf.reserve(UART_LINE_MAX);
     delay(800);
-    Serial.printf("\n=== racecar-35 dash crowpanel boot, firmware v%s ===\n",
-                  FIRMWARE_VERSION);
+    Serial.printf("\n=== racecar-35 dash %s boot, firmware v%s ===\n",
+                  DASH_BOARD_NAME, FIRMWARE_VERSION);
 
     // Silence the ESP-IDF WiFi log output — it would otherwise spam Serial
     // (= UART0 = the Teensy bridge) once WiFi.begin() runs. Without this,
@@ -7076,7 +7094,7 @@ void setup() {
             if (Wire.endTransmission() == 0) { a = cand; break; }
         }
         ts.begin(a ? a : GT911_ADDR1);
-        ts.setRotation(ROTATION_INVERTED);   // raw coords; switch if mirrored
+        ts.setRotation(DASH_TOUCH_ROTATION);   // raw coords; per-board (flip if mirrored)
         Serial.printf("GT911 touch (TAMC/Wire) init at 0x%02X\n", a ? a : GT911_ADDR1);
     }
 

@@ -62,21 +62,43 @@ $cli = "C:\Users\ChrisRawlings\AppData\Local\Programs\Arduino IDE\resources\app\
 & $cli upload  --fqbn $fqbn -p COM3 $sketch
 ```
 
+**Multi-board (5" and 7" share one source tree).** `RaceDash.ino` is panel-agnostic; the
+only board-specific values (RGB pin map, panel timing, backlight, touch rotation) live in
+`crowpanel-arduino/RaceDash/board_config.h`, selected at compile time by `-DDASH_BOARD`:
+- **7" (default):** `--build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7"` → board id `crowpanel7`
+- **5":** `--build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5"` → board id `crowpanel5`
+
+Use `compiler.cpp.extra_flags` (empty by default), NOT `build.extra_flags` (which carries the
+required USB-mode flags — overriding it bricks the build). Use a distinct `--build-path` per
+board so the define can't cross-contaminate the cache. The 5" pin map/timing came from the
+Elecrow V3.0 course file (`gfx_conf.h`, block `CrowPanel_50`); the 7" `freq_write` is kept at
+our field-proven 15 MHz (vendor uses 12 MHz). **Identity is baked at the first USB flash** —
+there is no runtime panel auto-detect (a wrong RGB-timing guess = an unrecoverable black
+screen). OTA only ever pulls the manifest entry keyed by the binary's own board id, so a 5"
+can never flash a 7" image and vice-versa.
+
 **Always disconnect the Teensy↔CrowPanel UART jumpers before flashing the CrowPanel.** UART0 (GPIO 43/44) is shared with the CH340 used for upload — Teensy contention silently corrupts the flash, or you get `The serial TX path seems to be down` from esptool.
 
-## OTA release — ⚠️ ALWAYS bump BOTH MCUs to the SAME version
+## OTA release — ⚠️ ALWAYS bump ALL THREE artifacts to the SAME version
 
-The dash OTA pulls `firmware/manifest.json` from GitHub raw and flashes whichever MCU's
-manifest `version` is newer than what's installed. **The two firmwares MUST always be released
-at the SAME version number, even if only one side's code changed.** Shipping e.g. Teensy
-`0.1.42` while leaving CrowPanel at `0.1.41` produces a **version mismatch** in the field — do
-not do this. If you touch *either* `src/main.cpp` or `RaceDash.ino`, you rebuild *both*, bump
-*both* `FIRMWARE_VERSION` defines to the same number, and republish *both* artifacts.
+The dash OTA pulls `firmware/manifest.json` from GitHub raw and flashes whichever artifact's
+manifest `version` is newer than what's installed. There are now **THREE** release artifacts —
+`teensy`, `crowpanel7` (7" dash), `crowpanel5` (5" dash) — plus a legacy `crowpanel` alias
+(below). **They MUST always be released at the SAME version number, even if only one side's
+code changed.** If you touch *any* of `src/main.cpp`, `RaceDash.ino`, or `board_config.h`, you
+rebuild *all three*, bump *both* `FIRMWARE_VERSION` defines (Teensy + dash) to the same number,
+and republish *all three* artifacts.
+
+Each CrowPanel binary carries its board id (`crowpanel7`/`crowpanel5`) baked in at compile
+time, reads only the manifest entry keyed by that id, and refuses an entry whose `board` field
+doesn't match (belt-and-suspenders against a mis-pointed URL). The legacy `crowpanel` key
+mirrors `crowpanel7` so already-deployed 0.1.60 7" units (whose old firmware reads the bare
+`crowpanel` key) can still OTA forward; keep it pointing at the 7" bin for one or two cycles.
 
 Full publish procedure (Linux host, `export HOME=/root` first so git + arduino-cli configs load):
 ```bash
 export HOME=/root
-NEW=0.1.43   # pick the next version
+NEW=0.1.62   # pick the next version
 
 # 1. bump BOTH version defines to the same number
 sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" src/main.cpp
@@ -86,26 +108,29 @@ sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" crowpa
 ~/.local/bin/pio run
 cp .pio/build/teensy41/firmware.hex firmware/teensy41-dash.hex
 
-# 3. build CrowPanel -> firmware/crowpanel-dash.bin  (use the APP bin: RaceDash.ino.bin,
-#    NOT .bootloader.bin / .partitions.bin)
+# 3. build BOTH CrowPanel variants (use the APP bin RaceDash.ino.bin, NOT .bootloader/.partitions).
+#    Distinct --build-path per board so the -DDASH_BOARD define can't cross-contaminate the cache.
 cli=~/.local/bin/arduino-cli
 fqbn="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none"
-$cli compile --fqbn "$fqbn" --output-dir /tmp/rd_build crowpanel-arduino/RaceDash
-cp /tmp/rd_build/RaceDash.ino.bin firmware/crowpanel-dash.bin
+$cli compile --fqbn "$fqbn" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7" --build-path /tmp/rd7_build --output-dir /tmp/rd7_out crowpanel-arduino/RaceDash
+$cli compile --fqbn "$fqbn" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5" --build-path /tmp/rd5_build --output-dir /tmp/rd5_out crowpanel-arduino/RaceDash
+cp /tmp/rd7_out/RaceDash.ino.bin firmware/crowpanel7-dash.bin
+cp /tmp/rd5_out/RaceDash.ino.bin firmware/crowpanel5-dash.bin
 
-# 4. update firmware/manifest.json: set BOTH version fields to $NEW, and recompute BOTH
-#    sha256 + size (the CrowPanel verifies sha256 before flashing — a stale hash aborts OTA)
-sha256sum firmware/teensy41-dash.hex firmware/crowpanel-dash.bin
-stat -c%s firmware/teensy41-dash.hex firmware/crowpanel-dash.bin
+# 4. update firmware/manifest.json: set ALL version fields to $NEW, recompute every sha256+size
+#    (the CrowPanel verifies sha256 before flashing — a stale hash aborts OTA). Keep the legacy
+#    "crowpanel" entry == the "crowpanel7" entry (same url/sha/size).
+sha256sum firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin
+stat -c%s firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin
 
 # 5. commit + push, then verify GitHub raw serves the new manifest + matching hashes
-git add src/main.cpp crowpanel-arduino/RaceDash/RaceDash.ino firmware/
+git add src/main.cpp crowpanel-arduino/RaceDash/RaceDash.ino crowpanel-arduino/RaceDash/board_config.h firmware/
 git commit -m "Release v$NEW: <what changed>"
 git push origin main
 curl -s https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/manifest.json
 ```
-The manifest's two version checks are independent in code, but **operationally they are
-lockstep** — keep them equal.
+The manifest's version checks are independent in code, but **operationally they are
+lockstep** — keep all three equal.
 
 ## Hardware constants that bit us repeatedly
 
@@ -437,11 +462,13 @@ On Teensy boot: DHCP → NTP query to `0.pool.ntp.org` → set the Teensy's RTC.
 ```
 src/main.cpp                              Teensy: GNSS + tach + REC/TRACK consumer + (TODO) W5500 cloud client
 platformio.ini                            Teensy build (do NOT add a CrowPanel env)
-crowpanel-arduino/RaceDash/RaceDash.ino   CrowPanel: dash UI + settings + keyboards + track picker + GT911 touch (LIVE)
+crowpanel-arduino/RaceDash/RaceDash.ino   CrowPanel: dash UI + settings + keyboards + track picker + GT911 touch (LIVE, panel-agnostic)
+crowpanel-arduino/RaceDash/board_config.h Per-panel RGB pin map/timing/backlight/touch (DASH_BOARD 7|5); 7"=crowpanel7, 5"=crowpanel5
 crowpanel-arduino/RaceDash_v0139_orig/    Pre-touch-rework backup of RaceDash (swap/revert screens easily)
 crowpanel-arduino/PanelTest/PanelTest.ino Bare panel bring-up sketch — display only, NO touch (not a touch baseline)
 crowpanel-baseline/                       Dead PIO experiments — do not touch
 crowpanel-ui/                             Dead PIO experiments — do not touch
-_vendor/CrowPanel-ESP32-Display-Course-File/   Elecrow's reference source, all revs (cloned for offline use)
+firmware/                                 OTA artifacts + manifest.json: teensy41-dash.hex, crowpanel7-dash.bin, crowpanel5-dash.bin
+_vendor/CrowPanel-ESP32-Display-Course-File/   Elecrow's reference source, all revs (cloned for offline use; gfx_conf.h block CrowPanel_50 = the 5" pin map/timing)
 LVGL_Library.pdf                          Generic upstream LVGL 9.0 docs (NOT Elecrow-specific, useless)
 ```
