@@ -62,75 +62,126 @@ $cli = "C:\Users\ChrisRawlings\AppData\Local\Programs\Arduino IDE\resources\app\
 & $cli upload  --fqbn $fqbn -p COM3 $sketch
 ```
 
-**Multi-board (5" and 7" share one source tree).** `RaceDash.ino` is panel-agnostic; the
-only board-specific values (RGB pin map, panel timing, backlight, touch rotation) live in
-`crowpanel-arduino/RaceDash/board_config.h`, selected at compile time by `-DDASH_BOARD`:
-- **7" (default):** `--build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7"` → board id `crowpanel7`
-- **5":** `--build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5"` → board id `crowpanel5`
+**Multi-board (one source tree, THREE display panels).** `RaceDash.ino` is panel-agnostic; the
+only board-specific values (RGB pin map, panel timing + sync polarities, touch I2C pins,
+backlight method, LCD-reset method) live in `crowpanel-arduino/RaceDash/board_config.h`,
+selected at compile time by `-DDASH_BOARD`. **Each panel also needs its own FlashSize** in the
+FQBN:
+
+| `-DDASH_BOARD` | board id | panel | FlashSize | notes |
+| --- | --- | --- | --- | --- |
+| `7` (default) | `crowpanel7` | CrowPanel 7.0" V3.0 (Basic RGB) | `4M` | PCA9557 reset, touch 19/20, GPIO2 PWM backlight |
+| `5` | `crowpanel5` | CrowPanel 5.0" V3.0 (Basic RGB) | `4M` | same family as 7", different pin map/porches |
+| `51` | `crowpanel5adv` | CrowPanel **Advance** 5.0" (HMI IPS, N16R8) | `16M` | inverted sync polarity, touch 15/16, **I2C 0x30 coprocessor** backlight, NO PCA9557, GPIO 38 is an RGB data pin |
 
 Use `compiler.cpp.extra_flags` (empty by default), NOT `build.extra_flags` (which carries the
 required USB-mode flags — overriding it bricks the build). Use a distinct `--build-path` per
-board so the define can't cross-contaminate the cache. The 5" pin map/timing came from the
-Elecrow V3.0 course file (`gfx_conf.h`, block `CrowPanel_50`); the 7" `freq_write` is kept at
-our field-proven 15 MHz (vendor uses 12 MHz). **Identity is baked at the first USB flash** —
-there is no runtime panel auto-detect (a wrong RGB-timing guess = an unrecoverable black
-screen). OTA only ever pulls the manifest entry keyed by the binary's own board id, so a 5"
-can never flash a 7" image and vice-versa.
+board so the define can't cross-contaminate the cache. Sources of truth for the pin maps:
+Elecrow V3.0 course file `gfx_conf.h` (`CrowPanel_70`/`CrowPanel_50`) for the Basic panels, and
+the `Elecrow-RD/CrowPanel-Advance-5-...` repo (`example/V1.2_and_V1.3/.../LovyanGFX_Driver.h` +
+`main.cpp`) for the Advance. The 7" `freq_write` is kept at our field-proven 15 MHz (vendor uses
+12 MHz). **Identity is baked at the first USB flash** — there is no runtime panel auto-detect (a
+wrong RGB-timing guess = an unrecoverable black screen). OTA only ever pulls the manifest entry
+keyed by the binary's own board id, so one panel can never flash another panel's image.
+
+**⚠️ ALWAYS verify which board is connected IMMEDIATELY BEFORE every CrowPanel flash** (boards
+get swapped on the bench between commands — re-check each time, don't trust the last check):
+```bash
+# Hardware check via flash size:
+python3 ~/.arduino15/packages/esp32/tools/esptool_py/4.5.1/esptool.py --port /dev/ttyUSB0 flash_id | grep -iE "flash size|MAC"
+#   16 MB  -> CrowPanel Advance 5" -> build crowpanel5adv (DASH_BOARD=51, FlashSize=16M)
+#    4 MB  -> a Basic panel (7" crowpanel7 OR 5" crowpanel5, both FlashSize=4M)
+```
+- Flash size distinguishes the **Advance (16M)** from the **Basic 4M** boards; it does NOT tell
+  7" from 5" Basic (both 4M) — for those, go by which panel is physically plugged in (and/or
+  the MAC: the Advance on this bench is `1c:db:d4:4d:67:04`).
+- **After flashing, confirm the boot banner** over `/dev/ttyUSB0` @ 921600 prints the expected
+  `crowpanel-…` board id (`crowpanel-5.0`, `crowpanel-5.0-adv`, `crowpanel-7.0`). A mismatch =
+  wrong build flashed (e.g. Basic firmware on the Advance → touch on 19/20 instead of 15/16 =
+  dead touch, wrong RGB pins = garbled display).
 
 **Always disconnect the Teensy↔CrowPanel UART jumpers before flashing the CrowPanel.** UART0 (GPIO 43/44) is shared with the CH340 used for upload — Teensy contention silently corrupts the flash, or you get `The serial TX path seems to be down` from esptool.
 
-## OTA release — ⚠️ ALWAYS bump ALL THREE artifacts to the SAME version
+## ⛳ STANDING ORDERS — do these EVERY update without being asked
+
+This is the default release contract for this repo. When code is changed and the user says
+"update / release / ship / flash", do ALL of the following unless told otherwise:
+
+1. **Bump the version** in BOTH `FIRMWARE_VERSION` defines (`src/main.cpp` + `RaceDash.ino`) to
+   the same new number. Every artifact ships at one identical version (lockstep).
+2. **Rebuild ALL FOUR artifacts** even if only one side changed: `teensy`, `crowpanel7`,
+   `crowpanel5`, `crowpanel5adv`. The three dash bins are one source built with different
+   `-DDASH_BOARD` (and the Advance uses `FlashSize=16M`, the Basics `4M`).
+3. **Update `firmware/manifest.json`**: set every `version` to the new number, recompute every
+   `sha256` + `size`, keep each entry's `board` field, and keep the legacy `crowpanel` entry
+   mirroring `crowpanel7`. A stale sha aborts OTA on the device.
+4. **Check-then-flash, every time** — if a panel is connected on USB: FIRST run `esptool
+   flash_id` to confirm which board it is (16M=Advance, 4M=Basic) and flash the MATCHING build,
+   then read the boot banner over `/dev/ttyUSB0` @ 921600 (`crowpanel-…` line = board id +
+   version) to confirm the right firmware landed. NEVER flash without checking what's connected
+   first — boards get swapped on the bench, and Basic firmware on the Advance kills touch +
+   garbles the display. Confirm new UI with the user when the serial log alone can't.
+5. **Commit + push** to `origin/main` (HTTPS token; `HOME=/root` or an explicit token URL), then
+   curl the raw manifest to confirm GitHub serves the new version + matching hashes.
+6. **Keep CLAUDE.md current** — if the change adds a board, a setting/NVS key, a wire-protocol
+   line, or a maintenance step, update the relevant section here in the same commit.
+7. **board_config.h is the seam** — anything panel-specific goes there or behind a
+   `#if DASH_IS_ADVANCE` guard, never a forked copy of `RaceDash.ino`.
+8. **NVS keys are short + append-only** — add new `Preferences` keys to BOTH `loadSettings()`
+   and `saveSettings()`; never repurpose an existing key's meaning.
+
+## OTA release — ⚠️ ALWAYS bump ALL FOUR artifacts to the SAME version
 
 The dash OTA pulls `firmware/manifest.json` from GitHub raw and flashes whichever artifact's
-manifest `version` is newer than what's installed. There are now **THREE** release artifacts —
-`teensy`, `crowpanel7` (7" dash), `crowpanel5` (5" dash) — plus a legacy `crowpanel` alias
-(below). **They MUST always be released at the SAME version number, even if only one side's
-code changed.** If you touch *any* of `src/main.cpp`, `RaceDash.ino`, or `board_config.h`, you
-rebuild *all three*, bump *both* `FIRMWARE_VERSION` defines (Teensy + dash) to the same number,
-and republish *all three* artifacts.
+manifest `version` is newer than what's installed. There are **FOUR** release artifacts —
+`teensy`, `crowpanel7` (7" Basic), `crowpanel5` (5" Basic), `crowpanel5adv` (5" Advance IPS) —
+plus a legacy `crowpanel` alias (below). **They MUST always be released at the SAME version
+number, even if only one side's code changed.** If you touch *any* of `src/main.cpp`,
+`RaceDash.ino`, or `board_config.h`, you rebuild *all four*, bump *both* `FIRMWARE_VERSION`
+defines to the same number, and republish *all four* artifacts.
 
-Each CrowPanel binary carries its board id (`crowpanel7`/`crowpanel5`) baked in at compile
-time, reads only the manifest entry keyed by that id, and refuses an entry whose `board` field
-doesn't match (belt-and-suspenders against a mis-pointed URL). The legacy `crowpanel` key
-mirrors `crowpanel7` so already-deployed 0.1.60 7" units (whose old firmware reads the bare
-`crowpanel` key) can still OTA forward; keep it pointing at the 7" bin for one or two cycles.
+Each CrowPanel binary carries its board id (`crowpanel7`/`crowpanel5`/`crowpanel5adv`) baked in
+at compile time, reads only the manifest entry keyed by that id, and refuses an entry whose
+`board` field doesn't match (belt-and-suspenders against a mis-pointed URL). The legacy
+`crowpanel` key mirrors `crowpanel7` so already-deployed 0.1.60 7" units (whose old firmware
+reads the bare `crowpanel` key) can still OTA forward; keep it pointing at the 7" bin.
 
-Full publish procedure (Linux host, `export HOME=/root` first so git + arduino-cli configs load):
+Full publish procedure (Linux host; `$HOME` is unset in this shell — prefix git ops with
+`HOME=/root` OR push to an explicit token URL):
 ```bash
-export HOME=/root
-NEW=0.1.62   # pick the next version
+NEW=0.1.63   # pick the next version
 
 # 1. bump BOTH version defines to the same number
 sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" src/main.cpp
 sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" crowpanel-arduino/RaceDash/RaceDash.ino
 
 # 2. build Teensy -> firmware/teensy41-dash.hex
-~/.local/bin/pio run
-cp .pio/build/teensy41/firmware.hex firmware/teensy41-dash.hex
+~/.local/bin/pio run && cp .pio/build/teensy41/firmware.hex firmware/teensy41-dash.hex
 
-# 3. build BOTH CrowPanel variants (use the APP bin RaceDash.ino.bin, NOT .bootloader/.partitions).
-#    Distinct --build-path per board so the -DDASH_BOARD define can't cross-contaminate the cache.
+# 3. build ALL THREE dash variants (APP bin RaceDash.ino.bin). Distinct --build-path each.
+#    NOTE the per-board FlashSize: Advance=16M, Basics=4M.
 cli=~/.local/bin/arduino-cli
-fqbn="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none"
-$cli compile --fqbn "$fqbn" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7" --build-path /tmp/rd7_build --output-dir /tmp/rd7_out crowpanel-arduino/RaceDash
-$cli compile --fqbn "$fqbn" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5" --build-path /tmp/rd5_build --output-dir /tmp/rd5_out crowpanel-arduino/RaceDash
-cp /tmp/rd7_out/RaceDash.ino.bin firmware/crowpanel7-dash.bin
-cp /tmp/rd5_out/RaceDash.ino.bin firmware/crowpanel5-dash.bin
+base="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none"
+$cli compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7"  --build-path /tmp/rd7_build  --output-dir /tmp/rd7_out  crowpanel-arduino/RaceDash
+$cli compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5"  --build-path /tmp/rd5_build  --output-dir /tmp/rd5_out  crowpanel-arduino/RaceDash
+$cli compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
+cp /tmp/rd7_out/RaceDash.ino.bin   firmware/crowpanel7-dash.bin
+cp /tmp/rd5_out/RaceDash.ino.bin   firmware/crowpanel5-dash.bin
+cp /tmp/rdadv_out/RaceDash.ino.bin firmware/crowpanel5adv-dash.bin
 
-# 4. update firmware/manifest.json: set ALL version fields to $NEW, recompute every sha256+size
-#    (the CrowPanel verifies sha256 before flashing — a stale hash aborts OTA). Keep the legacy
-#    "crowpanel" entry == the "crowpanel7" entry (same url/sha/size).
-sha256sum firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin
-stat -c%s firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin
+# 4. update firmware/manifest.json: every version=$NEW, recompute every sha256+size, keep each
+#    entry's "board" field, keep legacy "crowpanel" == "crowpanel7".
+sha256sum firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin firmware/crowpanel5adv-dash.bin
+stat -c%s  firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin firmware/crowpanel5adv-dash.bin
 
 # 5. commit + push, then verify GitHub raw serves the new manifest + matching hashes
-git add src/main.cpp crowpanel-arduino/RaceDash/RaceDash.ino crowpanel-arduino/RaceDash/board_config.h firmware/
-git commit -m "Release v$NEW: <what changed>"
-git push origin main
+HOME=/root git add src/main.cpp crowpanel-arduino/RaceDash/RaceDash.ino crowpanel-arduino/RaceDash/board_config.h firmware/
+HOME=/root git commit -m "Release v$NEW: <what changed>"
+HOME=/root git push origin main
 curl -s https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/manifest.json
 ```
 The manifest's version checks are independent in code, but **operationally they are
-lockstep** — keep all three equal.
+lockstep** — keep all four (+ the legacy alias) equal.
 
 ## Hardware constants that bit us repeatedly
 

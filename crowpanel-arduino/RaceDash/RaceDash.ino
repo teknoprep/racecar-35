@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.61"
+#define FIRMWARE_VERSION "0.1.63"
 
 #include <Preferences.h>
 #include <time.h>
@@ -45,7 +45,8 @@ enum SettingId : uint8_t {
     // Internet block at the very top — picks whether all internet-bound
     // operations route via Teensy/W5500 (Ethernet) or CrowPanel/ESP32-S3 WiFi.
     // SSID/pass/status rows are hidden when Mode=Ethernet.
-    ST_INET_MODE = 0,
+    ST_BRIGHTNESS = 0,            // LCD backlight slider — top of the settings list
+    ST_INET_MODE,
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
     ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_ALERTS,
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
@@ -124,7 +125,7 @@ Preferences prefs;
 // that runs on I2C_NUM_1 and its init steals the GPIO 19/20 matrix routing
 // from Wire, killing all I2C reads. INT=-1, RST=-1 (board handles reset),
 // address auto-detected (0x5D or 0x14) in setup().
-static TAMC_GT911 ts(19, 20, (uint8_t)-1, (uint8_t)-1, 800, 480);
+static TAMC_GT911 ts(DASH_TOUCH_SDA, DASH_TOUCH_SCL, (uint8_t)-1, (uint8_t)-1, 800, 480);
 
 // ---------------------------------------------------------------------------
 // LovyanGFX driver — RGB display only. Panel pin map + timing come from
@@ -147,6 +148,16 @@ public:
             cfg.offset_x = 0;        cfg.offset_y = 0;
             _panel_instance.config(cfg);
         }
+#if DASH_IS_ADVANCE
+        {
+            // Advance: explicitly place the RGB framebuffer in PSRAM (vendor sets
+            // config_detail.use_psram = 1). 800x480x16bpp = 768 KB, far beyond the
+            // ~512 KB internal SRAM, so it MUST live in the N16R8's OPI PSRAM.
+            auto cfg = _panel_instance.config_detail();
+            cfg.use_psram = 1;
+            _panel_instance.config_detail(cfg);
+        }
+#endif
         {
             auto cfg = _bus_instance.config();
             cfg.panel = &_panel_instance;
@@ -161,26 +172,31 @@ public:
             cfg.pin_hsync   = DASH_PIN_HSYNC;
             cfg.pin_pclk    = DASH_PIN_PCLK;
             cfg.freq_write  = DASH_FREQ_WRITE;
-            cfg.hsync_polarity    = 0;
+            cfg.hsync_polarity    = DASH_HSYNC_POLARITY;
             cfg.hsync_front_porch = DASH_HSYNC_FRONT_PORCH;
             cfg.hsync_pulse_width = DASH_HSYNC_PULSE_WIDTH;
             cfg.hsync_back_porch  = DASH_HSYNC_BACK_PORCH;
-            cfg.vsync_polarity    = 0;
+            cfg.vsync_polarity    = DASH_VSYNC_POLARITY;
             cfg.vsync_front_porch = DASH_VSYNC_FRONT_PORCH;
             cfg.vsync_pulse_width = DASH_VSYNC_PULSE_WIDTH;
             cfg.vsync_back_porch  = DASH_VSYNC_BACK_PORCH;
-            cfg.pclk_active_neg = 1;
-            cfg.de_idle_high    = 0;
-            cfg.pclk_idle_high  = 0;
+            cfg.pclk_active_neg = DASH_PCLK_ACTIVE_NEG;
+            cfg.de_idle_high    = DASH_DE_IDLE_HIGH;
+            cfg.pclk_idle_high  = DASH_PCLK_IDLE_HIGH;
             _bus_instance.config(cfg);
             _panel_instance.setBus(&_bus_instance);
         }
+#if !DASH_IS_ADVANCE
         {
+            // PWM backlight on GPIO 2 (Basic V3.0 panels). The Advance has no
+            // PWM backlight pin — it drives brightness over I2C (0x30), so we
+            // attach no Light_PWM there (GPIO 2 may be used for something else).
             auto cfg = _light_instance.config();
             cfg.pin_bl = DASH_PIN_BL;
             _light_instance.config(cfg);
             _panel_instance.light(&_light_instance);
         }
+#endif
         setPanel(&_panel_instance);
     }
 };
@@ -223,6 +239,7 @@ namespace {
     LGFX_Sprite spr_track_name(&tft);  // active track name under TRACK btn
     LGFX_Sprite spr_recbtn(&tft);      // START/STOP button face
     LGFX_Sprite spr_upbtn(&tft);       // manual queue-upload button
+    LGFX_Sprite spr_settings(&tft);    // full settings-body back-buffer (anti-flicker)
 }
 static bool   dash_sprites_ready = false;
 
@@ -577,6 +594,10 @@ struct Settings {
     // Time zone — index into TIMEZONES[] (defined below). Display only;
     // the Teensy's RTC + the wire-format TIME line are always UTC.
     uint8_t  timezone_idx     = 0;     // default UTC
+
+    // LCD backlight brightness, 0-100 %. Applied board-specifically by
+    // applyBrightness() (Advance: I2C 0x30 coprocessor; Basic: GPIO 2 PWM).
+    uint8_t  brightness       = 100;
 };
 static Settings s;
 
@@ -919,7 +940,9 @@ static void loadSettings() {
     s.afr_warn_lo_x10    = prefs.getUShort("afr_lo",   s.afr_warn_lo_x10);
     s.afr_warn_hi_x10    = prefs.getUShort("afr_hi",   s.afr_warn_hi_x10);
     s.afr_warn_col       = prefs.getUChar ("afr_col",  s.afr_warn_col);
+    s.brightness         = prefs.getUChar ("bright",   s.brightness);
     if (s.timezone_idx >= N_TIMEZONES) s.timezone_idx = 0;   // sanitise stale NVS
+    if (s.brightness < 10) s.brightness = 10;               // never fully dark
     {
         char ltrk[64] = "";
         prefs.getString("last_trk",   ltrk,               sizeof(ltrk));
@@ -978,8 +1001,32 @@ static void saveSettings() {
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
     prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
     prefs.putUChar ("afr_col",  s.afr_warn_col);
+    prefs.putUChar ("bright",   s.brightness);
     prefs.end();
     sendCfgToTeensy();   // keep Teensy in sync after every settings save
+}
+
+// Apply LCD brightness (0-100 %). Board-aware via board_config.h:
+//   Advance (DASH_IS_ADVANCE): backlight coprocessor at I2C 0x30. It takes
+//     DISCRETE command codes, NOT a linear value — valid backlight levels (from
+//     the vendor factory firmware's PWM ladder) are exactly these 7 codes,
+//     brightest -> dimmest. Sending arbitrary bytes makes the coprocessor
+//     misbehave (visible backlight flicker), so we snap to the ladder.
+//   Basic 7"/5":              GPIO 2 PWM on ledc channel 1 (duty 0-255).
+// Called at boot (after loadSettings) and live while the brightness slider drags.
+static void applyBrightness(uint8_t pct) {
+    if (pct > 100) pct = 100;
+#if DASH_IS_ADVANCE
+    // The 0x30 coprocessor takes a backlight level 0..245 (0 = brightest,
+    // 245 = off) per the vendor example. Map the 10..100 % slider linearly
+    // across that range (100 % -> 0 brightest, 10 % -> ~221 dim-but-on).
+    const uint8_t v = (uint8_t)(245 - (uint32_t)pct * 245 / 100);
+    Wire.beginTransmission(0x30);
+    Wire.write(v);
+    Wire.endTransmission();
+#else
+    ledcWrite(1, (uint32_t)pct * 255 / 100);
+#endif
 }
 
 // Push the runtime config the Teensy needs to do cloud uploads. Format:
@@ -2156,6 +2203,7 @@ enum Gesture : uint8_t {
     GESTURE_NONE = 0,             // not yet classified
     GESTURE_DRAG_V,               // active vertical drag (settings scroll)
     GESTURE_SWIPE_H,              // tentative horizontal swipe — confirmed on release
+    GESTURE_SLIDER,               // dragging the brightness slider (settings page)
 };
 
 struct TouchTracker {
@@ -2180,6 +2228,9 @@ constexpr int  GESTURE_THRESH   = 30;        // movement before we classify
 // Forward decls.
 static void handleSettingsTap(int x, int y);
 static void handleDashTap(int x, int y);
+static bool    settingsSliderHit(int x, int y);      // touch landed on the brightness slider?
+static uint8_t settingsSliderPctFromX(int x);        // map screen-x to 10..100 % along the track
+static void    applyBrightness(uint8_t pct);
 static void handleTimeSetTap(int x, int y);
 static void openTrackPicker(bool for_recording = false);
 static void openConfigPicker(int track_idx, bool from_auto, bool for_recording = false);
@@ -2312,6 +2363,14 @@ static void handleTouch() {
         tt.active  = true;
         tt.gesture = GESTURE_NONE;
         tt.scrollAtStart = settingsScrollY;
+        // Brightness slider grab: claim the gesture so swipe/scroll can't steal
+        // it, and apply immediately so a plain tap also sets the level.
+        if (settingsSliderHit(x, y)) {
+            tt.gesture   = GESTURE_SLIDER;
+            s.brightness = settingsSliderPctFromX(x);
+            applyBrightness(s.brightness);
+            settingsDirty = true;
+        }
         return;
     }
 
@@ -2319,6 +2378,15 @@ static void handleTouch() {
         // ---- Touch dragging ----
         const int dxFromStart = x - tt.startX;
         const int dyFromStart = y - tt.startY;
+
+        // Brightness slider drag: live-update from current X (no scroll/swipe).
+        if (tt.gesture == GESTURE_SLIDER) {
+            s.brightness = settingsSliderPctFromX(x);
+            applyBrightness(s.brightness);
+            settingsDirty = true;
+            tt.lastX = x; tt.lastY = y;
+            return;
+        }
 
         // Classify on first significant movement.
         if (tt.gesture == GESTURE_NONE
@@ -2639,12 +2707,15 @@ static void drawDashPage() {
         tft.setFont(&fonts::Font2);
         tft.setTextDatum(textdatum_t::top_left);
         tft.setTextColor(TFT_DARKGREY, bg);
-        tft.drawString("PRED", 255, 380);    // middle column — predictive lap time
-        tft.drawString("LAP",  255, 405);    // middle column — last completed lap time
-        tft.drawString("DELTA",255, 430);    // middle column — predictive delta vs best lap
-        tft.drawString("FIX",  620, 355);
-        tft.drawString("SATS", 620, 380);
-        tft.drawString("GPS",  620, 405);
+        // x=264 (not 255): clears the bottom-left TEMP/PSI/AFR sensor sprites,
+        // which span x=20..260 and were re-painting bg over the first letter
+        // (P/L/D) of these labels each time a sensor value updated.
+        tft.drawString("PRED", 264, 380);    // middle column — predictive lap time
+        tft.drawString("LAP",  264, 405);    // middle column — last completed lap time
+        tft.drawString("DELTA",264, 430);    // middle column — predictive delta vs best lap
+        tft.drawString("FIX",  620, 380);
+        tft.drawString("SATS", 620, 405);
+        tft.drawString("GPS",  620, 430);
 
         // TRACK button — static, drawn once on enter / bg-flip.
         tft.fillRect(TRKBTN_X, TRKBTN_Y, TRKBTN_W, TRKBTN_H, TFT_DARKCYAN);
@@ -3074,21 +3145,21 @@ static void drawDashPage() {
         if (g.fix != ld.fix) {
             const uint16_t col = (g.fix >= 3) ? TFT_GREEN : (g.fix >= 2) ? TFT_YELLOW : TFT_RED;
             char buf[8]; snprintf(buf, sizeof(buf), "%-5s", fixName(g.fix));
-            if (dash_sprites_ready) drawTextSprite(spr_fix, 680, 355, buf, col);
-            else                    drawValue(680, 355, buf, col);
+            if (dash_sprites_ready) drawTextSprite(spr_fix, 680, 380, buf, col);
+            else                    drawValue(680, 380, buf, col);
             ld.fix = g.fix;
         }
         if (g.sats != ld.sats) {
             char buf[8]; snprintf(buf, sizeof(buf), "%2u", (unsigned)g.sats);
-            if (dash_sprites_ready) drawTextSprite(spr_sats, 680, 380, buf, TFT_WHITE);
-            else                    drawValue(680, 380, buf, TFT_WHITE);
+            if (dash_sprites_ready) drawTextSprite(spr_sats, 680, 405, buf, TFT_WHITE);
+            else                    drawValue(680, 405, buf, TFT_WHITE);
             ld.sats = g.sats;
         }
         if (g.status != ld.status) {
             char buf[8]; snprintf(buf, sizeof(buf), "%-5s", gpsStatusName(g.status));
             const uint16_t col = gpsStatusColor(g.status);
-            if (dash_sprites_ready) drawTextSprite(spr_gps, 680, 405, buf, col);
-            else                    drawValue(680, 405, buf, col);
+            if (dash_sprites_ready) drawTextSprite(spr_gps, 680, 430, buf, col);
+            else                    drawValue(680, 430, buf, col);
             ld.status = g.status;
         }
     }
@@ -3241,9 +3312,10 @@ struct SettingRow {
     //        that's implemented (next iteration).
     // INFO = read-only display row (no controls, no tap action). Used today
     // for the WiFi connection status line in the Internet block.
-    enum Kind { NUMERIC, TOGGLE, COLOR, ENUM, TEXT, ACTION, INFO } kind;
+    enum Kind { NUMERIC, TOGGLE, COLOR, ENUM, TEXT, ACTION, INFO, SLIDER } kind;
 };
 static const SettingRow ROWS[ST_COUNT] = {
+    { ST_BRIGHTNESS,   "Brightness",            SettingRow::SLIDER  },
     { ST_INET_MODE,    "Internet",              SettingRow::ENUM    },
     { ST_WIFI_SSID,    "WiFi network (SSID)",   SettingRow::TEXT    },
     { ST_WIFI_PASS,    "WiFi password",         SettingRow::TEXT    },
@@ -3290,6 +3362,7 @@ constexpr int CTRL_PLUS_X  = 720, CTRL_PLUS_W  = 60;
 constexpr int CTRL_VALUE_X = 470, CTRL_VALUE_W = 240;
 constexpr int CTRL_TOGGLE_X = 410, CTRL_TOGGLE_W = 100;
 constexpr int CTRL_COLOR_X  = 410, CTRL_COLOR_W  = 130;
+constexpr int SLIDER_TRACK_X = 410, SLIDER_TRACK_W = 300;   // brightness slider groove
 
 // (rowY removed — scroll-aware rowScreenY() defined further down replaces it.)
 
@@ -3847,6 +3920,27 @@ static bool rowVisible(int yScreen) {
     return yScreen + SETTINGS_ROW_HEIGHT > BODY_TOP && yScreen < BODY_BOTTOM;
 }
 
+// Brightness slider geometry / hit-testing (used by the touch handler so a
+// drag on the slider isn't mistaken for a page swipe or a scroll).
+static bool settingsSliderHit(int x, int y) {
+    if (currentPage != PAGE_SETTINGS) return false;
+    int idx = -1;
+    for (uint8_t i = 0; i < ST_COUNT; ++i)
+        if (ROWS[i].id == ST_BRIGHTNESS) { idx = (int)i; break; }
+    if (idx < 0 || !rowShouldShow(ST_BRIGHTNESS)) return false;
+    const int ry = rowScreenY((uint8_t)idx);
+    if (!rowVisible(ry)) return false;
+    if (y < ry || y >= ry + SETTINGS_ROW_DY) return false;
+    // Only the track region grabs; left of it (the label) stays scroll/swipe.
+    return x >= SLIDER_TRACK_X - 20 && x <= SLIDER_TRACK_X + SLIDER_TRACK_W + 40;
+}
+static uint8_t settingsSliderPctFromX(int x) {
+    int v = (x - SLIDER_TRACK_X) * 100 / SLIDER_TRACK_W;
+    if (v < 10)  v = 10;     // never fully dark (keep the screen usable)
+    if (v > 100) v = 100;
+    return (uint8_t)v;
+}
+
 static void drawSettingsPage() {
     // Content height depends on how many rows are currently visible.
     {
@@ -3873,14 +3967,16 @@ static void drawSettingsPage() {
     }
 
     if (!settingsDirty) return;
+    // Cap redraws to ~30 Hz during drags so the LCD gets a clean scan window
+    // between renders. Stays dirty so the next loop picks it up.
+    static uint32_t lastDraw = 0;
+    if (millis() - lastDraw < 33) return;
+    lastDraw = millis();
     settingsDirty = false;
 
-    // On scroll-position change, wipe ONLY the narrow strips at the top
-    // and bottom of the body band — that's where partial rows sliding
-    // off-edge leave a hairline of stale pixels. Full-body wipe (the
-    // previous version) was 624 KB of PSRAM writes which the LCD scan-out
-    // caught mid-render and looked like flashing. Two 64 KB strip wipes
-    // are ~1.3 ms each, well under the LCD's 16 ms scan period.
+    // Per-row direct draw with narrow strip-wipes on scroll. (A full-screen
+    // PSRAM back-buffer push was tried and reverted: on this single-framebuffer
+    // RGB panel the ~600 KB push burst-starves the scan-out DMA and tears.)
     static int lastDrawnScrollY = -1;
     if (settingsScrollY != lastDrawnScrollY) {
         tft.fillRect(0, BODY_TOP,                       800, SETTINGS_ROW_DY, TFT_BLACK);
@@ -3888,7 +3984,6 @@ static void drawSettingsPage() {
         lastDrawnScrollY = settingsScrollY;
     }
 
-    // Per-row redraw — each row paints its own SETTINGS_ROW_DY-tall band.
     tft.setTextSize(1);
     tft.setFont(&fonts::Font4);
     tft.setTextDatum(textdatum_t::top_left);
@@ -3899,18 +3994,27 @@ static void drawSettingsPage() {
         const int y = rowScreenY(i);
         if (!rowVisible(y)) continue;
 
-        // Clip drawing to the body band so partially-visible rows don't
-        // bleed into the sticky header or footer.
         tft.setClipRect(0, BODY_TOP, 800, BODY_HEIGHT);
-
-        // Wipe THIS row's full DY band only.
         tft.fillRect(0, y, 800, SETTINGS_ROW_DY, TFT_BLACK);
-
-        // Label
         tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
         tft.drawString(r.label, 20, y + 6);
 
-        if (r.kind == SettingRow::NUMERIC) {
+        if (r.kind == SettingRow::SLIDER) {
+            // Brightness: groove + filled portion + knob + % readout.
+            const uint8_t pct = s.brightness;
+            const int cy = y + SETTINGS_ROW_HEIGHT / 2;
+            const int fillW = (int)((uint32_t)pct * SLIDER_TRACK_W / 100);
+            tft.fillRoundRect(SLIDER_TRACK_X, cy - 4, SLIDER_TRACK_W, 8, 4, TFT_DARKGREY);
+            tft.fillRoundRect(SLIDER_TRACK_X, cy - 4, fillW > 1 ? fillW : 1, 8, 4, TFT_CYAN);
+            const int kx = SLIDER_TRACK_X + fillW;
+            tft.fillCircle(kx, cy, 12, TFT_WHITE);
+            tft.drawCircle(kx, cy, 12, TFT_DARKGREY);
+            char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%u%%", (unsigned)pct);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.setTextDatum(textdatum_t::middle_right);
+            tft.drawString(pbuf, 790, cy);
+            tft.setTextDatum(textdatum_t::top_left);
+        } else if (r.kind == SettingRow::NUMERIC) {
             // [-]
             tft.fillRect(CTRL_MINUS_X, y, CTRL_MINUS_W, SETTINGS_ROW_HEIGHT, TFT_DARKGREY);
             tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
@@ -4060,6 +4164,11 @@ static void handleSettingsTap(int x, int y) {
         if (r.kind == SettingRow::NUMERIC) {
             const NumBounds nb = numBounds(r.id);
             const uint16_t step = (r.id == ST_CL_PORT) ? CL_PORT_STEP : nb.step;
+            // Tap the value to type it directly on the numeric keypad.
+            if (inRect(x, y, CTRL_VALUE_X, ry, CTRL_VALUE_W, SETTINGS_ROW_HEIGHT)) {
+                openNumericKeyboard(r.id);
+                return;
+            }
             if (inRect(x, y, CTRL_MINUS_X, ry, CTRL_MINUS_W, SETTINGS_ROW_HEIGHT)) {
                 uint16_t v = getNum(r.id);
                 v = (v > nb.lo + step) ? (v - step) : nb.lo;
@@ -4158,7 +4267,9 @@ static void handleSettingsTap(int x, int y) {
                 // (Check for updates + Format SD have moved to PAGE_TOOLS.
                 //  Tap dispatch for those lives in handleToolsTap.)
             }
-        } else { // TEXT — open the appropriate on-screen keyboard.
+        } else if (r.kind == SettingRow::TEXT) { // open the appropriate on-screen keyboard.
+                 // (SLIDER + INFO rows have no tap action — the slider is
+                 //  handled as a drag gesture in handleTouch.)
             constexpr int TEXT_X = 410, TEXT_W = 360;
             if (inRect(x, y, TEXT_X, ry, TEXT_W, SETTINGS_ROW_HEIGHT)) {
                 if (r.id == ST_CL_PORT)              openNumericKeyboard(r.id);
@@ -4308,7 +4419,19 @@ static void closeKeyboard(bool commit) {
                 s.wifi_pass[sizeof(s.wifi_pass) - 1] = '\0';
                 wifiForceReconfigure();
                 break;
-            default: break;
+            default: {
+                // Any numeric settings row typed on the keypad (RPM min/max,
+                // alert RPM/Hz, temp/psi/afr): clamp to that setting's bounds.
+                const NumBounds nb = numBounds(kb.target);
+                if (nb.step > 0) {
+                    long v = atol(kb.editBuf);
+                    if (v < nb.lo) v = nb.lo;
+                    if (v > nb.hi) v = nb.hi;
+                    setNum(kb.target, (uint16_t)v);
+                    clampInvariants();
+                }
+                break;
+            }
         }
     }
     currentPage = PAGE_SETTINGS;
@@ -7040,6 +7163,21 @@ static void handleStatusTap(int x, int y) {
     }
 }
 
+#if DASH_IS_ADVANCE
+// CrowPanel Advance: the GT911 (0x5D) and a backlight/reset coprocessor (0x30)
+// share Wire (I2C_NUM_0) on SDA 15 / SCL 16. Backlight + screen activation are
+// I2C commands to 0x30 (0 = brightest, 245 = off, 250 = activate touch screen).
+static bool advI2cPresent(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return Wire.endTransmission() == 0;
+}
+static void advCoproCmd(uint8_t cmd) {
+    Wire.beginTransmission(0x30);
+    Wire.write(cmd);
+    Wire.endTransmission();
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Boot — same V3.0 init sequence that worked in PanelTest.ino.
 // ---------------------------------------------------------------------------
@@ -7065,6 +7203,40 @@ void setup() {
     esp_log_level_set("wifi",    ESP_LOG_NONE);
     esp_log_level_set("wifi_init", ESP_LOG_NONE);
 
+#if DASH_IS_ADVANCE
+    // --- CrowPanel Advance 5" bring-up (Elecrow example V1.2_and_V1.3) ---
+    // No PCA9557 and GPIO 38 is an RGB data line here, so none of the Basic
+    // reset sequence applies. Touch + backlight live on a 0x30 coprocessor.
+    pinMode(19, OUTPUT);                          // vendor strap (left LOW)
+    Wire.begin(DASH_TOUCH_SDA, DASH_TOUCH_SCL);   // 15 / 16
+    delay(50);
+    {
+        // Wait (<=3 s) for the coprocessor (0x30) + GT911 (0x5D). If they don't
+        // answer, kick them awake (cmd 250 + GPIO 1 toggle) and retry.
+        uint32_t t0 = millis();
+        while (!(advI2cPresent(0x30) && advI2cPresent(0x5D))) {
+            advCoproCmd(250);                     // activate touch screen
+            pinMode(1, OUTPUT); digitalWrite(1, LOW);
+            delay(120);
+            pinMode(1, INPUT);
+            delay(100);
+            if (millis() - t0 > 3000) {
+                Serial.println("Advance coprocessor (0x30/0x5D) not detected; continuing");
+                break;
+            }
+        }
+    }
+
+    tft.begin();                                  // RGB only (no PCA9557)
+    tft.fillScreen(TFT_BLACK);
+
+    ts.begin(0x5D);                               // GT911 on Wire (15/16), addr 0x5D
+    ts.setRotation(DASH_TOUCH_ROTATION);          // verify on first boot; flip if mirrored
+    Serial.println("Advance 5\" panel + GT911 (0x5D) init");
+
+    tft.setTextSize(1);
+    delay(200);
+#else
     // GPIO 38 = GT911 RST. Hold LOW during PCA9557 bring-up.
     pinMode(38, OUTPUT);
     digitalWrite(38, LOW);
@@ -7101,22 +7273,32 @@ void setup() {
     tft.setTextSize(1);                 // explicit default; PanelTest's old size-3 leak made
                                          // the dash's first frame draw labels at size 3.
     delay(200);
+#endif
 
     // Allocate sprite back-buffers for the dash page's tearing-prone regions.
     // Must run after tft.begin() because LGFX_Sprite borrows its color depth
     // and panel reference from the parent device.
     setupDashSprites();
 
+#if DASH_IS_ADVANCE
+    // Advance: backlight is an I2C command to the 0x30 coprocessor (0 =
+    // brightest). Turned on AFTER sprites are ready so no garbage frame shows.
+    advCoproCmd(0);
+    Serial.println("backlight on (i2c 0x30)");
+#else
+    // Basic 7"/5": GPIO 2 PWM on ledc channel 1. Keep ledc attached (don't
+    // override with digitalWrite) so applyBrightness() can dim it. Full on
+    // during boot; the saved level is applied right after loadSettings().
     ledcSetup(1, 300, 8);
     ledcAttachPin(TFT_BL, 1);
     ledcWrite(1, 0);
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, LOW);
     delay(500);
-    digitalWrite(TFT_BL, HIGH);
-    Serial.println("backlight on");
+    ledcWrite(1, 255);
+    Serial.println("backlight on (pwm)");
+#endif
 
     loadSettings();
+    applyBrightness(s.brightness);   // honour the saved brightness on both paths
     Serial.printf("settings: rpm[%u..%u] alerts=%d a1=%uRPM/%uHz/%s aM=%uRPM/%uHz/%s\n",
                   s.rpm_min, s.rpm_max, (int)s.alerts_enabled,
                   s.alert1_rpm, s.alert1_hz, PALETTE_NAMES[s.alert1_color_idx],
