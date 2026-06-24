@@ -3322,7 +3322,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_WIFI_STATUS,  "WiFi status",           SettingRow::INFO    },
     { ST_RPM_MIN,    "Min RPM display",      SettingRow::NUMERIC },
     { ST_RPM_MAX,    "Max RPM display",      SettingRow::NUMERIC },
-    { ST_RPM_DIV,    "Tach pulses/rev",      SettingRow::ENUM    },
+    { ST_RPM_DIV,    "Tach pulses/rev",      SettingRow::NUMERIC },
     { ST_ALERTS,     "Enable RPM alerts",    SettingRow::TOGGLE  },
     { ST_A1_RPM,     "Alert 1 RPM",          SettingRow::NUMERIC },
     { ST_A1_COL,     "Alert 1 color",        SettingRow::COLOR   },
@@ -4021,7 +4021,9 @@ static void drawSettingsPage() {
             tft.setTextDatum(textdatum_t::middle_center);
             tft.drawString("-", CTRL_MINUS_X + CTRL_MINUS_W / 2, y + SETTINGS_ROW_HEIGHT / 2);
             // value
-            char buf[16]; snprintf(buf, sizeof(buf), "%u", (unsigned)getNum(r.id));
+            char buf[16];
+            if (r.id == ST_RPM_DIV) snprintf(buf, sizeof(buf), "%s", RPM_PPR_NAMES[rpmPprIndex()]);
+            else                    snprintf(buf, sizeof(buf), "%u", (unsigned)getNum(r.id));
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
             tft.drawString(buf, CTRL_VALUE_X + CTRL_VALUE_W / 2, y + SETTINGS_ROW_HEIGHT / 2);
             // [+]
@@ -4164,6 +4166,20 @@ static void handleSettingsTap(int x, int y) {
         if (r.kind == SettingRow::NUMERIC) {
             const NumBounds nb = numBounds(r.id);
             const uint16_t step = (r.id == ST_CL_PORT) ? CL_PORT_STEP : nb.step;
+            // Tach pulses/rev steps through a discrete list (0.5,1,2,3,4,6,8) via
+            // -/+; no keypad (free numeric entry wouldn't map to the list).
+            if (r.id == ST_RPM_DIV) {
+                int idx = rpmPprIndex();
+                if (inRect(x, y, CTRL_MINUS_X, ry, CTRL_MINUS_W, SETTINGS_ROW_HEIGHT)) {
+                    if (idx > 0) idx--;
+                    s.rpm_ppr_x10 = RPM_PPR_X10[idx]; settingsDirty = true; return;
+                }
+                if (inRect(x, y, CTRL_PLUS_X, ry, CTRL_PLUS_W, SETTINGS_ROW_HEIGHT)) {
+                    if (idx < N_RPM_PPR - 1) idx++;
+                    s.rpm_ppr_x10 = RPM_PPR_X10[idx]; settingsDirty = true; return;
+                }
+                return;
+            }
             // Tap the value to type it directly on the numeric keypad.
             if (inRect(x, y, CTRL_VALUE_X, ry, CTRL_VALUE_W, SETTINGS_ROW_HEIGHT)) {
                 openNumericKeyboard(r.id);
@@ -4228,8 +4244,6 @@ static void handleSettingsTap(int x, int y) {
                     s.internet_mode = (s.internet_mode + 1) % N_INET_MODE;
                     wifiForceReconfigure();
                     Serial.printf("CFG,inet,%u\n", (unsigned)s.internet_mode);
-                } else if (r.id == ST_RPM_DIV) {
-                    s.rpm_ppr_x10 = RPM_PPR_X10[(rpmPprIndex() + 1) % N_RPM_PPR];
                 } else if (r.id == ST_SENSOR_TYPE) {
                     s.sensor_type = (s.sensor_type + 1) % N_SENSOR_TYPE;
                     // Reset stale ECU state on a source flip so the dash
