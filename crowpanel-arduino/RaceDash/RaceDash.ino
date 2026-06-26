@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.63"
+#define FIRMWARE_VERSION "0.1.64"
 
 #include <Preferences.h>
 #include <time.h>
@@ -48,7 +48,7 @@ enum SettingId : uint8_t {
     ST_BRIGHTNESS = 0,            // LCD backlight slider — top of the settings list
     ST_INET_MODE,
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
-    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_ALERTS,
+    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_ALERTS,
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
     ST_AM_RPM, ST_AM_COL, ST_AM_HZ,
     // Coolant temp warn-color + oil PSI warn-color. Each has a master
@@ -64,6 +64,7 @@ enum SettingId : uint8_t {
     ST_CL_HOST, ST_CL_PORT, ST_CL_PROTO, ST_CL_STREAM,
     ST_CL_AUTH_USER, ST_CL_AUTH_PASS,
     ST_AUTO_TRACK,
+    ST_AUTO_START, ST_AUTO_START_MPH,   // auto-start recording + its speed threshold
     ST_TIMEZONE,    // ENUM: cycle through TIMEZONES[]
     ST_SET_TIME,    // action: open time-set page
     ST_COUNT,
@@ -580,6 +581,11 @@ struct Settings {
     // this (RPM comes straight from CAN).
     uint16_t rpm_ppr_x10        = 20;
 
+    // RPM display smoothing trim, -10..+10 (0 = current/baseline). Sent to the
+    // Teensy as CFG,rpmsm,<level>; it maps the level to its EMA strength:
+    // -ve = rawer/snappier (numbers jump), +ve = heavier smoothing.
+    int8_t   rpm_smooth         = 0;
+
     // AFR (Air/Fuel Ratio) — only meaningful in MegaSquirt sensor mode.
     // Two-sided warn band: too rich (< afr_warn_lo) and too lean (> afr_warn_hi)
     // both flip the value to the warn colour. Values are AFR × 10 (so 145 = 14.5).
@@ -590,6 +596,11 @@ struct Settings {
 
     // Track selection
     bool     auto_select_track = true; // when on, skip picker if a clear closest match exists
+
+    // Auto-start recording: when enabled AND a track is selected, the dash
+    // sends REC,1 on its own once GPS speed crosses auto_start_mph.
+    bool     auto_start       = false;
+    uint16_t auto_start_mph   = 25;
 
     // Time zone — index into TIMEZONES[] (defined below). Display only;
     // the Teensy's RTC + the wire-format TIME line are always UTC.
@@ -924,6 +935,8 @@ static void loadSettings() {
     // truncated. NVS only stores what was put, so if the value present is
     // shorter than the new buffer that's fine; nothing extra to do.
     s.auto_select_track  = prefs.getBool  ("auto_trk", s.auto_select_track);
+    s.auto_start         = prefs.getBool  ("autost",   s.auto_start);
+    s.auto_start_mph     = prefs.getUShort("astmph",   s.auto_start_mph);
     s.timezone_idx       = prefs.getUChar ("tz",       s.timezone_idx);
     s.internet_mode      = prefs.getUChar ("inet",     s.internet_mode);
     prefs.getString      ("wssid",    s.wifi_ssid, sizeof(s.wifi_ssid));
@@ -936,6 +949,9 @@ static void loadSettings() {
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
     s.rpm_ppr_x10        = prefs.getUShort("rpmppr",   s.rpm_ppr_x10);
+    s.rpm_smooth         = prefs.getChar  ("rpmsm",    s.rpm_smooth);
+    if (s.rpm_smooth < -10) s.rpm_smooth = -10;
+    if (s.rpm_smooth >  10) s.rpm_smooth =  10;
     s.show_afr           = prefs.getBool  ("s_afr",    s.show_afr);
     s.afr_warn_lo_x10    = prefs.getUShort("afr_lo",   s.afr_warn_lo_x10);
     s.afr_warn_hi_x10    = prefs.getUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -983,6 +999,8 @@ static void saveSettings() {
     if (prefs.isKey("cl_user")) prefs.remove("cl_user");
     if (prefs.isKey("cl_pass")) prefs.remove("cl_pass");
     prefs.putBool  ("auto_trk", s.auto_select_track);
+    prefs.putBool  ("autost",   s.auto_start);
+    prefs.putUShort("astmph",   s.auto_start_mph);
     // (sendCfgToTeensy() is called at end of this function so any save also
     // re-syncs the cloud config to the Teensy.)
     prefs.putUChar ("tz",       s.timezone_idx);
@@ -997,6 +1015,7 @@ static void saveSettings() {
     prefs.putUChar ("p_col",    s.oil_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
     prefs.putUShort("rpmppr",   s.rpm_ppr_x10);
+    prefs.putChar  ("rpmsm",    s.rpm_smooth);
     prefs.putBool  ("s_afr",    s.show_afr);
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
     prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -1045,6 +1064,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,inet,%u\n",      (unsigned)s.internet_mode);
     Serial.printf("CFG,srctyp,%u\n",    (unsigned)s.sensor_type);
     Serial.printf("CFG,rpmppr,%u\n",    (unsigned)s.rpm_ppr_x10);
+    Serial.printf("CFG,rpmsm,%d\n",     (int)s.rpm_smooth);
 }
 
 static void saveLastTrack(int idx, const char* display_name = nullptr) {
@@ -1149,6 +1169,25 @@ static bool parseGpsLine(const String& line) {
     g.hdg_deg = field(5).toFloat();
     g.status  = (n >= 7) ? (uint8_t)field(6).toInt() : 0;
     g.last_ms = millis();
+
+    // Auto-start recording: once enabled with a track selected, kick off the
+    // session when speed crosses the threshold. Latched so a manual stop (or
+    // holding above the threshold) doesn't re-trigger; re-arms only after speed
+    // drops back below the threshold.
+    {
+        static bool autostart_fired = false;
+        if (!s.auto_start || active_track_name[0] == '\0') {
+            autostart_fired = false;
+        } else if (g.mph < (float)s.auto_start_mph) {
+            autostart_fired = false;                      // slow -> re-arm
+        } else if (!autostart_fired && !recording) {
+            Serial.printf("TRACK,%s\n", active_track_name);
+            Serial.printf("REC,1\n");
+            recording = true; rec_start_ms = millis();
+            autostart_fired = true;
+        }
+        if (recording) autostart_fired = true;            // any session spends the latch
+    }
     return true;
 }
 static bool parseEngLine(const String& line) {
@@ -2198,6 +2237,7 @@ static void pumpUart() {
 static int  settingsScrollY = 0;
 static int  settingsContentHeight = 0;       // computed in drawSettingsPage()
 static void clampSettingsScroll();
+static void snapSettingsScroll();
 
 enum Gesture : uint8_t {
     GESTURE_NONE = 0,             // not yet classified
@@ -2217,10 +2257,11 @@ struct TouchTracker {
     int      scrollAtStart    = 0;
 };
 static TouchTracker tt;
+static SettingId    active_slider = ST_COUNT;   // which SLIDER row is being dragged (ST_COUNT = none)
 
-constexpr int  SWIPE_DX_MIN     = 120;
+constexpr int  SWIPE_DX_MIN     = DASH_SWIPE_DX_MIN;   // per-board (board_config.h)
 constexpr int  SWIPE_DY_MAX     = 100;
-constexpr uint32_t SWIPE_MS_MAX = 800;
+constexpr uint32_t SWIPE_MS_MAX = DASH_SWIPE_MS_MAX;   // per-board (board_config.h)
 constexpr int  TAP_DXY_MAX      = 30;
 constexpr uint32_t TAP_MS_MAX   = 600;
 constexpr int  GESTURE_THRESH   = 30;        // movement before we classify
@@ -2228,9 +2269,9 @@ constexpr int  GESTURE_THRESH   = 30;        // movement before we classify
 // Forward decls.
 static void handleSettingsTap(int x, int y);
 static void handleDashTap(int x, int y);
-static bool    settingsSliderHit(int x, int y);      // touch landed on the brightness slider?
-static uint8_t settingsSliderPctFromX(int x);        // map screen-x to 10..100 % along the track
-static void    applyBrightness(uint8_t pct);
+static SettingId settingsSliderHit(int x, int y);    // which SLIDER row is at (x,y), or ST_COUNT
+static void      sliderSetFromX(SettingId id, int x);// set a SLIDER row's value from screen-x
+static void      applyBrightness(uint8_t pct);
 static void handleTimeSetTap(int x, int y);
 static void openTrackPicker(bool for_recording = false);
 static void openConfigPicker(int track_idx, bool from_auto, bool for_recording = false);
@@ -2256,7 +2297,21 @@ static bool parseVerLine(const String& line);
 static void handleStatusTap(int x, int y);
 
 static void handleTouch() {
-    ts.read();
+    // Throttle GT911 reads. The main loop spins at ~950 Hz, and TAMC's read()
+    // clears the controller's data-ready register on every call. Polling that
+    // fast saturates the GT911's I2C servicing and (on the 5" Basic) collapses
+    // its effective report rate to ~7-12 Hz -> swipes never accumulate enough
+    // samples and are mis-read as taps. Reading at ~75 Hz lets the GT911 sample
+    // at its native rate (the vendor LVGL build polls at only ~33 Hz).
+    static uint32_t lastReadMs = 0;
+    constexpr uint32_t TOUCH_POLL_MS = 13;          // ~77 Hz
+    const uint32_t pollNow = millis();
+    if (pollNow - lastReadMs >= TOUCH_POLL_MS) {
+        lastReadMs = pollNow;
+        ts.read();
+        { static uint32_t _tc=0,_rc=0,_tp=0; _rc++; if(ts.isTouched)_tc++; uint32_t _n=millis();  // TEMP rate probe
+          if(_n-_tp>=1000){_tp=_n; Serial.printf("TCHrate touched/s=%lu reads/s=%lu\n",(unsigned long)_tc,(unsigned long)_rc); _tc=0; _rc=0;} }
+    }
     const bool raw = ts.isTouched;
 
     // GT911 release debounce. TAMC clears the GT911 data-ready flag after each
@@ -2267,7 +2322,7 @@ static void handleTouch() {
     // TOUCH_RELEASE_MS after the last real sample, retaining the last position.
     static int32_t  heldX = 0, heldY = 0;
     static uint32_t lastTouchMs = 0;
-    constexpr uint32_t TOUCH_RELEASE_MS = 80;
+    constexpr uint32_t TOUCH_RELEASE_MS = DASH_TOUCH_RELEASE_MS;   // per-board (board_config.h)
     if (raw) {
         heldX = (int32_t)ts.points[0].x;
         heldY = (int32_t)ts.points[0].y;
@@ -2363,13 +2418,17 @@ static void handleTouch() {
         tt.active  = true;
         tt.gesture = GESTURE_NONE;
         tt.scrollAtStart = settingsScrollY;
-        // Brightness slider grab: claim the gesture so swipe/scroll can't steal
-        // it, and apply immediately so a plain tap also sets the level.
-        if (settingsSliderHit(x, y)) {
-            tt.gesture   = GESTURE_SLIDER;
-            s.brightness = settingsSliderPctFromX(x);
-            applyBrightness(s.brightness);
-            settingsDirty = true;
+        Serial.printf("TS x=%ld y=%ld pg=%d\n", (long)x, (long)y, (int)currentPage);  // TEMP touch debug
+        // Slider grab: claim the gesture so swipe/scroll can't steal it, and
+        // apply immediately so a plain tap also sets the value.
+        {
+            const SettingId sid = settingsSliderHit(x, y);
+            if (sid != ST_COUNT) {
+                tt.gesture    = GESTURE_SLIDER;
+                active_slider = sid;
+                sliderSetFromX(sid, x);
+                settingsDirty = true;
+            }
         }
         return;
     }
@@ -2379,10 +2438,9 @@ static void handleTouch() {
         const int dxFromStart = x - tt.startX;
         const int dyFromStart = y - tt.startY;
 
-        // Brightness slider drag: live-update from current X (no scroll/swipe).
+        // Slider drag: live-update the active slider from current X.
         if (tt.gesture == GESTURE_SLIDER) {
-            s.brightness = settingsSliderPctFromX(x);
-            applyBrightness(s.brightness);
+            sliderSetFromX(active_slider, x);
             settingsDirty = true;
             tt.lastX = x; tt.lastY = y;
             return;
@@ -2413,9 +2471,24 @@ static void handleTouch() {
         const int      dx  = tt.lastX - tt.startX;
         const int      dy  = tt.lastY - tt.startY;
         const uint32_t dur = millis() - tt.startMs;
+        Serial.printf("TR g=%d dx=%d dy=%d dur=%lu\n", (int)tt.gesture, dx, dy, (unsigned long)dur);  // TEMP touch debug
 
         if (tt.gesture == GESTURE_DRAG_V) {
-            // Already handled per-frame; nothing else to do.
+            // Snap the settings scroll to a row boundary on release so every
+            // visible row sits fully inside the tappable body band (otherwise a
+            // row's -/+ buttons can straddle the y>=BODY_BOTTOM dead zone and
+            // refuse taps at certain scroll offsets).
+            if (currentPage == PAGE_SETTINGS) {
+                snapSettingsScroll();
+                settingsDirty = true;
+            }
+        } else if (tt.gesture == GESTURE_SLIDER) {
+            // RPM smoothing must reach the Teensy on the fly -> push it the moment
+            // the finger lifts (it also rides the full re-send on exit + the 5 s
+            // periodic re-send). Brightness was already applied live to the panel.
+            if (active_slider == ST_RPM_SMOOTH)
+                Serial.printf("CFG,rpmsm,%d\n", (int)s.rpm_smooth);
+            active_slider = ST_COUNT;
         } else if (tt.gesture == GESTURE_SWIPE_H) {
             if (abs(dx) > SWIPE_DX_MIN && abs(dy) < SWIPE_DY_MAX && dur < SWIPE_MS_MAX) {
                 if (dx < 0 && currentPage == PAGE_DASH) {
@@ -3323,6 +3396,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_RPM_MIN,    "Min RPM display",      SettingRow::NUMERIC },
     { ST_RPM_MAX,    "Max RPM display",      SettingRow::NUMERIC },
     { ST_RPM_DIV,    "Tach pulses/rev",      SettingRow::NUMERIC },
+    { ST_RPM_SMOOTH, "RPM smoothing",        SettingRow::SLIDER  },
     { ST_ALERTS,     "Enable RPM alerts",    SettingRow::TOGGLE  },
     { ST_A1_RPM,     "Alert 1 RPM",          SettingRow::NUMERIC },
     { ST_A1_COL,     "Alert 1 color",        SettingRow::COLOR   },
@@ -3341,15 +3415,17 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_AFR_WARN_LO,  "AFR rich-warn (x10)",   SettingRow::NUMERIC },
     { ST_AFR_WARN_HI,  "AFR lean-warn (x10)",   SettingRow::NUMERIC },
     { ST_AFR_WARN_COL, "AFR warn color",        SettingRow::COLOR   },
-    { ST_REC_SD,     "Record to SD card",    SettingRow::TOGGLE  },
-    { ST_REC_CLOUD,  "Record to cloud",      SettingRow::TOGGLE  },
+    { ST_REC_SD,        "Record to SD card",    SettingRow::TOGGLE  },
+    { ST_REC_CLOUD,     "Record to cloud",      SettingRow::TOGGLE  },
+    { ST_AUTO_TRACK,    "Auto select by GPS",   SettingRow::TOGGLE  },
+    { ST_AUTO_START,    "Auto start recording", SettingRow::TOGGLE  },
+    { ST_AUTO_START_MPH,"Auto start at (mph)",  SettingRow::NUMERIC },
     { ST_CL_HOST,      "Cloud host (DNS/IP)",   SettingRow::TEXT    },
     { ST_CL_PORT,      "Cloud port",            SettingRow::TEXT    },
     { ST_CL_PROTO,     "Cloud protocol",        SettingRow::ENUM    },
     { ST_CL_STREAM,    "Cloud stream mode",     SettingRow::ENUM    },
     { ST_CL_AUTH_USER, "User email",            SettingRow::TEXT    },
     { ST_CL_AUTH_PASS, "API key",               SettingRow::TEXT    },
-    { ST_AUTO_TRACK,   "Auto select by GPS",    SettingRow::TOGGLE  },
     { ST_TIMEZONE,     "Time zone",              SettingRow::ENUM    },
     { ST_SET_TIME,     "Set time",                SettingRow::ACTION  },
 };
@@ -3385,6 +3461,7 @@ static NumBounds numBounds(SettingId id) {
         // Range 8.0–20.0 spans every realistic operating point on gasoline.
         case ST_AFR_WARN_LO:  return {  80, 200, 1 };
         case ST_AFR_WARN_HI:  return {  80, 200, 1 };
+        case ST_AUTO_START_MPH: return { 5, 150, 5 };  // speed to trigger auto-record
         default:         return {    0,     0,   0 };
     }
 }
@@ -3402,6 +3479,7 @@ static uint16_t getNum(SettingId id) {
         case ST_PSI_WARN_PSI: return s.oil_warn_psi;
         case ST_AFR_WARN_LO:  return s.afr_warn_lo_x10;
         case ST_AFR_WARN_HI:  return s.afr_warn_hi_x10;
+        case ST_AUTO_START_MPH: return s.auto_start_mph;
         default:         return 0;
     }
 }
@@ -3418,6 +3496,7 @@ static void setNum(SettingId id, uint16_t v) {
         case ST_PSI_WARN_PSI: s.oil_warn_psi   = v; break;
         case ST_AFR_WARN_LO:  s.afr_warn_lo_x10 = v; break;
         case ST_AFR_WARN_HI:  s.afr_warn_hi_x10 = v; break;
+        case ST_AUTO_START_MPH: s.auto_start_mph = v; break;
         default: break;
     }
 }
@@ -3467,12 +3546,21 @@ static void clampSettingsScroll() {
     if (settingsScrollY > maxScroll) settingsScrollY = maxScroll;
 }
 
+// Snap the settings scroll to a row boundary (on drag release) so every visible
+// row lands fully inside the tappable body band — otherwise a row's -/+ buttons
+// can straddle the y>=BODY_BOTTOM dead zone and refuse taps at some offsets.
+static void snapSettingsScroll() {
+    settingsScrollY = ((settingsScrollY + SETTINGS_ROW_DY / 2) / SETTINGS_ROW_DY) * SETTINGS_ROW_DY;
+    clampSettingsScroll();
+}
+
 static const char* boolValueOnRow(SettingId id) {
     switch (id) {
         case ST_ALERTS:      return s.alerts_enabled    ? "ON" : "OFF";
         case ST_REC_SD:      return s.record_sd         ? "ON" : "OFF";
         case ST_REC_CLOUD:   return s.record_cloud      ? "ON" : "OFF";
         case ST_AUTO_TRACK:  return s.auto_select_track ? "ON" : "OFF";
+        case ST_AUTO_START:  return s.auto_start        ? "ON" : "OFF";
         case ST_SHOW_TEMP:   return s.show_coolant      ? "ON" : "OFF";
         case ST_SHOW_PSI:    return s.show_oil_psi      ? "ON" : "OFF";
         case ST_SHOW_AFR:    return s.show_afr          ? "ON" : "OFF";
@@ -3485,6 +3573,7 @@ static bool boolValueOnState(SettingId id) {
         case ST_REC_SD:      return s.record_sd;
         case ST_REC_CLOUD:   return s.record_cloud;
         case ST_AUTO_TRACK:  return s.auto_select_track;
+        case ST_AUTO_START:  return s.auto_start;
         case ST_SHOW_TEMP:   return s.show_coolant;
         case ST_SHOW_PSI:    return s.show_oil_psi;
         case ST_SHOW_AFR:    return s.show_afr;
@@ -3904,7 +3993,33 @@ static bool rowShouldShow(SettingId id) {
         // mode the dash forwards files to the cloud after the session ends;
         // live streaming over UART-to-WiFi is intentionally deferred.
         case ST_CL_STREAM:   return s.internet_mode == 0;
+        // Auto-start speed only matters when auto-start is enabled.
+        case ST_AUTO_START_MPH: return s.auto_start;
         default:           return true;
+    }
+}
+
+// Settings sections. A divider line is drawn above the first visible row whose
+// group differs from the row above it, so related settings read as a block.
+enum SettingsGroup : int { SG_DISPLAY, SG_NET, SG_RPM, SG_SENSORS, SG_RECORDING, SG_CLOUD, SG_TIME };
+static int rowGroup(SettingId id) {
+    switch (id) {
+        case ST_BRIGHTNESS:  return SG_DISPLAY;
+        case ST_INET_MODE:
+        case ST_WIFI_SSID: case ST_WIFI_PASS: case ST_WIFI_STATUS: return SG_NET;
+        case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_ALERTS:
+        case ST_A1_RPM: case ST_A1_COL: case ST_A1_HZ:
+        case ST_AM_RPM: case ST_AM_COL: case ST_AM_HZ: return SG_RPM;
+        case ST_SENSOR_TYPE:
+        case ST_SHOW_TEMP: case ST_TEMP_WARN_F: case ST_TEMP_WARN_COL:
+        case ST_SHOW_PSI:  case ST_PSI_WARN_PSI: case ST_PSI_WARN_COL:
+        case ST_SHOW_AFR:  case ST_AFR_WARN_LO: case ST_AFR_WARN_HI: case ST_AFR_WARN_COL: return SG_SENSORS;
+        case ST_REC_SD: case ST_REC_CLOUD: case ST_AUTO_TRACK:
+        case ST_AUTO_START: case ST_AUTO_START_MPH: return SG_RECORDING;
+        case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO: case ST_CL_STREAM:
+        case ST_CL_AUTH_USER: case ST_CL_AUTH_PASS: return SG_CLOUD;
+        case ST_TIMEZONE: case ST_SET_TIME: return SG_TIME;
+        default: return SG_DISPLAY;
     }
 }
 
@@ -3922,23 +4037,40 @@ static bool rowVisible(int yScreen) {
 
 // Brightness slider geometry / hit-testing (used by the touch handler so a
 // drag on the slider isn't mistaken for a page swipe or a scroll).
-static bool settingsSliderHit(int x, int y) {
-    if (currentPage != PAGE_SETTINGS) return false;
-    int idx = -1;
-    for (uint8_t i = 0; i < ST_COUNT; ++i)
-        if (ROWS[i].id == ST_BRIGHTNESS) { idx = (int)i; break; }
-    if (idx < 0 || !rowShouldShow(ST_BRIGHTNESS)) return false;
-    const int ry = rowScreenY((uint8_t)idx);
-    if (!rowVisible(ry)) return false;
-    if (y < ry || y >= ry + SETTINGS_ROW_DY) return false;
-    // Only the track region grabs; left of it (the label) stays scroll/swipe.
-    return x >= SLIDER_TRACK_X - 20 && x <= SLIDER_TRACK_X + SLIDER_TRACK_W + 40;
+static SettingId settingsSliderHit(int x, int y) {
+    if (currentPage != PAGE_SETTINGS) return ST_COUNT;
+    for (uint8_t i = 0; i < ST_COUNT; ++i) {
+        if (ROWS[i].kind != SettingRow::SLIDER) continue;
+        if (!rowShouldShow(ROWS[i].id)) continue;
+        const int ry = rowScreenY(i);
+        if (!rowVisible(ry)) continue;
+        // Only the track region grabs; left of it (the label) stays scroll/swipe.
+        if (y >= ry && y < ry + SETTINGS_ROW_DY &&
+            x >= SLIDER_TRACK_X - 20 && x <= SLIDER_TRACK_X + SLIDER_TRACK_W + 40)
+            return ROWS[i].id;
+    }
+    return ST_COUNT;
 }
-static uint8_t settingsSliderPctFromX(int x) {
-    int v = (x - SLIDER_TRACK_X) * 100 / SLIDER_TRACK_W;
-    if (v < 10)  v = 10;     // never fully dark (keep the screen usable)
-    if (v > 100) v = 100;
-    return (uint8_t)v;
+// Value range + current value for a SLIDER-kind row.
+static void sliderSpec(SettingId id, int* vmin, int* vmax, int* val) {
+    switch (id) {
+        case ST_BRIGHTNESS: *vmin = 10;  *vmax = 100; *val = s.brightness; break;
+        case ST_RPM_SMOOTH: *vmin = -10; *vmax = 10;  *val = s.rpm_smooth; break;
+        default:            *vmin = 0;   *vmax = 100; *val = 0;            break;
+    }
+}
+static int sliderValFromX(SettingId id, int x) {
+    int vmin, vmax, cur; sliderSpec(id, &vmin, &vmax, &cur);
+    const int span = (vmax > vmin) ? (vmax - vmin) : 1;
+    int v = vmin + ((x - SLIDER_TRACK_X) * span + SLIDER_TRACK_W / 2) / SLIDER_TRACK_W;
+    if (v < vmin) v = vmin;
+    if (v > vmax) v = vmax;
+    return v;
+}
+static void sliderSetFromX(SettingId id, int x) {
+    const int v = sliderValFromX(id, x);
+    if (id == ST_BRIGHTNESS)      { s.brightness = (uint8_t)v; applyBrightness(s.brightness); }
+    else if (id == ST_RPM_SMOOTH) { s.rpm_smooth = (int8_t)v; }
 }
 
 static void drawSettingsPage() {
@@ -3988,28 +4120,40 @@ static void drawSettingsPage() {
     tft.setFont(&fonts::Font4);
     tft.setTextDatum(textdatum_t::top_left);
 
+    int prevGroup = -1;
     for (uint8_t i = 0; i < ST_COUNT; ++i) {
         const SettingRow& r = ROWS[i];
         if (!rowShouldShow(r.id)) continue;
+        const int  g            = rowGroup(r.id);
+        const bool sectionStart = (prevGroup >= 0 && g != prevGroup);
+        prevGroup = g;
         const int y = rowScreenY(i);
         if (!rowVisible(y)) continue;
 
         tft.setClipRect(0, BODY_TOP, 800, BODY_HEIGHT);
         tft.fillRect(0, y, 800, SETTINGS_ROW_DY, TFT_BLACK);
+        // Section divider above the first row of each group.
+        if (sectionStart) tft.drawFastHLine(20, y + 1, 760, TFT_DARKGREY);
         tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
         tft.drawString(r.label, 20, y + 6);
 
         if (r.kind == SettingRow::SLIDER) {
-            // Brightness: groove + filled portion + knob + % readout.
-            const uint8_t pct = s.brightness;
-            const int cy = y + SETTINGS_ROW_HEIGHT / 2;
-            const int fillW = (int)((uint32_t)pct * SLIDER_TRACK_W / 100);
+            // groove + filled portion + knob + value readout (brightness % or
+            // RPM-smoothing +/-). 0 sits mid-track for the signed smoothing slider.
+            int vmin, vmax, val; sliderSpec(r.id, &vmin, &vmax, &val);
+            const int cy   = y + SETTINGS_ROW_HEIGHT / 2;
+            const int span = (vmax > vmin) ? (vmax - vmin) : 1;
+            int fillW = (int)((long)(val - vmin) * SLIDER_TRACK_W / span);
+            if (fillW < 0) fillW = 0;
+            if (fillW > SLIDER_TRACK_W) fillW = SLIDER_TRACK_W;
             tft.fillRoundRect(SLIDER_TRACK_X, cy - 4, SLIDER_TRACK_W, 8, 4, TFT_DARKGREY);
             tft.fillRoundRect(SLIDER_TRACK_X, cy - 4, fillW > 1 ? fillW : 1, 8, 4, TFT_CYAN);
             const int kx = SLIDER_TRACK_X + fillW;
             tft.fillCircle(kx, cy, 12, TFT_WHITE);
             tft.drawCircle(kx, cy, 12, TFT_DARKGREY);
-            char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%u%%", (unsigned)pct);
+            char pbuf[8];
+            if (r.id == ST_BRIGHTNESS) snprintf(pbuf, sizeof(pbuf), "%d%%", val);
+            else                       snprintf(pbuf, sizeof(pbuf), "%+d", val);
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
             tft.setTextDatum(textdatum_t::middle_right);
             tft.drawString(pbuf, 790, cy);
@@ -4169,6 +4313,9 @@ static void handleSettingsTap(int x, int y) {
             // Tach pulses/rev steps through a discrete list (0.5,1,2,3,4,6,8) via
             // -/+; no keypad (free numeric entry wouldn't map to the list).
             if (r.id == ST_RPM_DIV) {
+                // Discrete list (0.5..8) via -/+; no keypad. IMPORTANT: only
+                // return when the tap actually hit THIS row's -/+ ; otherwise
+                // fall through so taps on rows below this one still dispatch.
                 int idx = rpmPprIndex();
                 if (inRect(x, y, CTRL_MINUS_X, ry, CTRL_MINUS_W, SETTINGS_ROW_HEIGHT)) {
                     if (idx > 0) idx--;
@@ -4178,26 +4325,26 @@ static void handleSettingsTap(int x, int y) {
                     if (idx < N_RPM_PPR - 1) idx++;
                     s.rpm_ppr_x10 = RPM_PPR_X10[idx]; settingsDirty = true; return;
                 }
-                return;
-            }
-            // Tap the value to type it directly on the numeric keypad.
-            if (inRect(x, y, CTRL_VALUE_X, ry, CTRL_VALUE_W, SETTINGS_ROW_HEIGHT)) {
-                openNumericKeyboard(r.id);
-                return;
-            }
-            if (inRect(x, y, CTRL_MINUS_X, ry, CTRL_MINUS_W, SETTINGS_ROW_HEIGHT)) {
-                uint16_t v = getNum(r.id);
-                v = (v > nb.lo + step) ? (v - step) : nb.lo;
-                setNum(r.id, v); clampInvariants();
-                settingsDirty = true;
-                return;
-            }
-            if (inRect(x, y, CTRL_PLUS_X, ry, CTRL_PLUS_W, SETTINGS_ROW_HEIGHT)) {
-                uint16_t v = getNum(r.id);
-                v = (v + step <= nb.hi) ? (v + step) : nb.hi;
-                setNum(r.id, v); clampInvariants();
-                settingsDirty = true;
-                return;
+            } else {
+                // Tap the value to type it directly on the numeric keypad.
+                if (inRect(x, y, CTRL_VALUE_X, ry, CTRL_VALUE_W, SETTINGS_ROW_HEIGHT)) {
+                    openNumericKeyboard(r.id);
+                    return;
+                }
+                if (inRect(x, y, CTRL_MINUS_X, ry, CTRL_MINUS_W, SETTINGS_ROW_HEIGHT)) {
+                    uint16_t v = getNum(r.id);
+                    v = (v > nb.lo + step) ? (v - step) : nb.lo;
+                    setNum(r.id, v); clampInvariants();
+                    settingsDirty = true;
+                    return;
+                }
+                if (inRect(x, y, CTRL_PLUS_X, ry, CTRL_PLUS_W, SETTINGS_ROW_HEIGHT)) {
+                    uint16_t v = getNum(r.id);
+                    v = (v + step <= nb.hi) ? (v + step) : nb.hi;
+                    setNum(r.id, v); clampInvariants();
+                    settingsDirty = true;
+                    return;
+                }
             }
         } else if (r.kind == SettingRow::TOGGLE) {
             if (inRect(x, y, CTRL_TOGGLE_X, ry, CTRL_TOGGLE_W, SETTINGS_ROW_HEIGHT)) {
@@ -4206,6 +4353,7 @@ static void handleSettingsTap(int x, int y) {
                     case ST_REC_SD:     s.record_sd         = !s.record_sd;         break;
                     case ST_REC_CLOUD:  s.record_cloud      = !s.record_cloud;      break;
                     case ST_AUTO_TRACK: s.auto_select_track = !s.auto_select_track; break;
+                    case ST_AUTO_START: s.auto_start        = !s.auto_start;        break;
                     case ST_SHOW_TEMP:  s.show_coolant      = !s.show_coolant;      break;
                     case ST_SHOW_PSI:   s.show_oil_psi      = !s.show_oil_psi;      break;
                     case ST_SHOW_AFR:   s.show_afr          = !s.show_afr;          break;
@@ -7338,6 +7486,12 @@ void loop() {
     handleTouch();
     wifiTick();   // WiFi state machine + one-shot NTP push to Teensy (1 Hz tick)
     uploadTick(); // Dash-initiated upload state machine (UF_*)
+
+    // Periodically re-push the full config to the Teensy so it recovers its
+    // settings after any UART hiccup / Teensy reboot with no user action.
+    // Idempotent — the Teensy just re-applies the same values.
+    { static uint32_t lastCfgResend = 0;
+      if (millis() - lastCfgResend >= 5000) { lastCfgResend = millis(); sendCfgToTeensy(); } }
 
     // Expire SD format arm state after 5 s so the button reverts to red.
     if (sd_format_armed && millis() - sd_format_arm_ms >= 5000) {

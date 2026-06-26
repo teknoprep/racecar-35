@@ -85,6 +85,12 @@
 #define DASH_TOUCH_SCL      20
 #define DASH_TOUCH_ROTATION ROTATION_INVERTED
 
+// Touch gesture tuning. The 7" GT911 reports fast, so keep the snappy defaults
+// (short release debounce, normal swipe distance/time).
+#define DASH_TOUCH_RELEASE_MS 80
+#define DASH_SWIPE_DX_MIN     120
+#define DASH_SWIPE_MS_MAX     800
+
 // ---------------------------------------------------------------------------
 #elif DASH_BOARD == 5
 // ---------------------------------------------------------------------------
@@ -114,9 +120,9 @@
 #define DASH_PIN_VSYNC   GPIO_NUM_41
 #define DASH_PIN_HSYNC   GPIO_NUM_39
 #define DASH_PIN_PCLK    GPIO_NUM_0
-// The current "HMI" 5" (CrowPanel-5.0-HMI repo, V3.0) uses 9 MHz; the older
-// course-file CrowPanel_50 used 12 MHz. Match 9 MHz — it's the value the panel
-// in hand was shipped with, and lower pclk is safe on our 80 MHz-PSRAM build.
+// EXACT vendor values for this panel: CrowPanel-5.0-HMI repo V3.0 demo
+// (example/V3.0/Arduino/Course/LVGL_Arduino5.0) ships freq_write=9 MHz with
+// pclk_active_neg=1. Every data pin + porch already matches that file.
 #define DASH_FREQ_WRITE  9000000
 
 #define DASH_HSYNC_FRONT_PORCH 8
@@ -128,17 +134,33 @@
 
 #define DASH_HSYNC_POLARITY  0
 #define DASH_VSYNC_POLARITY  0
-// Latch on the rising pclk edge (0). The vendor course used 1, but on our build
-// that sampled data mid-transition -> blurry text / colour fringing on this TFT;
-// 0 matches the crisp Advance. (pclk FREQUENCY doesn't affect sharpness, only
-// refresh rate, so the edge is the lever here.)
-#define DASH_PCLK_ACTIVE_NEG 0
+// Latch data on the FALLING pclk edge (1) — the vendor value for this panel.
+// A previous build set this to 0 ("matches the Advance / crisper") but that was
+// wrong: 0 latches the RGB bus mid-transition on this TFT, giving red/colour
+// fringing on thin strokes (small text) while thick strokes (big fonts) mask
+// it. 1 samples in the stable window -> clean small text. (pclk FREQUENCY only
+// affects refresh rate, not sharpness; the latch EDGE is the lever here.)
+#define DASH_PCLK_ACTIVE_NEG 1
 #define DASH_DE_IDLE_HIGH    0
 #define DASH_PCLK_IDLE_HIGH  0
 
 #define DASH_TOUCH_SDA      19
 #define DASH_TOUCH_SCL      20
 #define DASH_TOUCH_ROTATION ROTATION_INVERTED
+
+// Touch gesture tuning — LOOSENED for this panel. The 5" Basic GT911 delivers
+// position updates very slowly (~7-12 Hz even while a finger is dragging, vs
+// the Advance which is fast). With the snappy 80 ms release debounce a swipe
+// gets "released" before the GT911's 2nd sample lands, so dx never accumulates
+// and the swipe is mis-read as a tap (taps work, swipes don't). A longer
+// release debounce BRIDGES the inter-sample gaps so one continuous gesture
+// stays alive across the sparse samples; a shorter swipe distance + longer
+// time window let a 2-3 sample swipe still register. Cost: ~200 ms of tap-
+// release latency, acceptable for the payoff of working swipes. (Advance/7"
+// keep the snappy defaults.)
+#define DASH_TOUCH_RELEASE_MS 200
+#define DASH_SWIPE_DX_MIN     60
+#define DASH_SWIPE_MS_MAX     1500
 
 // ---------------------------------------------------------------------------
 #elif DASH_BOARD == 51
@@ -194,6 +216,12 @@
 #define DASH_TOUCH_SDA      15
 #define DASH_TOUCH_SCL      16
 #define DASH_TOUCH_ROTATION ROTATION_INVERTED   // verify on first boot; flip if mirrored
+
+// Touch gesture tuning. The Advance GT911 reports fast (the user confirms its
+// swipes feel good) — keep the snappy defaults.
+#define DASH_TOUCH_RELEASE_MS 80
+#define DASH_SWIPE_DX_MIN     120
+#define DASH_SWIPE_MS_MAX     800
 
 // ---------------------------------------------------------------------------
 #else

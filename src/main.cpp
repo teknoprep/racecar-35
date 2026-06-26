@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.63"
+#define FIRMWARE_VERSION "0.1.64"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -188,6 +188,8 @@ static struct {
     uint8_t  sensor_type = 0;     // 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN)
     uint16_t rpm_ppr_x10 = 20;    // tach pulses/rev x10 (20 = 2.0). Divides the
                                   // opto-tach frequency into RPM in Direct mode.
+    int8_t   rpm_smooth  = 0;     // RPM display smoothing trim from the dash slider
+                                  // (-10..+10): <0 raw/jumpy, 0 baseline, >0 smoother.
 } g_cfg;
 
 // Set when the dash sends UPLOAD,CANCEL. Volatile across reboot — deliberately
@@ -534,10 +536,16 @@ static void pumpTach() {
         rpm_inst_ring[rpm_ring_head] = inst;
         rpm_ring_head = (rpm_ring_head + 1) % RPM_MEDIAN_N;
         if (rpm_ring_fill < RPM_MEDIAN_N) rpm_ring_fill++;
-        const double med = rpmRingMedian();
-        // Stage 3: EMA smoothing (seed on first good sample so it ramps fast).
+        // Stage 3: smoothing, trimmed by the dash's RPM-smoothing slider
+        // (g_cfg.rpm_smooth, -10..+10): <0 = raw latest sample (skip median) +
+        // EMA off (snappiest/jumpy); 0 = median + EMA off (RPM_EMA_ALPHA baseline);
+        // >0 = median + EMA with alpha 0.91..0.10 (progressively smoother).
+        const int    sm    = g_cfg.rpm_smooth;
+        const double med   = (sm < 0) ? inst : rpmRingMedian();
+        float        alpha = (sm <= 0) ? RPM_EMA_ALPHA : (RPM_EMA_ALPHA - sm * 0.09f);
+        if (alpha < 0.1f) alpha = 0.1f;
         if (rpm_ema <= 0.0f) rpm_ema = (float)med;
-        else                 rpm_ema += RPM_EMA_ALPHA * ((float)med - rpm_ema);
+        else                 rpm_ema += alpha * ((float)med - rpm_ema);
         rpm_last_pulse_ms = millis();
     }
 }
@@ -1679,6 +1687,16 @@ static void handleCfgLine(const String& line) {
         g_cfg.rpm_ppr_x10 = (uint16_t)val.toInt();
         if (g_cfg.rpm_ppr_x10 == 0) g_cfg.rpm_ppr_x10 = 20;
         Serial.printf("[cfg] tach pulses/rev = %.1f\n", g_cfg.rpm_ppr_x10 / 10.0);
+    }
+    else if (key == "rpmsm") {
+        // RPM display smoothing trim from the dash slider (-10..+10).
+        int v = val.toInt();
+        if (v < -10) v = -10;
+        if (v >  10) v =  10;
+        if ((int8_t)v != g_cfg.rpm_smooth) {   // print only on change (periodic re-send is quiet)
+            g_cfg.rpm_smooth = (int8_t)v;
+            Serial.printf("[cfg] rpm smoothing = %d\n", (int)g_cfg.rpm_smooth);
+        }
     }
     else {
         Serial.printf("[cfg] unknown key %s\n", key.c_str());
