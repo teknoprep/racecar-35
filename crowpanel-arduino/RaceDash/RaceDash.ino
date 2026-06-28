@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.64"
+#define FIRMWARE_VERSION "0.1.65"
 
 #include <Preferences.h>
 #include <time.h>
@@ -463,6 +463,19 @@ static bool ts_dirty = false;   // set by +/- taps; triggers value redraw
 // ---------------------------------------------------------------------------
 // Lap timer — GPS-proximity start/finish detection + distance integration.
 // ---------------------------------------------------------------------------
+// Predictive / live-delta engine. We record the session's BEST lap as a
+// "ghost": a table of elapsed-time-vs-distance-into-the-lap, bucketed by
+// distance. The live delta then compares the current lap's elapsed time to the
+// ghost at the SAME distance, and the predicted final = best_lap + that delta.
+// This is position-anchored (not a crude time-ratio), so it tracks where you
+// gained/lost time and converges to the real result as you cross the line.
+constexpr float LAP_BUCKET_MI = 0.0050f;     // ~8 m delta resolution per bucket
+constexpr int   LAP_BUCKETS   = 1200;        // 1200 * 0.005 mi = 6.0 mi max lap
+// Bucket tables live OUTSIDE LapTimer so `lapTimer = LapTimer{}` stays a cheap
+// scalar reset — a ~10 KB temporary on the loopTask stack would risk overflow.
+static uint32_t lapCurBt[LAP_BUCKETS];       // elapsed ms at each dist bucket, current lap
+static uint32_t lapRefBt[LAP_BUCKETS];       // same, for the reference (best) lap
+
 struct LapTimer {
     bool     active          = false;
     int      track_idx       = -1;    // which TRACKS[] entry we're timing at
@@ -476,11 +489,16 @@ struct LapTimer {
     float    last_lap_dist   = 0.0f;  // distance of last completed lap (miles)
     uint32_t best_lap_ms     = 0;     // fastest completed lap this session (0 = none)
     float    best_lap_dist   = 0.0f;  // distance of the best lap (miles)
+
+    int      cur_bucket      = 0;     // # of distance buckets filled this lap (index into lapCurBt)
+    bool     ref_valid       = false; // a reference (best) ghost lap has been captured
+    int      ref_buckets     = 0;     // # of valid buckets in lapRefBt[]
 };
 static LapTimer lapTimer;
 
 constexpr float    LAP_RADIUS_KM = 0.075f;   // 75 m start/finish detection radius
 constexpr uint32_t MIN_LAP_MS    = 15000;    // minimum lap time before a crossing counts
+constexpr int32_t  DELTA_SAME_MS = 50;       // |delta| <= this -> "same pace" (white)
 
 // Recording state — toggled by the START/STOP button on the dash. Sent to
 // the Teensy as `REC,<0|1>\n` on UART0 TX. The Teensy doesn't read this
@@ -871,6 +889,34 @@ static int closestTrackIdx() {
 }
 
 // ---------------------------------------------------------------------------
+// Per-track start/finish override. The baked sf_lat/sf_lon are approximate;
+// this lets the user park on (or cross) the real line and capture it on-site.
+// Stored in NVS as one blob keyed by TRACKS[] index (append-only: never insert
+// a track in the middle or existing overrides shift onto the wrong track).
+// ---------------------------------------------------------------------------
+struct SfOverride { uint8_t used; float lat; float lon; };
+static SfOverride sfOverride[N_TRACKS];   // zero-init: used==0 => fall back to baked
+
+// UI state for the STATUS-page "SET START/FINISH" capture button.
+static bool     sf_set_armed  = false;
+static uint32_t sf_set_arm_ms = 0;
+static char     sf_set_msg[48] = "";
+static uint32_t sf_set_msg_ms = 0;
+
+// Resolve the start/finish line actually used for lap detection at track idx.
+static void effectiveSf(int idx, float* lat, float* lon) {
+    if (idx < 0 || idx >= N_TRACKS) { *lat = 0; *lon = 0; return; }
+    if (sfOverride[idx].used) { *lat = sfOverride[idx].lat; *lon = sfOverride[idx].lon; }
+    else                      { *lat = TRACKS[idx].sf_lat;  *lon = TRACKS[idx].sf_lon;  }
+}
+
+static void saveSfOverrides() {
+    prefs.begin("dash", false);
+    prefs.putBytes("sf_ovr", sfOverride, sizeof(sfOverride));
+    prefs.end();
+}
+
+// ---------------------------------------------------------------------------
 // Track picker state. Defined here (not next to its drawing code) so
 // handleTouch() can read tp.scrollY / tp.dirty for drag-scroll without
 // type-ordering dance.
@@ -971,6 +1017,11 @@ static void loadSettings() {
         if (active_track_name[0] == '\0' && last_track_idx >= 0)
             strncpy(active_track_name, TRACKS[last_track_idx].name, sizeof(active_track_name) - 1);
     }
+    // Per-track start/finish overrides (one blob). Only restore if the stored
+    // size matches the current TRACKS[] count — a size change means tracks were
+    // added/removed, so the old index map can't be trusted; ignore it then.
+    if (prefs.getBytesLength("sf_ovr") == sizeof(sfOverride))
+        prefs.getBytes("sf_ovr", sfOverride, sizeof(sfOverride));
     prefs.end();
 }
 
@@ -1258,10 +1309,21 @@ static void updateLapTimer() {
     lapTimer.dist_miles += g.mph * dt_h;
     lapTimer.prev_gps_ms = now;
 
-    // Distance from THIS track's start/finish line.
-    const TrackInfo& track = TRACKS[tIdx];
-    const float sfKm = trackDistanceKm(g.lat_deg, g.lon_deg, track.sf_lat, track.sf_lon);
     const uint32_t elapsed = now - lapTimer.lap_start_ms;
+
+    // Record this lap's elapsed-time-vs-distance into the ghost table. Each
+    // bucket holds the elapsed time at which cumulative distance first reached
+    // that bucket boundary; cur_bucket is how many we've filled.
+    {
+        int b = (int)(lapTimer.dist_miles / LAP_BUCKET_MI);
+        if (b >= LAP_BUCKETS) b = LAP_BUCKETS - 1;
+        while (lapTimer.cur_bucket <= b) lapCurBt[lapTimer.cur_bucket++] = elapsed;
+    }
+
+    // Distance from THIS track's start/finish line (user override if set).
+    float sfLat, sfLon;
+    effectiveSf(tIdx, &sfLat, &sfLon);
+    const float sfKm = trackDistanceKm(g.lat_deg, g.lon_deg, sfLat, sfLon);
 
     if (!lapTimer.left_start && sfKm > LAP_RADIUS_KM * 2.0f) {
         lapTimer.left_start = true;
@@ -1271,11 +1333,16 @@ static void updateLapTimer() {
             // Clean completed lap — record it.
             lapTimer.last_lap_ms   = elapsed;
             lapTimer.last_lap_dist = lapTimer.dist_miles;
-            // Track the session's fastest lap so the predictive delta has a
-            // reference to compare against.
+            // Track the session's fastest lap and snapshot it as the predictive
+            // reference ("ghost") the live delta compares against.
             if (lapTimer.best_lap_ms == 0 || elapsed < lapTimer.best_lap_ms) {
                 lapTimer.best_lap_ms   = elapsed;
                 lapTimer.best_lap_dist = lapTimer.dist_miles;
+                int nb = lapTimer.cur_bucket;
+                if (nb > LAP_BUCKETS) nb = LAP_BUCKETS;
+                memcpy(lapRefBt, lapCurBt, sizeof(uint32_t) * (size_t)nb);
+                lapTimer.ref_buckets = nb;
+                lapTimer.ref_valid   = true;
             }
         }
         // First crossing just arms the timer; subsequent ones record lap times.
@@ -1284,30 +1351,50 @@ static void updateLapTimer() {
         lapTimer.dist_miles     = 0.0f;
         lapTimer.left_start     = false;
         lapTimer.prev_gps_ms    = now;
+        lapTimer.cur_bucket     = 0;   // start a fresh ghost trace for the new lap
     }
 }
 
-// Extrapolate a predicted final lap time. Returns 0 when there's not yet
-// enough data for a meaningful estimate (< 20 % of last lap distance done).
-static uint32_t predictiveLapMs() {
-    if (!lapTimer.active)               return 0;
-    if (lapTimer.last_lap_ms   == 0)   return 0;
-    if (lapTimer.last_lap_dist < 0.001f) return 0;
-    if (lapTimer.dist_miles < lapTimer.last_lap_dist * 0.20f) return 0;
+// Live delta (ms) vs the reference/best lap at the SAME distance into the lap
+// (the "ghost car" gap). Negative = ahead of best pace, positive = behind.
+// Returns INT32_MIN when there's no reference lap yet or the current lap hasn't
+// started timing. Linear-interpolates between ghost buckets for a smooth value.
+static int32_t liveDeltaMs() {
+    if (!lapTimer.active || !lapTimer.ref_valid) return INT32_MIN;
+    if (!lapTimer.timing_started)                return INT32_MIN;
+    if (lapTimer.ref_buckets < 2)                return INT32_MIN;
     const uint32_t elapsed = millis() - lapTimer.lap_start_ms;
-    const float ratio = lapTimer.last_lap_dist / lapTimer.dist_miles;
-    return (uint32_t)((float)elapsed * ratio);
+
+    const float fb = lapTimer.dist_miles / LAP_BUCKET_MI;
+    int k = (int)fb;
+    uint32_t refE;
+    if (k <= 0) {
+        refE = lapRefBt[0];
+    } else if (k >= lapTimer.ref_buckets - 1) {
+        refE = lapRefBt[lapTimer.ref_buckets - 1];   // past the ghost's end — clamp
+    } else {
+        const float frac = fb - (float)k;
+        refE = lapRefBt[k] + (uint32_t)((float)(lapRefBt[k + 1] - lapRefBt[k]) * frac);
+    }
+    return (int32_t)elapsed - (int32_t)refE;
 }
 
-// Signed predictive lap delta vs the session's BEST lap, in milliseconds.
-// Negative = on pace to beat the best lap, positive = slower. Returns
-// INT32_MIN when there's no best lap yet or not enough of the current lap
-// has been driven to extrapolate.
+// Predicted final lap time = best lap + the live delta. As you drive, the delta
+// converges to the true difference, so PRED converges to the real lap time.
+// Returns 0 when there's no reference lap / not enough data yet.
+static uint32_t predictiveLapMs() {
+    if (lapTimer.best_lap_ms == 0) return 0;
+    const int32_t d = liveDeltaMs();
+    if (d == INT32_MIN) return 0;
+    int32_t p = (int32_t)lapTimer.best_lap_ms + d;
+    if (p < 0) p = 0;
+    return (uint32_t)p;
+}
+
+// Signed predictive lap delta vs the session's BEST lap, live. INT32_MIN when
+// there's no best lap yet or the current lap hasn't begun timing.
 static int32_t predictiveDeltaMs() {
-    if (lapTimer.best_lap_ms == 0) return INT32_MIN;
-    const uint32_t pred = predictiveLapMs();
-    if (pred == 0) return INT32_MIN;
-    return (int32_t)pred - (int32_t)lapTimer.best_lap_ms;
+    return liveDeltaMs();
 }
 
 // ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>
@@ -3238,8 +3325,8 @@ static void drawDashPage() {
     }
 
     // Middle column: predictive (PRED) and last completed (LAP) lap times.
-    // PRED is green if on pace for a faster lap, red if slower, grey when
-    // there's not enough data. LAP is white — it's a static fact.
+    // PRED is green when on pace for a faster lap, white when ~even, red when
+    // slower, grey until there's a ghost lap. LAP is white — a static fact.
     {
         const uint32_t predMs = predictiveLapMs();
         const uint32_t cs = predMs / 10;
@@ -3251,9 +3338,12 @@ static void drawDashPage() {
                 col = TFT_DARKGREY;
             } else {
                 formatLapTime(predMs, buf, sizeof(buf));
-                const uint32_t ref = lapTimer.best_lap_ms ? lapTimer.best_lap_ms
-                                                          : lapTimer.last_lap_ms;
-                col = (ref > 0 && predMs < ref) ? TFT_GREEN : TFT_RED;
+                // Colour by pace vs best: faster=green, same=white, slower=red.
+                const int32_t d = predictiveDeltaMs();
+                col = (d == INT32_MIN)     ? TFT_WHITE
+                    : (d < -DELTA_SAME_MS) ? TFT_GREEN
+                    : (d >  DELTA_SAME_MS) ? TFT_RED
+                                           : TFT_WHITE;
             }
             if (dash_sprites_ready) {
                 spr_pred.fillSprite(bg);
@@ -3300,9 +3390,9 @@ static void drawDashPage() {
         }
     }
 
-    // DELTA — predictive lap delta vs the session's best lap. Green when we're
-    // on pace to beat the best lap, red when slower, grey until there's a best
-    // lap recorded and enough of the current lap is done to extrapolate.
+    // DELTA — live gap vs the session's best lap at the same point on track.
+    // Green when ahead of best pace, white when within DELTA_SAME_MS (even),
+    // red when behind, grey until a ghost (best) lap has been recorded.
     {
         const int32_t deltaMs = predictiveDeltaMs();
         const int32_t cs = (deltaMs == INT32_MIN) ? INT32_MIN : deltaMs / 10;
@@ -3317,7 +3407,10 @@ static void drawDashPage() {
                 snprintf(buf, sizeof(buf), "%c%u.%02u",
                          deltaMs < 0 ? '-' : '+',
                          (unsigned)(a / 1000), (unsigned)((a % 1000) / 10));
-                col = deltaMs < 0 ? TFT_GREEN : TFT_RED;
+                // faster=green, within DELTA_SAME_MS=white (same), slower=red.
+                col = (deltaMs < -DELTA_SAME_MS) ? TFT_GREEN
+                    : (deltaMs >  DELTA_SAME_MS) ? TFT_RED
+                                                 : TFT_WHITE;
             }
             if (dash_sprites_ready) {
                 spr_delta.fillSprite(bg);
@@ -7263,6 +7356,33 @@ static void drawStatusPage() {
         tft.drawString(buf, RV, 326);
     }
 
+    // SET START/FINISH capture button (right column, above the firmware row).
+    // Park on (or cross) the real line and two-tap to store it as this track's
+    // S/F override; the baked sf_lat/sf_lon are only approximate.
+    {
+        const int bx = 410, by = 344, bw = 370, bh = 32;
+        const int tIdx = closestTrackIdx();
+        const bool armed   = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
+        const bool haveMsg = (sf_set_msg[0] != '\0') && (millis() - sf_set_msg_ms < 4000);
+        uint16_t fill = haveMsg     ? TFT_DARKGREEN
+                      : (tIdx < 0)  ? TFT_DARKGREY
+                      : armed       ? TFT_ORANGE
+                                     : TFT_NAVY;
+        tft.fillRect(bx, by, bw, bh, fill);
+        tft.drawRect(bx, by, bw, bh, TFT_WHITE);
+        tft.setFont(&fonts::Font2);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextColor(TFT_WHITE, fill);
+        char lbl[56];
+        if      (haveMsg)  snprintf(lbl, sizeof(lbl), "%s", sf_set_msg);
+        else if (tIdx < 0) snprintf(lbl, sizeof(lbl), "SET S/F - not at a known track");
+        else if (armed)    snprintf(lbl, sizeof(lbl), "TAP AGAIN: set S/F @ %s", TRACKS[tIdx].name);
+        else               snprintf(lbl, sizeof(lbl), "SET START/FINISH @ %s%s",
+                                    TRACKS[tIdx].name, sfOverride[tIdx].used ? " (custom)" : "");
+        tft.drawString(lbl, bx + bw / 2, by + bh / 2);
+        tft.setTextDatum(textdatum_t::top_left);
+    }
+
     // FIRMWARE section — dash version, teensy version, mismatch indicator,
     // and (if mismatched) a resolve button on the right column.
     tft.setTextPadding(LPAD);
@@ -7312,6 +7432,32 @@ static void drawStatusPage() {
 }
 
 static void handleStatusTap(int x, int y) {
+    // SET START/FINISH button (handled first so it works regardless of the
+    // version-match early-return below). Two-tap: first tap arms, second tap
+    // within 5 s stores the current GPS position as this track's S/F override.
+    if (x >= 410 && x <= 780 && y >= 344 && y <= 376) {
+        const int tIdx = closestTrackIdx();
+        if (tIdx < 0) {
+            snprintf(sf_set_msg, sizeof(sf_set_msg), "not at a known track");
+            sf_set_msg_ms = millis();
+            return;
+        }
+        const bool wasArmed = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
+        if (wasArmed) {
+            sf_set_armed = false;
+            sfOverride[tIdx].used = 1;
+            sfOverride[tIdx].lat  = g.lat_deg;
+            sfOverride[tIdx].lon  = g.lon_deg;
+            saveSfOverrides();
+            snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F SAVED: %s", TRACKS[tIdx].name);
+            sf_set_msg_ms = millis();
+        } else {
+            sf_set_armed  = true;
+            sf_set_arm_ms = millis();
+        }
+        return;
+    }
+
     // Only the mismatch button is currently tappable on the status page.
     const bool versions_known = (strcmp(teensy_fw_version, "?") != 0);
     const bool versions_match = versions_known &&

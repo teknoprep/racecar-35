@@ -1,37 +1,37 @@
 {
   "teensy": {
     "board":   "teensy",
-    "version": "0.1.64",
+    "version": "0.1.65",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/teensy41-dash.hex",
-    "sha256":  "4557423a484552f3f22dc361e7e3746f6666bf80442c54f388e32a2ef551a56b",
+    "sha256":  "719ad9a25423aa3c54f92d5086ab8d37e032b81a8c0f6640f83cf2105dc16d68",
     "size":    593434
   },
   "crowpanel7": {
     "board":   "crowpanel7",
-    "version": "0.1.64",
+    "version": "0.1.65",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
-    "sha256":  "ea0cba5ec8065ec0e29c4fd2ebad53275f095c1b14c8ffda0e958274b3d5d172",
-    "size":    1040000
+    "sha256":  "1b0f2c27cdffa505798129fcee72e6cfef52bc1eb6542e09a0ea895b4abea4b0",
+    "size":    1041088
   },
   "crowpanel5": {
     "board":   "crowpanel5",
-    "version": "0.1.64",
+    "version": "0.1.65",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5-dash.bin",
-    "sha256":  "dd04d233d014f8cf393ab711d02ae4af67d8051650b96c5a636ce1a8894440d8",
-    "size":    1040000
+    "sha256":  "80888e3d26d4aac6cc57bdcc3f46adf498420fad9589e9b0193804573bbe2cb2",
+    "size":    1041088
   },
   "crowpanel5adv": {
     "board":   "crowpanel5adv",
-    "version": "0.1.64",
+    "version": "0.1.65",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5adv-dash.bin",
-    "sha256":  "c55976b9f9def954aaefbbd8fd91f6b724bc37082cb006a8362502a1a7c495ac",
-    "size":    1039616
+    "sha256":  "80467dbacf1067fb696ed5d76fba0832a195ebe988b69e52cad3fc875dec5422",
+    "size":    1040688
   },
   "crowpanel": {
     "board":   "crowpanel7",
-    "version": "0.1.64",
+    "version": "0.1.65",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
-    "sha256":  "ea0cba5ec8065ec0e29c4fd2ebad53275f095c1b14c8ffda0e958274b3d5d172",
-    "size":    1040000
+    "sha256":  "1b0f2c27cdffa505798129fcee72e6cfef52bc1eb6542e09a0ea895b4abea4b0",
+    "size":    1041088
   }
 }

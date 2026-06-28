@@ -272,6 +272,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
+| `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon}` sized `N_TRACKS`, keyed by `TRACKS[]` index. Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
 
 `clampInvariants()` enforces `rpm_min < rpm_max`, `alert1_rpm < alertmax_rpm`, `alert1_hz < alertmax_hz` after every mutation.
 
@@ -294,6 +295,26 @@ The `Auto select by GPS` toggle determines whether the picker actually opens or 
 - **OFF** or no match → open picker; user taps a row, taps CONFIRM
 - The synthetic `(no track / unknown)` row is always last in the list and emits `TRACK,UNKNOWN`
 - Closest track is **highlighted green at the top** of the picker with a `closest · X.X km` distance label
+
+### Lap timer / predictive / delta (dash-only, GPS-derived)
+Lap timing lives entirely in `RaceDash.ino` (`updateLapTimer()`), runs whenever
+there's a GPS fix at a known track regardless of REC state, and is **display-only**
+(it is NOT written into the Teensy SD/cloud NDJSON). Middle dash column shows
+`PRED` / `LAP` / `DELTA`.
+- **Start/finish detection**: distance to the track's S/F line (override if set,
+  else baked) within `LAP_RADIUS_KM` (75 m). First clean crossing arms timing;
+  each subsequent crossing records a lap. `MIN_LAP_MS` (15 s) floor.
+- **Predictive = "ghost lap" method.** The session-best lap is snapshotted as a
+  time-vs-distance table (`lapRefBt[]`, ~8 m buckets, `LAP_BUCKET_MI`). The live
+  `liveDeltaMs()` compares the current lap's elapsed time to the ghost at the
+  **same distance into the lap** (interpolated); `PRED = best_lap + delta`. Needs
+  one complete lap to seed the ghost (lap 1 shows `--`). Bucket tables are kept
+  **outside** the `LapTimer` struct so `lapTimer = LapTimer{}` stays a cheap
+  scalar reset (a ~10 KB temporary on the loopTask stack would risk overflow).
+- **Colours (PRED + DELTA): green/white/red** = faster / same (within
+  `DELTA_SAME_MS` = 50 ms) / slower; grey `--` until a ghost lap exists.
+- The **baked `sf_lat/sf_lon` are approximate** — use the STATUS-page SET
+  START/FINISH capture (NVS `sf_ovr`) to pin the real line per track on-site.
 
 ### Touch handling
 Single touch handler at the top of `loop()` distinguishes:
