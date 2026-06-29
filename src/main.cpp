@@ -57,6 +57,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <EEPROM.h>
 #include "FXUtil.h"        // FlasherX: in-application reflash for Teensy 4.x
 extern "C" {
   #include "FlashTxx.h"     // low-level flash primitives (firmware_buffer_init, etc.)
@@ -66,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.66"
+#define FIRMWARE_VERSION "0.1.67"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -829,6 +830,44 @@ static struct {
     float   gx = 0, gy = 0, gz = 0;
 } imu;
 
+// --- Boot-time auto-calibration (see CLAUDE.md "IMU auto-calibration") -------
+// Applied to every read: gyro bias is SUBTRACTED, accel is SCALE-normalized so
+// |a| == 1 g. Offsets are recomputed every boot (gyro bias drifts with
+// temperature) but only COMMITTED when the device is provably still during the
+// cal window; otherwise the last-good EEPROM offsets are retained.
+static struct {
+    float gx_off = 0, gy_off = 0, gz_off = 0;   // gyro bias, deg/s (subtracted)
+    float a_scale = 1.0f;                         // accel scale so |a|=1g
+    bool  valid   = false;                        // loaded or freshly calibrated?
+} imuCal;
+
+// Stillness gate: max peak-to-peak over the cal window to accept a fresh cal.
+// At rest we measured ~0.2 dps / ~0.02 g jitter, so these are ~10x headroom.
+constexpr float GYRO_STILL_DPS = 2.0f;
+constexpr float ACCEL_STILL_G  = 0.10f;
+
+// EEPROM persistence of last-good offsets (Teensy flash-emulated EEPROM @ addr 0;
+// nothing else on the Teensy uses EEPROM — see CLAUDE.md).
+struct ImuCalStore { uint16_t magic; float gx_off, gy_off, gz_off, a_scale; };
+constexpr uint16_t IMUCAL_MAGIC   = 0xCA15;
+constexpr int      IMUCAL_EE_ADDR = 0;
+
+static void loadImuCal() {
+    ImuCalStore s;
+    EEPROM.get(IMUCAL_EE_ADDR, s);
+    if (s.magic == IMUCAL_MAGIC && s.a_scale > 0.5f && s.a_scale < 2.0f) {
+        imuCal.gx_off = s.gx_off; imuCal.gy_off = s.gy_off; imuCal.gz_off = s.gz_off;
+        imuCal.a_scale = s.a_scale; imuCal.valid = true;
+        Serial.printf("IMU cal loaded (EEPROM): bias[%.2f %.2f %.2f] dps, scale %.4f\n",
+                      imuCal.gx_off, imuCal.gy_off, imuCal.gz_off, imuCal.a_scale);
+    }
+}
+
+static void saveImuCal() {
+    ImuCalStore s{ IMUCAL_MAGIC, imuCal.gx_off, imuCal.gy_off, imuCal.gz_off, imuCal.a_scale };
+    EEPROM.put(IMUCAL_EE_ADDR, s);   // .put == update: only writes changed bytes
+}
+
 static bool setupIMU() {
     Wire.begin();
     Wire.setClock(400000);
@@ -850,7 +889,85 @@ static bool setupIMU() {
     return true;
 }
 
-// Read one 14-byte burst from the MPU-6050 and accumulate into the averager.
+// Read one 14-byte burst from the MPU-6050 into engineering units (RAW, no
+// calibration applied). All 14 bytes are buffered first so the int16 assembly
+// has a well-defined byte order (the old inline (read()<<8)|read() relied on
+// unspecified C++ operand evaluation order). Returns false on I2C failure.
+static bool readImuRaw(float a[3], float g[3]) {
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x3B);   // ACCEL_XOUT_H — burst start
+    Wire.endTransmission(false);
+    if (Wire.requestFrom(MPU6050_ADDR, (uint8_t)14, (uint8_t)true) < 14) return false;
+    uint8_t b[14];
+    for (int i = 0; i < 14; i++) b[i] = Wire.read();
+    a[0] = (int16_t)((b[0]  << 8) | b[1])  * (1.0f / 16384.0f);
+    a[1] = (int16_t)((b[2]  << 8) | b[3])  * (1.0f / 16384.0f);
+    a[2] = (int16_t)((b[4]  << 8) | b[5])  * (1.0f / 16384.0f);
+    // b[6..7] = temperature (discarded)
+    g[0] = (int16_t)((b[8]  << 8) | b[9])  * (1.0f / 131.0f);
+    g[1] = (int16_t)((b[10] << 8) | b[11]) * (1.0f / 131.0f);
+    g[2] = (int16_t)((b[12] << 8) | b[13]) * (1.0f / 131.0f);
+    return true;
+}
+
+// Boot-time calibration. Loads last-good offsets from EEPROM first (the
+// fallback), then samples ~0.5 s at rest. If the device is moving during the
+// window (peak-to-peak over threshold) the fresh cal is REJECTED and the loaded
+// offsets stand — this is what stops a calibration taken while driving / idling
+// from corrupting the whole session. Otherwise: gyro bias = mean (true rest
+// value is 0); accel scale = 1/|a| so gravity reads exactly 1 g regardless of
+// how the unit is oriented at boot (orientation-independent — no assumption the
+// car is level). Committed offsets are written back to EEPROM.
+static void calibrateIMU() {
+    if (!imu_present) return;
+    loadImuCal();                         // fallback if the gate rejects this cal
+    delay(50);                            // let the gyro PLL settle after wake
+
+    float a[3], g[3];
+    for (int i = 0; i < 10; i++) { readImuRaw(a, g); delay(2); }   // discard warm-up
+
+    constexpr int N = 200;
+    double as[3] = {0,0,0}, gs[3] = {0,0,0};
+    float  amin[3], amax[3], gmin[3], gmax[3];
+    for (int k = 0; k < 3; k++) { amin[k]=1e9f; amax[k]=-1e9f; gmin[k]=1e9f; gmax[k]=-1e9f; }
+    int got = 0;
+    for (int i = 0; i < N; i++) {
+        if (!readImuRaw(a, g)) { delay(2); continue; }
+        for (int k = 0; k < 3; k++) {
+            as[k] += a[k]; gs[k] += g[k];
+            if (a[k] < amin[k]) amin[k] = a[k];  if (a[k] > amax[k]) amax[k] = a[k];
+            if (g[k] < gmin[k]) gmin[k] = g[k];  if (g[k] > gmax[k]) gmax[k] = g[k];
+        }
+        got++;
+        delay(2);
+    }
+    if (got < N / 2) { Serial.println(F("IMU cal: too few reads, keeping prior offsets")); return; }
+
+    const float inv = 1.0f / got;
+    float am[3], gm[3];
+    for (int k = 0; k < 3; k++) { am[k] = as[k] * inv; gm[k] = gs[k] * inv; }
+
+    float gp2p = 0, ap2p = 0;
+    for (int k = 0; k < 3; k++) {
+        float gd = gmax[k] - gmin[k]; if (gd > gp2p) gp2p = gd;
+        float ad = amax[k] - amin[k]; if (ad > ap2p) ap2p = ad;
+    }
+    if (gp2p > GYRO_STILL_DPS || ap2p > ACCEL_STILL_G) {
+        Serial.printf("IMU cal ABORTED — device moving (gyro p2p=%.2f dps, accel p2p=%.3f g); using %s offsets\n",
+                      gp2p, ap2p, imuCal.valid ? "stored" : "zero");
+        return;
+    }
+
+    imuCal.gx_off = gm[0]; imuCal.gy_off = gm[1]; imuCal.gz_off = gm[2];
+    const float mag = sqrtf(am[0]*am[0] + am[1]*am[1] + am[2]*am[2]);
+    if (mag > 0.5f && mag < 1.5f) imuCal.a_scale = 1.0f / mag;   // else keep prior scale
+    imuCal.valid = true;
+    saveImuCal();
+    Serial.printf("IMU calibrated: gyro bias[%.2f %.2f %.2f] dps, |a|=%.3f g -> scale %.4f\n",
+                  imuCal.gx_off, imuCal.gy_off, imuCal.gz_off, mag, imuCal.a_scale);
+}
+
+// Read one burst and accumulate CALIBRATED samples into the averager.
 // Returns silently if the device is absent or the burst is incomplete.
 static void readIMU() {
     if (!imu_present) return;
@@ -859,25 +976,14 @@ static void readIMU() {
     if (now - lastReadMs < 4) return;   // cap at ~250 Hz
     lastReadMs = now;
 
-    Wire.beginTransmission(MPU6050_ADDR);
-    Wire.write(0x3B);   // ACCEL_XOUT_H — burst start
-    Wire.endTransmission(false);
-    if (Wire.requestFrom(MPU6050_ADDR, (uint8_t)14, (uint8_t)true) < 14) return;
-
-    const int16_t raw_ax = (int16_t)((Wire.read() << 8) | Wire.read());
-    const int16_t raw_ay = (int16_t)((Wire.read() << 8) | Wire.read());
-    const int16_t raw_az = (int16_t)((Wire.read() << 8) | Wire.read());
-    Wire.read(); Wire.read();   // temp — discard
-    const int16_t raw_gx = (int16_t)((Wire.read() << 8) | Wire.read());
-    const int16_t raw_gy = (int16_t)((Wire.read() << 8) | Wire.read());
-    const int16_t raw_gz = (int16_t)((Wire.read() << 8) | Wire.read());
-
-    imu.ax_sum += raw_ax * (1.0f / 16384.0f);
-    imu.ay_sum += raw_ay * (1.0f / 16384.0f);
-    imu.az_sum += raw_az * (1.0f / 16384.0f);
-    imu.gx_sum += raw_gx * (1.0f / 131.0f);
-    imu.gy_sum += raw_gy * (1.0f / 131.0f);
-    imu.gz_sum += raw_gz * (1.0f / 131.0f);
+    float a[3], g[3];
+    if (!readImuRaw(a, g)) return;
+    imu.ax_sum += a[0] * imuCal.a_scale;
+    imu.ay_sum += a[1] * imuCal.a_scale;
+    imu.az_sum += a[2] * imuCal.a_scale;
+    imu.gx_sum += g[0] - imuCal.gx_off;
+    imu.gy_sum += g[1] - imuCal.gy_off;
+    imu.gz_sum += g[2] - imuCal.gz_off;
     imu.n++;
 }
 
@@ -2447,6 +2553,9 @@ void setup() {
 
     // IMU on Wire (SDA=18, SCL=19). Non-fatal if absent.
     imu_present = setupIMU();
+    // Boot-time auto-calibration (gyro bias + accel scale), gated by a stillness
+    // check; falls back to EEPROM offsets if the car is moving at boot.
+    if (imu_present) calibrateIMU();
 
     // W5500 Ethernet (SPI0: CS=10, RST=6). Non-fatal if unplugged.
     setupEthernet();

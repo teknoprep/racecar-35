@@ -458,6 +458,65 @@ Workflow: wire transceiver → enable TunerStudio broadcast → run engine → T
 capture → vary RPM ~30 s → Stop → pull SD → decode which byte pairs track RPM/CLT/AFR → lock in
 the real offsets in `pumpCAN()`.
 
+## IMU (MPU-6050) — wiring + boot auto-calibration
+
+GY-521 / MPU-6050 on the Teensy's **default `Wire` bus (I2C0) = pin 18 SDA, pin 19 SCL**,
+400 kHz, address **0x68** (`AD0` → GND). Read as a raw 14-byte burst from `0x3B` at ~250 Hz,
+averaged into each emit window (`readIMU()` / `flushImu()` in [src/main.cpp](src/main.cpp)),
+emitted as the `IMU,ax,ay,az,gx,gy,gz` wire line. Accel ±2 g (16384 LSB/g), gyro ±250 °/s
+(131 LSB/°s), DLPF 44 Hz (`CONFIG=0x03`).
+
+**Wiring (the part that bit us — SDA/SCL get swapped, or wired to the wrong I2C pair):**
+
+| GY-521 | → Teensy 4.1 | note |
+| --- | --- | --- |
+| VCC | **3.3V** | NOT 5V — Teensy GPIO isn't 5V-tolerant; the module's pull-ups reference VCC |
+| GND | GND | common ground is mandatory |
+| **SDA** | **pin 18** | I2C0 SDA (not 17=Wire1, not 25=Wire2) |
+| **SCL** | **pin 19** | I2C0 SCL (not 16=Wire1, not 24=Wire2) |
+| AD0 | GND | leaving it high/floating → addr 0x69 → "MPU-6050 NOT found" |
+
+The Teensy 4.1 has **three** SDA/SCL pairs; only `Wire`=18/19 works here. Pins 16/17 (`Wire1`)
+are already the oil/coolant ADC (A2/A3). Boot banner says exactly which way it went:
+`MPU-6050 ready ...` (detected) vs `MPU-6050 NOT found on Wire (SDA=18, SCL=19)`.
+**Detection is one-shot at boot** — if the MPU doesn't ACK that boot, `imu_present` stays false
+and every `IMU` line is `0.00,...,0.0` for the whole session (the all-zeros signature = not
+detected, NOT a calibration artifact). We saw intermittent non-detection on a jostled DuPont
+jumper — if zeros show up sporadically, re-seat/solder the IMU header before suspecting code.
+
+### Boot auto-calibration (`calibrateIMU()`) — gyro bias + accel scale, every boot
+Runs once right after `setupIMU()` in `setup()`. **Chosen design (Option B):**
+- **Gyro: full bias removal, every boot.** True at-rest value is 0,0,0, so bias = mean of the
+  window, SUBTRACTED on every read. Re-done each boot because MPU-6050 gyro zero-rate drifts
+  with temperature (a stored one-time cal would be wrong on the next cold start). We measured
+  ~26 °/s bias on this unit → cal drives it to ~0.
+- **Accel: scale-normalize to 1 g, every boot.** `a_scale = 1 / |a_measured|`, MULTIPLIED on
+  every read so gravity reads exactly 1.00 g. **Orientation-independent** — it does NOT assume
+  the car is level or that any particular axis is "up", so a boot on a slope is fine. It fixes
+  the magnitude (we measured 1.41 g → 1.00 g) but does NOT remove per-axis offset (that needs a
+  6-position cal — deliberately deferred; can be added later as a stored EEPROM cal + dash cmd).
+- **Stillness gate (the critical safeguard).** ~0.5 s window; if any axis peak-to-peak exceeds
+  `GYRO_STILL_DPS` (2 °/s) or `ACCEL_STILL_G` (0.10 g) the device is moving → the fresh cal is
+  **REJECTED** and the last-good offsets stand. This stops a cal taken while idling/driving/
+  bumped from corrupting the whole session. Banner prints `IMU cal ABORTED — device moving ...`
+  when it trips.
+- **EEPROM persistence.** Last-good offsets live in the Teensy's flash-emulated **EEPROM at
+  address 0** (`ImuCalStore` = magic `0xCA15` + 3 gyro offsets + accel scale, 18 bytes).
+  `loadImuCal()` runs first as the fallback; `saveImuCal()` (`EEPROM.put` == update) writes back
+  only on an accepted cal. **EEPROM addr 0 is now reserved for IMU cal — nothing else on the
+  Teensy uses EEPROM; if you add EEPROM storage, start past `sizeof(ImuCalStore)`.**
+- **Bonus fix:** `readImuRaw()` buffers all 14 bytes before assembling the int16s, removing the
+  old `(read()<<8)|read()` reliance on unspecified C++ operand evaluation order.
+
+Verified at rest after flashing: `gyro ~0 °/s`, `|a| = 1.00 g`. If you ever need to wipe the
+stored cal, reflash won't clear EEPROM — power-cycle with the IMU still and it self-recomputes,
+or zero `ImuCalStore.magic`.
+
+Still on the table (not done): lowering the on-chip DLPF (44 Hz → 10/21 Hz) for better
+anti-aliasing before the 25 Hz decimation, and using the discarded MPU temperature bytes for
+gyro temp-drift compensation. Heavy filtering / IMU↔GPS fusion is intended for the Docker
+post-processing side, not the Teensy (keep the logged stream calibrated-but-raw).
+
 ## Libraries added this cycle
 - **`TAMC_GT911`** (Arduino registry) — GT911 touch on Wire. Installed via
   `arduino-cli lib install "TAMC_GT911"`.

@@ -1,37 +1,37 @@
 {
   "teensy": {
     "board":   "teensy",
-    "version": "0.1.66",
+    "version": "0.1.67",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/teensy41-dash.hex",
-    "sha256":  "828d2291296191883ac511c8a9b4901abf5a5f1f50a613c5ff136bd724d16563",
-    "size":    590554
+    "sha256":  "47708b57e00b3c4d391860bbd60c16a9ec9a3679ded6bb29ec782aeab4e08b24",
+    "size":    596314
   },
   "crowpanel7": {
     "board":   "crowpanel7",
-    "version": "0.1.66",
+    "version": "0.1.67",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
-    "sha256":  "b1e73c099f74b05e0ab75543d7b4ffa02a4103494edd85c38236241ec6a0a488",
+    "sha256":  "99e51f958283cde808e83500ce3be3e5e4e5bab9e56de53127e6b14f9fd40461",
     "size":    1040896
   },
   "crowpanel5": {
     "board":   "crowpanel5",
-    "version": "0.1.66",
+    "version": "0.1.67",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5-dash.bin",
-    "sha256":  "e5e21ba0776405341e082ca60ed297c7c1edb952f39dec745648f114d2230d5f",
+    "sha256":  "a43104dc40e150d63a6bfc2a969dc6398dba474fb5a0b59285e65016861ebc97",
     "size":    1040896
   },
   "crowpanel5adv": {
     "board":   "crowpanel5adv",
-    "version": "0.1.66",
+    "version": "0.1.67",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5adv-dash.bin",
-    "sha256":  "8abde05e7bb6789b03e1eaa9e8a403bd605b73618b5ab075ce854f808f721ddb",
+    "sha256":  "2b5caffb86011595b180ae18f22267de7ea3dc6fe9adc9f3eb37936832761451",
     "size":    1040512
   },
   "crowpanel": {
     "board":   "crowpanel7",
-    "version": "0.1.66",
+    "version": "0.1.67",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
-    "sha256":  "b1e73c099f74b05e0ab75543d7b4ffa02a4103494edd85c38236241ec6a0a488",
+    "sha256":  "99e51f958283cde808e83500ce3be3e5e4e5bab9e56de53127e6b14f9fd40461",
     "size":    1040896
   }
 }
