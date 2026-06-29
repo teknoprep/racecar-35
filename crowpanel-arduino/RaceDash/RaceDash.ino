@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.65"
+#define FIRMWARE_VERSION "0.1.66"
 
 #include <Preferences.h>
 #include <time.h>
@@ -61,7 +61,7 @@ enum SettingId : uint8_t {
     ST_SENSOR_TYPE,
     ST_SHOW_AFR, ST_AFR_WARN_LO, ST_AFR_WARN_HI, ST_AFR_WARN_COL,
     ST_REC_SD, ST_REC_CLOUD,
-    ST_CL_HOST, ST_CL_PORT, ST_CL_PROTO, ST_CL_STREAM,
+    ST_CL_HOST, ST_CL_PORT, ST_CL_PROTO,
     ST_CL_AUTH_USER, ST_CL_AUTH_PASS,
     ST_AUTO_TRACK,
     ST_AUTO_START, ST_AUTO_START_MPH,   // auto-start recording + its speed threshold
@@ -557,7 +557,6 @@ struct Settings {
     char     cloud_host[64]   = "racecar.api.blueuc.com";  // default endpoint
     uint16_t cloud_port       = 80;
     uint8_t  cloud_protocol   = 1;     // 0=HTTP, 1=HTTPS, 2=FTP (default HTTPS; FTP NYI)
-    uint8_t  cloud_stream     = 1;     // 0=Live, 1=AfterRace (default AfterRace; WiFi forces AfterRace anyway)
     // cloud_user repurposed as a free-text USER EMAIL tag for data ownership.
     // Not an auth credential — the Teensy forwards it as X-User-Email header.
     // Real auth (Google OAuth) lives in the cloud-side Docker image.
@@ -633,8 +632,6 @@ static Settings s;
 // Names for ENUM-style settings (cycle-on-tap).
 const char* const PROTOCOL_NAMES[] = { "HTTP", "HTTPS", "FTP" };
 constexpr int N_PROTOCOL = 3;
-const char* const STREAM_NAMES[]   = { "Live Stream", "After Race" };
-constexpr int N_STREAM   = 2;
 const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt" };
 constexpr int N_SENSOR_TYPE = 2;
 // Tach pulses/rev choices (the Direct-mode RPM divider). Value shown = pulses
@@ -969,7 +966,6 @@ static void loadSettings() {
     prefs.getString      ("cl_host",  s.cloud_host, sizeof(s.cloud_host));
     s.cloud_port         = prefs.getUShort("cl_port",  s.cloud_port);
     s.cloud_protocol     = prefs.getUChar ("cl_proto", s.cloud_protocol);
-    s.cloud_stream       = prefs.getUChar ("cl_strm",  s.cloud_stream);
     // Renamed in NVS: cl_user -> cl_email, cl_pass -> cl_key. Old key reads
     // are kept as fallback for one release so existing dashes don't lose
     // their settings on upgrade. Drop after a deploy or two.
@@ -1041,7 +1037,6 @@ static void saveSettings() {
     prefs.putString("cl_host",  s.cloud_host);
     prefs.putUShort("cl_port",  s.cloud_port);
     prefs.putUChar ("cl_proto", s.cloud_protocol);
-    prefs.putUChar ("cl_strm",  s.cloud_stream);
     prefs.putString("cl_email", s.cloud_auth_user);   // user email
     prefs.putString("cl_key",   s.cloud_auth_pass);   // API key
     // Clean up the renamed legacy keys so they don't shadow the new ones on
@@ -1107,7 +1102,6 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,cl_host,%s\n",   s.cloud_host);
     Serial.printf("CFG,cl_port,%u\n",   (unsigned)s.cloud_port);
     Serial.printf("CFG,cl_proto,%u\n",  (unsigned)s.cloud_protocol);
-    Serial.printf("CFG,cl_strm,%u\n",   (unsigned)s.cloud_stream);
     Serial.printf("CFG,cl_email,%s\n",  s.cloud_auth_user);
     Serial.printf("CFG,cl_key,%s\n",    s.cloud_auth_pass);
     Serial.printf("CFG,rec_sd,%d\n",    (int)s.record_sd);
@@ -3473,7 +3467,7 @@ static void drawDashPage() {
 struct SettingRow {
     SettingId   id;
     const char* label;
-    // ENUM = cycle through string list (PROTOCOL_NAMES, STREAM_NAMES).
+    // ENUM = cycle through string list (PROTOCOL_NAMES, etc.).
     // TEXT = read-only display today; tap will open a popup keyboard once
     //        that's implemented (next iteration).
     // INFO = read-only display row (no controls, no tap action). Used today
@@ -3516,7 +3510,9 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_CL_HOST,      "Cloud host (DNS/IP)",   SettingRow::TEXT    },
     { ST_CL_PORT,      "Cloud port",            SettingRow::TEXT    },
     { ST_CL_PROTO,     "Cloud protocol",        SettingRow::ENUM    },
-    { ST_CL_STREAM,    "Cloud stream mode",     SettingRow::ENUM    },
+    // ("Cloud stream mode" Live/AfterRace row removed — live "stream to cloud"
+    //  isn't ready and its code was deleted; cloud recording always uploads
+    //  After Race via the /queue/ + dash-driven upload path.)
     { ST_CL_AUTH_USER, "User email",            SettingRow::TEXT    },
     { ST_CL_AUTH_PASS, "API key",               SettingRow::TEXT    },
     { ST_TIMEZONE,     "Time zone",              SettingRow::ENUM    },
@@ -4061,7 +4057,6 @@ static const char* enumValue(SettingId id) {
     switch (id) {
         case ST_INET_MODE:   return INET_MODE_NAMES[s.internet_mode % N_INET_MODE];
         case ST_CL_PROTO:    return PROTOCOL_NAMES[s.cloud_protocol % N_PROTOCOL];
-        case ST_CL_STREAM:   return STREAM_NAMES[s.cloud_stream % N_STREAM];
         case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
         case ST_RPM_DIV:     return RPM_PPR_NAMES[rpmPprIndex()];
@@ -4082,10 +4077,6 @@ static bool rowShouldShow(SettingId id) {
         case ST_WIFI_SSID:
         case ST_WIFI_PASS:
         case ST_WIFI_STATUS: return s.internet_mode == 1;
-        // Live/AfterRace toggle is only meaningful in Ethernet mode. In WiFi
-        // mode the dash forwards files to the cloud after the session ends;
-        // live streaming over UART-to-WiFi is intentionally deferred.
-        case ST_CL_STREAM:   return s.internet_mode == 0;
         // Auto-start speed only matters when auto-start is enabled.
         case ST_AUTO_START_MPH: return s.auto_start;
         default:           return true;
@@ -4109,7 +4100,7 @@ static int rowGroup(SettingId id) {
         case ST_SHOW_AFR:  case ST_AFR_WARN_LO: case ST_AFR_WARN_HI: case ST_AFR_WARN_COL: return SG_SENSORS;
         case ST_REC_SD: case ST_REC_CLOUD: case ST_AUTO_TRACK:
         case ST_AUTO_START: case ST_AUTO_START_MPH: return SG_RECORDING;
-        case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO: case ST_CL_STREAM:
+        case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO:
         case ST_CL_AUTH_USER: case ST_CL_AUTH_PASS: return SG_CLOUD;
         case ST_TIMEZONE: case ST_SET_TIME: return SG_TIME;
         default: return SG_DISPLAY;
@@ -4473,8 +4464,6 @@ static void handleSettingsTap(int x, int y) {
             if (inRect(x, y, ENUM_X, ry, ENUM_W, SETTINGS_ROW_HEIGHT)) {
                 if (r.id == ST_CL_PROTO) {
                     s.cloud_protocol = (s.cloud_protocol + 1) % N_PROTOCOL;
-                } else if (r.id == ST_CL_STREAM) {
-                    s.cloud_stream   = (s.cloud_stream   + 1) % N_STREAM;
                 } else if (r.id == ST_TIMEZONE) {
                     s.timezone_idx = (s.timezone_idx + 1) % N_TIMEZONES;
                     // Notify Teensy so it has the active TZ for future use

@@ -66,7 +66,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.65"
+#define FIRMWARE_VERSION "0.1.66"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -163,9 +163,9 @@ SFE_UBLOX_GNSS myGNSS;
 //
 // SD logging: on REC,1 we open /sessions/session_<unix>_<track>.ndjson and
 // append one NDJSON sample per emit window (25 Hz). On REC,0 we flush +
-// close. Cloud upload runs alongside — live POSTs during the session in
-// Live mode, whole-file POST on close in AfterRace mode. Failed uploads
-// get queued to /queue/ and retried when the link comes back up.
+// close. Cloud upload is always After Race (live streaming was removed): the
+// session file lands in /queue/ and is uploaded after the session ends,
+// dash-driven (Q,GET) or via the queue drain. Nothing POSTs mid-session.
 // ---------------------------------------------------------------------------
 static bool     recording_active = false;
 static char     current_track[32] = "UNKNOWN";
@@ -179,7 +179,6 @@ static struct {
     char     host[64]   = "";
     uint16_t port       = 80;
     uint8_t  proto      = 0;     // 0=HTTP, 1=HTTPS (NYI), 2=FTP (NYI)
-    uint8_t  stream     = 0;     // 0=Live, 1=AfterRace
     char     email[64]  = "";
     char     api_key[64] = "";
     bool     rec_sd     = true;
@@ -201,11 +200,12 @@ static volatile bool uploads_disabled = false;
 static volatile bool upload_in_progress = false;
 static volatile bool upload_cancel_pending = false;
 
-static uint8_t  live_buf[2048];
-static size_t   live_buf_n          = 0;
-static uint32_t live_last_flush_ms  = 0;
-static bool     live_failed_session = false;   // give up on live POSTs for this session
-static bool     live_status_last_ok = false;   // last successful POST flag
+// Live "stream to cloud" was removed (not ready). Cloud recording now ALWAYS
+// uploads After Race: the session file is written to /queue/ and the dash
+// drives the upload (Q,LIST/Q,GET/Q,DEL) / queue drain after the session ends.
+// live_status_last_ok is retained only so the CLD line keeps its <live_ok>
+// field shape (now always 0 — there is no live POST to report on).
+static bool     live_status_last_ok = false;
 static uint32_t queue_depth         = 0;       // updated by scanQueue()
 
 // Test data generator. When test_mode_active is true, emitToDash() and the
@@ -1509,7 +1509,6 @@ static int  cloudUploadFile(const char* path, size_t body_len, File32* f);
 static bool moveToQueue(const char* src_path);
 static void scanQueue();
 static void emitCloudStatus();
-static void liveStreamAppend(const char* line, size_t n);
 static void emitUploadStart(const char* filename, uint32_t total);
 static void emitUploadProg(uint32_t done);
 static void emitUploadDone(const char* status, const char* reason = nullptr);
@@ -1525,9 +1524,9 @@ static void closeSession() {
     // Decide whether to upload now, queue for later, or do nothing.
     // (Order matters: the path we use depends on whether the file made it to SD.)
     const bool have_file = (session_path[0] != '\0' && sdFat.exists(session_path));
-    Serial.printf("[closeSession] path=%s have_file=%d rec_cl=%d inet=%u stream=%u host=%s port=%u\n",
+    Serial.printf("[closeSession] path=%s have_file=%d rec_cl=%d inet=%u host=%s port=%u\n",
                   session_path, (int)have_file, (int)g_cfg.rec_cl,
-                  (unsigned)g_cfg.inet, (unsigned)g_cfg.stream,
+                  (unsigned)g_cfg.inet,
                   g_cfg.host[0] ? g_cfg.host : "<unset>", (unsigned)g_cfg.port);
     if (have_file && g_cfg.rec_cl) {
         // The session is normally already in /queue/ (openSession writes there
@@ -1545,8 +1544,6 @@ static void closeSession() {
     }
 
     // Reset session-scoped state.
-    live_failed_session = false;
-    live_buf_n          = 0;
     session_path[0]     = '\0';
 
     // Refresh free-MB count so the dash sees the new value next status emit.
@@ -1612,10 +1609,6 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
     }
     session_samples++;
 
-    // Feed live cloud streamer (no-op if cloud disabled / Live mode off /
-    // session already gave up on live this run).
-    liveStreamAppend(buf, (size_t)n);
-
     // Periodic flush so power-loss costs <=1 s, and 1 Hz status heartbeat to dash.
     if (millis() - session_last_flush_ms >= 1000) {
         session_last_flush_ms = millis();
@@ -1628,17 +1621,12 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
 // Cloud upload (HTTP only — HTTPS + FTP deferred; see CLAUDE.md).
 //
 // Settings arrive from the dash as CFG,<key>,<val> lines (see handleCfgLine).
-// Three upload paths share one POST primitive (httpPostNdjson):
-//
-//   1. Live stream (rec_cl=1, cl_strm=0): liveStreamAppend() accumulates
-//      NDJSON lines in a small RAM buffer. Every ~200 ms we POST the buffer
-//      to /stream. If a POST fails we set live_failed_session=true; the rest
-//      of the file then becomes a queue candidate on closeSession().
-//   2. After Race (rec_cl=1, cl_strm=1): no live POSTs. closeSession() POSTs
-//      the whole file to /upload. Failure -> move file to /queue/.
-//   3. Queue walker: on link-up and once per 10 s when link is up + no
-//      active session, walk /queue/ oldest-first and POST each to /upload.
-//      Delete on 2xx, leave on failure for next pass.
+// Cloud upload is ALWAYS After Race (live "stream to cloud" was removed):
+//   1. During a session (rec_cl=1): the file is written straight into /queue/
+//      (kill-switch insurance). Nothing is POSTed mid-session.
+//   2. On close: if it isn't already in /queue/, move it there; scan queue.
+//   3. Upload: dash-driven (Q,LIST/Q,GET/Q,DEL), or the queue walker drains
+//      /queue/ oldest-first to /upload when the dash requests a drain.
 //
 // HTTP request format (both endpoints):
 //   POST /stream HTTP/1.1                  (or /upload)
@@ -1650,8 +1638,8 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
 //   X-Track-Name: <url-encoded track>
 //   Content-Length: <n>
 // ---------------------------------------------------------------------------
-// (g_cfg, live_buf, live_failed_session, queue_depth declared up above near
-// recording_active so closeSession() can reference them.)
+// (g_cfg, queue_depth declared up above near recording_active so
+// closeSession() can reference them.)
 static void handleCfgLine(const String& line) {
     // line == "CFG,<key>,<value>"
     // 'CFG,' is FOUR characters — c1 was off-by-one as 3, which made every
@@ -1666,7 +1654,10 @@ static void handleCfgLine(const String& line) {
     if      (key == "cl_host")  { strncpy(g_cfg.host,    val.c_str(), sizeof(g_cfg.host)-1);    g_cfg.host[sizeof(g_cfg.host)-1]=0; }
     else if (key == "cl_port")  { g_cfg.port  = (uint16_t)val.toInt(); }
     else if (key == "cl_proto") { g_cfg.proto = (uint8_t) val.toInt(); }
-    else if (key == "cl_strm")  { g_cfg.stream= (uint8_t) val.toInt(); }
+    // Live "stream to cloud" was removed (not ready). Ignore whatever value the
+    // dash sends and pin AfterRace so no per-sample POST ever blocks the loop
+    // mid-session (that loop stall was starving the GPS UART -> GPS STALE).
+    else if (key == "cl_strm")  { /* live "stream to cloud" removed — ignored; always After Race */ }
     else if (key == "cl_email") { strncpy(g_cfg.email,   val.c_str(), sizeof(g_cfg.email)-1);   g_cfg.email[sizeof(g_cfg.email)-1]=0; }
     else if (key == "cl_key")   { strncpy(g_cfg.api_key, val.c_str(), sizeof(g_cfg.api_key)-1); g_cfg.api_key[sizeof(g_cfg.api_key)-1]=0; }
     else if (key == "rec_sd")   { g_cfg.rec_sd = (val.toInt() != 0); }
@@ -2037,42 +2028,14 @@ static int cloudUploadFile(const char* path, size_t body_len, File32* f) {
     return httpPost("/upload", nullptr, body_len, f);
 }
 
-// --- Live streamer -------------------------------------------------------
-// Accumulates NDJSON sample lines in a small RAM buffer. Flushed periodically
-// from emitToDash() via liveStreamMaybeFlush(). (Storage declared up above
-// next to recording_active.)
+// --- Cloud status emit ---------------------------------------------------
+// CLD,<live_ok>,<queue_depth>. live_ok is always 0 now that live streaming is
+// removed (uploads are After Race, dash-driven); the field is kept for the
+// dash's existing CLD parser.
 static void emitCloudStatus() {
     DASH_SERIAL.printf("CLD,%u,%lu\n",
                        (unsigned)(live_status_last_ok ? 1 : 0),
                        (unsigned long)queue_depth);
-}
-
-static void liveStreamAppend(const char* line, size_t n) {
-    if (!g_cfg.rec_cl || g_cfg.stream != 0) return;     // not in Live mode
-    if (live_failed_session)                return;     // already gave up for this session
-    if (live_buf_n + n > sizeof(live_buf))  return;     // drop — next flush will catch up
-    memcpy(live_buf + live_buf_n, line, n);
-    live_buf_n += n;
-}
-
-static void liveStreamMaybeFlush() {
-    if (uploads_disabled) { live_buf_n = 0; return; }
-    if (wifiInetActive())  { live_buf_n = 0; return; }   // WiFi mode: AfterRace only
-    if (live_buf_n == 0) return;
-    if (millis() - live_last_flush_ms < 200) return;
-    live_last_flush_ms = millis();
-
-    const int status = httpPost("/stream", live_buf, live_buf_n, nullptr);
-    const bool ok = (status >= 200 && status < 300);
-    if (ok) {
-        live_buf_n = 0;
-        if (!live_status_last_ok) { live_status_last_ok = true; emitCloudStatus(); }
-    } else {
-        Serial.printf("[cloud] live POST failed (status=%d) — session will queue on close\n", status);
-        live_failed_session = true;
-        live_buf_n = 0;   // drop buffered samples — the SD file has them anyway
-        if (live_status_last_ok) { live_status_last_ok = false; emitCloudStatus(); }
-    }
 }
 
 // --- /queue/ walker ------------------------------------------------------
@@ -2351,9 +2314,10 @@ static bool drainOneQueued() {
 static void cloudTick() {
     if (uploads_disabled) return;   // cancel-latched until reboot
     if (recording_active) {
-        // Live streamer runs during a session (a no-op in WiFi mode — we
-        // force AfterRace). No queue work while recording.
-        liveStreamMaybeFlush();
+        // No cloud work while recording — the session is written to SD (and to
+        // /queue/ when cloud recording is on) and uploaded After Race. Keeping
+        // the loop free of blocking POSTs here is also what keeps the GPS UART
+        // serviced fast enough to stay locked during a session.
         return;
     }
     // Manual-only drain. Auto-drain has been disabled: the queue walker
@@ -2401,6 +2365,26 @@ void setup() {
     // also more resilient to any loop() jitter from SD sync / SPI bursts.
     static uint8_t dashRxBuf[32768];
     Serial3.addMemoryForRead(dashRxBuf, sizeof(dashRxBuf));
+
+    // SAME fix for the GPS UART (Serial2). Its default RX ring is only tens of
+    // bytes — SMALLER than a single ~100-byte UBX-NAV-PVT frame at 25 Hz. The
+    // GPS stream is parsed by POLLING getPVT() in loop(); RPM is NOT (CAN +
+    // FreqMeasureMulti are interrupt/FIFO-driven), which is why during a race
+    // RPM stays solid while GPS "freezes at the last position": any loop stall
+    // longer than ~25 ms overflows the tiny ring and corrupts the autoPVT
+    // stream. The big stalls come from the blocking cloud HTTP POST while
+    // recording (up to ~800 ms connect + ~1500 ms response ≈ 2.3 s) and, to a
+    // lesser degree, SD sync as the session file grows — which is exactly why
+    // it survives "half a lap or two" and then stays stale: once loops run
+    // chronically slow the 64-byte ring can never re-sync. 32 KB buffers ~8.5 s
+    // at 38400 baud, so the parser rides through a multi-second stall and
+    // recovers instead of permanently freezing. MUST be set before begin().
+    // NOTE: addMemoryForRead() lives on the concrete HardwareSerialIMXRT type,
+    // not the HardwareSerial& alias — call Serial2 directly (as the dash line
+    // calls Serial3 directly above). GPS_SERIAL is an alias for Serial2.
+    static uint8_t gpsRxBuf[32768];
+    Serial2.addMemoryForRead(gpsRxBuf, sizeof(gpsRxBuf));
+
     setSyncProvider(getTeensyTime);
 
     // Wait briefly for USB serial; don't block forever if no host is attached.
@@ -2828,7 +2812,7 @@ void loop() {
         emitCloudStatus();
     }
 
-    // Cloud upload tick — live streamer during recording, queue drainer between.
+    // Cloud upload tick — queue drainer (no-op while recording / nothing queued).
     cloudTick();
 
     // IMU accumulate — rate-limited internally to ~250 Hz.

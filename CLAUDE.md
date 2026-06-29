@@ -229,12 +229,15 @@ VER,teensy,<semver>
 - **`ECU`** carries the full MS3Pro CAN dataset; the dash uses it for coolant/AFR/MAP/TPS when `sensor_type == 1`. `-1` in any field = not-received / fault → dash shows `---`.
 - The dash parser tolerates short forms for back-compat (e.g. `ENG` with 1 or 3 fields).
 - **Rate-limiting**: emit only when `myGNSS.getPVT(0)` returns true OR every 1 s. `getPVT(0)` is non-blocking — never use the blocking variant or the 25 Hz loop chokes.
+- **GPS UART RX buffer (v0.1.66 fix) — DO NOT remove.** Serial2's default RX ring is only tens of bytes — SMALLER than one ~100-byte UBX-NAV-PVT frame. GPS is parsed by *polling* `getPVT()` in `loop()` (RPM is NOT — CAN + `FreqMeasureMulti` are interrupt/FIFO-driven). So any loop stall >~25 ms overflows the ring, desyncs the autoPVT stream, and with a sub-frame buffer it can NEVER re-sync → GPS "freezes at last position" (STALE) while RPM keeps running. The stalls come from **SD `sync()`/`write()` latency during recording** (this is why it only happened once a session started, after "half a lap or two"). Fix: `Serial2.addMemoryForRead(gpsRxBuf, 32768)` in `setup()` BEFORE `begin()` (mirrors the dash Serial3 buffer) — ~8.5 s of slack at 38400 baud so the parser rides through SD spikes. `addMemoryForRead()` is on the concrete `Serial2`, not the `HardwareSerial&` alias.
 
 ### CrowPanel → Teensy (control)
 ```
 REC,<0|1>          # start/stop recording
 TRACK,<name>       # set the current track name (sent immediately before REC,1)
-CFG,<key>,<value>  # push settings (incl. srctyp = sensor_type, cloud config, inet)
+CFG,<key>,<value>  # push settings (incl. srctyp = sensor_type, cloud config, inet).
+                   #   NOTE: cl_strm REMOVED in v0.1.66 (live "stream to cloud"
+                   #   deleted). Teensy ignores cl_strm if an old dash sends it.
 SETTIME,<unix>     # set Teensy RTC
 TZ,<id>            # timezone id (for SD filenames / metadata)
 SDFORMAT           # FAT32-format the SD card
@@ -261,7 +264,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `cl_host` | string | Cloud DNS or IP |
 | `cl_port` | uint16 | Cloud port |
 | `cl_proto` | uint8 | 0=HTTP, 1=HTTPS, 2=FTP |
-| `cl_strm` | uint8 | 0=Live, 1=AfterRace |
+| ~~`cl_strm`~~ | — | **REMOVED in v0.1.66.** Live "stream to cloud" was deleted (not ready, and its mid-session POSTs stalled the loop → GPS STALE). Cloud recording is now **always After Race**. Old stored key is orphaned/harmless. |
 | `cl_email` / `cl_key` | string | Cloud user email (X-User-Email) + API key (X-API-Key, masked). Migrated from legacy `cl_user`/`cl_pass`. |
 | `auto_trk` | bool | Auto-select closest track on START (skip picker if a clear match exists) |
 | `inet` | uint8 | Internet routing: 0=Ethernet (Teensy/W5500), 1=WiFi (CrowPanel) |
@@ -343,7 +346,7 @@ The settings page uses a `settingsDirty` flag, picker uses `tp.dirty`. Drawing i
 Speed renders at Font7 size 4 (~192 px tall) centred at x=600 (right side of screen, away from the START/STOP button on the left). **The decimal drops at >=100 mph** so 3-digit values stay narrow enough to fit the 400-px bg pad without clipping.
 
 ### Setting up new ENUM controls
-Add to `enumValue()`, the appropriate `_NAMES[]` array, and the cycle case in `handleSettingsTap()` ENUM branch. `PROTOCOL_NAMES = {"HTTP", "HTTPS", "FTP"}`, `STREAM_NAMES = {"Live Stream", "After Race"}`.
+Add to `enumValue()`, the appropriate `_NAMES[]` array, and the cycle case in `handleSettingsTap()` ENUM branch. `PROTOCOL_NAMES = {"HTTP", "HTTPS", "FTP"}`. (The `STREAM_NAMES` / `ST_CL_STREAM` Live-vs-AfterRace enum was removed in v0.1.66.)
 
 ## GT911 touch — the hard-won truth (do not regress this)
 
@@ -506,23 +509,26 @@ When the W5500 module arrives, the **Teensy** side gets:
   (~220 bytes/sample × 25 Hz = ~5.5 KB/s = 20 MB/hr — fine over LTE/wired)
 - **SD logging filename convention**: `/sessions/session_<unixtime>_<trackname>.ndjson`. Track name comes from the dash's `TRACK,<name>` line right before `REC,1`; falls back to `UNKNOWN` when not set.
 
-### Cloud strategy
+### Cloud strategy — After Race only (live streaming removed v0.1.66)
 
-| Setting | Live (HTTP/HTTPS) | After Race (HTTP/HTTPS/FTP) |
-| --- | --- | --- |
-| Endpoint | `https://<host>:<port>/stream` per-sample POST | `https://<host>:<port>/upload` whole-file POST, OR FTP PUT to `/incoming/<filename>` |
-| Auth | `Authorization: Basic <user:pass>` | same (or anonymous FTP) |
-| Headers | `Content-Type: application/x-ndjson` | + `X-Session-Id: <unixtime>`, `X-Track-Name: <approx>` |
-| Failure | each failed POST falls into the queue | move file to `/queue/` |
+Live "stream to cloud" (per-sample POST to `/stream` mid-session) was **deleted**
+in v0.1.66: it wasn't ready, and its blocking POSTs stalled the Teensy loop long
+enough to desync the GPS UART (see the GPS RX-buffer note above). The dash no
+longer exposes a stream-mode setting and the Teensy has no live-POST code.
 
-**FTP only supports After Race mode** (FTP isn't designed for streaming). If `Live Stream` is selected with FTP, fall through to After Race semantics.
+| | After Race (HTTP today; HTTPS/FTP NYI) |
+| --- | --- |
+| Endpoint | `http://<host>:<port>/upload` whole-file POST |
+| Headers | `Content-Type: application/x-ndjson`, `X-API-Key`, `X-User-Email`, `X-Session-Id`, `X-Track-Name` |
+| Flow | session file written into `/queue/` during recording (kill-switch insurance); uploaded after the session ends, **dash-driven** (`Q,LIST`/`Q,GET`/`Q,DEL`) or via the queue drain |
+| Failure | file stays in `/queue/`, retried on the next dash-requested drain |
 
 ### Outbound queue (offline / poor-connectivity tolerance)
 `/queue/session_*.ndjson` on SD card. On every boot or link-up event:
 1. Walk the queue oldest-first
 2. Attempt upload of each file
 3. Delete on success; leave for next time on failure
-4. Mid-session live-stream failures also dump the rest of the file into `/queue/`
+4. Cloud-recorded sessions are written straight into `/queue/` (so a mid-session power cut still leaves a valid, uploadable file)
 
 This means the car can have zero connectivity at the track and still get all data — power on at home with internet and the dash flushes the backlog.
 
