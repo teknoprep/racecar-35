@@ -1,7 +1,7 @@
 {
-  "versionCode": 5,
-  "versionName": "0.1.4",
-  "url": "https://github.com/teknoprep/racecar-35/releases/download/android-v0.1.4/RaceDash-0.1.4-debug.apk",
-  "sha256": "75b9fa53e7fbdf19f5d91c95dba45982d874f0fce06f174594f1f815452593b3",
-  "notes": "Track list: nearest first, then alphabetical."
+  "versionCode": 6,
+  "versionName": "0.1.5",
+  "url": "https://github.com/teknoprep/racecar-35/releases/download/android-v0.1.5/RaceDash-0.1.5-debug.apk",
+  "sha256": "23b6ec5cbd3b50c93d644af4ea95a68f56c1f98e12b3f79e54e8d3b2cac809ce",
+  "notes": "Fix cloud upload (allow HTTP/cleartext + auto-prepend scheme, clearer errors). Acoustic RPM: band-pass isolation to the firing band + harmonics with an in-band SNR gate so wind/road/voices are rejected."
 }

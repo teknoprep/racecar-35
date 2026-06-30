@@ -159,6 +159,29 @@ class AcousticRpm(
         val kMax = min(half - 1, Math.ceil(fMaxHz / binHz).toInt())
         if (kMax <= kMin + 1) return
 
+        // --- Band-pass isolation (keep ONLY the engine, drop everything else) ---
+        // The only frequencies that carry RPM are the firing fundamental
+        // [fMin..fMax] and the harmonics HPS relies on (up to MAX_HARMONICS x
+        // fMax). Zero every bin outside that passband so out-of-band sound -
+        // sub-bass road/exhaust drone & wind buffeting BELOW the band, and
+        // voices / wind hiss / cabin music ABOVE it - can't move the peak or
+        // lift the noise floor. This is the "isolate the RPM sound, remove all
+        // other sounds" stage the dash needs.
+        val kHiMask = min(half - 1, MAX_HARMONICS * kMax)
+        for (i in 0 until kMin) mag[i] = 0.0
+        for (i in kHiMask + 1 until half) mag[i] = 0.0
+
+        // In-band noise floor = median magnitude across the passband. A real
+        // engine peak towers over it; broadband noise (wind/road) doesn't.
+        val bandLen = kHiMask - kMin + 1
+        val bandSorted = DoubleArray(bandLen)
+        System.arraycopy(mag, kMin, bandSorted, 0, bandLen)
+        bandSorted.sort()
+        val noiseFloor = bandSorted[bandLen / 2] + 1e-9
+        var peakMag = 0.0
+        for (i in kMin..kMax) if (mag[i] > peakMag) peakMag = mag[i]
+        val snr = peakMag / noiseFloor
+
         // Harmonic Product Spectrum (log-sum form) across the firing band.
         var bestK = kMin
         var bestScore = -Double.MAX_VALUE
@@ -195,7 +218,13 @@ class AcousticRpm(
         for (s in scores) varSum += (s - mean2) * (s - mean2)
         val std = Math.sqrt(varSum / scoreCount) + 1e-9
         val z = (bestScore - mean2) / std
-        val confidence = (z / 4.0).coerceIn(0.0, 1.0).toFloat()
+        // Confidence requires BOTH a harmonic series that stands out within the
+        // band (z) AND the peak rising clearly above the in-band noise floor
+        // (SNR). Limited by the weaker of the two, so a windy/road-noisy frame
+        // with no genuine engine peak collapses to ~0 instead of guessing.
+        val zConf = (z / 4.0).coerceIn(0.0, 1.0)
+        val snrConf = ((snr - SNR_FLOOR) / (SNR_FULL - SNR_FLOOR)).coerceIn(0.0, 1.0)
+        val confidence = min(zConf, snrConf).toFloat()
 
         emit(rpm, confidence, firingHz.toFloat())
     }
@@ -225,6 +254,8 @@ class AcousticRpm(
         const val READ_CHUNK = 2048
         const val MAX_HARMONICS = 5
         const val CONF_GATE = 0.18f
+        const val SNR_FLOOR = 3.0                  // peak/median below this = noise
+        const val SNR_FULL = 12.0                  // peak/median above this = clean tone
         const val EMA_ALPHA = 0.45f
         const val MAX_SLEW = 1200f                // RPM per analysis frame
     }

@@ -22,15 +22,22 @@ class Uploader {
     suspend fun upload(file: File, cfg: Config): Result<Int> = withContext(Dispatchers.IO) {
         if (cfg.url.isBlank()) return@withContext Result.failure(IOException("No upload URL set"))
         if (!file.exists()) return@withContext Result.failure(IOException("File missing"))
+        val target = try {
+            URL(normalizeUrl(cfg.url))
+        } catch (e: Exception) {
+            return@withContext Result.failure(IOException("Bad URL: ${cfg.url}"))
+        }
         val (sessionId, track) = parseName(file.name)
         var conn: HttpURLConnection? = null
         try {
-            conn = (URL(cfg.url).openConnection() as HttpURLConnection).apply {
+            conn = (target.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 connectTimeout = 8000
                 readTimeout = 20000
                 doOutput = true
+                instanceFollowRedirects = true
                 setRequestProperty("Content-Type", "application/x-ndjson")
+                setRequestProperty("Accept", "*/*")
                 if (cfg.apiKey.isNotBlank()) setRequestProperty("X-API-Key", cfg.apiKey)
                 if (cfg.email.isNotBlank()) setRequestProperty("X-User-Email", cfg.email)
                 setRequestProperty("X-Session-Id", sessionId)
@@ -41,14 +48,32 @@ class Uploader {
             val code = conn.responseCode
             Log.i(TAG, "upload ${file.name} -> HTTP $code")
             if (code in 200..299) Result.success(code)
-            else Result.failure(IOException("HTTP $code"))
+            else {
+                val body = readError(conn)
+                Result.failure(IOException("HTTP $code${if (body.isNotBlank()) ": $body" else ""}"))
+            }
         } catch (e: Exception) {
+            // Surface the concrete cause (cleartext blocked, DNS, timeout, refused...).
             Log.e(TAG, "upload failed", e)
-            Result.failure(e)
+            Result.failure(IOException(e.message ?: e.javaClass.simpleName, e))
         } finally {
             conn?.disconnect()
         }
     }
+
+    /** Accept host-only / scheme-less entries by defaulting to http://. */
+    private fun normalizeUrl(raw: String): String {
+        val s = raw.trim()
+        return if (s.startsWith("http://", true) || s.startsWith("https://", true)) s
+        else "http://$s"
+    }
+
+    /** Best-effort read of an error response body for a useful message. */
+    private fun readError(conn: HttpURLConnection): String = try {
+        (conn.errorStream ?: conn.inputStream)?.bufferedReader()?.use {
+            it.readText().trim().take(200)
+        } ?: ""
+    } catch (_: Exception) { "" }
 
     /** session_<unix>_<track>.ndjson -> (sessionId, trackName) */
     private fun parseName(name: String): Pair<String, String> {

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The After-Race uploader POSTs session NDJSON to a user-configured endpoint
+  that is typically a plain-HTTP host/IP on the local network or a self-hosted
+  box (the firmware cloud convention is `http://<host>:<port>/upload`). Android 9+
+  (targetSdk 34) blocks cleartext HTTP by default, which made every upload fail
+  with "Cleartext HTTP traffic to <host> not permitted". Permit cleartext so HTTP
+  endpoints work; HTTPS endpoints still use TLS normally.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
