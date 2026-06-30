@@ -1,7 +1,7 @@
 {
-  "versionCode": 4,
-  "versionName": "0.1.3",
-  "url": "https://github.com/teknoprep/racecar-35/releases/download/android-v0.1.3/RaceDash-0.1.3-debug.apk",
-  "sha256": "f637ee361664c1c465065ff4776c963628243ed0b1734d43c35bba2c3267c3fe",
-  "notes": "Added tracks: NJMP Thunderbolt & Lightning, Thompson Speedway, NHMS (Oval, Road, North, South)."
+  "versionCode": 5,
+  "versionName": "0.1.4",
+  "url": "https://github.com/teknoprep/racecar-35/releases/download/android-v0.1.4/RaceDash-0.1.4-debug.apk",
+  "sha256": "75b9fa53e7fbdf19f5d91c95dba45982d874f0fce06f174594f1f815452593b3",
+  "notes": "Track list: nearest first, then alphabetical."
 }

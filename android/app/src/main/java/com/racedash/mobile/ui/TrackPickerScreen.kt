@@ -46,13 +46,13 @@ fun TrackPickerScreen(vm: DashViewModel, onDone: () -> Unit) {
     val nearest = remember { vm.nearest() }
     var selected by remember { mutableStateOf(nearest?.first ?: Tracks.REAL.first()) }
 
-    // Put the nearest track first if we have a fix.
+    // Nearest track first (if we have a fix), then the rest alphabetically, with
+    // the synthetic "(no track / unknown)" row always pinned last.
     val ordered = remember(nearest) {
-        if (nearest != null) {
-            listOf(nearest.first) + Tracks.ALL.filter { it != nearest.first }
-        } else {
-            Tracks.ALL
-        }
+        val rest = Tracks.ALL
+            .filter { it != nearest?.first }
+            .sortedWith(compareBy({ it.isUnknown }, { it.name.lowercase() }))
+        if (nearest != null) listOf(nearest.first) + rest else rest
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
