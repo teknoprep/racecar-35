@@ -230,6 +230,15 @@ VER,teensy,<semver>
 - The dash parser tolerates short forms for back-compat (e.g. `ENG` with 1 or 3 fields).
 - **Rate-limiting**: emit only when `myGNSS.getPVT(0)` returns true OR every 1 s. `getPVT(0)` is non-blocking — never use the blocking variant or the 25 Hz loop chokes.
 - **GPS UART RX buffer (v0.1.66 fix) — DO NOT remove.** Serial2's default RX ring is only tens of bytes — SMALLER than one ~100-byte UBX-NAV-PVT frame. GPS is parsed by *polling* `getPVT()` in `loop()` (RPM is NOT — CAN + `FreqMeasureMulti` are interrupt/FIFO-driven). So any loop stall >~25 ms overflows the ring, desyncs the autoPVT stream, and with a sub-frame buffer it can NEVER re-sync → GPS "freezes at last position" (STALE) while RPM keeps running. The stalls come from **SD `sync()`/`write()` latency during recording** (this is why it only happened once a session started, after "half a lap or two"). Fix: `Serial2.addMemoryForRead(gpsRxBuf, 32768)` in `setup()` BEFORE `begin()` (mirrors the dash Serial3 buffer) — ~8.5 s of slack at 38400 baud so the parser rides through SD spikes. `addMemoryForRead()` is on the concrete `Serial2`, not the `HardwareSerial&` alias.
+- **GPS stale auto-recovery watchdog (v0.1.68).** Belt-and-suspenders net on top of the buffer:
+  `gpsStaleWatchdog()` runs every `loop()` and, once the link is up, watches the age of the last
+  fresh PVT. **LIGHT** (>2.5 s stale): flush the Serial2 RX ring (non-blocking) so the UBX parser
+  drops corrupted/backlogged bytes and resyncs on the next LIVE frame — position jumps to NOW
+  instead of replaying the stale backlog; rate-limited to once / 2 s. **HEAVY** (>10 s stale): the
+  module itself may have glitched, so re-run `myGNSS.begin()` + re-assert `setUART1Output(UBX)` /
+  `setNavigationFrequency` / `setAutoPVT` (blocking ~handshake but bounded; last resort, once / 10 s;
+  the 32 KB ring covers the one-time stall). No-op until the first PVT, so it never trips during
+  cold-start acquisition. Recovery events log `[gps] STALE …` / `[gps] re-begin …` to USB serial.
 
 ### CrowPanel → Teensy (control)
 ```

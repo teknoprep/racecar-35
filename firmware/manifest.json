@@ -1,37 +1,37 @@
 {
   "teensy": {
     "board":   "teensy",
-    "version": "0.1.67",
+    "version": "0.1.68",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/teensy41-dash.hex",
-    "sha256":  "47708b57e00b3c4d391860bbd60c16a9ec9a3679ded6bb29ec782aeab4e08b24",
+    "sha256":  "e1b284f6294d66b02d268b43de799c16d7fd53ddc63850785f84f4796f2c0cb9",
     "size":    596314
   },
   "crowpanel7": {
     "board":   "crowpanel7",
-    "version": "0.1.67",
+    "version": "0.1.68",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
-    "sha256":  "99e51f958283cde808e83500ce3be3e5e4e5bab9e56de53127e6b14f9fd40461",
+    "sha256":  "e300494eee5419d1251b1d9340dd2751b4ede3f9ad2bb4a93ecc4fde4199fd24",
     "size":    1040896
   },
   "crowpanel5": {
     "board":   "crowpanel5",
-    "version": "0.1.67",
+    "version": "0.1.68",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5-dash.bin",
-    "sha256":  "a43104dc40e150d63a6bfc2a969dc6398dba474fb5a0b59285e65016861ebc97",
+    "sha256":  "47130f9366464c756e41636efec1c9fed586b9c3278ae2e2854d30a9b3a1e752",
     "size":    1040896
   },
   "crowpanel5adv": {
     "board":   "crowpanel5adv",
-    "version": "0.1.67",
+    "version": "0.1.68",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5adv-dash.bin",
-    "sha256":  "2b5caffb86011595b180ae18f22267de7ea3dc6fe9adc9f3eb37936832761451",
+    "sha256":  "45648e55b1612f5ff5a587286bda6c4a1f7f994a4f761b201485e1942b0a70eb",
     "size":    1040512
   },
   "crowpanel": {
     "board":   "crowpanel7",
-    "version": "0.1.67",
+    "version": "0.1.68",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
-    "sha256":  "99e51f958283cde808e83500ce3be3e5e4e5bab9e56de53127e6b14f9fd40461",
+    "sha256":  "e300494eee5419d1251b1d9340dd2751b4ede3f9ad2bb4a93ecc4fde4199fd24",
     "size":    1040896
   }
 }

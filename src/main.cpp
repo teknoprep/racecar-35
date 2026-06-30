@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.67"
+#define FIRMWARE_VERSION "0.1.68"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -470,6 +470,27 @@ static bool     gnss_lib_ok       = false;
 static uint32_t gnss_last_fresh_ms = 0;
 static uint32_t gnss_raw_bytes    = 0;
 
+// GPS stale auto-recovery watchdog. The root causes of mid-session GPS freeze
+// are gone (live per-sample cloud POST removed; Ethernet.maintain() no longer
+// runs in loop) and a 32 KB UART RX ring rides through SD-sync hiccups — so
+// STALE should not occur during a session. This is a belt-and-suspenders net for
+// if it ever does:
+//   LIGHT  (>2.5 s stale): flush the RX ring so the UBX parser drops any
+//          corrupted/backlogged bytes and resyncs on the next LIVE frame (the
+//          reported position jumps to NOW instead of replaying stale fixes).
+//          Fully non-blocking; rate-limited to once / 2 s.
+//   HEAVY  (>10 s stale): the module itself may have glitched — re-run begin()
+//          and re-assert UBX/autoPVT. Blocking (~handshake) but bounded, last
+//          resort only; rate-limited to once / 10 s (the 32 KB ring covers the
+//          one-time stall).
+constexpr uint32_t GPS_STALE_RECOVER_MS    = 2500;
+constexpr uint32_t GPS_RECOVER_INTERVAL_MS = 2000;
+constexpr uint32_t GPS_REINIT_MS           = 10000;
+constexpr uint32_t GPS_REINIT_INTERVAL_MS  = 10000;
+static uint32_t gnss_last_recover_ms = 0;
+static uint32_t gnss_last_reinit_ms  = 0;
+static uint32_t gnss_recover_count   = 0;
+
 static bool tryConnectGNSS(uint32_t baud) {
     GPS_SERIAL.begin(baud);
     delay(50);
@@ -482,6 +503,42 @@ static uint8_t gpsStatus() {
     if (gnss_lib_ok)        return (age < 1500) ? 2 /*OK*/   : 3 /*STALE*/;
     if (gnss_raw_bytes > 0) return (age < 1500) ? 1 /*RAW*/  : 0 /*OFF*/;
     return 0; // OFF — never seen a byte
+}
+
+// Called every loop(); self-rate-limited. Recovery strategy documented on the
+// GPS_STALE_* constants above. No-op until the link is up and has produced at
+// least one PVT, so it never fires during cold-start acquisition.
+static void gpsStaleWatchdog() {
+    if (!gnss_lib_ok || gnss_last_fresh_ms == 0) return;
+    const uint32_t now = millis();
+    const uint32_t age = now - gnss_last_fresh_ms;
+    if (age < GPS_STALE_RECOVER_MS) return;            // healthy — nothing to do
+
+    // LIGHT: flush the RX ring (non-blocking) so the parser resyncs on a live frame.
+    if (now - gnss_last_recover_ms >= GPS_RECOVER_INTERVAL_MS) {
+        gnss_last_recover_ms = now;
+        gnss_recover_count++;
+        uint32_t drained = 0;
+        while (GPS_SERIAL.available()) { (void)GPS_SERIAL.read(); drained++; }
+        Serial.printf("[gps] STALE %lums -> flush+resync #%lu (dropped %lu bytes)%s\n",
+                      (unsigned long)age, (unsigned long)gnss_recover_count,
+                      (unsigned long)drained, recording_active ? " [REC]" : "");
+    }
+
+    // HEAVY: module may have glitched — re-establish the link. Blocking but bounded.
+    if (age >= GPS_REINIT_MS && now - gnss_last_reinit_ms >= GPS_REINIT_INTERVAL_MS) {
+        gnss_last_reinit_ms = now;
+        Serial.println(F("[gps] persistent STALE -> re-begin() GNSS link"));
+        if (myGNSS.begin(GPS_SERIAL)) {
+            myGNSS.setUART1Output(COM_TYPE_UBX);
+            myGNSS.setNavigationFrequency(NAV_RATE_HZ);
+            myGNSS.setAutoPVT(true);
+            gnss_last_fresh_ms = millis();   // grace window so we don't re-trip instantly
+            Serial.println(F("[gps] re-begin OK"));
+        } else {
+            Serial.println(F("[gps] re-begin FAILED — will retry"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2943,6 +3000,9 @@ void loop() {
             gnss_last_fresh_ms = millis();
         }
     }
+
+    // Auto-recover if the PVT stream ever goes stale (esp. mid-recording).
+    gpsStaleWatchdog();
 
     // Emit on every fresh PVT (== 25 Hz when GPS is reporting) plus a 1 Hz
     // heartbeat fallback so the dash's LINK indicator stays green even
