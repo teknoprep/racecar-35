@@ -52,6 +52,7 @@ fun SettingsScreen(vm: DashViewModel, onBack: () -> Unit) {
     val s by vm.settings.collectAsStateWithLifecycle()
     val st by vm.state.collectAsStateWithLifecycle()
     var editing by remember { mutableStateOf<EditSpec?>(null) }
+    val appVer = remember { vm.appVersion() }
 
     Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -161,6 +162,11 @@ fun SettingsScreen(vm: DashViewModel, onBack: () -> Unit) {
                     vm.settingsRepo.update { it.copy(autoSelectTrack = !it.autoSelectTrack) }
                 }
             }
+            item { Header("About") }
+            item {
+                ActionRow("Check for updates", "v$appVer") { vm.checkForUpdate(manual = true) }
+            }
+
             item { Spacer(Modifier.height(24.dp)) }
         }
     }

@@ -1,0 +1,7 @@
+{
+  "versionCode": 3,
+  "versionName": "0.1.2",
+  "url": "https://github.com/teknoprep/racecar-35/releases/download/android-v0.1.2/RaceDash-0.1.2-debug.apk",
+  "sha256": "b85774f0c91666a9f6f9ba594d98acdbd9a36c0d0dfc100bdf702fe92ccf20b6",
+  "notes": "In-app OTA self-update: checks GitHub for newer APKs and prompts to install."
+}

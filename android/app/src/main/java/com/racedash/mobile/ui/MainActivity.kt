@@ -72,6 +72,9 @@ private fun AppRoot() {
         }
     }
 
+    // Silent OTA check on launch; only surfaces a dialog if an update exists.
+    LaunchedEffect(Unit) { vm.checkForUpdate(manual = false) }
+
     var page by remember { mutableStateOf(Page.DASH) }
     when (page) {
         Page.DASH -> DashScreen(
@@ -88,4 +91,7 @@ private fun AppRoot() {
             onDone = { page = Page.DASH },
         )
     }
+
+    // OTA update prompts overlay every page.
+    UpdateDialogHost(vm)
 }

@@ -2,6 +2,7 @@ package com.racedash.mobile.vm
 
 import android.annotation.SuppressLint
 import android.app.Application
+import android.content.Intent
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -12,6 +13,8 @@ import com.racedash.mobile.data.SettingsRepository
 import com.racedash.mobile.data.SessionStore
 import com.racedash.mobile.data.Track
 import com.racedash.mobile.data.Tracks
+import com.racedash.mobile.data.UpdateInfo
+import com.racedash.mobile.data.UpdateManager
 import com.racedash.mobile.data.Uploader
 import com.racedash.mobile.lap.LapTimer
 import com.racedash.mobile.sensors.AcousticRpm
@@ -38,11 +41,16 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     private val recorder = SessionRecorder(app)
     private val store = SessionStore(app)
     private val uploader = Uploader()
+    private val updateManager = UpdateManager(app)
     private val lapTimer = LapTimer()
     private val acoustic = AcousticRpm(::onRpm)
 
     private val _state = MutableStateFlow(DashState())
     val state: StateFlow<DashState> = _state.asStateFlow()
+
+    private val _update = MutableStateFlow(UpdateState())
+    val update: StateFlow<UpdateState> = _update.asStateFlow()
+    @Volatile private var pendingUpdate: UpdateInfo? = null
 
     // --- Latest sensor values (written from callbacks, read by the ticker) ---
     @Volatile private var lat = 0.0
@@ -211,6 +219,54 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         uploadStatus = if (fail == 0) "uploaded $ok ✓" else "uploaded $ok, $fail failed"
         pendingUploads = store.pending(recorder.currentFile).size
     }
+
+    // --- OTA self-update --------------------------------------------------
+
+    fun appVersion(): String = updateManager.currentVersionName()
+
+    /** Check GitHub for a newer APK. [manual]=true shows an "up to date" / error
+     *  dialog; automatic checks stay silent unless an update is actually found. */
+    fun checkForUpdate(manual: Boolean) {
+        viewModelScope.launch {
+            _update.value = UpdateState(UpdatePhase.CHECKING)
+            val info = updateManager.fetchManifest()
+            _update.value = when {
+                info == null ->
+                    if (manual) UpdateState(UpdatePhase.ERROR, message = "Couldn't reach the update server.")
+                    else UpdateState()
+                info.versionCode > updateManager.currentVersionCode() -> {
+                    pendingUpdate = info
+                    UpdateState(UpdatePhase.AVAILABLE, versionName = info.versionName, notes = info.notes)
+                }
+                else ->
+                    if (manual) UpdateState(UpdatePhase.UPTODATE, versionName = updateManager.currentVersionName())
+                    else UpdateState()
+            }
+        }
+    }
+
+    fun downloadAndInstall() {
+        val info = pendingUpdate ?: return
+        if (!updateManager.canInstall()) {
+            _update.value = _update.value.copy(phase = UpdatePhase.NEED_PERMISSION)
+            return
+        }
+        viewModelScope.launch {
+            _update.value = UpdateState(UpdatePhase.DOWNLOADING, versionName = info.versionName)
+            val file = updateManager.download(info) { p ->
+                _update.value = _update.value.copy(progress = p)
+            }
+            if (file == null) {
+                _update.value = UpdateState(UpdatePhase.ERROR, message = "Download failed or checksum mismatch.")
+                return@launch
+            }
+            _update.value = UpdateState(UpdatePhase.INSTALLING, versionName = info.versionName)
+            updateManager.installApk(file)
+        }
+    }
+
+    fun installPermissionIntent(): Intent = updateManager.installPermissionIntent()
+    fun dismissUpdate() { _update.value = UpdateState() }
 
     // --- 20 Hz state rebuild + logging ------------------------------------
 
