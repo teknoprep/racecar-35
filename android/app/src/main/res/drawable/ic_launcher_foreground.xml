@@ -1,0 +1,15 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple speedometer-style mark. -->
+    <path
+        android:fillColor="#00E5A0"
+        android:pathData="M54,30a24,24 0 1,0 0.01,0z M54,38a16,16 0 1,1 -0.01,0z" />
+    <path
+        android:strokeColor="#00E5A0"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M54,54 L66,42" />
+</vector>
