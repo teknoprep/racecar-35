@@ -37,4 +37,8 @@ data class DashState(
 
     // Lap timing
     val lap: LapState = LapState(),
+
+    // Cloud upload
+    val pendingUploads: Int = 0,
+    val uploadStatus: String = "",
 )

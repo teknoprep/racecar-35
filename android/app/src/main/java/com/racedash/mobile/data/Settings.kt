@@ -27,6 +27,13 @@ data class Settings(
 
     // --- Recording ---
     val autoSelectTrack: Boolean = true,
+
+    // --- Cloud upload (After Race) ---
+    val cloudEnabled: Boolean = false,
+    val uploadUrl: String = "",          // e.g. https://host:port/upload
+    val userEmail: String = "",          // sent as X-User-Email
+    val apiKey: String = "",             // sent as X-API-Key
+    val autoUpload: Boolean = true,      // upload automatically when a session stops
 ) {
     /** Power strokes per crank revolution. 4-stroke = cyl/2, 2-stroke = cyl. */
     val firingsPerRev: Double
@@ -73,6 +80,11 @@ class SettingsRepository(context: Context) {
         useMph = prefs.getBoolean("mph", true),
         audioRpmEnabled = prefs.getBoolean("audio_rpm", true),
         autoSelectTrack = prefs.getBoolean("auto_trk", true),
+        cloudEnabled = prefs.getBoolean("cl_en", false),
+        uploadUrl = prefs.getString("cl_url", "") ?: "",
+        userEmail = prefs.getString("cl_email", "") ?: "",
+        apiKey = prefs.getString("cl_key", "") ?: "",
+        autoUpload = prefs.getBoolean("cl_auto", true),
     )
 
     private fun save(s: Settings) {
@@ -87,6 +99,11 @@ class SettingsRepository(context: Context) {
             .putBoolean("mph", s.useMph)
             .putBoolean("audio_rpm", s.audioRpmEnabled)
             .putBoolean("auto_trk", s.autoSelectTrack)
+            .putBoolean("cl_en", s.cloudEnabled)
+            .putString("cl_url", s.uploadUrl)
+            .putString("cl_email", s.userEmail)
+            .putString("cl_key", s.apiKey)
+            .putBoolean("cl_auto", s.autoUpload)
             .apply()
     }
 }

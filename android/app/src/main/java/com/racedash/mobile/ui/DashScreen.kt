@@ -1,5 +1,6 @@
 package com.racedash.mobile.ui
 
+import android.content.res.Configuration
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -31,6 +32,8 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -68,14 +71,30 @@ fun DashScreen(
 
         Spacer(Modifier.height(8.dp))
 
-        Row(modifier = Modifier.fillMaxWidth().weight(1f)) {
-            LapColumn(s, modifier = Modifier.weight(1f).fillMaxHeight())
-            SpeedBlock(
-                speed = s.speedMph,
-                useMph = cfg.useMph,
-                modifier = Modifier.weight(1.4f).fillMaxHeight(),
-            )
-            GpsColumn(s, modifier = Modifier.weight(1f).fillMaxHeight())
+        val portrait =
+            LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
+        if (portrait) {
+            // Portrait: speed on top, lap + GPS side-by-side below.
+            Column(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                SpeedBlock(
+                    speed = s.speedMph, useMph = cfg.useMph, fontSize = 128.sp,
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                )
+                Row(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                    LapColumn(s, modifier = Modifier.weight(1f).fillMaxHeight())
+                    GpsColumn(s, modifier = Modifier.weight(1f).fillMaxHeight())
+                }
+            }
+        } else {
+            // Landscape: lap | speed | GPS in three columns.
+            Row(modifier = Modifier.fillMaxWidth().weight(1f)) {
+                LapColumn(s, modifier = Modifier.weight(1f).fillMaxHeight())
+                SpeedBlock(
+                    speed = s.speedMph, useMph = cfg.useMph, fontSize = 150.sp,
+                    modifier = Modifier.weight(1.4f).fillMaxHeight(),
+                )
+                GpsColumn(s, modifier = Modifier.weight(1f).fillMaxHeight())
+            }
         }
 
         Spacer(Modifier.height(8.dp))
@@ -152,7 +171,7 @@ private fun RpmBar(
 }
 
 @Composable
-private fun SpeedBlock(speed: Float, useMph: Boolean, modifier: Modifier) {
+private fun SpeedBlock(speed: Float, useMph: Boolean, fontSize: TextUnit, modifier: Modifier) {
     val value = if (useMph) speed else speed * 1.609344f
     val shown = value.roundToInt()
     Box(modifier = modifier, contentAlignment = Alignment.Center) {
@@ -160,7 +179,7 @@ private fun SpeedBlock(speed: Float, useMph: Boolean, modifier: Modifier) {
             Text(
                 text = shown.toString(),
                 color = Neutral,
-                fontSize = 150.sp,
+                fontSize = fontSize,
                 fontWeight = FontWeight.Black,
                 fontFamily = FontFamily.Monospace,
             )

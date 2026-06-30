@@ -9,8 +9,10 @@ import com.racedash.mobile.data.Sample
 import com.racedash.mobile.data.SessionRecorder
 import com.racedash.mobile.data.Settings
 import com.racedash.mobile.data.SettingsRepository
+import com.racedash.mobile.data.SessionStore
 import com.racedash.mobile.data.Track
 import com.racedash.mobile.data.Tracks
+import com.racedash.mobile.data.Uploader
 import com.racedash.mobile.lap.LapTimer
 import com.racedash.mobile.sensors.AcousticRpm
 import com.racedash.mobile.sensors.LocationProvider
@@ -23,6 +25,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import java.io.File
 import kotlin.math.abs
 
 class DashViewModel(app: Application) : AndroidViewModel(app) {
@@ -33,6 +36,8 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     private val location = LocationProvider(app)
     private val motion = MotionProvider(app)
     private val recorder = SessionRecorder(app)
+    private val store = SessionStore(app)
+    private val uploader = Uploader()
     private val lapTimer = LapTimer()
     private val acoustic = AcousticRpm(::onRpm)
 
@@ -68,6 +73,9 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
 
     @Volatile private var selectedTrack: Track? = null
     @Volatile private var recording = false
+
+    @Volatile private var uploadStatus = ""
+    @Volatile private var pendingUploads = 0
 
     init {
         // Push current engine geometry into the acoustic estimator and keep it
@@ -155,8 +163,12 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleRecording(): Boolean {
         if (recording) {
-            recorder.stop()
+            val closed = recorder.stop()
             recording = false
+            val cfg = settingsRepo.current
+            if (closed != null && cfg.cloudEnabled && cfg.autoUpload) {
+                viewModelScope.launch(Dispatchers.IO) { uploadList(listOf(closed)) }
+            }
         } else {
             // Auto-pick the closest track if enabled and none chosen.
             if (selectedTrack == null && settingsRepo.current.autoSelectTrack) {
@@ -171,11 +183,42 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
 
     val isRecording: Boolean get() = recording
 
+    // --- Cloud upload -----------------------------------------------------
+
+    /** Manually upload every pending session (not the one being recorded). */
+    fun uploadPending() {
+        viewModelScope.launch(Dispatchers.IO) {
+            uploadList(store.pending(recorder.currentFile))
+        }
+    }
+
+    private suspend fun uploadList(files: List<File>) {
+        val cfg = settingsRepo.current
+        when {
+            !cfg.cloudEnabled -> { uploadStatus = "cloud upload is off"; return }
+            cfg.uploadUrl.isBlank() -> { uploadStatus = "set an upload URL first"; return }
+            files.isEmpty() -> { uploadStatus = "nothing to upload"; return }
+        }
+        val ucfg = Uploader.Config(cfg.uploadUrl, cfg.apiKey, cfg.userEmail)
+        var ok = 0
+        var fail = 0
+        files.forEachIndexed { i, f ->
+            uploadStatus = "uploading ${i + 1}/${files.size}\u2026"
+            val r = uploader.upload(f, ucfg)
+            if (r.isSuccess) { store.markUploaded(f); ok++ }
+            else { fail++; uploadStatus = "failed: ${r.exceptionOrNull()?.message ?: "error"}" }
+        }
+        uploadStatus = if (fail == 0) "uploaded $ok ✓" else "uploaded $ok, $fail failed"
+        pendingUploads = store.pending(recorder.currentFile).size
+    }
+
     // --- 20 Hz state rebuild + logging ------------------------------------
 
     private suspend fun ticker() {
+        var n = 0
         while (true) {
             val now = SystemClock.elapsedRealtime()
+            if (n++ % 20 == 0) pendingUploads = store.pending(recorder.currentFile).size
             val age = if (haveFix) now - lastFixElapsed else 0L
             val status = when {
                 !sensorsStarted -> GpsStatus.OFF
@@ -223,6 +266,8 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
                 nearestTrackName = near?.first?.name,
                 nearestDistKm = near?.second,
                 lap = lap,
+                pendingUploads = pendingUploads,
+                uploadStatus = uploadStatus,
             )
             delay(50)
         }
