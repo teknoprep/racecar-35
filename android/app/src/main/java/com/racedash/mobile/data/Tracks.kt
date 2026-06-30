@@ -41,6 +41,16 @@ object Tracks {
         Track("Mid-Ohio", 40.68889, -82.63611, 2.0),
         Track("Barber", 33.53056, -86.61750, 2.0),
         Track("Lime Rock", 41.92778, -73.38389, 1.5),
+        // NJMP (Millville, NJ) — two circuits.
+        Track("NJMP Thunderbolt", 39.41480, -75.07900, 1.5),
+        Track("NJMP Lightning", 39.40830, -75.08380, 1.5),
+        // Thompson Speedway Motorsports Park road course (Thompson, CT).
+        Track("Thompson Speedway", 41.98730, -71.83660, 1.5),
+        // New Hampshire Motor Speedway (Loudon, NH) — all configs.
+        Track("NHMS Oval", 43.36180, -71.46250, 1.0),
+        Track("NHMS Road Course", 43.36350, -71.46000, 1.0),
+        Track("NHMS North Road Course", 43.36400, -71.45980, 1.0),
+        Track("NHMS South Road Course", 43.36140, -71.46180, 1.0),
         Track(Track.UNKNOWN_NAME, 0.0, 0.0, 0.0),
     )
 
