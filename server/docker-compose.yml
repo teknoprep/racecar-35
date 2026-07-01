@@ -39,6 +39,13 @@ services:
       # Reject any body larger than this many bytes. 64 MB is generous for an
       # hour of 25 Hz NDJSON. Increase if you record longer sessions.
       RACECAR_MAX_BODY_BYTES: "67108864"
+      # Firmware-upload key (gates POST /firmware/upload; separate from API_KEY).
+      RACECAR_FIRMWARE_KEY: "${RACECAR_FIRMWARE_KEY:-}"
+      # AI corner analysis (Open WebUI). Blank AI_API_KEY hides the AI card.
+      RACECAR_AI_BASE_URL: "${RACECAR_AI_BASE_URL:-https://ai.blueuc.com}"
+      RACECAR_AI_API_KEY: "${RACECAR_AI_API_KEY:-}"
+      RACECAR_AI_MODEL: "${RACECAR_AI_MODEL:-}"
+      RACECAR_AI_TIMEOUT_SECONDS: "${RACECAR_AI_TIMEOUT_SECONDS:-120}"
     volumes:
       # Persistent on-disk storage for uploaded sessions. Survives container
       # rebuilds. Map to wherever you keep server data on the host.

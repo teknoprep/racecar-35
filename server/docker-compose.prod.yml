@@ -40,6 +40,13 @@ services:
       # Behind HTTPS (TLS terminated at the external proxy), mark cookies Secure.
       RACECAR_COOKIE_SECURE: "${RACECAR_COOKIE_SECURE:-1}"
       RACECAR_SESSION_TTL_SECONDS: "${RACECAR_SESSION_TTL_SECONDS:-604800}"
+      # Firmware-upload key (gates POST /firmware/upload; separate from API_KEY).
+      RACECAR_FIRMWARE_KEY: "${RACECAR_FIRMWARE_KEY:-}"
+      # AI corner analysis (Open WebUI). Blank AI_API_KEY hides the AI card.
+      RACECAR_AI_BASE_URL: "${RACECAR_AI_BASE_URL:-https://ai.blueuc.com}"
+      RACECAR_AI_API_KEY: "${RACECAR_AI_API_KEY:-}"
+      RACECAR_AI_MODEL: "${RACECAR_AI_MODEL:-}"
+      RACECAR_AI_TIMEOUT_SECONDS: "${RACECAR_AI_TIMEOUT_SECONDS:-120}"
     volumes:
       - ./data:/data
     networks:
