@@ -79,10 +79,32 @@ AI_BASE_URL = os.environ.get("RACECAR_AI_BASE_URL", "https://ai.blueuc.com").str
 AI_API_KEY = os.environ.get("RACECAR_AI_API_KEY", "").strip()
 AI_MODEL = os.environ.get("RACECAR_AI_MODEL", "").strip()   # default model id, e.g. "gpt-4o-mini"
 AI_TIMEOUT = int(os.environ.get("RACECAR_AI_TIMEOUT_SECONDS", "120"))
+# Model ALLOWLIST. RACECAR_AI_MODELS is a CSV of model ids the UI may offer and
+# the server will accept; if unset it falls back to just [RACECAR_AI_MODEL].
+# When the allowlist is non-empty it is authoritative — the live 100+ model
+# catalogue is NOT exposed and any other model id is rejected/forced to default.
+# Leave BOTH unset only if you want the full live catalogue selectable.
+AI_MODELS = [x.strip() for x in os.environ.get("RACECAR_AI_MODELS", "").split(",") if x.strip()]
+if not AI_MODELS and AI_MODEL:
+    AI_MODELS = [AI_MODEL]
+# The default/preselected model: explicit RACECAR_AI_MODEL wins, else first of
+# the allowlist, else empty (full-catalogue mode with no preselection).
+AI_DEFAULT_MODEL = AI_MODEL or (AI_MODELS[0] if AI_MODELS else "")
 
 
 def ai_enabled() -> bool:
     return bool(AI_API_KEY)
+
+
+def ai_resolve_model(requested: Optional[str]) -> str:
+    """Enforce the allowlist. Returns an allowed model id (or raises 503 if none
+    is configured). A disallowed/blank request is forced to the default so a
+    stale UI can never sneak a non-allowed model past the server."""
+    req = (requested or "").strip()
+    if AI_MODELS:
+        return req if req in AI_MODELS else (AI_DEFAULT_MODEL or AI_MODELS[0])
+    # Unrestricted mode: honor the request, else the default.
+    return req or AI_DEFAULT_MODEL
 
 
 # Per-session AI Q&A history lives in a parallel tree so it survives rebuilds
@@ -1920,7 +1942,7 @@ def _ai_chat(messages: list, model: Optional[str] = None,
     if not AI_API_KEY:
         raise HTTPException(status_code=503,
                             detail="AI is not configured (set RACECAR_AI_API_KEY)")
-    use_model = (model or "").strip() or AI_MODEL
+    use_model = ai_resolve_model(model)   # allowlist-enforced
     if not use_model:
         raise HTTPException(status_code=503,
                             detail="No AI model selected and RACECAR_AI_MODEL is unset")
@@ -2004,9 +2026,13 @@ def _ai_history_delete_file(user: str, session_name: str) -> None:
 
 
 def _ai_model_list() -> list:
-    """Fetch the model catalogue from Open WebUI so the UI can offer a picker."""
+    """Models the UI may offer. If an allowlist is configured (RACECAR_AI_MODELS
+    or RACECAR_AI_MODEL), it is authoritative and we do NOT expose the live
+    100+ catalogue. Only with NO allowlist do we fetch the full list."""
     if not AI_API_KEY:
         return []
+    if AI_MODELS:
+        return [{"id": mid, "name": mid} for mid in AI_MODELS]
     req = urllib.request.Request(
         AI_BASE_URL + "/api/models",
         headers={"Authorization": "Bearer " + AI_API_KEY},
@@ -2196,7 +2222,7 @@ async def ai_models(request: Request) -> JSONResponse:
     require_web_user(request)
     return JSONResponse({
         "enabled": ai_enabled(),
-        "default": AI_MODEL,
+        "default": AI_DEFAULT_MODEL,
         "models": _ai_model_list(),
     })
 
@@ -4216,6 +4242,8 @@ _REVIEW_HTML = (
           if (m.id===j.default) o.selected=true; modelSel.appendChild(o);
         }
         if (!list.length){ const o=document.createElement('option'); o.textContent='(server default)'; o.value=''; modelSel.appendChild(o); }
+        // Single allowed model -> hide the picker (nothing to choose).
+        const lbl = modelSel.closest('label'); if (lbl) lbl.style.display = (list.length<=1 ? 'none' : '');
         loadHistory();
       } catch(e){ card.style.display='none'; }
     }
