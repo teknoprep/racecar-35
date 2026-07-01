@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.76"
+#define FIRMWARE_VERSION "0.1.77"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2033,6 +2033,8 @@ static bool parseQLine(const String& line) {
     }
     if (strncmp(p, "ERR,", 4) == 0) {
         snprintf(uf.last_err, sizeof(uf.last_err), "%s", p + 4);
+        Serial.printf("DBG,uf_err from_teensy=%s at buflen=%lu lines=%lu\n",
+                      p + 4, (unsigned long)uf.buflen, (unsigned long)uf.lines_recv);
         uf.failed++;
         ufNextFile();
         return true;
@@ -5425,13 +5427,7 @@ static void drawUploadModal() {
         tft.fillRect(UM_CARD_X, UM_CARD_Y, UM_CARD_W, UM_CARD_H, TFT_NAVY);
         tft.drawRect(UM_CARD_X,   UM_CARD_Y,   UM_CARD_W,   UM_CARD_H,   TFT_WHITE);
         tft.drawRect(UM_CARD_X+1, UM_CARD_Y+1, UM_CARD_W-2, UM_CARD_H-2, TFT_WHITE);
-        // Title
-        tft.setFont(&fonts::Font4);
-        tft.setTextSize(1);
-        tft.setTextColor(TFT_WHITE, TFT_NAVY);
-        tft.setTextDatum(textdatum_t::middle_center);
-        tft.drawString("Uploading session", UM_CARD_X + UM_CARD_W / 2,
-                       UM_CARD_Y + 30);
+        // (Phase title is drawn dynamically below, every frame.)
         // Static CANCEL button frame
         tft.fillRect(UM_BTN_X, UM_BTN_Y, UM_BTN_W, UM_BTN_H, TFT_MAROON);
         tft.drawRect(UM_BTN_X, UM_BTN_Y, UM_BTN_W, UM_BTN_H, TFT_WHITE);
@@ -5441,6 +5437,28 @@ static void drawUploadModal() {
         tft.setTextDatum(textdatum_t::top_left);
         pageJustEntered = false;
     }
+
+    // Dynamic phase title. Uploads are two explicit phases: first the whole
+    // session file is copied off the Teensy/SD into the dash's PSRAM cache
+    // ("Copying to cache"), and ONLY once that completes does the network
+    // upload begin ("Uploading to cloud"). Redrawn each frame with its own bg.
+    const char* phase = "Uploading session";
+    switch (uf.state) {
+        case UF_LISTING:
+        case UF_FETCH_HEAD:    phase = "Preparing...";        break;
+        case UF_STREAMING:     phase = "Copying to cache";    break;
+        case UF_POSTING:       phase = "Uploading to cloud";  break;
+        case UF_STREAM_FINISH: phase = "Finalizing...";       break;
+        case UF_DELETING:      phase = "Cleaning up...";      break;
+        default: break;
+    }
+    tft.setFont(&fonts::Font4);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextPadding(UM_CARD_W - 40);
+    tft.drawString(phase, UM_CARD_X + UM_CARD_W / 2, UM_CARD_Y + 30);
+    tft.setTextPadding(0);
 
     // Filename (truncated visually by the padded background).
     tft.setFont(&fonts::Font2);
@@ -5455,10 +5473,12 @@ static void drawUploadModal() {
     const uint32_t total = upload_total > 0 ? upload_total : 1;
     const uint32_t done  = upload_done > total ? total : upload_done;
     const int fillW = (int)((uint64_t)done * (UM_BAR_W - 4) / total);
+    // Cache phase = cyan bar, cloud-upload phase = green bar.
+    const uint16_t barColor = (uf.state == UF_STREAMING) ? TFT_CYAN : TFT_GREEN;
     tft.drawRect(UM_BAR_X, UM_BAR_Y, UM_BAR_W, UM_BAR_H, TFT_WHITE);
     tft.fillRect(UM_BAR_X + 2, UM_BAR_Y + 2, UM_BAR_W - 4, UM_BAR_H - 4, TFT_BLACK);
     if (fillW > 0)
-        tft.fillRect(UM_BAR_X + 2, UM_BAR_Y + 2, fillW, UM_BAR_H - 4, TFT_GREEN);
+        tft.fillRect(UM_BAR_X + 2, UM_BAR_Y + 2, fillW, UM_BAR_H - 4, barColor);
 
     // Bytes / percentage line
     char line[64];
@@ -7784,8 +7804,16 @@ void loop() {
     // Periodically re-push the full config to the Teensy so it recovers its
     // settings after any UART hiccup / Teensy reboot with no user action.
     // Idempotent — the Teensy just re-applies the same values.
+    // Re-push config to the Teensy periodically — but NEVER during an upload or
+    // a sessions list/delete. The Teensy handles Q,GET/Q,DEL in a blocking
+    // per-line-ACK loop; injecting a 12-line CFG burst into that exchange
+    // desynced its ACK wait and aborted the transfer (~5 s in = ~67 lines).
     { static uint32_t lastCfgResend = 0;
-      if (millis() - lastCfgResend >= 5000) { lastCfgResend = millis(); sendCfgToTeensy(); } }
+      const bool link_busy = (uf.state != UF_IDLE) || (sl.state != SL_IDLE);
+      if (!link_busy && millis() - lastCfgResend >= 5000) {
+          lastCfgResend = millis();
+          sendCfgToTeensy();
+      } }
 
     // Expire SD format arm state after 5 s so the button reverts to red.
     if (sd_format_armed && millis() - sd_format_arm_ms >= 5000) {
