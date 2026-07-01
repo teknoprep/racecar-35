@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.77"
+#define FIRMWARE_VERSION "0.1.78"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2299,8 +2299,11 @@ static void handleQList() {
 // inbound lines (telemetry/cancel/etc) are intentionally drained and ignored
 // here so a stray telemetry line doesn't get mis-parsed in the middle of a
 // streaming session.
-static bool qWaitForAck(uint32_t timeout_ms) {
-    char line[32];
+// Wait for a sequence-numbered ack 'Q,A,<seq>' from the dash. Returns the
+// acked seq (>=0) or -1 on timeout. The dash acks the HIGHEST contiguous line
+// seq it has applied, so any ack >= the line we just sent confirms delivery.
+static long qWaitForAckSeq(uint32_t timeout_ms) {
+    char line[24];
     size_t n = 0;
     const uint32_t end = millis() + timeout_ms;
     while ((int32_t)(end - millis()) > 0) {
@@ -2310,16 +2313,17 @@ static bool qWaitForAck(uint32_t timeout_ms) {
             if (c == '\n') {
                 line[n] = '\0';
                 n = 0;
-                if (strncmp(line, "Q,A", 3) == 0) return true;
-                // ignore other lines (telemetry, stray commands)
-                continue;
+                if (strncmp(line, "Q,A,", 4) == 0) return strtol(line + 4, nullptr, 10);
+                // bare "Q,A" (older dash, no seq): treat as ack-of-anything
+                if (strncmp(line, "Q,A", 3) == 0) return 0x7fffffffL;
+                continue;   // ignore telemetry / stray lines
             }
             if (n + 1 < sizeof(line)) line[n++] = c;
             else n = 0;
         }
         delay(0);
     }
-    return false;
+    return -1;
 }
 
 static void handleQGet(const char* basename) {
@@ -2346,9 +2350,15 @@ static void handleQGet(const char* basename) {
     // next one. This keeps Teensy's pace strictly tied to the dash's actual
     // throughput so we never out-run the dash regardless of UART buffer size
     // or TCP write speed on the dash's WiFi link.
+    // Stop-and-wait ARQ with sequence numbers. Each ndjson line goes out as
+    // 'Q,L,<seq>,<line>\n'; the dash applies it and replies 'Q,A,<seq>'. If a
+    // line OR its ack is lost/corrupted on the (long, noisy) UART wire, the
+    // ack times out and we RETRANSMIT the same seq — the dash dedups by seq, so
+    // a dropped byte costs one retransmit instead of aborting the whole upload.
     char     line[320];
     size_t   line_n = 0;
-    uint32_t lines_sent = 0;
+    uint32_t seq = 0;
+    uint32_t retransmits = 0;
     bool     ack_fail = false;
     while (true) {
         const int c = f.read();
@@ -2357,16 +2367,20 @@ static void handleQGet(const char* basename) {
         if (c == '\n' || c < 0) {
             line[line_n] = '\0';
             if (line_n > 0) {
-                DASH_SERIAL.print(F("Q,L,"));
-                DASH_SERIAL.write((const uint8_t*)line, line_n);
-                DASH_SERIAL.write('\n');
-                lines_sent++;
-                // Wait up to 10 s for the dash to ACK this line before
-                // sending the next. 10 s covers a slow remote HTTPS POST
-                // burst; faster than that on local LAN.
-                if (!qWaitForAck(10000)) {
-                    Serial.printf("[Q] GET %s: ACK timeout after %lu lines\n",
-                                  basename, (unsigned long)lines_sent);
+                seq++;
+                bool acked = false;
+                // ~30 s worst case per line (15 * 2 s) before declaring the
+                // link dead; a transient glitch clears on the first retry.
+                for (int attempt = 0; attempt < 15 && !acked; ++attempt) {
+                    if (attempt > 0) retransmits++;
+                    DASH_SERIAL.printf("Q,L,%lu,", (unsigned long)seq);
+                    DASH_SERIAL.write((const uint8_t*)line, line_n);
+                    DASH_SERIAL.write('\n');
+                    if (qWaitForAckSeq(2000) >= (long)seq) acked = true;
+                }
+                if (!acked) {
+                    Serial.printf("[Q] GET %s: ACK timeout at seq %lu\n",
+                                  basename, (unsigned long)seq);
                     ack_fail = true;
                     break;
                 }
@@ -2383,10 +2397,11 @@ static void handleQGet(const char* basename) {
         DASH_SERIAL.println(F("Q,ERR,ack_timeout"));
         return;
     }
-    DASH_SERIAL.printf("Q,EOF,%lu\n", (unsigned long)lines_sent);
+    DASH_SERIAL.printf("Q,EOF,%lu\n", (unsigned long)seq);
     DASH_SERIAL.flush();
-    Serial.printf("[Q] GET %s: streamed %lu lines, %lu bytes\n",
-                  basename, (unsigned long)lines_sent, (unsigned long)sz);
+    Serial.printf("[Q] GET %s: streamed %lu lines, %lu bytes (%lu retransmits)\n",
+                  basename, (unsigned long)seq, (unsigned long)sz,
+                  (unsigned long)retransmits);
 }
 
 static void handleQDel(const char* basename) {

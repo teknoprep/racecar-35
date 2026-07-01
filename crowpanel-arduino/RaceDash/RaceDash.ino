@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.77"
+#define FIRMWARE_VERSION "0.1.78"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1623,6 +1623,7 @@ struct UploadFlow {
     uint32_t   buflen;          // bytes staged so far
     uint32_t   post_off;        // body bytes written to the socket so far
     bool       post_started;    // request headers written, body in progress
+    uint32_t   next_seq;        // next expected Q,L sequence number (ARQ dedup)
 };
 static UploadFlow uf = {};
 static constexpr uint32_t UF_MAX_FILE = 6UL * 1024 * 1024;   // PSRAM staging cap
@@ -1968,6 +1969,7 @@ static bool parseQLine(const String& line) {
         uf.bufcap        = sz;
         uf.buflen        = 0;
         uf.lines_recv    = 0;
+        uf.next_seq      = 1;       // Teensy numbers lines from 1
         uf.expected_size = sz;      // modal progress while staging
         uf.bytes_written = 0;
         ufEnter(UF_STREAMING);
@@ -1975,41 +1977,51 @@ static bool parseQLine(const String& line) {
         return true;
     }
     if (strncmp(p, "L,", 2) == 0 && uf.state == UF_STREAMING) {
-        const char* data = p + 2;
-        const size_t n = strlen(data);
+        // Sequence-numbered line: L,<seq>,<data>. Stop-and-wait ARQ so a
+        // dropped/corrupted byte on the UART wire costs one retransmit, not the
+        // whole upload. We only APPLY seq == next_seq; a duplicate (seq <
+        // next_seq, from a lost ACK) is ignored but still re-ACKed; a corrupt
+        // line that fails to parse is ignored (Teensy retransmits).
         if (!uf.buf) {
             snprintf(uf.last_err, sizeof(uf.last_err), "no buffer for Q,L");
             uf.failed++;
             ufNextFile();
             return true;
         }
-        const size_t need = n + 1;   // line + '\n'
-        if (uf.buflen + need > uf.bufcap) {
-            // More data than the advertised size — corrupt; never write past buf.
-            snprintf(uf.last_err, sizeof(uf.last_err),
-                     "buffer overflow %lu+%u/%lu",
-                     (unsigned long)uf.buflen, (unsigned)need, (unsigned long)uf.bufcap);
-            uf.failed++;
-            ufNextFile();
-            return true;
-        }
-        memcpy(uf.buf + uf.buflen, data, n);
-        uf.buf[uf.buflen + n] = '\n';
-        uf.buflen        += need;
-        uf.bytes_written  = uf.buflen;
-        uf.last_rx_ms     = millis();
-        uf.lines_recv++;
+        const char* s = p + 2;
+        char* endp = nullptr;
+        const unsigned long seq = strtoul(s, &endp, 10);
+        if (!endp || *endp != ',') return true;   // malformed; Teensy will resend
+        const char* data = endp + 1;
+        const size_t n = strlen(data);
 
-        // ACK instantly (the line is safely in RAM) so the Teensy sends the
-        // next line immediately — zero network in this path.
-        Serial.println("Q,A");
+        if (seq == uf.next_seq) {
+            const size_t need = n + 1;   // line + '\n'
+            if (uf.buflen + need > uf.bufcap) {
+                snprintf(uf.last_err, sizeof(uf.last_err),
+                         "buffer overflow %lu+%u/%lu",
+                         (unsigned long)uf.buflen, (unsigned)need, (unsigned long)uf.bufcap);
+                uf.failed++;
+                ufNextFile();
+                return true;
+            }
+            memcpy(uf.buf + uf.buflen, data, n);
+            uf.buf[uf.buflen + n] = '\n';
+            uf.buflen       += need;
+            uf.bytes_written = uf.buflen;
+            uf.next_seq++;
+            uf.lines_recv++;
+            if ((uf.lines_recv % 1000) == 0) {
+                Serial.printf("DBG,uf_buf lines=%lu bytes=%lu/%lu\n",
+                              (unsigned long)uf.lines_recv,
+                              (unsigned long)uf.buflen, (unsigned long)uf.bufcap);
+            }
+        }
+        uf.last_rx_ms = millis();
+        // ACK the highest contiguous seq applied (next_seq-1). Covers dedup:
+        // a resent already-applied line still gets a satisfying ACK.
+        Serial.printf("Q,A,%lu\n", (unsigned long)(uf.next_seq - 1));
         Serial.flush();
-
-        if ((uf.lines_recv % 1000) == 0) {
-            Serial.printf("DBG,uf_buf lines=%lu bytes=%lu/%lu\n",
-                          (unsigned long)uf.lines_recv,
-                          (unsigned long)uf.buflen, (unsigned long)uf.bufcap);
-        }
         return true;
     }
     if (strncmp(p, "EOF", 3) == 0 && uf.state == UF_STREAMING) {
