@@ -3500,7 +3500,10 @@ _REVIEW_HTML = (
   <span class="pill" id="started">__WHEN__</span>
   <span class="pill" id="count">\u2026</span>
   <span id="admin-move" style="display:none;align-items:center;gap:6px">
-    <select id="move-target" class="cmp-input" style="width:auto;min-width:180px"></select>
+    <input id="move-target" class="cmp-input" list="move-targets" type="text"
+           placeholder="reassign to email…" autocomplete="off"
+           style="width:auto;min-width:210px">
+    <datalist id="move-targets"></datalist>
     <button id="move-btn" class="btn">reassign</button>
   </span>
   <a class="btn" href="/sessions/__USER__/__FILE__">download</a>
@@ -4460,18 +4463,20 @@ _REVIEW_HTML = (
   if (!me || !me.is_admin) return;
   const wrap=document.getElementById('admin-move');
   const sel=document.getElementById('move-target');
+  const dl=document.getElementById('move-targets');
   const btn=document.getElementById('move-btn');
   if (!wrap||!sel||!btn) return;
   try {
     const t = await (await fetch('/admin/sessions/targets')).json();
     for (const em of (t.targets||[])){
-      const o=document.createElement('option'); o.value=em; o.textContent=em; sel.appendChild(o);
+      const o=document.createElement('option'); o.value=em; dl.appendChild(o);
     }
   } catch(e){}
   wrap.style.display='inline-flex';
   btn.addEventListener('click', async ()=>{
-    const target=sel.value;
-    if (!target){ return; }
+    const target=(sel.value||'').trim().toLowerCase();
+    if (!target){ sel.focus(); return; }
+    if (target.indexOf('@')<0 || target.indexOf('.')<0){ alert('Enter a valid email address to reassign to.'); sel.focus(); return; }
     if (!confirm('Move this session (and its AI history) to '+target+'?\\nThe URL will change to that user.')) return;
     btn.disabled=true; btn.textContent='moving\u2026';
     try {
