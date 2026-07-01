@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.71"
+#define FIRMWARE_VERSION "0.1.72"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1736,11 +1736,14 @@ static bool ufOpenStream(uint32_t content_length) {
         uf.tcp = plain;
         uf.tcp_secure = false;
     }
-    Serial.printf("DBG,uf_connect host=%s port=%u sec=%d size=%lu heap=%u maxblk=%u\n",
+    // NOTE: only ESP.getFreeHeap() here (a cheap maintained counter). Do NOT
+    // call heap_caps_get_largest_free_block() — it walks the whole heap inside
+    // a critical section (interrupts off) and on the Advance's large heap that
+    // walk trips the Interrupt WDT -> panic/reboot mid-upload (v0.1.70/0.1.71).
+    Serial.printf("DBG,uf_connect host=%s port=%u sec=%d size=%lu heap=%u\n",
                   s.cloud_host, (unsigned)s.cloud_port, (int)uf.tcp_secure,
                   (unsigned long)content_length,
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+                  (unsigned)ESP.getFreeHeap());
     const uint32_t t_conn0 = millis();
     const bool connected = uf.tcp->connect(s.cloud_host, s.cloud_port);
     Serial.printf("DBG,uf_connect_done ok=%d ms=%lu\n",
