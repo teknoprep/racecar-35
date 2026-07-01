@@ -3739,8 +3739,7 @@ _REVIEW_HTML = (
   }
   drawGTrail();
 
-  function placeGDot(idx) {
-    const lat = GLat[idx], lng = GLong[idx];
+  function placeGDotVal(lat, lng) {
     if (lat == null || lng == null) { gdot.style.display = 'none'; return; }
     gdot.style.display = '';
     // map [-G_MAX, +G_MAX] -> [0%, 100%]
@@ -3749,6 +3748,7 @@ _REVIEW_HTML = (
     gdot.style.left = xPct.toFixed(2) + '%';
     gdot.style.top  = yPct.toFixed(2) + '%';
   }
+  function placeGDot(idx) { placeGDotVal(GLat[idx], GLong[idx]); }
 
   // ---- slider + render ------------------------------------------------
   const slider = el('slider');
@@ -3786,6 +3786,58 @@ _REVIEW_HTML = (
   slider.addEventListener('input', () => render(Number(slider.value)));
   render(0);
 
+  // ---- interpolated render for smooth playback ------------------------
+  // The /data feed is downsampled for fast load (a long session may be only a
+  // few Hz), so snapping the follow-dot to discrete samples looks jerky. During
+  // playback we render at the real clock `target` (seconds) and LERP position +
+  // readouts between the two bracketing samples, so motion stays smooth at 60fps
+  // no matter the sample rate. Scrubbing still uses the exact-sample render().
+  const lerpN = (a, b, f) =>
+    (typeof a === 'number' && isFinite(a) && typeof b === 'number' && isFinite(b))
+      ? a + (b - a) * f : (typeof a === 'number' ? a : b);
+  function lerpHeading(a, b, f) {
+    if (typeof a !== 'number') return b;
+    if (typeof b !== 'number') return a;
+    let d = ((b - a + 540) % 360) - 180;   // shortest way round the compass
+    return (a + d * f + 360) % 360;
+  }
+  function renderAt(target) {
+    const endIdx = S.length - 1;
+    let i0 = Number(slider.value);
+    while (i0 < endIdx && T[i0 + 1] <= target) i0++;
+    while (i0 > 0 && T[i0] > target) i0--;
+    const i1 = Math.min(i0 + 1, endIdx);
+    const span = (T[i1] - T[i0]) || 1;
+    let f = (target - T[i0]) / span;
+    if (!isFinite(f) || f < 0) f = 0; else if (f > 1) f = 1;
+    const a = S[i0], b = S[i1];
+    const speed = lerpN(a.speed_mph, b.speed_mph, f);
+    el('v-speed').textContent = (typeof speed === 'number')
+        ? (speed >= 100 ? fmtInt(speed) : fmt(speed, 1)) : '\u2014';
+    el('v-rpm').textContent = fmtInt(lerpN(a.rpm, b.rpm, f));
+    el('v-hdg').textContent = fmt(lerpHeading(a.heading_deg, b.heading_deg, f), 0);
+    const lat = lerpN(a.lat, b.lat, f), lon = lerpN(a.lon, b.lon, f);
+    el('v-lat').textContent = fmt(lat, 6);
+    el('v-lon').textContent = fmt(lon, 6);
+    el('v-alt').textContent = fmt(lerpN(a.alt_m, b.alt_m, f), 1);
+    const fix = a.fix, sats = a.sats;
+    el('v-fix').textContent = (fix == null) ? '\u2014'
+      : (FIX_NAMES[fix] || ('fix ' + fix)) + (sats != null ? ' \u00b7 ' + sats : '');
+    el('t-now').textContent = fmtTime(target - T0);
+    if (dot && typeof lat === 'number' && typeof lon === 'number' && (lat || lon)) {
+      dot.setLatLng([lat, lon]);
+    }
+    const gl = lerpN(GLat[i0], GLat[i1], f);
+    const gL = lerpN(GLong[i0], GLong[i1], f);
+    const gv = lerpN(GVert[i0], GVert[i1], f);
+    el('v-glat').textContent  = (gl == null) ? '\u2014' : gl.toFixed(2) + ' g';
+    el('v-glong').textContent = (gL == null) ? '\u2014' : gL.toFixed(2) + ' g';
+    el('v-gvert').textContent = (gv == null) ? '\u2014' : gv.toFixed(2) + ' g';
+    placeGDotVal(gl, gL);
+    placeDeltaCursor(i0);
+    updateCompReadouts(i0);
+  }
+
   // ---- play / pause ---------------------------------------------------
   // Drives the slider in real time, paced by the normalized T[] array so
   // both real-clock and synthetic-25Hz files play at the right cadence.
@@ -3802,11 +3854,11 @@ _REVIEW_HTML = (
     const endIdx = lapWindow ? lapWindow.i1 : S.length - 1;
     let next = Number(slider.value);
     while (next < endIdx && T[next+1] <= target) next++;
-    if (next >= endIdx) {
+    if (target >= T[endIdx] || next >= endIdx) {
       slider.value = String(endIdx); render(endIdx); stop(); return;
     }
     slider.value = String(next);
-    render(next);
+    renderAt(target);         // smooth interpolated frame
     rafId = requestAnimationFrame(tick);
   }
   function start() {
