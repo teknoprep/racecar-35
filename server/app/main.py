@@ -58,6 +58,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 # ---------------------------------------------------------------------------
 DATA_DIR = pathlib.Path(os.environ.get("RACECAR_DATA_DIR", "/data"))
 API_KEY = os.environ.get("RACECAR_API_KEY", "").strip()
+# Firmware-upload auth is DELIBERATELY separate from session-upload auth. If we
+# reused RACECAR_API_KEY, setting it to lock down firmware uploads would also
+# force every dash session upload to send that exact key (and 401 otherwise —
+# which is precisely the bug that made uploads "die at ~250 lines"). Set
+# RACECAR_FIRMWARE_KEY to gate POST /firmware/upload independently; it falls
+# back to RACECAR_API_KEY only if unset.
+FIRMWARE_KEY = os.environ.get("RACECAR_FIRMWARE_KEY", "").strip() or API_KEY
 SERVICE_NAME = os.environ.get("RACECAR_SERVICE_NAME", "racecar-35 cloud")
 MAX_BODY_BYTES = int(os.environ.get("RACECAR_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
@@ -1413,7 +1420,10 @@ async def firmware_list() -> JSONResponse:
 @app.post("/firmware/upload")
 async def firmware_upload(request: Request, name: str = Query(...),
                          x_api_key: Optional[str] = Header(None)) -> JSONResponse:
-    authorize(x_api_key)
+    # Gated by the DEDICATED firmware key (RACECAR_FIRMWARE_KEY), never the
+    # session RACECAR_API_KEY — see the FIRMWARE_KEY comment above.
+    if FIRMWARE_KEY and x_api_key != FIRMWARE_KEY:
+        raise HTTPException(status_code=401, detail="invalid firmware key")
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="empty body")
@@ -1446,8 +1456,12 @@ async def _save_body(
     """Common body for /upload (mode='w') and /stream (mode='a')."""
     web_user = None
     if API_KEY and x_api_key != API_KEY:
+        # Accept EITHER a logged-in web user OR a valid per-user API key
+        # (the dash sends its account key as X-API-Key). Without the per-user
+        # check, setting RACECAR_API_KEY for any reason would 401 every dash
+        # upload whose key isn't the global one.
         web_user = current_user(request) if oauth_enabled() else None
-        if not web_user:
+        if not web_user and not (x_api_key and email_for_api_key(x_api_key)):
             raise HTTPException(status_code=401, detail="invalid api key")
     elif oauth_enabled():
         web_user = current_user(request)
