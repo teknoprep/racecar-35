@@ -44,6 +44,7 @@ import os
 import pathlib
 import re
 import secrets
+import shutil
 import time
 import urllib.error
 import urllib.parse
@@ -2116,6 +2117,66 @@ async def delete_session_form(
     return await delete_session(request, user, filename, x_api_key)
 
 
+@app.get("/admin/sessions/targets")
+async def admin_session_targets(request: Request) -> JSONResponse:
+    """Emails an admin may reassign a session TO (all known accounts). Admin only."""
+    require_admin(request)
+    return JSONResponse({"targets": sorted(all_known_users())})
+
+
+@app.post("/admin/sessions/move")
+async def admin_move_session(request: Request) -> JSONResponse:
+    """Reassign a session (and its AI history) to another user. Admin only.
+
+    Body JSON: {user, filename, target}  where `user`/`filename` identify the
+    source session (same as the URL params) and `target` is the destination
+    account EMAIL. Moves the .ndjson into the target's sessions dir and moves
+    the matching ai_history file alongside it. Refuses if the target already
+    has a session with the same name (so nothing is silently overwritten).
+    """
+    require_admin(request)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    user = str(body.get("user", ""))
+    filename = str(body.get("filename", ""))
+    target = str(body.get("target", "")).strip().lower()
+    if not target:
+        raise HTTPException(status_code=400, detail="target (email) required")
+
+    src = _resolve_session(user, filename)     # 404 if it doesn't exist
+    dst_dir = session_dir_for(target)          # creates the target dir; slug = safe_name(target)
+    dst = dst_dir / src.name
+    if dst.resolve() == src.resolve():
+        raise HTTPException(status_code=400, detail="source and target are the same user")
+    if dst.exists():
+        raise HTTPException(status_code=409,
+                            detail=f"target already has a session named {src.name}")
+
+    shutil.move(str(src), str(dst))
+    # Move the AI Q&A history alongside the session (best-effort).
+    src_hist = _ai_history_path(user, src.name)
+    dst_hist = _ai_history_path(target, src.name)
+    if src_hist.exists():
+        dst_hist.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_hist), str(dst_hist))
+    # Tidy now-empty source dirs.
+    for d in (src.parent, src_hist.parent):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    new_user = safe_name(target)
+    log.info("admin moved session %s: %s -> %s", src.name, safe_name(user), new_user)
+    return JSONResponse({
+        "ok": True,
+        "user": new_user,
+        "filename": src.name,
+        "review": f"/review/{new_user}/{src.name}",
+    })
+
+
 @app.get("/sessions/{user}/{filename}/data")
 async def session_data(
     request: Request,
@@ -3438,6 +3499,10 @@ _REVIEW_HTML = (
   <span style="flex:1"></span>
   <span class="pill" id="started">__WHEN__</span>
   <span class="pill" id="count">\u2026</span>
+  <span id="admin-move" style="display:none;align-items:center;gap:6px">
+    <select id="move-target" class="cmp-input" style="width:auto;min-width:180px"></select>
+    <button id="move-btn" class="btn">reassign</button>
+  </span>
   <a class="btn" href="/sessions/__USER__/__FILE__">download</a>
 </header>
 <main>
@@ -4384,6 +4449,40 @@ _REVIEW_HTML = (
     });
     loadModels();
   })();
+})();
+</script>
+<script>
+// Admin-only: reassign this session (and its AI history) to another user.
+(async function(){
+  const U='__USER__', F='__FILE__';
+  let me;
+  try { me = await (await fetch('/me')).json(); } catch(e){ return; }
+  if (!me || !me.is_admin) return;
+  const wrap=document.getElementById('admin-move');
+  const sel=document.getElementById('move-target');
+  const btn=document.getElementById('move-btn');
+  if (!wrap||!sel||!btn) return;
+  try {
+    const t = await (await fetch('/admin/sessions/targets')).json();
+    for (const em of (t.targets||[])){
+      const o=document.createElement('option'); o.value=em; o.textContent=em; sel.appendChild(o);
+    }
+  } catch(e){}
+  wrap.style.display='inline-flex';
+  btn.addEventListener('click', async ()=>{
+    const target=sel.value;
+    if (!target){ return; }
+    if (!confirm('Move this session (and its AI history) to '+target+'?\\nThe URL will change to that user.')) return;
+    btn.disabled=true; btn.textContent='moving\u2026';
+    try {
+      const r=await fetch('/admin/sessions/move', {method:'POST',headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({user:U, filename:F, target})});
+      const j=await r.json();
+      if (r.ok && j.review){ location.href=j.review; return; }
+      alert('move failed: '+((j&&j.detail)||('HTTP '+r.status)));
+    } catch(e){ alert('move failed: '+e.message); }
+    btn.disabled=false; btn.textContent='reassign';
+  });
 })();
 </script>
 </body></html>

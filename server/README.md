@@ -26,6 +26,8 @@ LAN IP of the host running the container.
 | GET    | `/account/apikey`           | JSON `{email, api_key}` for the signed-in user (creates a key if missing). |
 | POST   | `/account/apikey/refresh`   | Regenerate the signed-in user's API key. Old key stops working immediately. |
 | GET    | `/admin`                    | Admin portal (admins only): add authorized Gmail accounts, grant/revoke admin. |
+| GET    | `/admin/sessions/targets`   | Emails an admin may reassign a session to (all known accounts). Admins only. |
+| POST   | `/admin/sessions/move`      | **Reassign a session to another user.** Body `{user, filename, target}` (target = destination email). Moves the `.ndjson` **and its AI history** into the target's dir; refuses if the target already has a same-named session. Admins only. |
 | POST   | `/admin/users`              | Add an account or change its admin flag (JSON `{email, is_admin}`). Admins only. |
 | POST   | `/admin/users/delete`       | Remove a managed account (JSON `{email}`). Admins only. |
 | GET    | `/admin/user/<email>`       | Per-user screen: ALL USERS toggle + manage who this account can see. Admins only. |

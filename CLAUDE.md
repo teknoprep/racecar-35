@@ -176,6 +176,18 @@ curl -s https://racecar.api.blueuc.com/firmware/list      # {"firmware":[...]}  
 ```
 Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
 
+### Admin: reassign a session to another user
+
+Sessions live at `/data/sessions/<safe_name(email)>/<file>.ndjson`. An **admin** can move a
+session to a different account (e.g. “someone drove my car — give them the data”) from the
+**review page header**: a `reassign` control (target dropdown, admin-only, shown after `/me`
+reports `is_admin`) POSTs `/admin/sessions/move {user, filename, target}`. The handler
+`shutil.move`s the `.ndjson` into `session_dir_for(target)` **and moves the matching
+`ai_history/<user>/<file>.json` alongside it**, tidies empty source dirs, and refuses (409) if
+the target already has a same-named session (never silently overwrites). Targets come from
+`GET /admin/sessions/targets` = `all_known_users()`. The browser then redirects to the new
+`/review/<new_slug>/<file>` URL. `require_admin` gates both routes.
+
 ### AI corner analysis on the review page (v-server, Open WebUI @ ai.blueuc.com)
 
 The review page (`/review/<user>/<file>`) has an **AI Corner Analysis** card: the user clicks
