@@ -1,37 +1,37 @@
 {
   "teensy": {
     "board":   "teensy",
-    "version": "0.1.68",
+    "version": "0.1.69",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/teensy41-dash.hex",
-    "sha256":  "e1b284f6294d66b02d268b43de799c16d7fd53ddc63850785f84f4796f2c0cb9",
-    "size":    596314
+    "sha256":  "d4b96653723af8527d5692a03c348ba90e2cf441de34339058992d18f2d5a29f",
+    "size":    610714
   },
   "crowpanel7": {
     "board":   "crowpanel7",
-    "version": "0.1.68",
+    "version": "0.1.69",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
-    "sha256":  "e300494eee5419d1251b1d9340dd2751b4ede3f9ad2bb4a93ecc4fde4199fd24",
-    "size":    1040896
+    "sha256":  "99f2b7d178a54f125fe0342d1556294e0b7ce86b80d8f8d92b1985f6f7894275",
+    "size":    1044016
   },
   "crowpanel5": {
     "board":   "crowpanel5",
-    "version": "0.1.68",
+    "version": "0.1.69",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5-dash.bin",
-    "sha256":  "47130f9366464c756e41636efec1c9fed586b9c3278ae2e2854d30a9b3a1e752",
-    "size":    1040896
+    "sha256":  "c9cef8a5099fcb64cf01ed824f593523dec54bf2cfbc01649115d6aa5ce79892",
+    "size":    1044016
   },
   "crowpanel5adv": {
     "board":   "crowpanel5adv",
-    "version": "0.1.68",
+    "version": "0.1.69",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5adv-dash.bin",
-    "sha256":  "45648e55b1612f5ff5a587286bda6c4a1f7f994a4f761b201485e1942b0a70eb",
-    "size":    1040512
+    "sha256":  "5199443cf6727373ad3f2729a3262e69958b0c5e4d77455bdb31368f8e89920c",
+    "size":    1043600
   },
   "crowpanel": {
     "board":   "crowpanel7",
-    "version": "0.1.68",
+    "version": "0.1.69",
     "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
-    "sha256":  "e300494eee5419d1251b1d9340dd2751b4ede3f9ad2bb4a93ecc4fde4199fd24",
-    "size":    1040896
+    "sha256":  "99f2b7d178a54f125fe0342d1556294e0b7ce86b80d8f8d92b1985f6f7894275",
+    "size":    1044016
   }
 }

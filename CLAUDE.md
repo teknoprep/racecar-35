@@ -271,7 +271,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `am_rpm` / `am_col` / `am_hz` | uint16/uint8/uint8 | MAX alert ditto |
 | `rec_sd` / `rec_cl` | bool | Record-to-SD / record-to-cloud master switches |
 | `cl_host` | string | Cloud DNS or IP |
-| `cl_port` | uint16 | Cloud port |
+| `cl_port` | uint16 | Cloud port. **Default 443** (HTTPS). Cycling `cl_proto` auto-snaps this to the protocol's well-known port (HTTP→80 / HTTPS→443 / FTP→21), still editable. The `racecar.api.blueuc.com` endpoint is HTTPS-only: port 80 just 301-redirects (which the dash won't follow), so HTTPS+443 is the only working combo. NOTE: existing units have the old `80` stored in NVS — change it on-device or it stays 80. |
 | `cl_proto` | uint8 | 0=HTTP, 1=HTTPS, 2=FTP |
 | ~~`cl_strm`~~ | — | **REMOVED in v0.1.66.** Live "stream to cloud" was deleted (not ready, and its mid-session POSTs stalled the loop → GPS STALE). Cloud recording is now **always After Race**. Old stored key is orphaned/harmless. |
 | `cl_email` / `cl_key` | string | Cloud user email (X-User-Email) + API key (X-API-Key, masked). Migrated from legacy `cl_user`/`cl_pass`. |
@@ -533,6 +533,12 @@ post-processing side, not the Teensy (keep the logged stream calibrated-but-raw)
   is also a Teensy-core lib.
 
 ## Toolchain note (Linux build host)
+
+> **Full from-scratch build setup + exact commands live in [BUILD.md](BUILD.md)** — install
+> arduino-cli + `esp32:esp32@2.0.14` + libs (LovyanGFX/TAMC_GT911/bundled PCA9557) + the
+> pyserial-on-PYTHONPATH gotcha for esptool, and PlatformIO in a venv. Keep tools OUT of the
+> OneDrive-synced `chrisrawlings/` tree (this build used `/home/chris/racecar-tools/`).
+
 This session built/flashed on Linux, not the Windows paths below:
 - PlatformIO: `~/.local/bin/pio` (or `~/.local/share/pipx/venvs/platformio/bin/platformio`)
 - arduino-cli: `~/.local/bin/arduino-cli`, `directories.user = ~/Arduino`

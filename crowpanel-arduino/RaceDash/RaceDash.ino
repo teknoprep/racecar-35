@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.68"
+#define FIRMWARE_VERSION "0.1.69"
 
 #include <Preferences.h>
 #include <time.h>
@@ -555,7 +555,8 @@ struct Settings {
     bool     record_sd        = false;
     bool     record_cloud     = false;
     char     cloud_host[64]   = "racecar.api.blueuc.com";  // default endpoint
-    uint16_t cloud_port       = 80;
+    uint16_t cloud_port       = 443;   // HTTPS endpoint. Port 80 only 301-redirects
+                                       // to https://.../upload, which the dash won't follow.
     uint8_t  cloud_protocol   = 1;     // 0=HTTP, 1=HTTPS, 2=FTP (default HTTPS; FTP NYI)
     // cloud_user repurposed as a free-text USER EMAIL tag for data ownership.
     // Not an auth credential — the Teensy forwards it as X-User-Email header.
@@ -3962,6 +3963,14 @@ static void wifiTick() {
     switch (wifi_state) {
         case WS_OFF: {
             WiFi.mode(WIFI_STA);
+            // Disable modem power-save. Default is WIFI_PS_MIN_MODEM, where the
+            // radio sleeps between AP beacons — that stretches DHCP
+            // DISCOVER/OFFER/REQUEST round-trips out to many seconds (the slow
+            // "took a while to get an IP" symptom), and adds latency to every
+            // later cloud upload packet. We're wall-powered in the car, so
+            // there's no reason to power-save the WiFi radio.
+            WiFi.setSleep(false);
+            WiFi.setAutoReconnect(true);
             WiFi.begin(s.wifi_ssid, s.wifi_pass);
             setWifiState(WS_CONNECTING);
             break;
@@ -4464,6 +4473,11 @@ static void handleSettingsTap(int x, int y) {
             if (inRect(x, y, ENUM_X, ry, ENUM_W, SETTINGS_ROW_HEIGHT)) {
                 if (r.id == ST_CL_PROTO) {
                     s.cloud_protocol = (s.cloud_protocol + 1) % N_PROTOCOL;
+                    // Snap the port to the new protocol's well-known default so
+                    // the common case (HTTPS->443) needs zero extra taps. Still
+                    // fully editable afterwards via the Cloud port row.
+                    static const uint16_t PROTO_DEFAULT_PORT[] = { 80, 443, 21 };
+                    s.cloud_port = PROTO_DEFAULT_PORT[s.cloud_protocol % N_PROTOCOL];
                 } else if (r.id == ST_TIMEZONE) {
                     s.timezone_idx = (s.timezone_idx + 1) % N_TIMEZONES;
                     // Notify Teensy so it has the active TZ for future use
