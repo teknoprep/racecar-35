@@ -2,35 +2,35 @@
   "teensy": {
     "board":   "teensy",
     "version": "0.1.73",
-    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/teensy41-dash.hex",
+    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/bc9d3a3d17a5a025028173dd1cadf9d2c85cc5ca/firmware/teensy41-dash.hex",
     "sha256":  "765a6d15c41bb6ad6cccffc028206d5046a85ad381df987ac977563703231593",
     "size":    610714
   },
   "crowpanel7": {
     "board":   "crowpanel7",
     "version": "0.1.73",
-    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
+    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/bc9d3a3d17a5a025028173dd1cadf9d2c85cc5ca/firmware/crowpanel7-dash.bin",
     "sha256":  "a2916cbf98202281622f54507d6897ae3784d967ab447abdb14e7a9ab6be47af",
     "size":    1045136
   },
   "crowpanel5": {
     "board":   "crowpanel5",
     "version": "0.1.73",
-    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5-dash.bin",
+    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/bc9d3a3d17a5a025028173dd1cadf9d2c85cc5ca/firmware/crowpanel5-dash.bin",
     "sha256":  "b2cce1fe6046307608108a7f76d1ceb7c797b3e52dce372489690d1e9c560173",
     "size":    1045136
   },
   "crowpanel5adv": {
     "board":   "crowpanel5adv",
     "version": "0.1.73",
-    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel5adv-dash.bin",
+    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/bc9d3a3d17a5a025028173dd1cadf9d2c85cc5ca/firmware/crowpanel5adv-dash.bin",
     "sha256":  "58688ed0d1da83cd27274079d6c528addf4375d088c8d2a8feeb59fb940c358a",
     "size":    1044720
   },
   "crowpanel": {
     "board":   "crowpanel7",
     "version": "0.1.73",
-    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/crowpanel7-dash.bin",
+    "url":     "https://raw.githubusercontent.com/teknoprep/racecar-35/bc9d3a3d17a5a025028173dd1cadf9d2c85cc5ca/firmware/crowpanel7-dash.bin",
     "sha256":  "a2916cbf98202281622f54507d6897ae3784d967ab447abdb14e7a9ab6be47af",
     "size":    1045136
   }
