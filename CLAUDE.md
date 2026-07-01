@@ -130,7 +130,40 @@ This is the default release contract for this repo. When code is changed and the
 8. **NVS keys are short + append-only** — add new `Preferences` keys to BOTH `loadSettings()`
    and `saveSettings()`; never repurpose an existing key's meaning.
 
-## OTA release — ⚠️ ALWAYS bump ALL FOUR artifacts to the SAME version
+## OTA is now served from OUR server (racecar.api.blueuc.com), not GitHub (v0.1.74+)
+
+As of **v0.1.73** the dash `OTA_MANIFEST_URL` points at
+`https://racecar.api.blueuc.com/firmware/manifest.json` (see `RaceDash.ino`).
+The FastAPI server (`server/app/main.py`) hosts the OTA feed:
+`GET /firmware/manifest.json` (served **`Cache-Control: no-store`** → instantly
+fresh, no CDN lag), `GET /firmware/{file}`, and `POST /firmware/upload?name=<f>`
+(gated by `X-API-Key` == the server's `RACECAR_API_KEY`). Files live in
+`RACECAR_DATA_DIR/firmware/`.
+
+**Why:** `raw.githubusercontent.com` is fronted by Fastly, which ignores
+query-string cache-busting AND client `no-cache` headers and serves ~5 min
+stale after a push — so a freshly published version wasn't visible to devices
+for minutes. The server's `no-store` fixes that outright.
+
+**Publishing a server release** (after building all four — see [BUILD.md](BUILD.md)):
+```bash
+RACECAR_API_KEY=<server key> ./server/publish_firmware.sh <version> https://racecar.api.blueuc.com
+```
+That uploads the four binaries then a server-pointed manifest (artifact URLs =
+`<base>/firmware/<file>`, legacy `crowpanel` alias = `crowpanel7`) and verifies.
+The API key for THIS bench lives OUTSIDE the repo at
+`/home/chris/racecar-tools/secrets/racecar_api_key.env` (never committed).
+
+**Two channels, deliberately:** the GitHub `firmware/manifest.json` is frozen
+at **0.1.73** (the transition build whose `OTA_MANIFEST_URL` is the server) so
+any panel still on ≤0.1.72 can OTA that far from GitHub and then hop to the
+server. Everything **0.1.74+ ships server-only** via `publish_firmware.sh`;
+those versions are NOT added to the GitHub manifest, and the GitHub `firmware/`
+binaries stay at the 0.1.73 build to match its frozen manifest. The lockstep
+rules below still apply (bump BOTH `FIRMWARE_VERSION` defines, build ALL FOUR,
+same version) — only the publish destination changed.
+
+## OTA release (GitHub path — used through v0.1.73; server path above supersedes it) — ⚠️ ALWAYS bump ALL FOUR artifacts to the SAME version
 
 The dash OTA pulls `firmware/manifest.json` from GitHub raw and flashes whichever artifact's
 manifest `version` is newer than what's installed. There are **FOUR** release artifacts —

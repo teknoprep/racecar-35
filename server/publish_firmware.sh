@@ -16,7 +16,7 @@ set -euo pipefail
 
 VER="${1:?usage: publish_firmware.sh <version> [base_url]}"
 BASE="${2:-https://racecar.api.blueuc.com}"
-KEY="${RACECAR_API_KEY:?set RACECAR_API_KEY (must equal the server's RACECAR_API_KEY env)}"
+KEY="${RACECAR_API_KEY:?set RACECAR_API_KEY to match the server RACECAR_API_KEY env}"
 
 # repo-root/firmware regardless of where we're called from
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

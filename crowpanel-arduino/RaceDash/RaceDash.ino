@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.73"
+#define FIRMWARE_VERSION "0.1.74"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4090,6 +4090,11 @@ static const char* enumValue(SettingId id) {
 // ST_REC_SD only makes sense when a card is mounted; ST_SD_FORMAT now lives
 // the card is present but unformatted. Hiding keeps the list uncluttered
 // and prevents tapping controls that have no effect.
+// Which rows are visible right now. A settings row is hidden when the toggle/
+// selector it depends on is off/irrelevant, so disabling a feature collapses
+// all of its dependent sub-settings out of the list (they don't just grey out).
+// rowScreenY() compacts the gaps, and the tap/draw/height loops all gate on
+// this, so a hidden row can't be drawn, tapped, or counted in the scroll height.
 static bool rowShouldShow(SettingId id) {
     switch (id) {
         case ST_REC_SD:    return sd_card_status == 2;  // hidden unless card is READY
@@ -4099,6 +4104,41 @@ static bool rowShouldShow(SettingId id) {
         case ST_WIFI_SSID:
         case ST_WIFI_PASS:
         case ST_WIFI_STATUS: return s.internet_mode == 1;
+
+        // Tach pulses/rev divider only applies to the Direct opto tach; in
+        // MegaSquirt mode RPM comes straight from CAN.
+        case ST_RPM_DIV:   return s.sensor_type == 0;
+
+        // RPM alert thresholds/colours/blink only when alerts are enabled.
+        case ST_A1_RPM:
+        case ST_A1_COL:
+        case ST_A1_HZ:
+        case ST_AM_RPM:
+        case ST_AM_COL:
+        case ST_AM_HZ:     return s.alerts_enabled;
+
+        // Coolant warn threshold + colour only when the gauge is shown.
+        case ST_TEMP_WARN_F:
+        case ST_TEMP_WARN_COL: return s.show_coolant;
+
+        // Oil-pressure warn threshold + colour only when the gauge is shown.
+        case ST_PSI_WARN_PSI:
+        case ST_PSI_WARN_COL:  return s.show_oil_psi;
+
+        // AFR is a MegaSquirt-only reading: hide the whole AFR block in Direct
+        // mode, and hide the warn sub-settings unless AFR display is on.
+        case ST_SHOW_AFR:  return s.sensor_type == 1;
+        case ST_AFR_WARN_LO:
+        case ST_AFR_WARN_HI:
+        case ST_AFR_WARN_COL:  return s.sensor_type == 1 && s.show_afr;
+
+        // Cloud endpoint/credentials only matter when recording to cloud.
+        case ST_CL_HOST:
+        case ST_CL_PORT:
+        case ST_CL_PROTO:
+        case ST_CL_AUTH_USER:
+        case ST_CL_AUTH_PASS:  return s.record_cloud;
+
         // Auto-start speed only matters when auto-start is enabled.
         case ST_AUTO_START_MPH: return s.auto_start;
         default:           return true;
@@ -4181,12 +4221,10 @@ static void sliderSetFromX(SettingId id, int x) {
 
 static void drawSettingsPage() {
     // Content height depends on how many rows are currently visible.
-    {
-        int vis = 0;
-        for (uint8_t i = 0; i < ST_COUNT; ++i)
-            if (rowShouldShow(ROWS[i].id)) vis++;
-        settingsContentHeight = vis * SETTINGS_ROW_DY + 10;
-    }
+    int visCount = 0;
+    for (uint8_t i = 0; i < ST_COUNT; ++i)
+        if (rowShouldShow(ROWS[i].id)) visCount++;
+    settingsContentHeight = visCount * SETTINGS_ROW_DY + 10;
     clampSettingsScroll();
 
     if (pageJustEntered) {
@@ -4216,6 +4254,16 @@ static void drawSettingsPage() {
     // PSRAM back-buffer push was tried and reverted: on this single-framebuffer
     // RGB panel the ~600 KB push burst-starves the scan-out DMA and tears.)
     static int lastDrawnScrollY = -1;
+    // When a toggle collapses/expands its dependent rows the visible-row COUNT
+    // changes and every row below shifts — a strip-wipe isn't enough (the rows
+    // that used to sit at the bottom would linger). Full-clear the body band
+    // once on any visible-count change so no stale row text is left behind.
+    static int lastVisCount = -1;
+    if (visCount != lastVisCount) {
+        tft.fillRect(0, BODY_TOP, 800, BODY_HEIGHT, TFT_BLACK);
+        lastVisCount = visCount;
+        lastDrawnScrollY = settingsScrollY;
+    }
     if (settingsScrollY != lastDrawnScrollY) {
         tft.fillRect(0, BODY_TOP,                       800, SETTINGS_ROW_DY, TFT_BLACK);
         tft.fillRect(0, BODY_BOTTOM - SETTINGS_ROW_DY,  800, SETTINGS_ROW_DY, TFT_BLACK);
