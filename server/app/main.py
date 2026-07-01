@@ -2119,17 +2119,36 @@ async def delete_session_form(
 
 @app.get("/admin/sessions/targets")
 async def admin_session_targets(request: Request) -> JSONResponse:
-    """Everyone an admin may reassign a session TO. Admin only.
+    """Users to offer as reassignment targets, alphabetical.
 
-    Union of (a) all known accounts (admins + allowlist + managed) as emails, and
-    (b) every user directory that already holds sessions — including “orphan”
-    owners that aren't registered accounts (shown by their dir slug). Deduped so
-    an account isn't listed twice (email vs its slug). Sorted alphabetically.
+    - **Admin / view-all**: EVERYONE — all known accounts (admins + allowlist +
+      managed) as emails, unioned with every user dir that holds sessions
+      (orphan owners shown by slug), deduped.
+    - **Regular user**: only the users they're allowed to view (their own dir +
+      any can_view grants).
+
+    (The reassign UI itself is admin-only, but the list honors view scope so it
+    can be reused elsewhere without leaking who exists.)
     """
-    require_admin(request)
-    emails = set(all_known_users())
-    known_slugs = {safe_name(e) for e in emails}
+    web_user = require_web_user(request)
+    viewer = str((web_user or {}).get("email", ""))
     root = DATA_DIR / "sessions"
+
+    # Non-admin: restrict to the dirs this account may view.
+    if oauth_enabled() and not user_sees_all(viewer):
+        allowed = visible_dirnames_for(viewer)   # set of slugs, or None (=all)
+        out = set()
+        if viewer:
+            out.add(viewer)
+        if root.exists():
+            for d in sorted(root.iterdir()):
+                if d.is_dir() and any(d.iterdir()) and (allowed is None or d.name in allowed):
+                    out.add(d.name)
+        return JSONResponse({"targets": sorted(out, key=str.lower)})
+
+    # Admin / view-all / dev-mode: everyone.
+    emails = set(allowed_emails())
+    known_slugs = {safe_name(e) for e in emails}
     if root.exists():
         for d in sorted(root.iterdir()):
             if d.is_dir() and d.name not in known_slugs and any(d.iterdir()):

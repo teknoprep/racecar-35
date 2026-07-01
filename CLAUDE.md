@@ -185,8 +185,14 @@ reports `is_admin`) POSTs `/admin/sessions/move {user, filename, target}`. The h
 `shutil.move`s the `.ndjson` into `session_dir_for(target)` **and moves the matching
 `ai_history/<user>/<file>.json` alongside it**, tidies empty source dirs, and refuses (409) if
 the target already has a same-named session (never silently overwrites). Targets come from
-`GET /admin/sessions/targets` = `all_known_users()`. The browser then redirects to the new
-`/review/<new_slug>/<file>` URL. `require_admin` gates both routes.
+`GET /admin/sessions/targets`: for an **admin/view-all** viewer = `allowed_emails()` (known
+accounts) ∪ every session-owning dir (orphan owners by slug), deduped + alphabetical; for a
+**regular** viewer = only the dirs they may view. The review-page combobox is a custom
+filterable dropdown (click = full list, type = substring filter, ↑↓/Enter/Esc). On success the
+browser redirects to the new `/review/<new_slug>/<file>` URL. `admin_move_session` is
+`require_admin`-gated; the targets list is `require_web_user` + view-scoped.
+(NOTE: there is no `all_known_users()` — the helper is `allowed_emails()`; using the wrong name
+500s the endpoint → empty combobox → “no users found”.)
 
 ### AI corner analysis on the review page (v-server, Open WebUI @ ai.blueuc.com)
 
