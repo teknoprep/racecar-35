@@ -1943,9 +1943,13 @@ def _ai_chat(messages: list, model: Optional[str] = None,
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI request failed: {e}")
     try:
-        return payload["choices"][0]["message"]["content"], use_model
+        content = payload["choices"][0]["message"]["content"]
     except Exception:
         return json.dumps(payload)[:2000], use_model
+    # Open WebUI appends a collapsible <details> usage/cost footer to the reply.
+    # Strip it so the review card shows only the coaching text.
+    content = re.sub(r"\n*<details>.*?</details>\s*$", "", content, flags=re.S).strip()
+    return content, use_model
 
 
 def _ai_model_list() -> list:
@@ -2030,30 +2034,51 @@ async def session_data(
     user: str,
     filename: str,
     stride: int = Query(1, ge=1, le=100),
+    target: int = Query(0, ge=0, le=200000),
 ) -> JSONResponse:
     """Parsed NDJSON for the review UI.
 
-    Returns every Nth sample (default every sample). The dash logs at 25 Hz, so
-    a one-hour session is ~90 000 samples; the slider only needs maybe 5-10k
-    points to feel smooth, so the client may request stride=10 for long files.
+    The dash logs at 25 Hz, so a one-hour session is ~90 000 samples — shipping
+    all of them as JSON is slow to serialize, transfer, and parse in the browser.
+    The map/playback only needs ~10k points to look smooth, so the review UI
+    passes `target` (desired sample count) and the server auto-picks a stride to
+    hit it. Crucially this is a TWO-PASS read: pass 1 just COUNTS lines (no JSON
+    parse), pass 2 parses only the ~target kept lines — so a 200 MB file costs
+    ~target parses instead of millions. `stride` is still honored when `target`
+    is 0 (back-compat / explicit control).
 
     Response shape:
-        { "count": N, "samples": [ {t, lat, lon, speed_mph, ...}, ... ],
+        { "count": N, "total": M, "stride": S,
+          "samples": [ {t, lat, lon, speed_mph, ...}, ... ],
           "bounds": [[minLat,minLon],[maxLat,maxLon]] | null }
     """
     require_web_user(request)
     gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
+
+    total = 0
+    eff_stride = max(1, stride)
+    if target > 0:
+        # Pass 1: count non-empty lines without parsing JSON (cheap).
+        with open(p, "rb") as f:
+            for raw in f:
+                if raw.strip():
+                    total += 1
+        if total > target:
+            eff_stride = math.ceil(total / target)
+
     samples: list[dict] = []
     min_lat = min_lon = float("inf")
     max_lat = max_lon = float("-inf")
     has_geo = False
+    j = -1  # index over non-empty lines only
     with open(p, "rb") as f:
-        for i, raw in enumerate(f):
-            if i % stride != 0:
-                continue
+        for raw in f:
             raw = raw.strip()
             if not raw:
+                continue
+            j += 1
+            if j % eff_stride != 0:
                 continue
             try:
                 obj = json.loads(raw)
@@ -2074,11 +2099,14 @@ async def session_data(
                 if lat > max_lat: max_lat = lat
                 if lon < min_lon: min_lon = lon
                 if lon > max_lon: max_lon = lon
+    if target <= 0:
+        total = j + 1
     bounds = (
         [[min_lat, min_lon], [max_lat, max_lon]] if has_geo else None
     )
     return JSONResponse(
-        {"count": len(samples), "stride": stride, "bounds": bounds, "samples": samples}
+        {"count": len(samples), "total": total, "stride": eff_stride,
+         "bounds": bounds, "samples": samples}
     )
 
 
@@ -3424,7 +3452,7 @@ _REVIEW_HTML = (
 
   let resp, data;
   try {
-    resp = await fetch('/sessions/' + encodeURIComponent(USER) + '/' + encodeURIComponent(FILE) + '/data');
+    resp = await fetch('/sessions/' + encodeURIComponent(USER) + '/' + encodeURIComponent(FILE) + '/data?target=12000');
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     data = await resp.json();
   } catch(e) {
@@ -3440,7 +3468,9 @@ _REVIEW_HTML = (
   }
   el('loading').style.display = 'none';
   el('app').style.display = 'block';
-  el('count').textContent = data.count + ' samples';
+  el('count').textContent = (data.total && data.total > data.count)
+      ? (data.count + ' of ' + data.total + ' samples')
+      : (data.count + ' samples');
 
   // ---- Leaflet map (dark tiles match the surface palette) -------------
   const map = L.map('map', { zoomControl: true, attributionControl: true });
