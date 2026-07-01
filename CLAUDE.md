@@ -194,6 +194,27 @@ browser redirects to the new `/review/<new_slug>/<file>` URL. `admin_move_sessio
 (NOTE: there is no `all_known_users()` — the helper is `allowed_emails()`; using the wrong name
 500s the endpoint → empty combobox → “no users found”.)
 
+### Admin: impersonate a user + login audit + activity report
+
+**Impersonation.** From the `/admin` user list, each non-self row has an **impersonate** button
+(`POST /admin/impersonate {email}`). It re-issues the signed session cookie with `imp=<target>`
++ `imp_by=<admin>` (base fields stay the real admin). `current_user()` then reports the target
+for ALL view/authorization logic (so the admin literally browses as that user and temporarily
+loses admin powers). A global `@app.middleware("http")` injects a **fixed red badge (bottom-
+right, every HTML page)**; clicking it → confirm → `GET /impersonate/stop` restores the admin
+from the cookie's base fields. `_session_payload()` reads the raw cookie incl. `imp`/`imp_by`;
+`current_user()` is the effective (possibly impersonated) user. Only real admins can START
+(require_admin runs before impersonation is active); self-impersonation is rejected.
+
+**Login audit.** Every real OAuth sign-in calls `record_login()` → appends `{ts,email,ip,ua,event}`
+to `/data/logins/<safe_name(email)>.jsonl` (per-user, append-only; `x-forwarded-for` aware).
+Admin rows have a **history** button → `/admin/user/<email>/history` (page) / `/admin/user/<email>/logins`
+(JSON). Impersonation is NOT logged as the target's login (it's an admin action).
+
+**Report.** `/admin` header **report** button → `/admin/report`: metric cards (tracked users,
+total sign-ins, active 7d/30d, sign-ins 7d/30d, new users 30d) + a per-user table (total / 30d /
+7d logins, distinct active days, first & last seen) built from `login_stats_all()`.
+
 ### AI corner analysis on the review page (v-server, Open WebUI @ ai.blueuc.com)
 
 The review page (`/review/<user>/<file>`) has an **AI Corner Analysis** card: the user clicks

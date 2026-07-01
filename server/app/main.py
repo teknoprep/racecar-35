@@ -160,6 +160,48 @@ if SESSION_SECRET == "racecar-35-dev-session-secret-change-me":
 app = FastAPI(title=SERVICE_NAME, version="0.1.0", docs_url="/docs")
 
 
+# Floating "you are impersonating" badge injected into every HTML page while an
+# admin is impersonating. Fixed bottom-right, always visible; click -> confirm ->
+# /impersonate/stop restores the admin session.
+_IMPERSONATE_BADGE = (
+    "<div id=\"imp-badge\" onclick=\"if(confirm('Leave impersonation mode and "
+    "return to your admin account?'))location.href='/impersonate/stop';\" "
+    "style=\"position:fixed;right:18px;bottom:18px;z-index:2147483647;"
+    "background:#FF5D5D;color:#1A1300;padding:11px 16px;border-radius:9999px;"
+    "font:600 12px/1 Inter,system-ui,sans-serif;letter-spacing:.02em;cursor:pointer;"
+    "box-shadow:0 6px 20px rgba(0,0,0,.5);user-select:none\" "
+    "title=\"Click to leave impersonation mode\">"
+    "\U0001F464 impersonating <b>__IMP__</b> \u2014 exit\u2715</div>"
+)
+
+
+@app.middleware("http")
+async def _impersonation_badge_mw(request: Request, call_next):
+    """Append the floating exit badge to HTML responses while impersonating."""
+    resp = await call_next(request)
+    try:
+        payload = _session_payload(request)
+        imp = payload.get("imp") if payload else None
+        ctype = resp.headers.get("content-type", "")
+        path = request.url.path
+        if imp and ctype.startswith("text/html") and not path.startswith("/impersonate"):
+            body = b""
+            async for chunk in resp.body_iterator:
+                body += chunk
+            badge = _IMPERSONATE_BADGE.replace("__IMP__", html.escape(str(imp))).encode("utf-8")
+            if b"</body>" in body:
+                body = body.replace(b"</body>", badge + b"</body>", 1)
+            else:
+                body += badge
+            headers = dict(resp.headers)
+            headers.pop("content-length", None)
+            return Response(content=body, status_code=resp.status_code,
+                            headers=headers, media_type="text/html")
+    except Exception:
+        log.exception("impersonation badge injection failed")
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -188,6 +230,90 @@ def session_dir_for(email: str) -> pathlib.Path:
     p = DATA_DIR / "sessions" / safe_name(email)
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# --- login audit log (per-user append-only JSONL under /data/logins) --------
+LOGIN_LOG_DIR = DATA_DIR / "logins"
+
+
+def _login_log_path(email: str) -> pathlib.Path:
+    return LOGIN_LOG_DIR / (safe_name(email) + ".jsonl")
+
+
+def record_login(email: str, request: Request, event: str = "login") -> None:
+    """Append one audit record for a sign-in (or other tracked event).
+    Best-effort: never let logging break the auth flow."""
+    try:
+        email = (email or "").lower()
+        if not email:
+            return
+        LOGIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        fwd = request.headers.get("x-forwarded-for", "")
+        ip = (fwd.split(",")[0].strip() if fwd
+              else (request.client.host if request.client else ""))
+        ua = request.headers.get("user-agent", "")[:300]
+        rec = {"ts": int(time.time()), "email": email, "ip": ip,
+               "ua": ua, "event": event}
+        with open(_login_log_path(email), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception:
+        log.exception("login log write failed for %s", email)
+
+
+def load_login_log(email: str, limit: int = 1000) -> list:
+    """Recent login records for one user, newest first."""
+    p = _login_log_path(email)
+    out: list = []
+    if p.exists():
+        try:
+            for line in p.read_text("utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return out[-limit:][::-1]
+
+
+def login_stats_all() -> list:
+    """Per-user login metrics across everyone who has a login log. Rows:
+    {email, logins, first_ts, last_ts, distinct_days, logins_7d, logins_30d}."""
+    now = int(time.time())
+    d7, d30 = now - 7 * 86400, now - 30 * 86400
+    rows = []
+    if not LOGIN_LOG_DIR.exists():
+        return rows
+    for p in LOGIN_LOG_DIR.glob("*.jsonl"):
+        recs = []
+        try:
+            for line in p.read_text("utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        recs.append(json.loads(line))
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+        if not recs:
+            continue
+        ts = [int(r.get("ts", 0)) for r in recs if r.get("ts")]
+        email = recs[-1].get("email", p.stem)
+        days = {time.strftime("%Y-%m-%d", time.gmtime(t)) for t in ts}
+        rows.append({
+            "email": email,
+            "logins": len(recs),
+            "first_ts": min(ts) if ts else 0,
+            "last_ts": max(ts) if ts else 0,
+            "distinct_days": len(days),
+            "logins_7d": sum(1 for t in ts if t >= d7),
+            "logins_30d": sum(1 for t in ts if t >= d30),
+        })
+    return rows
 
 
 def authorize(x_api_key: Optional[str]) -> None:
@@ -490,7 +616,8 @@ def _sign(data: str) -> str:
     return _b64url(mac)
 
 
-def make_session_cookie(user: dict) -> str:
+def make_session_cookie(user: dict, imp: Optional[str] = None,
+                        imp_by: Optional[str] = None) -> str:
     now = int(time.time())
     payload = {
         "email": str(user.get("email", "")).lower(),
@@ -500,11 +627,18 @@ def make_session_cookie(user: dict) -> str:
         "iat": now,
         "exp": now + SESSION_TTL_SECONDS,
     }
+    # Impersonation: `imp` is the account the (admin) `imp_by` is viewing AS. The
+    # base fields above stay the REAL admin so we can restore them on exit.
+    if imp:
+        payload["imp"] = str(imp).lower()
+        payload["imp_by"] = str(imp_by or user.get("email", "")).lower()
     raw = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     return raw + "." + _sign(raw)
 
 
-def current_user(request: Request) -> Optional[dict]:
+def _session_payload(request: Request) -> Optional[dict]:
+    """Verified raw cookie payload (INCLUDING imp/imp_by), or None. Use this when
+    you need the impersonation fields; use current_user() for the effective user."""
     cookie = request.cookies.get(SESSION_COOKIE, "")
     if not cookie or "." not in cookie:
         return None
@@ -517,9 +651,29 @@ def current_user(request: Request) -> Optional[dict]:
         return None
     if int(payload.get("exp", 0)) < int(time.time()):
         return None
-    email = str(payload.get("email", "")).lower()
-    if not email:
+    if not str(payload.get("email", "")).lower():
         return None
+    return payload
+
+
+def current_user(request: Request) -> Optional[dict]:
+    payload = _session_payload(request)
+    if not payload:
+        return None
+    imp = str(payload.get("imp", "")).lower()
+    if imp:
+        # Present as the impersonated account so ALL view/authorization logic
+        # treats the request as that user; tag the real admin for the exit path.
+        return {
+            "email": imp,
+            "name": imp,
+            "picture": "",
+            "sub": "",
+            "iat": payload.get("iat", 0),
+            "exp": payload.get("exp", 0),
+            "impersonating": True,
+            "real_admin": str(payload.get("imp_by", "")).lower(),
+        }
     return payload
 
 
@@ -788,6 +942,7 @@ async def auth_google_callback(
     # Guarantee this account has a persisted record + per-user API key the
     # first time it signs in (bootstrap admins included).
     ensure_user_record(email)
+    record_login(email, request)   # audit: track every real sign-in
 
     next_url = request.cookies.get(OAUTH_NEXT_COOKIE, "/")
     if not next_url.startswith("/") or next_url.startswith("//"):
@@ -876,6 +1031,16 @@ def _admin_rows_html(self_email: str) -> str:
     def you_badge(em: str) -> str:
         return ' <span class="badge env">you</span>' if em == self_email else ''
 
+    def imp_btn(em: str) -> str:
+        if em == self_email:
+            return ''
+        return (f"<button class='btn' data-act='impersonate' "
+                f"data-email='{html.escape(em)}'>impersonate</button>")
+
+    def hist_btn(em: str) -> str:
+        return (f"<button class='btn' data-act='history' "
+                f"data-email='{html.escape(em)}'>history</button>")
+
     def vis_badge(view_all: bool, n: int) -> str:
         if view_all:
             return " <span class='badge admin'>sees all</span>"
@@ -892,7 +1057,8 @@ def _admin_rows_html(self_email: str) -> str:
         return (f"<tr><td class=mono>{em_h}{you_badge(em)}</td>"
                 f"<td>{role} <span class='badge env'>env</span>{sees}</td>"
                 f"<td class=mono>.env</td>"
-                f"<td><span style='color:var(--muted)'>locked</span></td></tr>")
+                f"<td><div class='row-actions'>{imp_btn(em)}{hist_btn(em)}"
+                f"<span style='color:var(--muted)'>locked</span></div></td></tr>")
 
     def managed_row(em: str, u: dict) -> str:
         em_h = html.escape(em)
@@ -908,6 +1074,7 @@ def _admin_rows_html(self_email: str) -> str:
                 f"<td class=mono>{added_by}</td>"
                 f"<td><div class='row-actions'>"
                 f"<a class='btn' href='/admin/user/{em_h}'>manage</a>"
+                f"{imp_btn(em)}{hist_btn(em)}"
                 f"<button class='btn' data-act='toggle' data-admin='{1 if is_admin else 0}' data-email='{em_h}'>{toggle_label}</button>"
                 f"<button class='btn danger' data-act='remove' data-email='{em_h}'>remove</button>"
                 f"</div></td></tr>")
@@ -963,6 +1130,180 @@ async def admin_list_users(request: Request) -> dict:
         "managed": sorted(load_managed_users().values(), key=lambda u: u["email"]),
         "allowlist_active": allowlist_active(),
     }
+
+
+@app.post("/admin/impersonate")
+async def admin_impersonate_start(request: Request) -> JSONResponse:
+    """Begin impersonating another user (admin only). Re-issues the session
+    cookie with imp=<target>, imp_by=<admin>. From then on current_user() reports
+    the target so the whole site behaves as them; the floating badge exits.
+    Body JSON: {email}."""
+    admin = require_admin(request)   # must be a REAL admin (not already impersonating)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    target = str(body.get("email", "")).strip().lower()
+    if not target:
+        raise HTTPException(status_code=400, detail="email required")
+    admin_email = str(admin.get("email", "")).lower()
+    if target == admin_email:
+        raise HTTPException(status_code=400, detail="cannot impersonate yourself")
+    resp = JSONResponse({"ok": True, "impersonating": target})
+    resp.set_cookie(
+        SESSION_COOKIE,
+        make_session_cookie(admin, imp=target, imp_by=admin_email),
+        max_age=SESSION_TTL_SECONDS, **cookie_kwargs(),
+    )
+    log.info("admin %s START impersonating %s", admin_email, target)
+    return resp
+
+
+@app.get("/impersonate/stop")
+async def impersonate_stop(request: Request) -> Response:
+    """Leave impersonation mode and restore the real admin session. GET so the
+    floating badge can just navigate here. No-op (→ home) if not impersonating."""
+    payload = _session_payload(request)
+    resp = RedirectResponse("/admin")
+    if payload and payload.get("imp"):
+        # base fields in the cookie are still the real admin — restore them.
+        resp = RedirectResponse("/admin")
+        resp.set_cookie(
+            SESSION_COOKIE,
+            make_session_cookie({
+                "email": payload.get("email", ""),
+                "name": payload.get("name", ""),
+                "picture": payload.get("picture", ""),
+                "sub": payload.get("sub", ""),
+            }),
+            max_age=SESSION_TTL_SECONDS, **cookie_kwargs(),
+        )
+        log.info("admin %s STOP impersonating %s",
+                 str(payload.get("imp_by", "")), str(payload.get("imp", "")))
+    return resp
+
+
+def _admin_shell(title: str, body_html: str) -> str:
+    """Minimal admin sub-page wrapper (header + Pit Wall CSS)."""
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{html.escape(title)}</title>{_FONTS_LINK}<style>{_BASE_CSS}"
+        ".metrics{display:flex;flex-wrap:wrap;gap:var(--sp-md);margin:0 0 var(--sp-lg)}"
+        ".metric{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);"
+        "padding:var(--sp-md) var(--sp-lg);min-width:150px}"
+        ".metric .v{font:600 28px/1 var(--ff-mono);color:var(--primary)}"
+        ".metric .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:6px}"
+        "table.rep{width:100%;border-collapse:collapse}"
+        "table.rep th,table.rep td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);font-size:13px}"
+        "table.rep th{color:var(--muted);text-transform:uppercase;font-size:11px;letter-spacing:.06em}"
+        "table.rep td.mono{font-family:var(--ff-mono)}"
+        ".ua{max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}"
+        f"</style></head><body><header class=app><span class=dot></span>"
+        f"<h1>racecar-35 \u00b7 admin</h1><span class=crumbs>&rsaquo; "
+        f"<a href='/admin'>admin</a> &rsaquo; {html.escape(title)}</span>"
+        f"<span style='flex:1'></span><a class=btn href='/admin'>back to admin</a></header>"
+        f"<main>{body_html}</main></body></html>"
+    )
+
+
+@app.get("/admin/user/{email}/logins")
+async def admin_user_logins(request: Request, email: str) -> JSONResponse:
+    """JSON login history for one user (admin only)."""
+    require_admin(request)
+    return JSONResponse({"email": email.lower(), "logins": load_login_log(email.lower())})
+
+
+@app.get("/admin/user/{email}/history", response_class=HTMLResponse)
+async def admin_user_history(request: Request, email: str) -> Response:
+    """Per-user login history page (admin only)."""
+    if not oauth_enabled():
+        return HTMLResponse(_ADMIN_DISABLED_HTML, status_code=400)
+    u = current_user(request)
+    if not u:
+        return login_redirect(request)
+    if not is_admin_email(str(u.get("email", ""))):
+        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", "Admin access required."),
+                            status_code=403)
+    email = email.lower()
+    logins = load_login_log(email)
+    rows = []
+    for r in logins:
+        when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(r.get("ts", 0))))
+        rows.append(
+            f"<tr><td class=mono>{when}</td>"
+            f"<td class=mono>{html.escape(str(r.get('ip','')))}</td>"
+            f"<td class='mono ua' title=\"{html.escape(str(r.get('ua','')))}\">"
+            f"{html.escape(str(r.get('ua','')))}</td>"
+            f"<td>{html.escape(str(r.get('event','login')))}</td></tr>"
+        )
+    if not rows:
+        rows = ["<tr><td colspan=4 style='color:var(--muted);text-align:center;font-style:italic'>"
+                "no logins recorded yet</td></tr>"]
+    body = (
+        f"<div class=toolbar><h2 class=t-display style='margin:0'>{html.escape(email)}</h2></div>"
+        f"<p style='color:var(--muted)'>{len(logins)} recorded sign-in(s), newest first.</p>"
+        "<div class=card><div class=card-body><table class=rep><thead><tr>"
+        "<th>When</th><th>IP</th><th>User agent</th><th>Event</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div></div>"
+    )
+    return HTMLResponse(_admin_shell("login history", body))
+
+
+@app.get("/admin/report", response_class=HTMLResponse)
+async def admin_report(request: Request) -> Response:
+    """Aggregate user-activity report (admin only)."""
+    if not oauth_enabled():
+        return HTMLResponse(_ADMIN_DISABLED_HTML, status_code=400)
+    u = current_user(request)
+    if not u:
+        return login_redirect(request)
+    if not is_admin_email(str(u.get("email", ""))):
+        return HTMLResponse(_LOGIN_ERROR_HTML.replace("__ERROR__", "Admin access required."),
+                            status_code=403)
+    stats = login_stats_all()
+    now = int(time.time())
+    d7, d30 = now - 7 * 86400, now - 30 * 86400
+    total_users = len(stats)
+    total_logins = sum(s["logins"] for s in stats)
+    active7 = sum(1 for s in stats if s["last_ts"] >= d7)
+    active30 = sum(1 for s in stats if s["last_ts"] >= d30)
+    new30 = sum(1 for s in stats if s["first_ts"] >= d30)
+    logins7 = sum(s["logins_7d"] for s in stats)
+    logins30 = sum(s["logins_30d"] for s in stats)
+
+    def metric(v, k):
+        return f"<div class=metric><div class=v>{v}</div><div class=k>{k}</div></div>"
+    cards = (
+        metric(total_users, "tracked users") + metric(total_logins, "total sign-ins")
+        + metric(active7, "active (7d)") + metric(active30, "active (30d)")
+        + metric(logins7, "sign-ins (7d)") + metric(logins30, "sign-ins (30d)")
+        + metric(new30, "new users (30d)")
+    )
+    stats.sort(key=lambda s: s["last_ts"], reverse=True)
+    rows = []
+    for s in stats:
+        first = time.strftime("%Y-%m-%d", time.gmtime(s["first_ts"])) if s["first_ts"] else "\u2014"
+        last = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(s["last_ts"])) if s["last_ts"] else "\u2014"
+        em_h = html.escape(s["email"])
+        rows.append(
+            f"<tr><td class=mono><a href='/admin/user/{em_h}/history'>{em_h}</a></td>"
+            f"<td class=mono>{s['logins']}</td><td class=mono>{s['logins_30d']}</td>"
+            f"<td class=mono>{s['logins_7d']}</td><td class=mono>{s['distinct_days']}</td>"
+            f"<td class=mono>{first}</td><td class=mono>{last}</td></tr>"
+        )
+    if not rows:
+        rows = ["<tr><td colspan=7 style='color:var(--muted);text-align:center;font-style:italic'>"
+                "no login activity recorded yet</td></tr>"]
+    body = (
+        "<div class=toolbar><h2 class=t-display style='margin:0'>User activity report</h2></div>"
+        f"<div class=metrics>{cards}</div>"
+        "<div class=card><div class=card-body><table class=rep><thead><tr>"
+        "<th>User</th><th>Total</th><th>30d</th><th>7d</th><th>Active days</th>"
+        "<th>First seen</th><th>Last seen</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div></div>"
+    )
+    return HTMLResponse(_admin_shell("activity report", body))
 
 
 @app.post("/admin/users")
@@ -2640,6 +2981,7 @@ _ADMIN_HTML = (
 <header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
   <span class="crumbs"><a href="/">sessions</a> &rsaquo; admin</span>
   <span style="flex:1"></span>
+  <a class="btn" href="/admin/report" style="margin-right:var(--sp-md)">report</a>
   <a class="btn" href="/admin/canbus" style="margin-right:var(--sp-md)">CAN captures</a>__USER_CHIP__</header>
 <main>
   <div id="msg" class="msg"></div>
@@ -2688,6 +3030,12 @@ _ADMIN_HTML = (
         await post('/admin/users/delete',{email:email});
       } else if(act==='toggle'){
         await post('/admin/users',{email:email, is_admin: t.dataset.admin!=='1'});
+      } else if(act==='impersonate'){
+        if(!confirm('Impersonate '+email+'?\\n\\nYou will browse the whole site AS this user. A red badge (bottom-right) exits impersonation.')) return;
+        await post('/admin/impersonate',{email:email});
+        location.href='/'; return;
+      } else if(act==='history'){
+        location.href='/admin/user/'+encodeURIComponent(email)+'/history'; return;
       }
       location.reload();
     }catch(e){ show('Action failed: '+e.message); }
