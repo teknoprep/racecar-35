@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.69"
+#define FIRMWARE_VERSION "0.1.70"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1716,10 +1716,14 @@ static bool ufOpenStream(uint32_t content_length) {
         return false;
     }
     ufCloseTcp();
-    // Tighter than the Teensy's 10 s per-line ACK wait, so a stalled TCP
-    // write fails fast on this side instead of hanging long enough for the
-    // Teensy to give up and abort the whole transfer with Q,ERR,ack_timeout.
-    constexpr int CLOUD_TCP_TIMEOUT_S = 8;
+    // The TLS handshake (WiFiClientSecure + setInsecure, full server cert
+    // chain) can take several seconds over the car's WiFi while the RGB
+    // display + UART streaming keep the loop busy. The old 8 s cap was too
+    // tight and the handshake was timing out "almost every time" — the OTA
+    // HTTPS path uses 15 s and connects reliably, so match it. Per-line TCP
+    // writes during streaming almost never block this long; if one does, the
+    // stall watchdog in uploadTick() still catches it.
+    constexpr int CLOUD_TCP_TIMEOUT_S = 15;
     if (s.cloud_protocol == 1) {
         WiFiClientSecure* sec = new WiFiClientSecure();
         sec->setInsecure();   // TODO: pin server cert when going public
@@ -1732,10 +1736,16 @@ static bool ufOpenStream(uint32_t content_length) {
         uf.tcp = plain;
         uf.tcp_secure = false;
     }
-    Serial.printf("DBG,uf_connect host=%s port=%u sec=%d size=%lu\n",
+    Serial.printf("DBG,uf_connect host=%s port=%u sec=%d size=%lu heap=%u maxblk=%u\n",
                   s.cloud_host, (unsigned)s.cloud_port, (int)uf.tcp_secure,
-                  (unsigned long)content_length);
-    if (!uf.tcp->connect(s.cloud_host, s.cloud_port)) {
+                  (unsigned long)content_length,
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+    const uint32_t t_conn0 = millis();
+    const bool connected = uf.tcp->connect(s.cloud_host, s.cloud_port);
+    Serial.printf("DBG,uf_connect_done ok=%d ms=%lu\n",
+                  (int)connected, (unsigned long)(millis() - t_conn0));
+    if (!connected) {
         snprintf(uf.last_err, sizeof(uf.last_err), "TCP connect failed");
         ufCloseTcp();
         return false;
