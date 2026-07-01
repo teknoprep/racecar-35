@@ -381,6 +381,35 @@ def gate_view_dir(request: Request, dirname: str) -> None:
         raise HTTPException(status_code=403, detail="you don't have access to that user's sessions")
 
 
+def can_delete_dir(email: str, dirname: str) -> bool:
+    """Web-delete permission: your OWN sessions only, unless you're an admin.
+
+    Being *granted* visibility of another account (can_view / view_all) lets
+    you SEE that account's sessions but NOT delete them — deletes are
+    destructive, so they stay owner-only. Admins (bootstrap or portal-granted)
+    may delete anyone's.
+    """
+    email = (email or "").lower()
+    if is_admin_email(email):
+        return True
+    return bool(email) and dirname == safe_name(email)
+
+
+def gate_delete_dir(request: Request, dirname: str) -> None:
+    """Raise unless the signed-in user may DELETE sessions under dirname.
+
+    No-op in dev mode (OAuth off) so bench testing still works — mirrors
+    gate_view_dir.
+    """
+    if not oauth_enabled():
+        return
+    user = current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="login required")
+    if not can_delete_dir(str(user.get("email", "")), dirname):
+        raise HTTPException(status_code=403, detail="you can only delete your own sessions")
+
+
 def require_admin(request: Request) -> dict:
     """Gate admin-portal routes: must be a logged-in admin Google account."""
     if not oauth_enabled():
@@ -1309,6 +1338,102 @@ async def health() -> dict:
     return {"ok": True, "service": SERVICE_NAME, "data_dir": str(DATA_DIR)}
 
 
+# ---------------------------------------------------------------------------
+# Firmware hosting (OTA)
+# ---------------------------------------------------------------------------
+# Serves the OTA manifest + artifacts to the dash so updates don't depend on
+# GitHub raw's CDN. That CDN ignores query-string cache-busting AND client
+# no-cache headers, and serves ~5 min stale after a push — which is exactly why
+# a freshly published version "isn't immediately available" on the device.
+#
+# Here the manifest is served no-store, so a freshly uploaded version is visible
+# to the dash immediately. Binaries are content-verified by the device against
+# the manifest sha256, so there's no correctness risk even if a proxy caches one.
+#
+#   GET  /firmware/manifest.json      public; no-store (always fresh)
+#   GET  /firmware/list               public JSON: name + size + sha256
+#   GET  /firmware/{file}             public; serves a .bin/.hex/.json artifact
+#   POST /firmware/upload?name=<f>    X-API-Key protected; body = raw artifact
+#
+# Storage: RACECAR_DATA_DIR/firmware/ (persists across container rebuilds).
+_FW_ALLOWED_EXT = (".bin", ".hex", ".json")
+_FW_NO_STORE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+}
+
+
+def _firmware_dir() -> pathlib.Path:
+    p = DATA_DIR / "firmware"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _resolve_firmware(file: str, must_exist: bool = True) -> pathlib.Path:
+    """Sanitize + resolve a firmware artifact name inside the firmware dir."""
+    f = re.sub(r"[^A-Za-z0-9._-]", "_", (file or "").strip()).lstrip(".")
+    if not f.lower().endswith(_FW_ALLOWED_EXT):
+        raise HTTPException(status_code=400, detail="only .bin/.hex/.json allowed")
+    base = _firmware_dir().resolve()
+    p = (base / f).resolve()
+    if p.parent != base:
+        raise HTTPException(status_code=400, detail="bad name")
+    if must_exist and (not p.exists() or not p.is_file()):
+        raise HTTPException(status_code=404, detail="not found")
+    return p
+
+
+def _fw_sha256(p: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@app.get("/firmware/manifest.json")
+async def firmware_manifest() -> Response:
+    p = _firmware_dir() / "manifest.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="no manifest uploaded")
+    return Response(content=p.read_bytes(), media_type="application/json",
+                    headers=_FW_NO_STORE)
+
+
+@app.get("/firmware/list")
+async def firmware_list() -> JSONResponse:
+    items = []
+    for p in sorted(_firmware_dir().glob("*")):
+        if p.is_file() and p.suffix.lower() in _FW_ALLOWED_EXT:
+            items.append({"name": p.name, "size": p.stat().st_size,
+                          "sha256": _fw_sha256(p)})
+    return JSONResponse({"firmware": items}, headers=_FW_NO_STORE)
+
+
+@app.post("/firmware/upload")
+async def firmware_upload(request: Request, name: str = Query(...),
+                         x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    authorize(x_api_key)
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty body")
+    if len(body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="body too large")
+    p = _resolve_firmware(name, must_exist=False)
+    p.write_bytes(body)
+    sha = hashlib.sha256(body).hexdigest()
+    log.info("firmware upload %s bytes=%d sha=%s -> %s",
+             request.client.host if request.client else "?", len(body), sha, p.name)
+    return JSONResponse({"ok": True, "name": p.name, "size": len(body), "sha256": sha})
+
+
+@app.get("/firmware/{file}")
+async def firmware_get(file: str) -> FileResponse:
+    p = _resolve_firmware(file)
+    return FileResponse(p, media_type="application/octet-stream",
+                        filename=p.name, headers=_FW_NO_STORE)
+
+
 async def _save_body(
     request: Request,
     x_api_key: Optional[str],
@@ -1642,10 +1767,11 @@ async def delete_session(
     x_api_key: Optional[str] = Header(None),
 ) -> JSONResponse:
     authorize_api_or_user(request, x_api_key)
-    # Web users may only delete sessions they can see; device/API-key callers
-    # (the dash) are exempt from the visibility gate.
+    # Web users may only delete their OWN sessions (admins may delete anyone's).
+    # Being granted visibility of another account does NOT grant delete. Device/
+    # API-key callers (the dash) are exempt from the gate.
     if not (x_api_key and (x_api_key == API_KEY or email_for_api_key(x_api_key))):
-        gate_view_dir(request, safe_name(user))
+        gate_delete_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
     size = p.stat().st_size
     rel = str(p.relative_to(DATA_DIR))
@@ -2389,6 +2515,9 @@ async def index(request: Request) -> Response:
                 continue
             if oauth_enabled() and not can_view_dir(viewer_email, user_dir.name):
                 continue
+            # Delete is owner-only (admins excepted) even when you can VIEW
+            # another user's sessions via a can_view / view_all grant.
+            dir_can_delete = (not oauth_enabled()) or can_delete_dir(viewer_email, user_dir.name)
             for f in sorted(user_dir.iterdir(), reverse=True):
                 if not f.is_file() or not f.name.endswith(".ndjson"):
                     continue
@@ -2407,6 +2536,11 @@ async def index(request: Request) -> Response:
                 file_h = html.escape(f.name)
                 track_h = html.escape(track)
                 when_h = html.escape(when)
+                delete_btn = (
+                    f'<button class="btn danger" data-delete="1" '
+                    f'data-user="{user_h}" data-file="{file_h}">delete</button>'
+                    if dir_can_delete else ""
+                )
                 rows.append(
                     f"<tr><td>{user_h}</td>"
                     f"<td class=mono>{when_h}</td>"
@@ -2415,7 +2549,7 @@ async def index(request: Request) -> Response:
                     f"<td class=num>{size_str}</td>"
                     f'<td><div class="actions">'
                     f'<a class="btn" href="/sessions/{user_h}/{file_h}">download</a>'
-                    f'<button class="btn danger" data-delete="1" data-user="{user_h}" data-file="{file_h}">delete</button>'
+                    f'{delete_btn}'
                     f'</div></td></tr>'
                 )
                 total += 1

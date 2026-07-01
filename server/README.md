@@ -242,6 +242,50 @@ your RPM field. Note the ID + start byte + endianness and lock them into
 `pumpCAN()` in `src/main.cpp`. Everything here is **admin-only** and the
 filename is sanitised (no path traversal, single `.csv` on disk).
 
+## Firmware / OTA hosting
+
+The server also hosts the dash OTA feed, so updates don't depend on GitHub
+raw's CDN (which ignores query-string cache-busting and serves ~5 min stale
+after a push — the "new version isn't immediately available" problem).
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| GET | `/firmware/manifest.json` | none | Served **`Cache-Control: no-store`** → dash sees a new version instantly |
+| GET | `/firmware/list` | none | JSON: each stored artifact's name + size + sha256 |
+| GET | `/firmware/{file}` | none | Serves a stored `.bin`/`.hex` (device verifies sha256 from the manifest) |
+| POST | `/firmware/upload?name=<file>` | `X-API-Key` | Body = raw artifact bytes. Only `.bin`/`.hex`/`.json` names allowed |
+
+Stored under `RACECAR_DATA_DIR/firmware/` (survives container rebuilds). The
+dash firmware's `OTA_MANIFEST_URL` points at `/firmware/manifest.json`; the
+manifest's artifact URLs point back at `/firmware/<file>`.
+
+### Publishing a release to the server
+
+Build the four artifacts (see [../BUILD.md](../BUILD.md)), then:
+
+```bash
+RACECAR_API_KEY=<server RACECAR_API_KEY> \
+  ./server/publish_firmware.sh 0.1.73 https://racecar.api.blueuc.com
+```
+
+This uploads all four binaries, then a **server-pointed manifest** (artifact
+URLs = `<base>/firmware/<file>`, every `version` = the arg, legacy `crowpanel`
+alias = `crowpanel7`), and prints the live manifest to verify. Binaries upload
+first so the manifest never references a not-yet-present artifact.
+
+### One-time transition off GitHub
+
+Devices only start reading the server after they run firmware whose
+`OTA_MANIFEST_URL` is the server. So the switch is a **single transition
+release** published to BOTH places:
+
+1. Rebuild + redeploy this container (so `/firmware/*` exists).
+2. `publish_firmware.sh <ver>` → populate the server.
+3. Cut the transition firmware (the one with the server `OTA_MANIFEST_URL`) to
+   **GitHub** as usual, so devices still on the old GitHub-pointed firmware can
+   OTA up to it one last time.
+4. From then on, publish only with `publish_firmware.sh` — no CDN lag.
+
 ## Behind nginx (production)
 
 Minimal nginx server block, assuming you've already got TLS termination on

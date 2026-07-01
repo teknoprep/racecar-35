@@ -5425,15 +5425,21 @@ static void handleUploadModalTap(int x, int y) {
 // CA validation: WiFiClientSecure.setInsecure() for v1. GitHub serves with
 // DigiCert; embedding the root would be more secure. Listed as future work.
 // ---------------------------------------------------------------------------
+// OTA now pulls from OUR OWN server (racecar.api.blueuc.com), not GitHub raw.
+// The server serves /firmware/manifest.json with Cache-Control: no-store, so a
+// freshly published version is visible to the dash INSTANTLY — no CDN lag. (The
+// GitHub raw path was fronted by Fastly, which ignores query-string cache-
+// busting AND client no-cache headers and serves ~5 min stale after a push:
+// the "device still sees the old version right after publishing" pain.) The
+// artifact .bin/.hex URLs inside the manifest also point at the server and are
+// served no-store. Push new firmware with server/publish_firmware.sh.
 static constexpr const char* OTA_MANIFEST_URL =
-    "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/manifest.json";
+    "https://racecar.api.blueuc.com/firmware/manifest.json";
 
-// raw.githubusercontent.com is fronted by Fastly with a ~5 min cache TTL, so a
-// freshly-pushed manifest/artifact can serve STALE for minutes after a release
-// (the exact "device still sees the old version right after publishing" pain).
-// Appending a unique query string makes the CDN cache key unique per request,
-// forcing a fresh origin fetch. dst must hold the URL + ~24 bytes. Also send
-// no-cache request headers (belt + suspenders) at the call site.
+// Kept from the GitHub-CDN era as belt-and-suspenders: appending a unique query
+// string + sending no-cache request headers. Harmless against our no-store
+// server (it ignores the extra query param); still helps if OTA_MANIFEST_URL is
+// ever repointed at a caching host. dst must hold the URL + ~24 bytes.
 static void otaBustCache(char* dst, size_t dstsz, const char* url) {
     const char sep = (strchr(url, '?') != nullptr) ? '&' : '?';
     snprintf(dst, dstsz, "%s%ccb=%lu", url, sep, (unsigned long)millis());
