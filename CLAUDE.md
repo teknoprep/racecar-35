@@ -195,6 +195,13 @@ exit speed, brake zones, best line, consistency). Server side (`server/app/main.
   `RACECAR_AI_TIMEOUT_SECONDS` (120). Keys documented in `server/.env.example` + `server/README.md`.
 - The lasso disables `map.dragging` while drawing; client-side point-in-poly shows a live
   “N points in region” count before asking. No new Python deps (uses stdlib `urllib`).
+- **Persistent per-session history + cascade delete:** every Q&A is appended to
+  `RACECAR_DATA_DIR/ai_history/<user>/<sessionfile>.json` and rendered as a collapsible list
+  (newest first; per-item *show region* redraws the polygon, *delete* = `POST .../ai/delete`).
+  `GET .../ai/history` loads it on page open. **`delete_session()` calls `_ai_history_delete_file()`
+  so deleting a session wipes its AI history too.** Open WebUI appends a `<details>` cost/token
+  footer (admin-only) to replies — `_ai_chat()` strips ALL `<details>…</details>` blocks before
+  storing/returning, so only coaching text is kept.
 
 **git push from this host:** remote is `https://github.com/teknoprep/racecar-35.git` (HTTPS token
 auth). `$HOME=/home/chris` here; push with an explicit token URL

@@ -84,6 +84,11 @@ AI_TIMEOUT = int(os.environ.get("RACECAR_AI_TIMEOUT_SECONDS", "120"))
 def ai_enabled() -> bool:
     return bool(AI_API_KEY)
 
+
+# Per-session AI Q&A history lives in a parallel tree so it survives rebuilds
+# alongside the session data and is trivially deleted with its session.
+AI_HISTORY_DIR = DATA_DIR / "ai_history"
+
 # Google OAuth is optional. If GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are
 # blank, the server stays in open dev mode. Once configured, all browser UI
 # routes require Google sign-in; dash ingestion still uses X-API-Key.
@@ -1946,10 +1951,56 @@ def _ai_chat(messages: list, model: Optional[str] = None,
         content = payload["choices"][0]["message"]["content"]
     except Exception:
         return json.dumps(payload)[:2000], use_model
-    # Open WebUI appends a collapsible <details> usage/cost footer to the reply.
-    # Strip it so the review card shows only the coaching text.
-    content = re.sub(r"\n*<details>.*?</details>\s*$", "", content, flags=re.S).strip()
+    # Open WebUI appends a collapsible <details> usage/cost/token footer (admin-
+    # only info) to the reply. Strip EVERY such block anywhere in the text so the
+    # review card shows only the coaching content.
+    content = re.sub(r"<details>.*?</details>", "", content, flags=re.S | re.I).strip()
     return content, use_model
+
+
+def _ai_history_path(user: str, session_name: str) -> pathlib.Path:
+    """On-disk path for a session's AI conversation history
+    (/data/ai_history/<user>/<sessionfile>.json). Keyed by the same safe user
+    slug + resolved session filename so it maps 1:1 to the session."""
+    d = AI_HISTORY_DIR / safe_name(user)
+    return d / (safe_name(session_name) + ".json")
+
+
+def _ai_history_load(user: str, session_name: str) -> list:
+    p = _ai_history_path(user, session_name)
+    if p.exists():
+        try:
+            data = json.loads(p.read_text("utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _ai_history_append(user: str, session_name: str, entry: dict) -> list:
+    p = _ai_history_path(user, session_name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    hist = _ai_history_load(user, session_name)
+    hist.append(entry)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(hist), "utf-8")
+    tmp.replace(p)   # atomic
+    return hist
+
+
+def _ai_history_delete_file(user: str, session_name: str) -> None:
+    """Remove a session's entire AI history (called when the session is deleted)."""
+    p = _ai_history_path(user, session_name)
+    try:
+        p.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+    try:
+        p.parent.rmdir()   # tidy empty per-user history dir
+    except OSError:
+        pass
 
 
 def _ai_model_list() -> list:
@@ -2008,12 +2059,15 @@ async def delete_session(
     p = _resolve_session(user, filename)
     size = p.stat().st_size
     rel = str(p.relative_to(DATA_DIR))
+    session_name = p.name
     p.unlink()
     try:
         p.parent.rmdir()  # tidy empty per-user directory
     except OSError:
         pass
-    log.info("deleted session %s bytes=%d", rel, size)
+    # Cascade: a deleted session takes its entire AI Q&A history with it.
+    _ai_history_delete_file(user, session_name)
+    log.info("deleted session %s bytes=%d (+ai history)", rel, size)
     return JSONResponse({"ok": True, "deleted": rel, "bytes": size})
 
 
@@ -2156,7 +2210,8 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
         "region": {"points": [[lat,lon], ...]},   # polygon the user circled
         "model": "<optional model id override>"
     }
-    Returns {ok, model, metrics, answer}.
+    Returns {ok, model, metrics, answer, entry, history}. Every Q&A is appended
+    to the session's persistent history (deleted when the session is deleted).
     """
     require_web_user(request)
     gate_view_dir(request, safe_name(user))
@@ -2192,14 +2247,60 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
     if not metrics.get("laps"):
         raise HTTPException(status_code=422,
                             detail="no lap data fell inside the selected region")
-    messages = _region_prompt(metrics, str(body.get("prompt", "")))
+    question = str(body.get("prompt", "")).strip()
+    messages = _region_prompt(metrics, question)
     answer, used_model = _ai_chat(messages, model=body.get("model"))
+
+    entry = {
+        "id": secrets.token_hex(8),
+        "ts": int(time.time()),
+        "question": question,
+        "model": used_model,
+        "answer": answer,
+        "region": {"points": poly},
+        "laps": len(metrics.get("laps", [])),
+        "points_in_region": metrics.get("points_in_region", 0),
+    }
+    history = _ai_history_append(user, p.name, entry)
     return JSONResponse({
         "ok": True,
         "model": used_model,
         "metrics": metrics,
         "answer": answer,
+        "entry": entry,
+        "history": history,
     })
+
+
+@app.get("/sessions/{user}/{filename}/ai/history")
+async def session_ai_history(request: Request, user: str, filename: str) -> JSONResponse:
+    """Persistent AI Q&A history for this session (newest handling is client-side)."""
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    return JSONResponse({"history": _ai_history_load(user, p.name)})
+
+
+@app.post("/sessions/{user}/{filename}/ai/delete")
+async def session_ai_delete(request: Request, user: str, filename: str) -> JSONResponse:
+    """Delete ONE AI Q&A entry (body {id}). Owner/admin gated like session delete."""
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    eid = str(body.get("id", ""))
+    hist = _ai_history_load(user, p.name)
+    new = [e for e in hist if e.get("id") != eid]
+    path = _ai_history_path(user, p.name)
+    if new:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(new), "utf-8")
+    else:
+        _ai_history_delete_file(user, p.name)
+    return JSONResponse({"ok": True, "history": new})
 
 
 @app.get("/review/{user}/{filename}", response_class=HTMLResponse)
@@ -3274,6 +3375,19 @@ _REVIEW_HTML = (
   .ai-answer h1,.ai-answer h2,.ai-answer h3 { font-size: 15px; margin: 10px 0 4px; color: var(--primary); }
   .ai-answer code { font-family: var(--ff-mono); color: var(--primary); }
   .ai-answer strong { color: var(--text); }
+  .ai-history { margin-top: var(--sp-sm); display:flex; flex-direction:column; gap: var(--sp-sm); }
+  .ai-hist-item { border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); overflow:hidden; }
+  .ai-hist-head { display:flex; align-items:center; gap: var(--sp-sm); padding: 10px 12px; cursor:pointer; }
+  .ai-hist-head:hover { background: var(--surface-2); }
+  .ai-hist-q { flex:1; color: var(--text); font-weight:600; }
+  .ai-hist-meta { color: var(--muted); font: 400 11px var(--ff-mono); white-space:nowrap; }
+  .ai-hist-body { display:none; padding: 4px 12px 12px; white-space:pre-wrap; line-height:1.5; }
+  .ai-hist-item.open .ai-hist-body { display:block; }
+  .ai-hist-body code { font-family: var(--ff-mono); color: var(--primary); }
+  .ai-hist-body strong { color: var(--text); }
+  .ai-hist-actions { display:flex; gap:6px; padding: 0 12px 10px; }
+  .ai-hist-actions .btn { padding: 4px 8px; }
+  .ai-hist-x { color: var(--bad); }
   .leaflet-crosshair, .leaflet-crosshair .leaflet-interactive { cursor: crosshair !important; }
 
   .delta-wrap { position: relative; }
@@ -3430,7 +3544,7 @@ _REVIEW_HTML = (
           <button id="ai-ask" class="btn primary">ask ai</button>
           <span id="ai-status" class="t-label" style="color:var(--muted)"></span>
         </div>
-        <div id="ai-answer" class="ai-answer" style="display:none"></div>
+        <div id="ai-history" class="ai-history"></div>
       </div>
     </div>
   </div>
@@ -4032,7 +4146,7 @@ _REVIEW_HTML = (
     let poly = null, pts = [], drawing = false;
     const drawBtn = el('ai-draw'), clearBtn = el('ai-clear'),
           info = el('ai-region'), status = el('ai-status'),
-          answer = el('ai-answer'), modelSel = el('ai-model');
+          histEl = el('ai-history'), modelSel = el('ai-model');
 
     function inPoly(lat, lon, P){
       let inside=false;
@@ -4102,13 +4216,66 @@ _REVIEW_HTML = (
           if (m.id===j.default) o.selected=true; modelSel.appendChild(o);
         }
         if (!list.length){ const o=document.createElement('option'); o.textContent='(server default)'; o.value=''; modelSel.appendChild(o); }
+        loadHistory();
       } catch(e){ card.style.display='none'; }
+    }
+
+    const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    function fmtWhen(ts){
+      try { return new Date(ts*1000).toLocaleString(); } catch(e){ return ''; }
+    }
+    // Render the persistent Q&A list, newest first; first item expanded.
+    function renderHistory(list){
+      const items = (list||[]).slice().reverse();
+      histEl.innerHTML = '';
+      items.forEach((e, k)=>{
+        const div = document.createElement('div');
+        div.className = 'ai-hist-item' + (k===0 ? ' open' : '');
+        const q = esc(e.question || '(no question)');
+        const meta = esc((e.model||'') + ' · ' + (e.laps||0) + ' laps · ' + fmtWhen(e.ts));
+        div.innerHTML =
+          '<div class="ai-hist-head"><span class="ai-hist-q">'+q+'</span>'+
+          '<span class="ai-hist-meta">'+meta+'</span></div>'+
+          '<div class="ai-hist-body">'+md(e.answer||'')+'</div>'+
+          '<div class="ai-hist-actions">'+
+            '<button class="btn ai-region-btn">show region</button>'+
+            '<button class="btn ai-hist-x ai-del-btn">delete</button></div>';
+        div.querySelector('.ai-hist-head').addEventListener('click', ()=> div.classList.toggle('open'));
+        div.querySelector('.ai-region-btn').addEventListener('click', ()=> showRegion(e.region && e.region.points));
+        div.querySelector('.ai-del-btn').addEventListener('click', ()=> delEntry(e.id));
+        histEl.appendChild(div);
+      });
+    }
+    function showRegion(P){
+      if (!P || P.length<3) return;
+      pts = P.map(x=>[x[0],x[1]]);
+      if (poly){ map.removeLayer(poly); poly=null; }
+      poly = L.polygon(pts, {color:'#6CD07A', weight:2, fillColor:'#6CD07A', fillOpacity:0.15}).addTo(map);
+      map.fitBounds(poly.getBounds(), {padding:[40,40]});
+      regionInfo();
+    }
+    async function delEntry(id){
+      if (!confirm('Delete this AI question and its answer?')) return;
+      try {
+        const r = await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/ai/delete', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})
+        });
+        const j = await r.json();
+        if (r.ok) renderHistory(j.history);
+      } catch(e){}
+    }
+    async function loadHistory(){
+      try {
+        const r = await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/ai/history');
+        const j = await r.json();
+        renderHistory(j.history);
+      } catch(e){}
     }
 
     async function ask(){
       if (pts.length<3){ status.textContent='circle a section of track first'; return; }
       const q = (el('ai-prompt').value||'').trim();
-      status.textContent='analyzing…'; answer.style.display='none';
+      status.textContent='analyzing…';
       el('ai-ask').disabled=true;
       try {
         const r = await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/ai', {
@@ -4118,8 +4285,8 @@ _REVIEW_HTML = (
         const j = await r.json();
         if (!r.ok){ status.textContent='error: '+((j&&j.detail)||('HTTP '+r.status)); el('ai-ask').disabled=false; return; }
         status.textContent = 'model: '+j.model;
-        answer.innerHTML = md(j.answer||'(no answer)');
-        answer.style.display='';
+        el('ai-prompt').value='';
+        renderHistory(j.history);
       } catch(e){ status.textContent='request failed: '+e.message; }
       el('ai-ask').disabled=false;
     }

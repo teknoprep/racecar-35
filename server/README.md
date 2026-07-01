@@ -194,6 +194,15 @@ dropdown, so a user can override the default model per question; `RACECAR_AI_MOD
 is the fallback. After setting these, recreate the container (`docker compose
 … up -d`) — no rebuild needed since it's just env.
 
+**Persistent history + cascade delete.** Every question + answer is saved per
+session under `RACECAR_DATA_DIR/ai_history/<user>/<sessionfile>.json` and shown
+as a collapsible list in the AI card (newest first; each item has *show region*
+— redraws the polygon on the map — and *delete*). `GET .../ai/history` lists them,
+`POST .../ai/delete {id}` removes one. **Deleting the session deletes its entire
+AI history** (session `DELETE` / `/delete` cascade). Open WebUI's `<details>`
+cost/token footer is stripped server-side (admin-only info) so only the coaching
+text is stored/shown.
+
 ## Lap detection + review page
 
 The review page (`/review/<user>/<file>`) shows a **lap table** and a
