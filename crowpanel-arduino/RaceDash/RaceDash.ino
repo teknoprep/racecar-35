@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.70"
+#define FIRMWARE_VERSION "0.1.71"
 
 #include <Preferences.h>
 #include <time.h>
@@ -5425,6 +5425,17 @@ static void handleUploadModalTap(int x, int y) {
 static constexpr const char* OTA_MANIFEST_URL =
     "https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/manifest.json";
 
+// raw.githubusercontent.com is fronted by Fastly with a ~5 min cache TTL, so a
+// freshly-pushed manifest/artifact can serve STALE for minutes after a release
+// (the exact "device still sees the old version right after publishing" pain).
+// Appending a unique query string makes the CDN cache key unique per request,
+// forcing a fresh origin fetch. dst must hold the URL + ~24 bytes. Also send
+// no-cache request headers (belt + suspenders) at the call site.
+static void otaBustCache(char* dst, size_t dstsz, const char* url) {
+    const char sep = (strchr(url, '?') != nullptr) ? '&' : '?';
+    snprintf(dst, dstsz, "%s%ccb=%lu", url, sep, (unsigned long)millis());
+}
+
 namespace {
     constexpr int OM_CARD_X = 80,  OM_CARD_Y = 55;
     constexpr int OM_CARD_W = 640, OM_CARD_H = 370;
@@ -5616,10 +5627,14 @@ static void otaDoCheck() {
     WiFiClientSecure client;
     client.setInsecure();   // TODO: embed GitHub root CA for proper validation
     HTTPClient http;
-    if (!http.begin(client, OTA_MANIFEST_URL)) {
+    char manifest_url[192];
+    otaBustCache(manifest_url, sizeof(manifest_url), OTA_MANIFEST_URL);
+    if (!http.begin(client, manifest_url)) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "manifest HTTPS begin failed");
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
+    http.addHeader("Cache-Control", "no-cache");
+    http.addHeader("Pragma", "no-cache");
     const int code = http.GET();
     if (code != HTTP_CODE_OK) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "manifest fetch HTTP %d", code);
@@ -5782,10 +5797,14 @@ static void otaDoTeensyUpdate() {
     client.setInsecure();
     client.setTimeout(15);
     HTTPClient http;
-    if (!http.begin(client, ota_teensy_url)) {
+    char teensy_url_cb[256];
+    otaBustCache(teensy_url_cb, sizeof(teensy_url_cb), ota_teensy_url);
+    if (!http.begin(client, teensy_url_cb)) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "teensy hex HTTPS begin failed");
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
+    http.addHeader("Cache-Control", "no-cache");
+    http.addHeader("Pragma", "no-cache");
     const int code = http.GET();
     if (code != HTTP_CODE_OK) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "teensy hex HTTP %d", code);
@@ -6100,10 +6119,14 @@ static void otaDoDownload() {
     client.setInsecure();
     client.setTimeout(15);   // seconds; setTimeout is in seconds for WiFiClient
     HTTPClient http;
-    if (!http.begin(client, ota_url)) {
+    char ota_url_cb[256];
+    otaBustCache(ota_url_cb, sizeof(ota_url_cb), ota_url);
+    if (!http.begin(client, ota_url_cb)) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), ".bin HTTPS begin failed");
         ota_state = OTA_S_FAILED; ota_modal_dirty = true; return;
     }
+    http.addHeader("Cache-Control", "no-cache");
+    http.addHeader("Pragma", "no-cache");
     const int code = http.GET();
     if (code != HTTP_CODE_OK) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), ".bin fetch HTTP %d", code);
