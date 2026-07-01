@@ -79,6 +79,10 @@ AI_BASE_URL = os.environ.get("RACECAR_AI_BASE_URL", "https://ai.blueuc.com").str
 AI_API_KEY = os.environ.get("RACECAR_AI_API_KEY", "").strip()
 AI_MODEL = os.environ.get("RACECAR_AI_MODEL", "").strip()   # default model id, e.g. "gpt-4o-mini"
 AI_TIMEOUT = int(os.environ.get("RACECAR_AI_TIMEOUT_SECONDS", "120"))
+# Sampling temperature. Newer models (e.g. Anthropic claude-sonnet-5) REJECT the
+# temperature param outright, so we OMIT it unless RACECAR_AI_TEMPERATURE is set.
+_ai_temp_raw = os.environ.get("RACECAR_AI_TEMPERATURE", "").strip()
+AI_TEMPERATURE = float(_ai_temp_raw) if _ai_temp_raw else None
 # Model ALLOWLIST. RACECAR_AI_MODELS is a CSV of model ids the UI may offer and
 # the server will accept; if unset it falls back to just [RACECAR_AI_MODEL].
 # When the allowlist is non-empty it is authoritative — the live 100+ model
@@ -1935,8 +1939,7 @@ def _region_prompt(metrics: dict, question: str) -> list:
     ]
 
 
-def _ai_chat(messages: list, model: Optional[str] = None,
-             temperature: float = 0.3) -> tuple:
+def _ai_chat(messages: list, model: Optional[str] = None) -> tuple:
     """Call the Open WebUI OpenAI-compatible chat endpoint. Returns
     (reply_text, model_used), or raises HTTPException on config/upstream errors."""
     if not AI_API_KEY:
@@ -1946,12 +1949,17 @@ def _ai_chat(messages: list, model: Optional[str] = None,
     if not use_model:
         raise HTTPException(status_code=503,
                             detail="No AI model selected and RACECAR_AI_MODEL is unset")
-    body = json.dumps({
+    payload_obj = {
         "model": use_model,
         "messages": messages,
-        "temperature": temperature,
         "stream": False,
-    }).encode()
+    }
+    # temperature is DEPRECATED / rejected by newer models (e.g. Anthropic
+    # claude-sonnet-5 -> "temperature is deprecated for this model"), so only
+    # send it when explicitly configured via RACECAR_AI_TEMPERATURE.
+    if AI_TEMPERATURE is not None:
+        payload_obj["temperature"] = AI_TEMPERATURE
+    body = json.dumps(payload_obj).encode()
     req = urllib.request.Request(
         AI_BASE_URL + "/api/chat/completions",
         data=body,
