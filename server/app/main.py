@@ -2119,9 +2119,22 @@ async def delete_session_form(
 
 @app.get("/admin/sessions/targets")
 async def admin_session_targets(request: Request) -> JSONResponse:
-    """Emails an admin may reassign a session TO (all known accounts). Admin only."""
+    """Everyone an admin may reassign a session TO. Admin only.
+
+    Union of (a) all known accounts (admins + allowlist + managed) as emails, and
+    (b) every user directory that already holds sessions — including “orphan”
+    owners that aren't registered accounts (shown by their dir slug). Deduped so
+    an account isn't listed twice (email vs its slug). Sorted alphabetically.
+    """
     require_admin(request)
-    return JSONResponse({"targets": sorted(all_known_users())})
+    emails = set(all_known_users())
+    known_slugs = {safe_name(e) for e in emails}
+    root = DATA_DIR / "sessions"
+    if root.exists():
+        for d in sorted(root.iterdir()):
+            if d.is_dir() and d.name not in known_slugs and any(d.iterdir()):
+                emails.add(d.name)   # orphan owner: a valid move target by slug
+    return JSONResponse({"targets": sorted(emails, key=str.lower)})
 
 
 @app.post("/admin/sessions/move")
@@ -3483,6 +3496,16 @@ _REVIEW_HTML = (
   .ai-hist-actions { display:flex; gap:6px; padding: 0 12px 10px; }
   .ai-hist-actions .btn { padding: 4px 8px; }
   .ai-hist-x { color: var(--bad); }
+  /* ---- filterable combobox (admin reassign) ---------------------- */
+  .combo { position: relative; display: inline-block; }
+  .combo-list { position: absolute; top: calc(100% + 4px); left: 0; z-index: 1000;
+    min-width: 240px; max-height: 320px; overflow-y: auto; background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: var(--r-sm);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45); }
+  .combo-opt { padding: 8px 12px; cursor: pointer; color: var(--text);
+    font: 13px var(--ff-mono); white-space: nowrap; }
+  .combo-opt:hover, .combo-opt.active { background: var(--surface-3); color: var(--primary); }
+  .combo-empty { padding: 8px 12px; color: var(--muted); font-size: 12px; }
   .leaflet-crosshair, .leaflet-crosshair .leaflet-interactive { cursor: crosshair !important; }
 
   .delta-wrap { position: relative; }
@@ -3500,10 +3523,12 @@ _REVIEW_HTML = (
   <span class="pill" id="started">__WHEN__</span>
   <span class="pill" id="count">\u2026</span>
   <span id="admin-move" style="display:none;align-items:center;gap:6px">
-    <input id="move-target" class="cmp-input" list="move-targets" type="text"
-           placeholder="reassign to email…" autocomplete="off"
-           style="width:auto;min-width:210px">
-    <datalist id="move-targets"></datalist>
+    <span class="combo">
+      <input id="move-target" class="cmp-input" type="text"
+             placeholder="reassign to user…" autocomplete="off"
+             style="width:auto;min-width:210px">
+      <div id="move-list" class="combo-list" style="display:none"></div>
+    </span>
     <button id="move-btn" class="btn">reassign</button>
   </span>
   <a class="btn" href="/sessions/__USER__/__FILE__">download</a>
@@ -4463,20 +4488,57 @@ _REVIEW_HTML = (
   if (!me || !me.is_admin) return;
   const wrap=document.getElementById('admin-move');
   const sel=document.getElementById('move-target');
-  const dl=document.getElementById('move-targets');
+  const list=document.getElementById('move-list');
   const btn=document.getElementById('move-btn');
-  if (!wrap||!sel||!btn) return;
+  if (!wrap||!sel||!list||!btn) return;
+  let targets=[];
   try {
     const t = await (await fetch('/admin/sessions/targets')).json();
-    for (const em of (t.targets||[])){
-      const o=document.createElement('option'); o.value=em; dl.appendChild(o);
-    }
+    targets = (t.targets||[]).slice().sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
   } catch(e){}
   wrap.style.display='inline-flex';
+
+  // Custom filterable dropdown: click shows the full alphabetical list; typing
+  // filters (substring, case-insensitive); click a row or Enter to pick.
+  let active=-1, shown=[];
+  function renderList(){
+    const q=(sel.value||'').trim().toLowerCase();
+    shown = q ? targets.filter(x=>x.toLowerCase().includes(q)) : targets.slice();
+    list.innerHTML='';
+    if (!shown.length){
+      const d=document.createElement('div'); d.className='combo-empty';
+      d.textContent = targets.length ? 'no match — type a full email to add' : 'no users found';
+      list.appendChild(d);
+    } else {
+      shown.forEach((em,i)=>{
+        const d=document.createElement('div'); d.className='combo-opt'+(i===active?' active':'');
+        d.textContent=em;
+        d.addEventListener('mousedown', ev=>{ ev.preventDefault(); sel.value=em; hide(); });
+        list.appendChild(d);
+      });
+    }
+    list.style.display='';
+  }
+  function hide(){ list.style.display='none'; active=-1; }
+  sel.addEventListener('focus', ()=>{ active=-1; renderList(); });
+  sel.addEventListener('input', ()=>{ active=-1; renderList(); });
+  sel.addEventListener('keydown', ev=>{
+    if (list.style.display==='none') return;
+    if (ev.key==='ArrowDown'){ ev.preventDefault(); active=Math.min(active+1, shown.length-1); renderList(); }
+    else if (ev.key==='ArrowUp'){ ev.preventDefault(); active=Math.max(active-1, 0); renderList(); }
+    else if (ev.key==='Enter'){ if (active>=0 && shown[active]){ ev.preventDefault(); sel.value=shown[active]; hide(); } }
+    else if (ev.key==='Escape'){ hide(); }
+  });
+  document.addEventListener('click', ev=>{ if (!wrap.contains(ev.target)) hide(); });
+
   btn.addEventListener('click', async ()=>{
     const target=(sel.value||'').trim().toLowerCase();
     if (!target){ sel.focus(); return; }
-    if (target.indexOf('@')<0 || target.indexOf('.')<0){ alert('Enter a valid email address to reassign to.'); sel.focus(); return; }
+    // Allow either a known target (email or slug) or a fresh, valid email.
+    const known = targets.some(x=>x.toLowerCase()===target);
+    if (!known && (target.indexOf('@')<0 || target.indexOf('.')<0)){
+      alert('Pick a user from the list, or type a valid email address.'); sel.focus(); return;
+    }
     if (!confirm('Move this session (and its AI history) to '+target+'?\\nThe URL will change to that user.')) return;
     btn.disabled=true; btn.textContent='moving\u2026';
     try {
