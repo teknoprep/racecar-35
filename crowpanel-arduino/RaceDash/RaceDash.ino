@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.74"
+#define FIRMWARE_VERSION "0.1.75"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1612,6 +1612,12 @@ struct UploadFlow {
     char       response[1024];  // accumulated HTTP response (headers + body)
     size_t     response_len;
     char       last_err[180];
+    // Coalescing TX buffer: Q,L lines are appended here and flushed to the TLS
+    // socket in big chunks (one TLS record per ~8 KB instead of one tiny record
+    // per ~230-byte line). This is the difference between ~2 KB/s and tens of
+    // KB/s, and lets the write path RETRY short writes instead of aborting.
+    uint8_t    txbuf[8192];
+    size_t     txlen;
 };
 static UploadFlow uf = {};
 
@@ -1627,6 +1633,44 @@ static void ufCloseTcp() {
     uf.lines_recv   = 0;
     uf.response_len = 0;
     uf.response[0]  = '\0';
+    uf.txlen        = 0;
+}
+
+// Flush the coalescing TX buffer to the TLS socket. Robust write-all loop: a
+// short write (WiFiClientSecure returns fewer bytes than asked under WiFi
+// backpressure) is RETRIED, not treated as fatal — the old one-write-per-line
+// path aborted the whole upload on the first short write, which is what made
+// uploads "die at ~70 lines". Returns false only on a real socket death or a
+// sustained (>12 s) stall; caller then fails the file.
+static bool ufFlushTx() {
+    if (uf.txlen == 0) return true;
+    if (!uf.tcp)  { snprintf(uf.last_err, sizeof(uf.last_err), "no tcp in flush"); return false; }
+    size_t off = 0;
+    uint32_t last_progress = millis();
+    while (off < uf.txlen) {
+        if (!uf.tcp->connected()) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "TCP closed during flush at %lu B", (unsigned long)uf.bytes_written);
+            Serial.printf("DBG,uf_flush_fail %s\n", uf.last_err);
+            return false;
+        }
+        const size_t w = uf.tcp->write(uf.txbuf + off, uf.txlen - off);
+        if (w > 0) {
+            off += w;
+            last_progress = millis();
+            uf.last_rx_ms = millis();
+        } else {
+            if (millis() - last_progress > 12000) {
+                snprintf(uf.last_err, sizeof(uf.last_err),
+                         "TCP write stalled at %lu B", (unsigned long)uf.bytes_written);
+                Serial.printf("DBG,uf_flush_fail %s\n", uf.last_err);
+                return false;
+            }
+            delay(1);   // transient WANT_WRITE / full send buffer — back off + retry
+        }
+    }
+    uf.txlen = 0;
+    return true;
 }
 
 static void ufReset() {
@@ -1935,20 +1979,16 @@ static bool parseQLine(const String& line) {
     if (strncmp(p, "L,", 2) == 0 && uf.state == UF_STREAMING) {
         const char* data = p + 2;
         const size_t n = strlen(data);
-        if (!uf.tcp || !uf.tcp->connected()) {
+        if (!uf.tcp) {
             snprintf(uf.last_err, sizeof(uf.last_err),
-                     "TCP died at %lu bytes", (unsigned long)uf.bytes_written);
+                     "no tcp at %lu bytes", (unsigned long)uf.bytes_written);
             ufCloseTcp();
             uf.failed++;
             ufNextFile();
             return true;
         }
-        // Single write per line: stack-build "<line>\n" then write once.
-        // Two writes per line through WiFiClientSecure adds an extra TLS
-        // record header per line — over 4000 lines on a 1 MB upload that's
-        // a measurable overhead and an extra blocking syscall per line.
-        uint8_t tx[576];
-        if (n + 1 > sizeof(tx)) {
+        const size_t need = n + 1;   // line + '\n'
+        if (need > sizeof(uf.txbuf)) {
             snprintf(uf.last_err, sizeof(uf.last_err),
                      "line too long %u", (unsigned)n);
             ufCloseTcp();
@@ -1956,28 +1996,22 @@ static bool parseQLine(const String& line) {
             ufNextFile();
             return true;
         }
-        memcpy(tx, data, n);
-        tx[n] = '\n';
-        const size_t need = n + 1;
-        const size_t w = uf.tcp->write(tx, need);
-        if (w != need) {
-            snprintf(uf.last_err, sizeof(uf.last_err),
-                     "TCP short write %u/%u at %lu B",
-                     (unsigned)w, (unsigned)need,
-                     (unsigned long)uf.bytes_written);
-            ufCloseTcp();
-            uf.failed++;
-            ufNextFile();
-            return true;
+        // Append into the coalescing buffer; flush to TLS first if this line
+        // wouldn't fit. The flush is the only place we block on the socket, and
+        // it retries short writes instead of aborting.
+        if (uf.txlen + need > sizeof(uf.txbuf)) {
+            if (!ufFlushTx()) { ufCloseTcp(); uf.failed++; ufNextFile(); return true; }
         }
+        memcpy(uf.txbuf + uf.txlen, data, n);
+        uf.txbuf[uf.txlen + n] = '\n';
+        uf.txlen         += need;
         uf.bytes_written += need;
         uf.last_rx_ms     = millis();
         uf.lines_recv++;
 
-        // Pace the Teensy file sender. It waits for Q,A after every Q,L line;
-        // without this ACK, uploads fail as Q,ERR,ack_timeout as soon as the
-        // first data record is sent. ACK only after the bytes are accepted by
-        // the cloud socket so TCP backpressure naturally slows the SD reader.
+        // ACK immediately (the line is safely buffered) so the Teensy streams
+        // the next line at full UART speed. Backpressure is applied naturally
+        // when the buffer fills and we block in ufFlushTx().
         Serial.println("Q,A");
         Serial.flush();
 
@@ -1996,6 +2030,8 @@ static bool parseQLine(const String& line) {
             ufNextFile();
             return true;
         }
+        // Flush whatever's left in the coalescing buffer before finishing.
+        if (!ufFlushTx()) { ufCloseTcp(); uf.failed++; ufNextFile(); return true; }
         if (uf.bytes_written != uf.expected_size) {
             // Server is waiting for exactly Content-Length bytes. Anything
             // less is a data integrity failure: lines dropped, the file got

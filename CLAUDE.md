@@ -147,12 +147,39 @@ for minutes. The server's `no-store` fixes that outright.
 
 **Publishing a server release** (after building all four — see [BUILD.md](BUILD.md)):
 ```bash
-RACECAR_API_KEY=<server key> ./server/publish_firmware.sh <version> https://racecar.api.blueuc.com
+export RACECAR_API_KEY=$(grep -oE '[0-9a-f]{64}' /home/chris/racecar-tools/secrets/racecar_api_key.env)
+./server/publish_firmware.sh <version> https://racecar.api.blueuc.com
 ```
 That uploads the four binaries then a server-pointed manifest (artifact URLs =
-`<base>/firmware/<file>`, legacy `crowpanel` alias = `crowpanel7`) and verifies.
-The API key for THIS bench lives OUTSIDE the repo at
-`/home/chris/racecar-tools/secrets/racecar_api_key.env` (never committed).
+`<base>/firmware/<file>`, legacy `crowpanel` alias = `crowpanel7`) and verifies. **A future
+agent can ship OTA entirely from this build host — no laptop, no SSH** (the server is reached
+over public HTTPS).
+
+**Keys & server env (the auth landmine — read this):** firmware-upload auth and dash
+session-upload auth are DELIBERATELY separate. Reusing one key 401'd every dash session upload
+mid-stream (the “uploads die at ~70 lines” bug).
+- `POST /firmware/upload` is gated by server env **`RACECAR_FIRMWARE_KEY`**. Its value is the
+  64-hex key stored OFF the repo at **`/home/chris/racecar-tools/secrets/racecar_api_key.env`**
+  (never committed). `publish_firmware.sh` sends it as `X-API-Key` (via the `RACECAR_API_KEY`
+  shell var — confusingly named, but it must hold the FIRMWARE key).
+- `POST /upload` (dash sessions) is gated by **`RACECAR_API_KEY`** (leave EMPTY = open dev mode,
+  which is how it ships) OR any valid per-user account key (the dash sends its account key as
+  `X-API-Key`). Setting `RACECAR_API_KEY` does NOT break dash uploads anymore (server accepts
+  per-user keys), but keep firmware on its own `RACECAR_FIRMWARE_KEY`.
+
+**Redeploying the server** (only when `server/app/main.py` etc. change; on the box hosting
+`racecar.api.blueuc.com`, external nginx `proxy_default` already routes `/firmware/*`):
+```bash
+cd /path/to/racecar-35 && git pull origin main
+cd server && docker compose -f docker-compose.prod.yml up -d --build
+curl -s https://racecar.api.blueuc.com/firmware/list      # {"firmware":[...]}  = live
+```
+Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
+
+**git push from this host:** remote is `https://github.com/teknoprep/racecar-35.git` (HTTPS token
+auth). `$HOME=/home/chris` here; push with an explicit token URL
+`https://teknoprep:<token>@github.com/teknoprep/racecar-35.git` (the token is supplied in chat by
+the user each session — do not hardcode it into files).
 
 **Two channels, deliberately:** the GitHub `firmware/manifest.json` is frozen
 at **0.1.73** (the transition build whose `OTA_MANIFEST_URL` is the server) so

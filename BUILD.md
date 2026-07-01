@@ -210,6 +210,63 @@ an explicit token URL. On this host `$HOME=/home/chris`; use whatever supplies t
 
 ---
 
+## Publishing OTA to the server (racecar.api.blueuc.com) — the normal path (v0.1.74+)
+
+Since **v0.1.73** the dash checks our OWN server for updates, not GitHub. This means a future
+agent can ship an OTA **entirely from this build host with no laptop** — build the four
+artifacts, then push straight to the server, which serves them `no-store` (instantly fresh, no
+CDN lag). See [server/README.md](server/README.md) for the endpoint reference.
+
+### The firmware-upload API key (already provisioned)
+- **Value** lives OFF the repo at **`/home/chris/racecar-tools/secrets/racecar_api_key.env`**
+  (mode 600, outside the git tree — never committed). Read it with `grep RACECAR_API_KEY <file>`
+  or `grep -oE '[0-9a-f]{64}' <file>`.
+- The SAME value is set on the server as env **`RACECAR_FIRMWARE_KEY`** (gates `POST
+  /firmware/upload`). It is DELIBERATELY separate from `RACECAR_API_KEY` (session-upload auth) —
+  reusing one key for both previously 401'd every dash session upload mid-stream.
+- The server is reachable over public HTTPS from this host; no SSH needed to publish.
+
+### Publish command (after building all four — sections 1–2 above put them in `firmware/`)
+```bash
+export RACECAR_API_KEY=$(grep -oE '[0-9a-f]{64}' /home/chris/racecar-tools/secrets/racecar_api_key.env)
+./server/publish_firmware.sh 0.1.NN https://racecar.api.blueuc.com
+```
+`publish_firmware.sh` uploads the four binaries then a server-pointed manifest (artifact URLs =
+`<base>/firmware/<file>`, every `version`=the arg, legacy `crowpanel` alias = `crowpanel7`) and
+prints the live manifest to verify. The script sends `X-API-Key: $RACECAR_API_KEY` — that env
+var is the FIRMWARE key here, matching the server's `RACECAR_FIRMWARE_KEY` (naming is a bit
+confusing: the script variable is `RACECAR_API_KEY` but it must hold the firmware key).
+
+### Verify a server release
+```bash
+curl -s https://racecar.api.blueuc.com/firmware/manifest.json | grep -E '"version"|"url"'
+curl -s https://racecar.api.blueuc.com/firmware/list                 # name+size+sha256 of all
+# hash-check one artifact against the manifest:
+curl -s https://racecar.api.blueuc.com/firmware/crowpanel5adv-dash.bin | sha256sum
+```
+
+### GitHub is now only the transition channel (frozen at 0.1.73)
+GitHub `firmware/manifest.json` stays at **0.1.73** (the build whose `OTA_MANIFEST_URL` is the
+server) so any panel still on ≤0.1.72 can OTA that far from GitHub and then hop to the server.
+**0.1.74+ ship server-only** via the script above; do NOT add them to the GitHub manifest, and
+keep the committed GitHub `firmware/` binaries at the 0.1.73 build (see the racy-index note
+below). You still commit the SOURCE (both `FIRMWARE_VERSION` defines + `RaceDash.ino`) to GitHub
+for provenance on every release.
+
+### ⚠ Networked-FS racy git index (bites every release)
+This working tree is on a filesystem whose stat-cache confuses git: an artifact that changed but
+kept the **same byte length** (the teensy `.hex` is always 610714 B; the manifest is a fixed
+size) gets treated as “clean” and silently NOT committed. Symptoms: `git show HEAD:firmware/x`
+differs from the working file while `git status` says clean. **Always** stage firmware/manifest
+changes with an index eviction:
+```bash
+git rm --cached firmware/teensy41-dash.hex firmware/manifest.json ... 2>/dev/null; git add firmware/ ...
+git cat-file -p :firmware/manifest.json | grep -m1 version   # CONFIRM the staged blob is right
+```
+And for GitHub releases, pin the manifest's artifact URLs to the commit SHA (immutable path →
+GitHub CDN can never serve a stale bin): commit artifacts first, `X=$(git rev-parse HEAD)`,
+`sed -i "s#/main/firmware#/$X/firmware#g" firmware/manifest.json`, evict+add+commit+push.
+
 ## Verified versions (this build, 2026-07-01)
 
 | Tool / lib | Version |
