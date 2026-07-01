@@ -657,6 +657,40 @@ longer exposes a stream-mode setting and the Teensy has no live-POST code.
 | Flow | session file written into `/queue/` during recording (kill-switch insurance); uploaded after the session ends, **dash-driven** (`Q,LIST`/`Q,GET`/`Q,DEL`) or via the queue drain |
 | Failure | file stays in `/queue/`, retried on the next dash-requested drain |
 
+### Upload transfer path (Teensy → dash → cloud) — how the bytes actually move
+
+The SD card + session files live on the **Teensy**; only the **dash** has WiFi. So an upload is a
+two-hop relay: the Teensy streams the file to the dash over UART, and the dash POSTs it to the
+cloud. Both hops and their hard-won fixes:
+
+**Hop 1 — Teensy→dash UART, sequence-numbered stop-and-wait ARQ (v0.1.78, `handleQGet`):**
+`Q,DATA,<name>,<size>` then `Q,L,<seq>,<line>` per line; the dash replies `Q,A,<seq>`. The
+Teensy RETRANSMITS a line if its ack doesn't arrive (2 s × 15 tries); the dash APPLIES only
+`seq == next_seq` and dedups resends. This is the fix that made uploads reliable — before it, a
+SINGLE dropped/corrupted byte on the long 921600-baud cabin↔trunk wire aborted the whole file
+(`Q,ERR,ack_timeout`) at a random line. Ends with `Q,EOF,<seq>`.
+
+**Hop 2 — dash→cloud HTTPS.** TWO designs have existed; keep this note so it's revertible:
+- **Whole-file cache (v0.1.76–0.1.78):** `Q,DATA` → `ps_malloc(size)`; each `Q,L` is memcpy'd into
+  PSRAM (`UF_STREAMING`, instant ack, no network in the loop); on `Q,EOF` the complete buffer is
+  POSTed with `Content-Length` in one shot (`UF_POSTING` → chunked `tcp->write` from the buffer).
+  Modal is two-phase: "Copying to cache" (cyan) then "Uploading to cloud" (green). **Limit: the
+  whole file must fit in PSRAM** — capped at `UF_MAX_FILE` (6 MB); the Advance has 8 MB PSRAM minus
+  the ~768 KB framebuffer. A >6 MB session (>~18 min at 25 Hz) is rejected. **To revert to this,
+  restore the `UF_STREAMING`=stage-to-PSRAM + `UF_POSTING`=post-buffer handlers.**
+- **Bounded streaming (v0.1.79+, current):** `Q,DATA` opens the TLS socket immediately with
+  `Transfer-Encoding: chunked` (no Content-Length needed — tolerant of CR-stripping size deltas),
+  and each `Q,L` appends into a fixed ~128 KB PSRAM buffer that is flushed to the socket as one
+  HTTP chunk whenever it fills; `Q,EOF` flushes the tail + writes the `0\r\n\r\n` terminator.
+  **Flat memory → any session size.** Backpressure is implicit: while the dash blocks on a chunk
+  flush it stops acking, and the Teensy's ARQ simply waits/retransmits (safe). Requires the ARQ
+  (hop 1) to be reliable, which is why streaming only works from v0.1.78 onward.
+
+Whichever hop-2 design: opening the socket, chunk/short-write retries, and the HTTP response
+parse live in `ufOpenStream`/`ufFlushChunk`/`UF_STREAM_FINISH`. Do NOT reintroduce per-line
+`CFG,...` config resends to the Teensy DURING a transfer (the loop gates on `uf.state==UF_IDLE`
+&& `sl.state==SL_IDLE`) — a 12-line CFG burst mid-ARQ used to desync it.
+
 ### Outbound queue (offline / poor-connectivity tolerance)
 `/queue/session_*.ndjson` on SD card. On every boot or link-up event:
 1. Walk the queue oldest-first

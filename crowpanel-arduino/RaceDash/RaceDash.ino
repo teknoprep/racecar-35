@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.78"
+#define FIRMWARE_VERSION "0.1.79"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1626,7 +1626,7 @@ struct UploadFlow {
     uint32_t   next_seq;        // next expected Q,L sequence number (ARQ dedup)
 };
 static UploadFlow uf = {};
-static constexpr uint32_t UF_MAX_FILE = 6UL * 1024 * 1024;   // PSRAM staging cap
+static constexpr uint32_t UF_CHUNK_BUF = 128UL * 1024;       // streaming flush buffer
 
 static void ufCloseTcp() {
     if (uf.tcp) {
@@ -1644,13 +1644,46 @@ static void ufCloseTcp() {
     uf.post_started = false;
 }
 
-// Free the PSRAM staging buffer between files.
+// Free the PSRAM chunk buffer between files.
 static void ufFreeBuf() {
     if (uf.buf) { free(uf.buf); uf.buf = nullptr; }
     uf.bufcap       = 0;
     uf.buflen       = 0;
     uf.post_off     = 0;
     uf.post_started = false;
+}
+
+// Flush the current buffer to the TLS socket as ONE HTTP chunk
+// ("<hexlen>\r\n<bytes>\r\n"). Robust write-all loop: short writes are retried,
+// only a real socket death / >15 s stall fails. Returns false on failure.
+static bool ufWriteAll(const uint8_t* data, size_t len) {
+    size_t off = 0;
+    uint32_t last = millis();
+    while (off < len) {
+        if (!uf.tcp || !uf.tcp->connected()) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "TCP closed at %lu B", (unsigned long)uf.bytes_written);
+            return false;
+        }
+        const int w = uf.tcp->write(data + off, len - off);
+        if (w > 0) { off += (size_t)w; last = millis(); uf.last_rx_ms = millis(); }
+        else if (millis() - last > 15000) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "TCP write stalled at %lu B", (unsigned long)uf.bytes_written);
+            return false;
+        } else delay(1);
+    }
+    return true;
+}
+static bool ufFlushChunk() {
+    if (uf.buflen == 0) return true;
+    char hdr[16];
+    const int hn = snprintf(hdr, sizeof(hdr), "%x\r\n", (unsigned)uf.buflen);
+    if (!ufWriteAll((const uint8_t*)hdr, (size_t)hn)) return false;
+    if (!ufWriteAll(uf.buf, uf.buflen))               return false;
+    if (!ufWriteAll((const uint8_t*)"\r\n", 2))        return false;
+    uf.buflen = 0;
+    return true;
 }
 
 static void ufReset() {
@@ -1732,7 +1765,11 @@ static void ufExtractTrack(const char* filename, char* out, size_t outsize) {
 // Body bytes are written incrementally as Q,L lines arrive. Returns true on
 // success; on failure, last_err is set and the caller should advance to the
 // next file.
-static bool ufOpenStream(uint32_t content_length) {
+// Open the TLS socket and write the HTTP request head. If chunked, use
+// Transfer-Encoding: chunked and stream the body as HTTP chunks (any size,
+// flat memory); otherwise send a fixed Content-Length. content_length is used
+// for the Content-Length header (non-chunked) and always for the progress bar.
+static bool ufOpenStream(uint32_t content_length, bool chunked = false) {
     if (s.cloud_host[0] == '\0' || s.cloud_port == 0) {
         snprintf(uf.last_err, sizeof(uf.last_err), "cloud host/port unset");
         return false;
@@ -1790,7 +1827,8 @@ static bool ufOpenStream(uint32_t content_length) {
     uf.tcp->printf("POST /upload HTTP/1.1\r\n");
     uf.tcp->printf("Host: %s\r\n",            s.cloud_host);
     uf.tcp->printf("Content-Type: application/x-ndjson\r\n");
-    uf.tcp->printf("Content-Length: %lu\r\n", (unsigned long)content_length);
+    if (chunked) uf.tcp->printf("Transfer-Encoding: chunked\r\n");
+    else         uf.tcp->printf("Content-Length: %lu\r\n", (unsigned long)content_length);
     uf.tcp->printf("X-API-Key: %s\r\n",       s.cloud_auth_pass);
     uf.tcp->printf("X-User-Email: %s\r\n",    s.cloud_auth_user);
     uf.tcp->printf("X-Session-Id: %ld\r\n",   sid);
@@ -1947,33 +1985,38 @@ static bool parseQLine(const String& line) {
         const char* comma = strchr(rest, ',');
         if (!comma) return true;
         const uint32_t sz = (uint32_t)strtoul(comma + 1, nullptr, 10);
-        // Stage the ENTIRE file into PSRAM first. Each Q,L is ACKed the instant
-        // it's copied (no network in the loop), so the Teensy streams at full
-        // UART speed; the cloud POST happens only AFTER the whole file is in
-        // RAM (UF_POSTING). No TLS socket is opened here.
+        // STREAMING upload: open the cloud socket NOW with chunked transfer
+        // encoding and stream each Q,L straight through a small fixed buffer.
+        // Flat memory => any session size (no whole-file PSRAM cache). The
+        // Teensy ARQ + implicit backpressure (we stop acking while a chunk
+        // flush blocks) keep it reliable.
         ufFreeBuf();
-        if (sz == 0 || sz > UF_MAX_FILE) {
-            snprintf(uf.last_err, sizeof(uf.last_err), "bad file size %lu", (unsigned long)sz);
+        if (sz == 0) {
+            snprintf(uf.last_err, sizeof(uf.last_err), "zero file size");
             uf.failed++;
             ufNextFile();
             return true;
         }
-        uf.buf = (uint8_t*)ps_malloc(sz);
+        uf.buf = (uint8_t*)ps_malloc(UF_CHUNK_BUF);
         if (!uf.buf) {
-            snprintf(uf.last_err, sizeof(uf.last_err),
-                     "PSRAM alloc %lu failed", (unsigned long)sz);
+            snprintf(uf.last_err, sizeof(uf.last_err), "PSRAM chunk alloc failed");
             uf.failed++;
             ufNextFile();
             return true;
         }
-        uf.bufcap        = sz;
+        uf.bufcap        = UF_CHUNK_BUF;
         uf.buflen        = 0;
         uf.lines_recv    = 0;
         uf.next_seq      = 1;       // Teensy numbers lines from 1
-        uf.expected_size = sz;      // modal progress while staging
+        uf.expected_size = sz;      // modal progress (total file bytes)
         uf.bytes_written = 0;
+        if (!ufOpenStream(sz, /*chunked=*/true)) {
+            uf.failed++;
+            ufNextFile();
+            return true;
+        }
         ufEnter(UF_STREAMING);
-        Serial.printf("DBG,uf_buf_start size=%lu\n", (unsigned long)sz);
+        Serial.printf("DBG,uf_stream_start size=%lu\n", (unsigned long)sz);
         return true;
     }
     if (strncmp(p, "L,", 2) == 0 && uf.state == UF_STREAMING) {
@@ -1997,50 +2040,54 @@ static bool parseQLine(const String& line) {
 
         if (seq == uf.next_seq) {
             const size_t need = n + 1;   // line + '\n'
-            if (uf.buflen + need > uf.bufcap) {
-                snprintf(uf.last_err, sizeof(uf.last_err),
-                         "buffer overflow %lu+%u/%lu",
-                         (unsigned long)uf.buflen, (unsigned)need, (unsigned long)uf.bufcap);
-                uf.failed++;
-                ufNextFile();
+            if (need > uf.bufcap) {
+                snprintf(uf.last_err, sizeof(uf.last_err), "line too long %u", (unsigned)need);
+                ufCloseTcp(); uf.failed++; ufNextFile();
                 return true;
+            }
+            // Flush the chunk to the socket if this line won't fit. This is the
+            // only place we block on the network; while blocked we stop acking
+            // and the Teensy ARQ waits/retransmits (safe backpressure).
+            if (uf.buflen + need > uf.bufcap) {
+                if (!ufFlushChunk()) { ufCloseTcp(); uf.failed++; ufNextFile(); return true; }
             }
             memcpy(uf.buf + uf.buflen, data, n);
             uf.buf[uf.buflen + n] = '\n';
-            uf.buflen       += need;
-            uf.bytes_written = uf.buflen;
+            uf.buflen        += need;
+            uf.bytes_written += need;   // total body bytes sent+buffered
             uf.next_seq++;
             uf.lines_recv++;
             if ((uf.lines_recv % 1000) == 0) {
-                Serial.printf("DBG,uf_buf lines=%lu bytes=%lu/%lu\n",
+                Serial.printf("DBG,uf_stream lines=%lu bytes=%lu/%lu\n",
                               (unsigned long)uf.lines_recv,
-                              (unsigned long)uf.buflen, (unsigned long)uf.bufcap);
+                              (unsigned long)uf.bytes_written,
+                              (unsigned long)uf.expected_size);
             }
         }
         uf.last_rx_ms = millis();
-        // ACK the highest contiguous seq applied (next_seq-1). Covers dedup:
-        // a resent already-applied line still gets a satisfying ACK.
+        // ACK the highest contiguous seq applied (next_seq-1); dedups resends.
         Serial.printf("Q,A,%lu\n", (unsigned long)(uf.next_seq - 1));
         Serial.flush();
         return true;
     }
     if (strncmp(p, "EOF", 3) == 0 && uf.state == UF_STREAMING) {
-        if (!uf.buf || uf.buflen == 0) {
-            snprintf(uf.last_err, sizeof(uf.last_err), "empty buffer at EOF");
+        if (!uf.tcp) {
+            snprintf(uf.last_err, sizeof(uf.last_err), "no tcp at EOF");
             uf.failed++;
             ufNextFile();
             return true;
         }
-        // Whole file is staged in PSRAM. Hand off to UF_POSTING, which opens
-        // the TLS socket and POSTs the buffer in one request. We POST exactly
-        // uf.buflen bytes (what we actually have) so a benign delta vs the
-        // advertised bufcap (e.g. CR stripping) doesn't matter.
-        Serial.printf("DBG,uf_buf_done bytes=%lu cap=%lu lines=%lu\n",
-                      (unsigned long)uf.buflen, (unsigned long)uf.bufcap,
-                      (unsigned long)uf.lines_recv);
-        uf.post_started = false;
-        uf.post_off     = 0;
-        ufEnter(UF_POSTING);
+        // Flush the final partial chunk, then write the chunked terminator
+        // ("0\r\n\r\n") to signal end-of-body, and drain the HTTP response.
+        if (!ufFlushChunk() ||
+            !ufWriteAll((const uint8_t*)"0\r\n\r\n", 5)) {
+            ufCloseTcp(); uf.failed++; ufNextFile();
+            return true;
+        }
+        uf.tcp->flush();
+        Serial.printf("DBG,uf_stream_done bytes=%lu lines=%lu\n",
+                      (unsigned long)uf.bytes_written, (unsigned long)uf.lines_recv);
+        ufEnter(UF_STREAM_FINISH);
         return true;
     }
     if (strncmp(p, "ERR,", 4) == 0) {
@@ -2120,49 +2167,6 @@ static void uploadTick() {
     }
 
     // Per-state housekeeping.
-    if (uf.state == UF_POSTING) {
-        // Whole file is staged in PSRAM (uf.buf/uf.buflen). Open the socket once
-        // (writes HTTP headers with Content-Length = buflen), then push the
-        // body in large chunks — one chunk per tick so the loop stays alive and
-        // the modal progress bar advances. Nothing here depends on the Teensy
-        // anymore, so a slow network can't desync/abort the transfer.
-        if (!uf.post_started) {
-            if (!uf.buf || uf.buflen == 0) { uf.failed++; ufNextFile(); return; }
-            if (!ufOpenStream(uf.buflen)) { uf.failed++; ufNextFile(); return; }
-            uf.post_started = true;
-            uf.post_off     = 0;
-            uf.bytes_written = 0;
-            uf.last_rx_ms   = millis();
-            return;
-        }
-        if (uf.post_off < uf.buflen) {
-            if (!uf.tcp || !uf.tcp->connected()) {
-                snprintf(uf.last_err, sizeof(uf.last_err),
-                         "TCP closed at %lu/%lu B",
-                         (unsigned long)uf.post_off, (unsigned long)uf.buflen);
-                ufCloseTcp(); uf.failed++; ufNextFile(); return;
-            }
-            size_t remain = uf.buflen - uf.post_off;
-            size_t chunk  = remain > 8192 ? 8192 : remain;
-            const int w = uf.tcp->write(uf.buf + uf.post_off, chunk);
-            if (w > 0) {
-                uf.post_off     += (size_t)w;
-                uf.bytes_written = uf.post_off;
-                uf.last_rx_ms    = millis();
-                if ((uf.post_off & 0x1FFFF) < 8192)
-                    Serial.printf("DBG,uf_post bytes=%lu/%lu\n",
-                                  (unsigned long)uf.post_off, (unsigned long)uf.buflen);
-            }
-            // w<=0: transient WANT_WRITE; the UF_POSTING stall watchdog below
-            // (last_rx_ms) catches a real stall. Just retry next tick.
-            return;
-        }
-        // Body fully sent.
-        uf.tcp->flush();
-        Serial.printf("DBG,uf_post_done bytes=%lu\n", (unsigned long)uf.post_off);
-        ufEnter(UF_STREAM_FINISH);
-        return;
-    }
     if (uf.state == UF_STREAM_FINISH) {
         if (!uf.tcp) {
             snprintf(uf.last_err, sizeof(uf.last_err), "no tcp in finish");
@@ -2241,8 +2245,7 @@ static void uploadTick() {
     switch (uf.state) {
         case UF_LISTING:        timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
         case UF_FETCH_HEAD:     timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
-        case UF_STREAMING:      timeout_ms = 20000;  since = now - uf.last_rx_ms;       break;
-        case UF_POSTING:        timeout_ms = 30000;  since = now - uf.last_rx_ms;       break;
+        case UF_STREAMING:      timeout_ms = 30000;  since = now - uf.last_rx_ms;       break;
         case UF_STREAM_FINISH:  timeout_ms = 30000;  since = now - uf.last_rx_ms;       break;
         case UF_DELETING:       timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
         default: return;
@@ -5458,7 +5461,7 @@ static void drawUploadModal() {
     switch (uf.state) {
         case UF_LISTING:
         case UF_FETCH_HEAD:    phase = "Preparing...";        break;
-        case UF_STREAMING:     phase = "Copying to cache";    break;
+        case UF_STREAMING:     phase = "Uploading to cloud";  break;
         case UF_POSTING:       phase = "Uploading to cloud";  break;
         case UF_STREAM_FINISH: phase = "Finalizing...";       break;
         case UF_DELETING:      phase = "Cleaning up...";      break;
@@ -5485,8 +5488,7 @@ static void drawUploadModal() {
     const uint32_t total = upload_total > 0 ? upload_total : 1;
     const uint32_t done  = upload_done > total ? total : upload_done;
     const int fillW = (int)((uint64_t)done * (UM_BAR_W - 4) / total);
-    // Cache phase = cyan bar, cloud-upload phase = green bar.
-    const uint16_t barColor = (uf.state == UF_STREAMING) ? TFT_CYAN : TFT_GREEN;
+    const uint16_t barColor = TFT_GREEN;
     tft.drawRect(UM_BAR_X, UM_BAR_Y, UM_BAR_W, UM_BAR_H, TFT_WHITE);
     tft.fillRect(UM_BAR_X + 2, UM_BAR_Y + 2, UM_BAR_W - 4, UM_BAR_H - 4, TFT_BLACK);
     if (fillW > 0)
