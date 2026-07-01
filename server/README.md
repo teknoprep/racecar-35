@@ -19,6 +19,8 @@ LAN IP of the host running the container.
 | GET    | `/sessions`                 | JSON listing of the sessions you're allowed to see. |
 | GET    | `/sessions/<user>/<file>`   | Download one session file.                     |
 | GET    | `/sessions/<user>/<file>/laps` | Auto-detected lap list + times for the review UI (JSON). Start/finish is detected from the GPS trace — no track table needed. |
+| POST   | `/sessions/<user>/<file>/ai` | **AI corner analysis.** Body `{prompt, region:{points:[[lat,lon],…]}, model?}`. Extracts the telemetry inside the drawn polygon, computes per-lap metrics (entry/min/exit/max speed, time, distance, peak lateral/longitudinal g, max rpm), and asks the LLM for coaching. Returns `{ok, model, metrics, answer}`. Requires `RACECAR_AI_API_KEY`. |
+| GET    | `/ai/models`                | `{enabled, default, models:[{id,name}]}` — the model picker for the review UI (fetched live from Open WebUI). |
 | GET    | `/health`                   | Healthcheck for Docker / nginx. Returns `{"ok":true}`. |
 | GET    | `/account`                  | Per-user account page (any signed-in user): view + copy + refresh your upload API key. |
 | GET    | `/account/apikey`           | JSON `{email, api_key}` for the signed-in user (creates a key if missing). |
@@ -158,6 +160,39 @@ INFO racecar.cloud: received 192.168.1.123 mode=w email=anon session=1714... tra
 ```
 
 And opening `http://<host>:8089/` in a browser shows the new session in the table.
+
+## AI corner analysis (review page)
+
+The review page has an **AI Corner Analysis** card. Click **circle a section**,
+then drag a loop around a corner (or a set of corners) on the track map — the
+samples inside that polygon, **across every lap**, become the context for an LLM
+coaching prompt. Preset buttons cover the common questions (brake zones, entry
+speed, exit speed, best line, consistency) and there's a free-text box for
+anything else.
+
+How it works:
+1. The browser sends the drawn polygon + question to `POST /sessions/<u>/<f>/ai`.
+2. The server reprojects every sample through the same auto lap-detector the
+   review page uses, keeps the points inside the polygon, and computes **per-lap
+   metrics** for that section: entry / min / exit / max speed, time, distance,
+   peak lateral & longitudinal g, max rpm.
+3. Those metrics become a compact table in a race-engineer system prompt, sent to
+   **Open WebUI** (`ai.blueuc.com`) via its OpenAI-compatible
+   `POST /api/chat/completions` (Bearer key). The reply is rendered in the card.
+
+**Config (`.env`):**
+
+| Var | Purpose |
+| --- | --- |
+| `RACECAR_AI_API_KEY` | Open WebUI API key. **Blank = the AI card is hidden entirely.** |
+| `RACECAR_AI_BASE_URL` | Open WebUI base (default `https://ai.blueuc.com`). |
+| `RACECAR_AI_MODEL` | **Default model id.** Open WebUI hosts many models, so this names the one used when a request doesn't override it. Must match an id from `GET {base}/api/models` (e.g. `gpt-4o-mini`, `llama3.1:8b`). |
+| `RACECAR_AI_TIMEOUT_SECONDS` | Upstream timeout (default 120). |
+
+The review UI also fetches the live model list (`GET /ai/models`) into a
+dropdown, so a user can override the default model per question; `RACECAR_AI_MODEL`
+is the fallback. After setting these, recreate the container (`docker compose
+… up -d`) — no rebuild needed since it's just env.
 
 ## Lap detection + review page
 

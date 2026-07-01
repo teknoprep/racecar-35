@@ -176,6 +176,26 @@ curl -s https://racecar.api.blueuc.com/firmware/list      # {"firmware":[...]}  
 ```
 Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
 
+### AI corner analysis on the review page (v-server, Open WebUI @ ai.blueuc.com)
+
+The review page (`/review/<user>/<file>`) has an **AI Corner Analysis** card: the user clicks
+**circle a section**, lassos a corner (or a set of corners) on the Leaflet track map, and the
+telemetry inside that polygon — **across every lap** — is analyzed by an LLM for coaching (entry/
+exit speed, brake zones, best line, consistency). Server side (`server/app/main.py`):
+- `POST /sessions/<u>/<f>/ai` body `{prompt, region:{points:[[lat,lon],…]}, model?}`. Runs
+  `_region_metrics()` (point-in-poly filter + per-lap entry/min/exit/max speed, time, distance,
+  peak lateral/longitudinal g, max rpm using the SAME `_detect_laps` boundaries the review UI
+  uses), builds a race-engineer prompt, and calls Open WebUI's OpenAI-compatible
+  `POST {base}/api/chat/completions` (Bearer key). Returns `{ok, model, metrics, answer}`.
+- `GET /ai/models` → `{enabled, default, models[]}` feeds the review UI's model dropdown.
+- **Config is env-only** (no rebuild, just `docker compose … up -d`): `RACECAR_AI_API_KEY`
+  (blank → the whole AI card is hidden), `RACECAR_AI_BASE_URL` (default `https://ai.blueuc.com`),
+  **`RACECAR_AI_MODEL` = the DEFAULT model id** (Open WebUI hosts many models, so this is
+  required to name the fallback; users can override per-question from the dropdown),
+  `RACECAR_AI_TIMEOUT_SECONDS` (120). Keys documented in `server/.env.example` + `server/README.md`.
+- The lasso disables `map.dragging` while drawing; client-side point-in-poly shows a live
+  “N points in region” count before asking. No new Python deps (uses stdlib `urllib`).
+
 **git push from this host:** remote is `https://github.com/teknoprep/racecar-35.git` (HTTPS token
 auth). `$HOME=/home/chris` here; push with an explicit token URL
 `https://teknoprep:<token>@github.com/teknoprep/racecar-35.git` (the token is supplied in chat by

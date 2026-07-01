@@ -68,6 +68,22 @@ FIRMWARE_KEY = os.environ.get("RACECAR_FIRMWARE_KEY", "").strip() or API_KEY
 SERVICE_NAME = os.environ.get("RACECAR_SERVICE_NAME", "racecar-35 cloud")
 MAX_BODY_BYTES = int(os.environ.get("RACECAR_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
+# ---- AI corner analysis (Open WebUI @ ai.blueuc.com, OpenAI-compatible) -----
+# The review page can send the telemetry inside a user-drawn track region to an
+# LLM for coaching feedback. We talk to Open WebUI's OpenAI-compatible API
+# (POST {base}/api/chat/completions, Bearer key). Open WebUI hosts MANY models,
+# so a default model id is REQUIRED (RACECAR_AI_MODEL) — it's the model used when
+# the request doesn't name one. The review UI also fetches the live model list
+# (GET {base}/api/models) so the user can override per-question from a dropdown.
+AI_BASE_URL = os.environ.get("RACECAR_AI_BASE_URL", "https://ai.blueuc.com").strip().rstrip("/")
+AI_API_KEY = os.environ.get("RACECAR_AI_API_KEY", "").strip()
+AI_MODEL = os.environ.get("RACECAR_AI_MODEL", "").strip()   # default model id, e.g. "gpt-4o-mini"
+AI_TIMEOUT = int(os.environ.get("RACECAR_AI_TIMEOUT_SECONDS", "120"))
+
+
+def ai_enabled() -> bool:
+    return bool(AI_API_KEY)
+
 # Google OAuth is optional. If GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are
 # blank, the server stays in open dev mode. Once configured, all browser UI
 # routes require Google sign-in; dash ingestion still uses X-API-Key.
@@ -1761,6 +1777,205 @@ def _detect_laps(samples: list) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# AI corner analysis helpers
+# ---------------------------------------------------------------------------
+def _point_in_poly(lat: float, lon: float, poly: list) -> bool:
+    """Ray-casting point-in-polygon. poly = [[lat,lon], ...] (lon = x, lat = y)."""
+    inside = False
+    n = len(poly)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        yi, xi = poly[i][0], poly[i][1]
+        yj, xj = poly[j][0], poly[j][1]
+        if ((yi > lat) != (yj > lat)) and \
+           (lon < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-15) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _region_metrics(samples: list, poly: list) -> dict:
+    """Per-lap driving metrics for the samples that fall inside `poly`.
+
+    Returns {laps:[{lap, n, entry_mph, min_mph, exit_mph, max_mph, seconds,
+    dist_m, peak_lat_g, peak_long_g, max_rpm}], points_in_region, total_laps,
+    best_lap}. Lap membership comes from the same auto start/finish detector the
+    review UI uses, so a region can be compared apex-to-apex across every lap.
+    """
+    rel, _basis = _relative_seconds(samples)
+    laps_info = _detect_laps(samples)
+    laps = laps_info.get("laps", [])
+
+    def lap_of(t: float):
+        for lp in laps:
+            if lp["t_start"] <= t <= lp["t_end"]:
+                return lp["lap"]
+        return None
+
+    per: dict = {}
+    total_pts = 0
+    for i, s in enumerate(samples):
+        lat, lon = s.get("lat"), s.get("lon")
+        if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+                and (lat or lon)):
+            continue
+        if not _point_in_poly(lat, lon, poly):
+            continue
+        total_pts += 1
+        lp = lap_of(rel[i])
+        per.setdefault(lp, []).append(i)
+
+    def num(s, k):
+        v = s.get(k)
+        return v if isinstance(v, (int, float)) else None
+
+    out = []
+    for lp in sorted(k for k in per.keys() if k is not None):
+        idxs = per[lp]
+        seg = [samples[i] for i in idxs]
+        speeds = [num(s, "speed_mph") for s in seg]
+        speeds = [v for v in speeds if v is not None]
+        latg = [abs(num(s, "ay")) for s in seg if num(s, "ay") is not None]
+        longg = [abs(num(s, "ax")) for s in seg if num(s, "ax") is not None]
+        rpm = [num(s, "rpm") for s in seg if num(s, "rpm") is not None]
+        dist_m = 0.0
+        for a, b in zip(idxs, idxs[1:]):
+            ga, gb = samples[a], samples[b]
+            dist_m += _haversine_km(ga["lat"], ga["lon"], gb["lat"], gb["lon"]) * 1000.0
+        entry = num(seg[0], "speed_mph")
+        exit_ = num(seg[-1], "speed_mph")
+        out.append({
+            "lap": lp,
+            "n": len(seg),
+            "entry_mph": round(entry, 1) if entry is not None else None,
+            "min_mph": round(min(speeds), 1) if speeds else None,
+            "exit_mph": round(exit_, 1) if exit_ is not None else None,
+            "max_mph": round(max(speeds), 1) if speeds else None,
+            "seconds": round(rel[idxs[-1]] - rel[idxs[0]], 2),
+            "dist_m": round(dist_m, 1),
+            "peak_lat_g": round(max(latg), 2) if latg else None,
+            "peak_long_g": round(max(longg), 2) if longg else None,
+            "max_rpm": int(max(rpm)) if rpm else None,
+        })
+    return {
+        "laps": out,
+        "points_in_region": total_pts,
+        "total_laps": len(laps),
+        "best_lap": laps_info.get("best_lap"),
+    }
+
+
+def _region_prompt(metrics: dict, question: str) -> list:
+    """Build the chat messages: a race-engineer system prompt + a compact
+    per-lap metrics table + the driver's question."""
+    laps = metrics.get("laps", [])
+    lines = [
+        "Per-lap telemetry through the track section the driver circled on the map.",
+        "Source: GPS + IMU logged at 25 Hz. Speeds in mph, distances in metres,",
+        "g-forces in units of g (peak_lat_g = cornering load, peak_long_g =",
+        "combined braking/acceleration load through the section).",
+        "",
+        "lap | entry_mph | min_mph | exit_mph | max_mph | time_s | dist_m | peak_lat_g | peak_long_g | max_rpm",
+    ]
+    for lp in laps:
+        def c(v):
+            return "-" if v is None else str(v)
+        lines.append(" | ".join(c(lp[k]) for k in (
+            "lap", "entry_mph", "min_mph", "exit_mph", "max_mph",
+            "seconds", "dist_m", "peak_lat_g", "peak_long_g", "max_rpm")))
+    if metrics.get("best_lap"):
+        lines.append("")
+        lines.append(f"Session's fastest overall lap (whole track): lap {metrics['best_lap']}.")
+    lines.append(f"({metrics.get('points_in_region', 0)} GPS points fell inside the region "
+                 f"across {len(laps)} laps.)")
+    table = "\n".join(lines)
+    system = (
+        "You are a professional race engineer and driving coach analyzing "
+        "telemetry from an amateur's track car. Be concise and concrete: give "
+        "specific, actionable coaching (braking points, apex speed, throttle "
+        "application, gear, line) grounded in the numbers provided. Compare the "
+        "laps to each other, call out the best and worst, and quantify the time "
+        "or speed on offer. Prefer short paragraphs and bullet points. If the "
+        "data is insufficient to answer, say so plainly."
+    )
+    user = f"{question.strip() or 'Analyze this section and tell me how to be faster through it.'}\n\n{table}"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _ai_chat(messages: list, model: Optional[str] = None,
+             temperature: float = 0.3) -> tuple:
+    """Call the Open WebUI OpenAI-compatible chat endpoint. Returns
+    (reply_text, model_used), or raises HTTPException on config/upstream errors."""
+    if not AI_API_KEY:
+        raise HTTPException(status_code=503,
+                            detail="AI is not configured (set RACECAR_AI_API_KEY)")
+    use_model = (model or "").strip() or AI_MODEL
+    if not use_model:
+        raise HTTPException(status_code=503,
+                            detail="No AI model selected and RACECAR_AI_MODEL is unset")
+    body = json.dumps({
+        "model": use_model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        AI_BASE_URL + "/api/chat/completions",
+        data=body,
+        headers={
+            "Authorization": "Bearer " + AI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as r:
+            payload = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:400] if e.fp else str(e)
+        raise HTTPException(status_code=502, detail=f"AI upstream {e.code}: {detail}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI request failed: {e}")
+    try:
+        return payload["choices"][0]["message"]["content"], use_model
+    except Exception:
+        return json.dumps(payload)[:2000], use_model
+
+
+def _ai_model_list() -> list:
+    """Fetch the model catalogue from Open WebUI so the UI can offer a picker."""
+    if not AI_API_KEY:
+        return []
+    req = urllib.request.Request(
+        AI_BASE_URL + "/api/models",
+        headers={"Authorization": "Bearer " + AI_API_KEY},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            payload = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        log.warning("AI model list fetch failed: %s", e)
+        return []
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    out = []
+    if isinstance(data, list):
+        for m in data:
+            if isinstance(m, dict):
+                mid = m.get("id") or m.get("name")
+                if mid:
+                    out.append({"id": mid, "name": m.get("name") or mid})
+            elif isinstance(m, str):
+                out.append({"id": m, "name": m})
+    return out
+
+
 @app.get("/sessions/{user}/{filename}")
 async def download_session(request: Request, user: str, filename: str) -> FileResponse:
     require_web_user(request)
@@ -1891,6 +2106,72 @@ async def session_laps(request: Request, user: str, filename: str) -> JSONRespon
             except Exception:
                 continue
     return JSONResponse(_detect_laps(samples))
+
+
+@app.get("/ai/models")
+async def ai_models(request: Request) -> JSONResponse:
+    """Model catalogue for the review UI's picker + the configured default."""
+    require_web_user(request)
+    return JSONResponse({
+        "enabled": ai_enabled(),
+        "default": AI_MODEL,
+        "models": _ai_model_list(),
+    })
+
+
+@app.post("/sessions/{user}/{filename}/ai")
+async def session_ai(request: Request, user: str, filename: str) -> JSONResponse:
+    """Analyze the telemetry inside a user-drawn track region with the LLM.
+
+    Body JSON: {
+        "prompt": "<question>",
+        "region": {"points": [[lat,lon], ...]},   # polygon the user circled
+        "model": "<optional model id override>"
+    }
+    Returns {ok, model, metrics, answer}.
+    """
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    if not ai_enabled():
+        raise HTTPException(status_code=503,
+                            detail="AI is not configured (set RACECAR_AI_API_KEY)")
+    p = _resolve_session(user, filename)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    region = body.get("region") or {}
+    poly = region.get("points") or []
+    if not isinstance(poly, list) or len(poly) < 3:
+        raise HTTPException(status_code=400,
+                            detail="region.points must be a polygon of >=3 [lat,lon] pairs")
+    try:
+        poly = [[float(pt[0]), float(pt[1])] for pt in poly]
+    except Exception:
+        raise HTTPException(status_code=400, detail="region.points malformed")
+
+    samples = []
+    with open(p, "rb") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                samples.append(json.loads(raw))
+            except Exception:
+                continue
+    metrics = _region_metrics(samples, poly)
+    if not metrics.get("laps"):
+        raise HTTPException(status_code=422,
+                            detail="no lap data fell inside the selected region")
+    messages = _region_prompt(metrics, str(body.get("prompt", "")))
+    answer, used_model = _ai_chat(messages, model=body.get("model"))
+    return JSONResponse({
+        "ok": True,
+        "model": used_model,
+        "metrics": metrics,
+        "answer": answer,
+    })
 
 
 @app.get("/review/{user}/{filename}", response_class=HTMLResponse)
@@ -2951,6 +3232,22 @@ _REVIEW_HTML = (
     padding: 7px 9px; font: 13px var(--ff-ui); min-width: 0; }
   .cmp-sub { color: var(--bad); font: 600 12px/1 var(--ff-mono);
     margin-top: 5px; min-height: 13px; }
+  /* ---- AI corner analysis ---------------------------------------- */
+  .ai-row { display:flex; align-items:center; gap: var(--sp-sm); margin: 0 0 var(--sp-sm); }
+  .ai-presets { display:flex; flex-wrap:wrap; gap: 6px; margin: 0 0 var(--sp-sm); }
+  .ai-preset { padding: 6px 10px; }
+  .ai-prompt { width:100%; background: var(--surface); color: var(--text);
+    border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 12px;
+    font: 14px var(--ff-ui); outline: none; resize: vertical; margin: 0 0 var(--sp-sm); }
+  .ai-prompt:focus { border-color: var(--primary); }
+  .ai-answer { margin-top: var(--sp-sm); padding: var(--sp-md); background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--r-sm); white-space: pre-wrap;
+    line-height: 1.5; max-height: 460px; overflow-y: auto; }
+  .ai-answer h1,.ai-answer h2,.ai-answer h3 { font-size: 15px; margin: 10px 0 4px; color: var(--primary); }
+  .ai-answer code { font-family: var(--ff-mono); color: var(--primary); }
+  .ai-answer strong { color: var(--text); }
+  .leaflet-crosshair, .leaflet-crosshair .leaflet-interactive { cursor: crosshair !important; }
+
   .delta-wrap { position: relative; }
   .delta-cursor { position: absolute; width: 11px; height: 11px;
     margin: -6px 0 0 -6px; border-radius: var(--r-full);
@@ -3077,6 +3374,35 @@ _REVIEW_HTML = (
             <div class="delta-cursor" id="delta-cursor" style="display:none"></div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <div class="card aicard" id="aicard" style="display:none">
+      <div class="card-head"><span class="t-label">AI Corner Analysis</span>
+        <span class="t-label" id="ai-region">no region selected</span></div>
+      <div class="card-body">
+        <div class="ai-row">
+          <button id="ai-draw" class="btn">circle a section</button>
+          <button id="ai-clear" class="btn">clear</button>
+          <span style="flex:1"></span>
+          <label class="t-label" style="display:flex;align-items:center;gap:6px">model
+            <select id="ai-model" class="cmp-input" style="width:auto;min-width:160px"></select>
+          </label>
+        </div>
+        <div class="ai-presets">
+          <button class="btn ai-preset" data-q="Analyze the braking zone for this section: where should I brake, how hard, and how consistent am I lap to lap?">brake zones</button>
+          <button class="btn ai-preset" data-q="How is my corner entry speed through this section, and where can I carry more speed in?">entry speed</button>
+          <button class="btn ai-preset" data-q="How is my corner exit and throttle application through this section? Where am I losing exit speed?">exit speed</button>
+          <button class="btn ai-preset" data-q="What is the fastest line through this section and how does my best lap compare to the others here?">best line</button>
+          <button class="btn ai-preset" data-q="How consistent am I through this section lap to lap, and which lap was best and why?">consistency</button>
+        </div>
+        <textarea id="ai-prompt" class="ai-prompt" rows="2"
+          placeholder="Ask about the section you circled — entry/exit speed, brake points, best line, consistency…"></textarea>
+        <div class="ai-row">
+          <button id="ai-ask" class="btn primary">ask ai</button>
+          <span id="ai-status" class="t-label" style="color:var(--muted)"></span>
+        </div>
+        <div id="ai-answer" class="ai-answer" style="display:none"></div>
       </div>
     </div>
   </div>
@@ -3668,6 +3994,110 @@ _REVIEW_HTML = (
     }
     selectPrimary(bestLap, rows);
     loadCompList();
+  })();
+
+  // ---- AI corner analysis ------------------------------------------
+  (function(){
+    const card = el('aicard'); if (!card) return;
+    let poly = null, pts = [], drawing = false;
+    const drawBtn = el('ai-draw'), clearBtn = el('ai-clear'),
+          info = el('ai-region'), status = el('ai-status'),
+          answer = el('ai-answer'), modelSel = el('ai-model');
+
+    function inPoly(lat, lon, P){
+      let inside=false;
+      for (let i=0,j=P.length-1;i<P.length;j=i++){
+        const yi=P[i][0],xi=P[i][1],yj=P[j][0],xj=P[j][1];
+        if (((yi>lat)!==(yj>lat)) &&
+            (lon < (xj-xi)*(lat-yi)/((yj-yi)||1e-15)+xi)) inside=!inside;
+      }
+      return inside;
+    }
+    function regionInfo(){
+      if (pts.length<3){ info.textContent='no region selected'; return; }
+      let n=0;
+      for (const s of S){
+        if (typeof s.lat==='number' && typeof s.lon==='number' && (s.lat||s.lon)
+            && inPoly(s.lat, s.lon, pts)) n++;
+      }
+      info.textContent = n+' points in region';
+    }
+    function setDraw(on){
+      drawing=on;
+      drawBtn.classList.toggle('primary', on);
+      drawBtn.textContent = on ? 'drag on the map…' : 'circle a section';
+      const c = map.getContainer();
+      if (on){ map.dragging.disable(); c.classList.add('leaflet-crosshair'); }
+      else   { map.dragging.enable();  c.classList.remove('leaflet-crosshair'); }
+    }
+    function onMove(e){ pts.push([e.latlng.lat, e.latlng.lng]); if(poly) poly.setLatLngs(pts); }
+    drawBtn.addEventListener('click', ()=> setDraw(!drawing));
+    clearBtn.addEventListener('click', ()=>{
+      if (poly){ map.removeLayer(poly); poly=null; } pts=[]; regionInfo();
+    });
+    map.on('mousedown', e=>{
+      if (!drawing) return;
+      pts=[[e.latlng.lat, e.latlng.lng]];
+      if (poly){ map.removeLayer(poly); poly=null; }
+      poly = L.polygon([], {color:'#6CD07A', weight:2, fillColor:'#6CD07A', fillOpacity:0.15}).addTo(map);
+      map.on('mousemove', onMove);
+    });
+    map.on('mouseup', ()=>{
+      if (!drawing) return;
+      map.off('mousemove', onMove);
+      setDraw(false);
+      if (pts.length<3){ if(poly){map.removeLayer(poly);poly=null;} pts=[]; }
+      regionInfo();
+    });
+
+    // Light markdown -> HTML (escape first, then inline bold/code + headings).
+    function md(t){
+      let h = t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      h = h.replace(/^#{1,6}\\s*(.+)$/gm,'<h3>$1</h3>');
+      h = h.replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>');
+      h = h.replace(/`([^`]+)`/g,'<code>$1</code>');
+      return h;
+    }
+
+    async function loadModels(){
+      try {
+        const r = await fetch('/ai/models'); const j = await r.json();
+        if (!j.enabled){ card.style.display='none'; return; }
+        card.style.display='';
+        modelSel.innerHTML='';
+        const list = (j.models||[]);
+        if (!list.length && j.default) list.push({id:j.default, name:j.default});
+        for (const m of list){
+          const o=document.createElement('option'); o.value=m.id; o.textContent=m.name;
+          if (m.id===j.default) o.selected=true; modelSel.appendChild(o);
+        }
+        if (!list.length){ const o=document.createElement('option'); o.textContent='(server default)'; o.value=''; modelSel.appendChild(o); }
+      } catch(e){ card.style.display='none'; }
+    }
+
+    async function ask(){
+      if (pts.length<3){ status.textContent='circle a section of track first'; return; }
+      const q = (el('ai-prompt').value||'').trim();
+      status.textContent='analyzing…'; answer.style.display='none';
+      el('ai-ask').disabled=true;
+      try {
+        const r = await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/ai', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ prompt:q, model:modelSel.value, region:{points:pts} })
+        });
+        const j = await r.json();
+        if (!r.ok){ status.textContent='error: '+((j&&j.detail)||('HTTP '+r.status)); el('ai-ask').disabled=false; return; }
+        status.textContent = 'model: '+j.model;
+        answer.innerHTML = md(j.answer||'(no answer)');
+        answer.style.display='';
+      } catch(e){ status.textContent='request failed: '+e.message; }
+      el('ai-ask').disabled=false;
+    }
+    el('ai-ask').addEventListener('click', ask);
+    document.querySelectorAll('.ai-preset').forEach(b=>{
+      b.addEventListener('click', ()=>{ el('ai-prompt').value=b.dataset.q; ask(); });
+    });
+    loadModels();
   })();
 })();
 </script>
