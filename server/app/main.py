@@ -2071,6 +2071,29 @@ def _relative_seconds(samples: list) -> tuple:
     return [r - t0 for r in raw], ("epoch" if usable else "synthetic")
 
 
+def _seg_cross(ax, ay, bx, by, cx, cy, dx, dy) -> bool:
+    """True if segment A-B intersects segment C-D (planar)."""
+    def cr(px, py, qx, qy, rx, ry):
+        return (qx - px) * (ry - py) - (qy - py) * (rx - px)
+    d1 = cr(cx, cy, dx, dy, ax, ay)
+    d2 = cr(cx, cy, dx, dy, bx, by)
+    d3 = cr(ax, ay, bx, by, cx, cy)
+    d4 = cr(ax, ay, bx, by, dx, dy)
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _sf_line_from(lat, lon, heading_deg, half_m=30.0):
+    """Perpendicular start/finish line segment (2 endpoints) at a point, given
+    the travel heading. Returns ((lat1,lon1),(lat2,lon2))."""
+    h = math.radians(heading_deg or 0.0)
+    # left of travel (E,N): rotate forward (sinH,cosH) by +90 -> (-cosH, sinH)
+    lE, lN = -math.cos(h), math.sin(h)
+    dlat = (half_m / 111320.0)
+    dlon = (half_m / (111320.0 * max(0.1, math.cos(math.radians(lat)))))
+    return ((lat + lN * dlat, lon + lE * dlon),
+            (lat - lN * dlat, lon - lE * dlon))
+
+
 def _detect_laps(samples: list) -> dict:
     rel, basis = _relative_seconds(samples)
     n = len(samples)
@@ -2083,40 +2106,80 @@ def _detect_laps(samples: list) -> dict:
             return lat, lon
         return None
 
-    # Anchor = first moving sample with a valid fix; fall back to first fix.
-    anchor = None
-    for i in range(n):
-        g = geo(i)
-        if g is None:
-            continue
-        mph = samples[i].get("speed_mph")
-        if isinstance(mph, (int, float)) and mph > _LAP_MOVING_MPH:
-            anchor = (g[0], g[1], i)
-            break
-    if anchor is None:
+    # -- Path 1: the Teensy stamped a lap counter into the stream. Trust it:
+    #    lap boundaries are exactly where the integer `lap` value increments.
+    has_lap_field = any(isinstance(s.get("lap"), int) for s in samples)
+    sf_info = None
+    if has_lap_field:
+        crossings = []
+        prev_lap = None
+        for i in range(n):
+            lp = samples[i].get("lap")
+            if not isinstance(lp, int):
+                continue
+            if prev_lap is None:
+                prev_lap = lp
+                crossings.append(i)
+            elif lp != prev_lap:
+                crossings.append(i)
+                prev_lap = lp
+        if len(crossings) < 2:
+            crossings = []
+    else:
+        crossings = []
+
+    # -- Path 2: no lap field -> auto-detect via a start/finish LINE crossing.
+    if not crossings:
+        anchor = None
         for i in range(n):
             g = geo(i)
-            if g is not None:
+            if g is None:
+                continue
+            mph = samples[i].get("speed_mph")
+            if isinstance(mph, (int, float)) and mph > _LAP_MOVING_MPH:
                 anchor = (g[0], g[1], i)
                 break
-    if anchor is None:
-        return {"laps": [], "best_lap": None, "sf": None, "time_basis": basis}
+        if anchor is None:
+            for i in range(n):
+                g = geo(i)
+                if g is not None:
+                    anchor = (g[0], g[1], i)
+                    break
+        if anchor is None:
+            return {"laps": [], "best_lap": None, "sf": None, "time_basis": basis}
 
-    alat, alon, ai = anchor
-    crossings = [ai]
-    left = False
-    last_cross_t = rel[ai]
-    for i in range(ai + 1, n):
-        g = geo(i)
-        if g is None:
-            continue
-        d = _haversine_km(g[0], g[1], alat, alon)
-        if not left and d > _LAP_RADIUS_KM * 2.0:
-            left = True
-        if left and d <= _LAP_RADIUS_KM and (rel[i] - last_cross_t) >= _LAP_MIN_SEC:
-            crossings.append(i)
-            left = False
-            last_cross_t = rel[i]
+        alat, alon, ai = anchor
+        # Heading at the anchor: prefer the logged heading, else bearing to the
+        # next distinct point, so the S/F line sits perpendicular to travel.
+        hd = samples[ai].get("heading_deg")
+        if not isinstance(hd, (int, float)):
+            hd = 0.0
+            for j in range(ai + 1, min(ai + 40, n)):
+                g = geo(j)
+                if g and (g[0] != alat or g[1] != alon):
+                    hd = math.degrees(math.atan2(
+                        math.sin(math.radians(g[1] - alon)) * math.cos(math.radians(g[0])),
+                        math.cos(math.radians(alat)) * math.sin(math.radians(g[0]))
+                        - math.sin(math.radians(alat)) * math.cos(math.radians(g[0]))
+                        * math.cos(math.radians(g[1] - alon)))) % 360.0
+                    break
+        (l1lat, l1lon), (l2lat, l2lon) = _sf_line_from(alat, alon, hd)
+        sf_info = {"lat1": l1lat, "lon1": l1lon, "lat2": l2lat, "lon2": l2lon,
+                   "lat": alat, "lon": alon}
+
+        crossings = [ai]
+        last_cross_t = rel[ai]
+        prev = geo(ai)
+        for i in range(ai + 1, n):
+            g = geo(i)
+            if g is None:
+                continue
+            if (rel[i] - last_cross_t) >= _LAP_MIN_SEC and _seg_cross(
+                    prev[1], prev[0], g[1], g[0],
+                    l1lon, l1lat, l2lon, l2lat):
+                crossings.append(i)
+                last_cross_t = rel[i]
+            prev = g
 
     laps = []
     for k in range(len(crossings) - 1):
@@ -2145,7 +2208,8 @@ def _detect_laps(samples: list) -> dict:
     return {
         "laps": laps,
         "best_lap": best,
-        "sf": {"lat": alat, "lon": alon, "radius_m": int(_LAP_RADIUS_KM * 1000)},
+        "sf": sf_info,
+        "source": "teensy_lap_field" if has_lap_field and laps else "line_crossing",
         "time_basis": basis,
     }
 

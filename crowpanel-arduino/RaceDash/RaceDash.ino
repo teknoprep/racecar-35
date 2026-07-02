@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.81"
+#define FIRMWARE_VERSION "0.1.82"
 
 #include <Preferences.h>
 #include <time.h>
@@ -483,8 +483,12 @@ struct LapTimer {
     uint32_t lap_start_ms    = 0;
     float    dist_miles      = 0.0f;  // odometer this lap (mph * dt)
     uint32_t prev_gps_ms     = 0;
-    bool     left_start      = false; // true once car has moved away from S/F line
+    bool     left_start      = false; // true once car has moved away from S/F (radius fallback only)
     bool     timing_started  = false; // true after first clean S/F crossing (guards partial first lap)
+    int      lap_number      = 0;     // current lap being driven (0 = out/before first crossing)
+    float    prev_lat        = 0.0f;  // previous GPS point (for line-crossing test)
+    float    prev_lon        = 0.0f;
+    bool     have_prev       = false;
 
     uint32_t last_lap_ms     = 0;     // most recent completed lap time (0 = none)
     float    last_lap_dist   = 0.0f;  // distance of last completed lap (miles)
@@ -818,10 +822,14 @@ struct TrackInfo {
     float       lat;                    // track centre (used for "are you at this track?")
     float       lon;
     float       radius_km;
-    float       sf_lat;                 // start/finish line (used for lap detection)
+    float       sf_lat;                 // start/finish line endpoint A (lap detection)
     float       sf_lon;                 // NOTE: all S/F coords are approximate — verify on-site
     const TrackConfig* configs;         // nullptr = single layout, no config sub-picker
     uint8_t            n_configs;       // 0 = single layout
+    // APPENDED (no default initializers -> struct stays an aggregate; existing
+    // positional initializers that omit these get 0 via aggregate zero-fill):
+    float       sf_lat2;                // S/F endpoint B. (0,0) => point-only -> radius fallback.
+    float       sf_lon2;                // Two endpoints => precise LINE-CROSSING lap detection.
 };
 // Config arrays — tracks with multiple layouts that share the same S/F line.
 // Layouts with genuinely different S/F locations get separate TRACKS[] entries.
@@ -874,6 +882,23 @@ static float trackDistanceKm(float lat1, float lon1, float lat2, float lon2) {
     return 6371.0f * 2.0f * atan2f(sqrtf(a), sqrtf(1.0f - a));
 }
 
+// Do the path segment P0->P1 and the S/F segment A->B intersect? Planar test
+// with longitude scaled by cos(lat) so it's accurate over the tiny distances
+// involved. This is the precise lap trigger: a lap is logged the instant the
+// car's track crosses the start/finish LINE (vs the old "within a radius").
+static inline double sfCross_(double px,double py,double qx,double qy,double rx,double ry){
+    return (qx-px)*(ry-py)-(qy-py)*(rx-px);
+}
+static bool segmentsCross(float p0Lat,float p0Lon,float p1Lat,float p1Lon,
+                          float aLat,float aLon,float bLat,float bLon){
+    const double k = cos(p0Lat * 0.017453292519943295);
+    const double ax=p0Lon*k, ay=p0Lat, bx=p1Lon*k, by=p1Lat;
+    const double cx=aLon*k, cy=aLat, dx=bLon*k, dy=bLat;
+    const double d1=sfCross_(cx,cy,dx,dy,ax,ay), d2=sfCross_(cx,cy,dx,dy,bx,by);
+    const double d3=sfCross_(ax,ay,bx,by,cx,cy), d4=sfCross_(ax,ay,bx,by,dx,dy);
+    return ((d1>0)!=(d2>0)) && ((d3>0)!=(d4>0));
+}
+
 // Returns index of closest track within its radius, OR -1 if no GPS / no
 // track in range. Used both for "auto select" and to highlight in the picker.
 static int closestTrackIdx() {
@@ -896,7 +921,11 @@ static int closestTrackIdx() {
 // Stored in NVS as one blob keyed by TRACKS[] index (append-only: never insert
 // a track in the middle or existing overrides shift onto the wrong track).
 // ---------------------------------------------------------------------------
-struct SfOverride { uint8_t used; float lat; float lon; };
+// used==0 => baked S/F. lat/lon = endpoint A; lat2/lon2 = endpoint B
+// (0,0 => point-only, radius fallback). Blob size changed with the line fields,
+// so any pre-line stored blob is length-mismatched and ignored (overrides reset
+// once — acceptable; re-capture via SET START/FINISH).
+struct SfOverride { uint8_t used; float lat; float lon; float lat2; float lon2; };
 static SfOverride sfOverride[N_TRACKS];   // zero-init: used==0 => fall back to baked
 
 // UI state for the STATUS-page "SET START/FINISH" capture button.
@@ -910,6 +939,30 @@ static void effectiveSf(int idx, float* lat, float* lon) {
     if (idx < 0 || idx >= N_TRACKS) { *lat = 0; *lon = 0; return; }
     if (sfOverride[idx].used) { *lat = sfOverride[idx].lat; *lon = sfOverride[idx].lon; }
     else                      { *lat = TRACKS[idx].sf_lat;  *lon = TRACKS[idx].sf_lon;  }
+}
+
+// Resolve the S/F as a LINE (endpoints A,B). hasLine=false => only a point is
+// known (endpoint B is 0,0) and the caller should use the radius method.
+static void effectiveSfLine(int idx, float* aLat, float* aLon,
+                            float* bLat, float* bLon, bool* hasLine) {
+    if (idx < 0 || idx >= N_TRACKS) { *aLat=*aLon=*bLat=*bLon=0; *hasLine=false; return; }
+    if (sfOverride[idx].used) {
+        *aLat=sfOverride[idx].lat;  *aLon=sfOverride[idx].lon;
+        *bLat=sfOverride[idx].lat2; *bLon=sfOverride[idx].lon2;
+    } else {
+        *aLat=TRACKS[idx].sf_lat;  *aLon=TRACKS[idx].sf_lon;
+        *bLat=TRACKS[idx].sf_lat2; *bLon=TRACKS[idx].sf_lon2;
+    }
+    *hasLine = (*bLat != 0.0f || *bLon != 0.0f);
+}
+
+// Send the active track's S/F line to the Teensy so IT can stamp lap numbers
+// into the recorded NDJSON (CFG,sf,aLat,aLon,bLat,bLon; all zero => none).
+static void sendSfToTeensy(int idx) {
+    float aLat=0,aLon=0,bLat=0,bLon=0; bool hasLine=false;
+    if (idx >= 0) effectiveSfLine(idx, &aLat,&aLon,&bLat,&bLon,&hasLine);
+    if (!hasLine) { Serial.printf("CFG,sf,0,0,0,0\n"); return; }
+    Serial.printf("CFG,sf,%.6f,%.6f,%.6f,%.6f\n", aLat,aLon,bLat,bLon);
 }
 
 static void saveSfOverrides() {
@@ -1115,6 +1168,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,srctyp,%u\n",    (unsigned)s.sensor_type);
     Serial.printf("CFG,rpmppr,%u\n",    (unsigned)s.rpm_ppr_x10);
     Serial.printf("CFG,rpmsm,%d\n",     (int)s.rpm_smooth);
+    sendSfToTeensy(last_track_idx);     // active track's S/F line for lap stamping
 }
 
 static void saveLastTrack(int idx, const char* display_name = nullptr) {
@@ -1127,6 +1181,7 @@ static void saveLastTrack(int idx, const char* display_name = nullptr) {
     prefs.putString("last_trk",   TRACKS[idx].name);
     prefs.putString("last_trk_d", active_track_name);
     prefs.end();
+    sendSfToTeensy(idx);   // Teensy needs the S/F line to stamp lap #s in NDJSON
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,16 +1374,29 @@ static void updateLapTimer() {
         while (lapTimer.cur_bucket <= b) lapCurBt[lapTimer.cur_bucket++] = elapsed;
     }
 
-    // Distance from THIS track's start/finish line (user override if set).
-    float sfLat, sfLon;
-    effectiveSf(tIdx, &sfLat, &sfLon);
-    const float sfKm = trackDistanceKm(g.lat_deg, g.lon_deg, sfLat, sfLon);
-
-    if (!lapTimer.left_start && sfKm > LAP_RADIUS_KM * 2.0f) {
-        lapTimer.left_start = true;
+    // ---- Start/finish crossing detection ----
+    // Precise LINE crossing when a 2-point S/F line is known; otherwise fall
+    // back to the legacy radius method (point-only tracks).
+    float aLat, aLon, bLat, bLon; bool hasLine;
+    effectiveSfLine(tIdx, &aLat, &aLon, &bLat, &bLon, &hasLine);
+    bool crossed = false;
+    if (hasLine) {
+        if (lapTimer.have_prev) {
+            crossed = segmentsCross(lapTimer.prev_lat, lapTimer.prev_lon,
+                                    g.lat_deg, g.lon_deg, aLat, aLon, bLat, bLon);
+        }
+        lapTimer.prev_lat = g.lat_deg;
+        lapTimer.prev_lon = g.lon_deg;
+        lapTimer.have_prev = true;
+    } else {
+        const float sfKm = trackDistanceKm(g.lat_deg, g.lon_deg, aLat, aLon);
+        if (!lapTimer.left_start && sfKm > LAP_RADIUS_KM * 2.0f) lapTimer.left_start = true;
+        if (lapTimer.left_start && sfKm <= LAP_RADIUS_KM) crossed = true;
     }
-    if (lapTimer.left_start && sfKm <= LAP_RADIUS_KM && elapsed >= MIN_LAP_MS) {
+
+    if (crossed && elapsed >= MIN_LAP_MS) {
         if (lapTimer.timing_started) {
+            lapTimer.lap_number++;            // completed a lap -> now driving the next
             // Clean completed lap — record it.
             lapTimer.last_lap_ms   = elapsed;
             lapTimer.last_lap_dist = lapTimer.dist_miles;
@@ -1343,6 +1411,8 @@ static void updateLapTimer() {
                 lapTimer.ref_buckets = nb;
                 lapTimer.ref_valid   = true;
             }
+        } else {
+            lapTimer.lap_number = 1;          // first crossing -> begin lap 1
         }
         // First crossing just arms the timer; subsequent ones record lap times.
         lapTimer.timing_started = true;
@@ -2853,6 +2923,7 @@ struct LastDrawn {
     // Composite tag for the manual UPLOAD button: low bit = visible, upper
     // bits = queue count. Sentinel UINT32_MAX = needs redraw.
     uint32_t upbtn_tag    = UINT32_MAX;
+    int32_t  lap_number   = INT32_MIN;   // current lap counter shown near the speed
 };
 static LastDrawn ld;
 static void invalidateAll() {
@@ -2863,6 +2934,7 @@ static void invalidateAll() {
     ld.upbtn_tag = UINT32_MAX;
     ld.pred_lap_cs = UINT32_MAX; ld.last_lap_cs = UINT32_MAX;
     ld.delta_cs    = INT32_MIN;
+    ld.lap_number  = INT32_MIN;
     ld.track_tag   = UINT32_MAX;
     ld.temp_x10 = INT32_MIN; ld.temp_col_tag = UINT32_MAX;
     ld.psi_x10  = INT32_MIN; ld.psi_col_tag  = UINT32_MAX;
@@ -3060,6 +3132,27 @@ static void drawDashPage() {
             }
             ld.spd_int = (int16_t)spd_int;
             ld.recording = -1;        // speed redraw can clip the button — force its repaint
+        }
+    }
+
+    // ---- Lap counter (right of the speed, just above the FIX/SATS/GPS column) ----
+    // Bigger than the GPS labels, smaller than the speed. Current lap being
+    // driven; "LAP --" until the first start/finish crossing arms timing.
+    {
+        const int lapn = lapTimer.active ? lapTimer.lap_number : 0;
+        if (lapn != ld.lap_number) {
+            char buf[12];
+            if (lapn > 0) snprintf(buf, sizeof(buf), "LAP %d", lapn);
+            else          snprintf(buf, sizeof(buf), "LAP --");
+            tft.setFont(&fonts::Font4);
+            tft.setTextSize(1);
+            tft.setTextColor(TFT_YELLOW, bg);
+            tft.setTextDatum(textdatum_t::top_left);
+            tft.setTextPadding(170);
+            tft.drawString(buf, 610, 346);
+            tft.setTextPadding(0);
+            tft.setTextDatum(textdatum_t::top_left);
+            ld.lap_number = lapn;
         }
     }
 
@@ -7630,11 +7723,23 @@ static void handleStatusTap(int x, int y) {
         const bool wasArmed = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
         if (wasArmed) {
             sf_set_armed = false;
+            // Build a start/finish LINE perpendicular to the current heading,
+            // centred on the car (+/- ~30 m), so lap detection is a precise
+            // line crossing (not a radius). Do this while rolling through S/F.
+            const float D2R = (float)M_PI / 180.0f;
+            const float H  = g.hdg_deg * D2R;
+            const float lE = -cosf(H), lN = sinf(H);      // left-of-travel (E,N)
+            const float half_m = 30.0f;
+            const float dLat = half_m / 111320.0f;
+            const float dLon = half_m / (111320.0f * cosf(g.lat_deg * D2R));
             sfOverride[tIdx].used = 1;
-            sfOverride[tIdx].lat  = g.lat_deg;
-            sfOverride[tIdx].lon  = g.lon_deg;
+            sfOverride[tIdx].lat  = g.lat_deg + lN * dLat;
+            sfOverride[tIdx].lon  = g.lon_deg + lE * dLon;
+            sfOverride[tIdx].lat2 = g.lat_deg - lN * dLat;
+            sfOverride[tIdx].lon2 = g.lon_deg - lE * dLon;
             saveSfOverrides();
-            snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F SAVED: %s", TRACKS[tIdx].name);
+            sendSfToTeensy(tIdx);        // Teensy stamps lap #s into the NDJSON
+            snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F LINE SET: %s", TRACKS[tIdx].name);
             sf_set_msg_ms = millis();
         } else {
             sf_set_armed  = true;

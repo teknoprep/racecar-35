@@ -370,7 +370,9 @@ VER,teensy,<semver>
 ```
 REC,<0|1>          # start/stop recording
 TRACK,<name>       # set the current track name (sent immediately before REC,1)
-CFG,<key>,<value>  # push settings (incl. srctyp = sensor_type, cloud config, inet).
+CFG,<key>,<value>  # push settings (incl. srctyp, cloud, inet, and sf = active
+                   #   track's S/F LINE: CFG,sf,aLat,aLon,bLat,bLon -> Teensy
+                   #   stamps "lap":N into NDJSON via line-crossing).
                    #   NOTE: cl_strm REMOVED in v0.1.66 (live "stream to cloud"
                    #   deleted). Teensy ignores cl_strm if an old dash sends it.
 SETTIME,<unix>     # set Teensy RTC
@@ -410,7 +412,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
-| `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon}` sized `N_TRACKS`, keyed by `TRACKS[]` index. Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
+| `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **Struct size changed, so pre-0.1.82 blobs are length-mismatched and ignored once (overrides reset — re-capture via SET S/F).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
 
 `clampInvariants()` enforces `rpm_min < rpm_max`, `alert1_rpm < alertmax_rpm`, `alert1_hz < alertmax_hz` after every mutation.
 
@@ -434,14 +436,28 @@ The `Auto select by GPS` toggle determines whether the picker actually opens or 
 - The synthetic `(no track / unknown)` row is always last in the list and emits `TRACK,UNKNOWN`
 - Closest track is **highlighted green at the top** of the picker with a `closest · X.X km` distance label
 
-### Lap timer / predictive / delta (dash-only, GPS-derived)
-Lap timing lives entirely in `RaceDash.ino` (`updateLapTimer()`), runs whenever
-there's a GPS fix at a known track regardless of REC state, and is **display-only**
-(it is NOT written into the Teensy SD/cloud NDJSON). Middle dash column shows
-`PRED` / `LAP` / `DELTA`.
-- **Start/finish detection**: distance to the track's S/F line (override if set,
-  else baked) within `LAP_RADIUS_KM` (75 m). First clean crossing arms timing;
-  each subsequent crossing records a lap. `MIN_LAP_MS` (15 s) floor.
+### Lap timer / predictive / delta / LAP COUNTER (S/F LINE-crossing, v0.1.82)
+Lap timing runs in `RaceDash.ino` (`updateLapTimer()`) whenever there's a GPS fix
+at a known track regardless of REC state. Middle dash column shows `PRED` / `LAP`
+(time) / `DELTA`; a **LAP COUNTER** (`"LAP N"`, yellow Font4) is drawn near the
+speed, just above the FIX/SATS/GPS column (current lap; `LAP --` until the first
+crossing).
+- **Start/finish = LINE crossing (v0.1.82).** The S/F is a **2-point line**
+  (endpoints A,B). `updateLapTimer()` keeps the previous GPS point and logs a lap
+  the instant the path segment prev→cur **intersects** the S/F segment
+  (`segmentsCross()`, planar w/ lon×cos lat) — precise + repeatable vs the old
+  radius method. `MIN_LAP_MS` (15 s) floor. **Fallback:** a track/override with
+  only a point (endpoint B = 0,0) still uses the legacy `LAP_RADIUS_KM` (75 m)
+  radius method (`effectiveSfLine()` returns `hasLine=false`).
+- **S/F line everywhere (all 4):** `TrackInfo` gained `sf_lat2/sf_lon2` (appended,
+  aggregate zero-fill keeps old rows valid). The picker (`tools/track_sf_picker.html`)
+  draws a 2-click line. **SET START/FINISH** now captures a point **+ heading** and
+  synthesizes a perpendicular ±30 m line. The dash pushes the active line to the
+  **Teensy** via `CFG,sf,aLat,aLon,bLat,bLon`; the Teensy runs the same crossing
+  test and stamps `"lap":N` into each NDJSON sample (`updateTeensyLap`, reset per
+  `openSession()`). The **server** `_detect_laps()` honors that `lap` field when
+  present, else auto-detects via a perpendicular S/F line at the anchor
+  (`_seg_cross`/`_sf_line_from`) instead of a radius.
 - **Predictive = "ghost lap" method.** The session-best lap is snapshotted as a
   time-vs-distance table (`lapRefBt[]`, ~8 m buckets, `LAP_BUCKET_MI`). The live
   `liveDeltaMs()` compares the current lap's elapsed time to the ghost at the

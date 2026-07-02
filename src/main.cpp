@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.81"
+#define FIRMWARE_VERSION "0.1.82"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -192,6 +192,56 @@ static struct {
                                   // (-10..+10): <0 raw/jumpy, 0 baseline, >0 smoother.
 } g_cfg;
 
+// ---------------------------------------------------------------------------
+// Start/finish LINE + lap counter. The dash pushes the active track's S/F line
+// (CFG,sf,aLat,aLon,bLat,bLon); we count precise LINE crossings on the GPS
+// stream and stamp the current lap number into each NDJSON sample so the server
+// (and review UI) get exact, driver-matching lap boundaries instead of having
+// to re-derive them. Reset at each REC,1.
+// ---------------------------------------------------------------------------
+static struct {
+    bool     has_line = false;
+    float    aLat = 0, aLon = 0, bLat = 0, bLon = 0;
+    bool     have_prev = false;
+    float    prevLat = 0, prevLon = 0;
+    int      lap = 0;                 // current lap being driven (0 = before 1st crossing)
+    uint32_t last_cross_ms = 0;
+} sf_lap;
+
+// Do path segment P0->P1 and S/F segment A->B intersect? (planar, lon*cos lat)
+static bool segCrossT(float p0Lat, float p0Lon, float p1Lat, float p1Lon,
+                      float aLat, float aLon, float bLat, float bLon) {
+    const double k = cos(p0Lat * 0.017453292519943295);
+    const double ax=p0Lon*k, ay=p0Lat, bx=p1Lon*k, by=p1Lat;
+    const double cx=aLon*k, cy=aLat, dx=bLon*k, dy=bLat;
+    auto cr = [](double px,double py,double qx,double qy,double rx,double ry){
+        return (qx-px)*(ry-py)-(qy-py)*(rx-px); };
+    const double d1=cr(cx,cy,dx,dy,ax,ay), d2=cr(cx,cy,dx,dy,bx,by);
+    const double d3=cr(ax,ay,bx,by,cx,cy), d4=cr(ax,ay,bx,by,dx,dy);
+    return ((d1>0)!=(d2>0)) && ((d3>0)!=(d4>0));
+}
+
+static void resetTeensyLap() {
+    sf_lap.have_prev = false;
+    sf_lap.lap = 0;
+    sf_lap.last_cross_ms = 0;
+}
+
+// Update the lap counter from a fresh fix. First crossing -> lap 1; each later
+// crossing -> lap++. 15 s minimum-lap guard against S/F double-triggers.
+static void updateTeensyLap(uint8_t fix, float lat, float lon) {
+    if (!sf_lap.has_line || fix < 2) return;
+    if (sf_lap.have_prev) {
+        if (segCrossT(sf_lap.prevLat, sf_lap.prevLon, lat, lon,
+                      sf_lap.aLat, sf_lap.aLon, sf_lap.bLat, sf_lap.bLon)
+            && (sf_lap.last_cross_ms == 0 || millis() - sf_lap.last_cross_ms >= 15000)) {
+            sf_lap.lap++;
+            sf_lap.last_cross_ms = millis();
+        }
+    }
+    sf_lap.prevLat = lat; sf_lap.prevLon = lon; sf_lap.have_prev = true;
+}
+
 // Set when the dash sends UPLOAD,CANCEL. Volatile across reboot — deliberately
 // in-RAM only so a reboot is the only way to re-enable uploads.
 static volatile bool uploads_disabled = false;
@@ -244,7 +294,7 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float mph, float hdg_deg,
                                uint16_t rpm, int16_t oil_x10, int16_t cool_x10,
                                float ax, float ay, float az,
-                               float gx, float gy, float gz);
+                               float gx, float gy, float gz, int lap);
 static void handleCfgLine(const String& line);   // cloud section below
 static bool sdReady();                            // SD status helper, defined below
 static void detectSD();                           // SD detect, defined below
@@ -1617,6 +1667,7 @@ static void openSession() {
     session_samples      = 0;
     session_last_flush_ms = millis();
     session_path[0]      = '\0';
+    resetTeensyLap();    // fresh lap counter for this session (line-crossing)
 
     if (sd_card_status != SD_CARD_READY) {
         Serial.println(F("[sd] openSession: card not READY — skipping"));
@@ -1722,7 +1773,7 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float mph, float hdg_deg,
                                uint16_t rpm, int16_t oil_x10, int16_t cool_x10,
                                float ax, float ay, float az,
-                               float gx, float gy, float gz) {
+                               float gx, float gy, float gz, int lap) {
     if (!session_file_open) return;
 
     // Sub-second epoch timestamp anchored at session start (monotonic).
@@ -1751,6 +1802,9 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
             fix, sats, lat_deg, lon_deg, mph, hdg_deg, rpm);
     }
     if (n < 0 || n >= (int)sizeof(buf)) return;
+
+    // Lap number (only when an S/F line is known, so the server can trust it).
+    if (lap >= 0) n += snprintf(buf+n, sizeof(buf)-n, "\"lap\":%d,", lap);
 
     if (oil_x10 < 0)  n += snprintf(buf+n, sizeof(buf)-n, "\"oil_psi\":null,");
     else              n += snprintf(buf+n, sizeof(buf)-n, "\"oil_psi\":%.1f,",  oil_x10 * 0.1f);
@@ -1825,6 +1879,20 @@ static void handleCfgLine(const String& line) {
     else if (key == "cl_key")   { strncpy(g_cfg.api_key, val.c_str(), sizeof(g_cfg.api_key)-1); g_cfg.api_key[sizeof(g_cfg.api_key)-1]=0; }
     else if (key == "rec_sd")   { g_cfg.rec_sd = (val.toInt() != 0); }
     else if (key == "rec_cl")   { g_cfg.rec_cl = (val.toInt() != 0); }
+    else if (key == "sf") {
+        // Active track's start/finish LINE: val = aLat,aLon,bLat,bLon.
+        // (0,0,0,0) => no line known (dash falls back / not at a track).
+        float v[4] = {0,0,0,0}; int idx = 0; int start = 0;
+        for (int i = 0; i <= (int)val.length() && idx < 4; i++) {
+            if (i == (int)val.length() || val[i] == ',') {
+                v[idx++] = val.substring(start, i).toFloat(); start = i + 1;
+            }
+        }
+        sf_lap.aLat=v[0]; sf_lap.aLon=v[1]; sf_lap.bLat=v[2]; sf_lap.bLon=v[3];
+        sf_lap.has_line = (v[2] != 0.0f || v[3] != 0.0f);
+        sf_lap.have_prev = false;
+        Serial.printf("[cfg] S/F line %s\n", sf_lap.has_line ? "set" : "cleared");
+    }
     else if (key == "inet") {
         g_cfg.inet = (uint8_t)val.toInt();
     } else if (key == "srctyp") {
@@ -2898,11 +2966,15 @@ static void emitToDash() {
     Serial.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                   ax, ay, az, gx, gy, gz);
 
+    // Lap counter: precise start/finish LINE crossing on the GPS stream.
+    updateTeensyLap(fix, lat_deg, lon_deg);
+
     // SD logging: append one NDJSON sample with all the fields we just emitted.
     if (recording_active && session_file_open) {
         writeSessionSample(fix, sats, lat_deg, lon_deg, mph, hdg_deg,
                            rpm, oil_psi_x10, cool_f_x10,
-                           ax, ay, az, gx, gy, gz);
+                           ax, ay, az, gx, gy, gz,
+                           sf_lap.has_line ? sf_lap.lap : -1);
     }
 
     // Time of day from RTC — piggybacks on the 1 Hz GPS heartbeat so the dash
