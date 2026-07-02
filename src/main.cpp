@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.89"
+#define FIRMWARE_VERSION "0.1.90"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -196,7 +196,13 @@ static struct {
                                   // opto-tach frequency into RPM in Direct mode.
     int8_t   rpm_smooth  = 0;     // RPM display smoothing trim from the dash slider
                                   // (-10..+10): <0 raw/jumpy, 0 baseline, >0 smoother.
+    bool     debug_enabled = true;// dash CFG,dbg_on. When false, NO on-SD .dbg
+                                  // health log is written for a session.
 } g_cfg;
+
+// ESP32-S3 dash temp, reported by the dash via the DTEMP line (heat diagnostics).
+// Declared here (before handleDashCommand) so the command parser can set it.
+static float dash_temp_c = -999.0f;
 
 // ---------------------------------------------------------------------------
 // Start/finish LINE + lap counter. The dash pushes the active track's S/F line
@@ -436,6 +442,10 @@ static void handleDashCommand(const String& line) {
         // DBG,<text> lines through and we forward to our USB CDC console. Use
         // `pio device monitor` on /dev/ttyACM0 to see dash-side state.
         Serial.printf("[dash-dbg] %s\n", line.substring(4).c_str());
+    } else if (line.startsWith("DTEMP,")) {
+        // Dash reports its ESP32-S3 die temp (°C) so we can log both MCUs' temps
+        // together in the health line / .dbg log (heat diagnostics).
+        dash_temp_c = line.substring(6).toFloat();
     } else if (line == "Q,LIST") {
         handleQList();
     } else if (line.startsWith("Q,GET,")) {
@@ -1027,6 +1037,7 @@ static int16_t readCoolantFx10() {
 constexpr uint8_t MPU6050_ADDR = 0x68;   // AD0 tied to GND
 
 static bool imu_present = false;
+static float imu_temp_c = -999.0f;   // MPU-6050 die temp (enclosure ambient proxy)
 
 static struct {
     float   ax_sum = 0, ay_sum = 0, az_sum = 0;
@@ -1110,7 +1121,9 @@ static bool readImuRaw(float a[3], float g[3]) {
     a[0] = (int16_t)((b[0]  << 8) | b[1])  * (1.0f / 16384.0f);
     a[1] = (int16_t)((b[2]  << 8) | b[3])  * (1.0f / 16384.0f);
     a[2] = (int16_t)((b[4]  << 8) | b[5])  * (1.0f / 16384.0f);
-    // b[6..7] = temperature (discarded)
+    // b[6..7] = die temperature. Now DECODED (heat diagnostics): the MPU-6050
+    // sits in the same enclosure, so it's a decent ambient-temp proxy.
+    imu_temp_c = (int16_t)((b[6] << 8) | b[7]) / 340.0f + 36.53f;
     g[0] = (int16_t)((b[8]  << 8) | b[9])  * (1.0f / 131.0f);
     g[1] = (int16_t)((b[10] << 8) | b[11]) * (1.0f / 131.0f);
     g[2] = (int16_t)((b[12] << 8) | b[13]) * (1.0f / 131.0f);
@@ -1792,15 +1805,19 @@ static void dbgHealth() {
     dbg_prev_recover = gnss_recover_count; dbg_prev_reinit = gnss_reinit_count;
     const uint32_t pvt_age = (gnss_last_fresh_ms == 0) ? 999999u : (now - gnss_last_fresh_ms);
     const int avail = GPS_SERIAL.available();   // GPS UART backlog RIGHT NOW
-    char line[260];
+    const float t_die = tempmonGetTemp();       // Teensy i.MX RT1062 die temp (°C)
+    const float batt  = (can_ecu.bat_x10 >= 0) ? can_ecu.bat_x10 / 10.0f : -1.0f;
+    char line[360];
     int n = snprintf(line, sizeof(line),
         "{\"t\":%lu,\"ev\":\"h\",\"loop_ms\":%lu,\"sdwr_ms\":%lu,\"fresh\":%lu,\"avail\":%d,"
-        "\"pvt_age\":%lu,\"flush\":%lu,\"rebegin\":%lu,\"samp\":%lu,\"status\":%u,\"lib_ok\":%u}\n",
+        "\"pvt_age\":%lu,\"flush\":%lu,\"rebegin\":%lu,\"samp\":%lu,\"status\":%u,\"lib_ok\":%u,"
+        "\"t_die\":%.1f,\"t_mpu\":%.1f,\"t_esp\":%.1f,\"batt\":%.1f}\n",
         (unsigned long)((now - session_start_ms) / 1000),
         (unsigned long)(dbg_loop_max_us / 1000), (unsigned long)(dbg_sdwr_max_us / 1000),
         (unsigned long)dbg_fresh_1s, avail, (unsigned long)pvt_age,
         (unsigned long)rec_d, (unsigned long)rei_d, (unsigned long)session_samples,
-        (unsigned)gpsStatus(), (unsigned)(gnss_lib_ok ? 1 : 0));
+        (unsigned)gpsStatus(), (unsigned)(gnss_lib_ok ? 1 : 0),
+        t_die, imu_temp_c, dash_temp_c, batt);
     dbg_loop_max_us = 0; dbg_sdwr_max_us = 0; dbg_fresh_1s = 0;
     if (n > 0) {
         dbg_file.write((const uint8_t*)line, n);
@@ -1816,6 +1833,29 @@ static void dbgClose() {
         dbg_file.close();
     }
     dbg_open = false;
+}
+
+// Always-on 1 Hz device-health emit (temps + battery), INDEPENDENT of recording
+// or the debug-log setting, so we can catch a thermal shutdown / brownout that
+// kills the UART link even when nothing is being logged. Sends the dash a
+// HLTH,<t_die_x10>,<t_mpu_x10>,<t_esp_x10>,<batt_x10> line (x10 °C / V; -9999 or
+// -1 = n/a) and prints a line to USB serial. t_die = Teensy die temp, t_mpu =
+// MPU-6050 (enclosure ambient proxy), t_esp = dash ESP32 (from its DTEMP line),
+// batt = MS3 CAN battery voltage.
+static uint32_t health_last_ms = 0;
+static void healthTick() {
+    const uint32_t now = millis();
+    if (now - health_last_ms < 1000) return;
+    health_last_ms = now;
+    const float   t_die     = tempmonGetTemp();
+    const int16_t t_die_x10 = (int16_t)lroundf(t_die * 10.0f);
+    const int16_t t_mpu_x10 = (imu_temp_c  > -100.0f) ? (int16_t)lroundf(imu_temp_c  * 10.0f) : -9999;
+    const int16_t t_esp_x10 = (dash_temp_c > -100.0f) ? (int16_t)lroundf(dash_temp_c * 10.0f) : -9999;
+    const int16_t batt_x10  = can_ecu.bat_x10;   // -1 if no CAN
+    DASH_SERIAL.printf("HLTH,%d,%d,%d,%d\n", t_die_x10, t_mpu_x10, t_esp_x10, batt_x10);
+    Serial.printf("[health] die=%.1fC mpu=%.1fC esp=%.1fC batt_x10=%d%s\n",
+                  t_die, imu_temp_c, dash_temp_c, (int)batt_x10,
+                  (t_die > 85.0f) ? "  <-- TEENSY HOT" : "");
 }
 static char    session_path[80]      = "";
 
@@ -1893,7 +1933,10 @@ static void openSession() {
     }
     session_file_open = true;
     Serial.printf("[sd] opened %s\n", session_path);
-    dbgOpen(session_path);   // companion .dbg.ndjson health log for this session
+    if (g_cfg.debug_enabled)
+        dbgOpen(session_path);   // companion .dbg.ndjson health log (dash CFG,dbg_on)
+    else
+        Serial.println("[dbg] debug logging OFF (CFG,dbg_on=0) — no .dbg file");
     emitSessionStatus(true);
 }
 
@@ -2069,6 +2112,8 @@ static void handleCfgLine(const String& line) {
     else if (key == "cl_key")   { strncpy(g_cfg.api_key, val.c_str(), sizeof(g_cfg.api_key)-1); g_cfg.api_key[sizeof(g_cfg.api_key)-1]=0; }
     else if (key == "rec_sd")   { g_cfg.rec_sd = (val.toInt() != 0); }
     else if (key == "rec_cl")   { g_cfg.rec_cl = (val.toInt() != 0); }
+    else if (key == "dbg_on")   { g_cfg.debug_enabled = (val.toInt() != 0);
+        Serial.printf("[cfg] debug logging = %s\n", g_cfg.debug_enabled ? "ON" : "OFF"); }
     else if (key == "gpsbaud") {
         const uint32_t b = (uint32_t)val.toInt();
         if (b >= 4800 && b <= 921600 && b != gps_baud_now) applyGpsBaud(b);
@@ -3243,6 +3288,7 @@ void loop() {
     pumpTach();
     pumpCAN();
     canDiagReport();   // 1 Hz CAN health line to USB serial + dash (self-throttled)
+    healthTick();      // 1 Hz temps + battery (heat/brownout diagnostics), always on
 
     // Periodic SD card recheck. SDIO occasionally misses a card on boot —
     // particularly if the card was inserted while the Teensy was already

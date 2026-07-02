@@ -1762,6 +1762,27 @@ async def admin_debug_get(request: Request, user: str, file: str,
     return Response(content=p.read_text("utf-8", "replace"), media_type="text/plain")
 
 
+@app.get("/admin/upload/log")
+async def admin_upload_log(request: Request, n: int = 200,
+                          x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    """Recent upload attempts (start/ok/recv_error/reject), newest last. Firmware-
+    key gated so the agent can see WHY the dash's uploads fail from the server
+    side even when the device can't upload its own debug log."""
+    if not FIRMWARE_KEY or x_api_key != FIRMWARE_KEY:
+        raise HTTPException(status_code=401, detail="firmware key required")
+    out = []
+    if UPLOAD_LOG.exists():
+        for line in UPLOAD_LOG.read_text(errors="replace").splitlines()[-max(1, min(n, 1000)):]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return JSONResponse({"events": out})
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": SERVICE_NAME, "data_dir": str(DATA_DIR)}
@@ -1866,6 +1887,25 @@ async def firmware_get(file: str) -> FileResponse:
                         filename=p.name, headers=_FW_NO_STORE)
 
 
+# Every upload attempt (success OR failure) appends one JSON line here so we can
+# diagnose the dash's flaky uploads from the RECEIVING end — crucial because when
+# an upload fails the device can't send us its own debug log either. Pullable via
+# GET /admin/upload/log (firmware-key gated). Capped so it can't grow unbounded.
+UPLOAD_LOG = DATA_DIR / "upload_log.jsonl"
+
+def _upload_event(d: dict) -> None:
+    try:
+        rec = {"ts": round(time.time(), 3), **d}
+        UPLOAD_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if UPLOAD_LOG.exists() and UPLOAD_LOG.stat().st_size > 512 * 1024:
+            lines = UPLOAD_LOG.read_text(errors="replace").splitlines()[-400:]
+            UPLOAD_LOG.write_text("\n".join(lines) + "\n")
+        with open(UPLOAD_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 async def _save_body(
     request: Request,
     x_api_key: Optional[str],
@@ -1879,6 +1919,12 @@ async def _save_body(
     """Common body for /upload (mode='w') and /stream (mode='a').
     kind='debug' files a companion GPS/health log under debug/<user>/ instead of
     overwriting the real session (same session-id+track)."""
+    _client_host = request.client.host if request.client else "?"
+    _upload_event({"ev": "start", "ip": _client_host, "kind": kind or "session",
+                   "mode": mode, "session": x_session_id, "track": x_track_name,
+                   "content_length": request.headers.get("content-length"),
+                   "transfer_encoding": request.headers.get("transfer-encoding"),
+                   "has_key": bool(x_api_key), "user": x_user_email})
     web_user = None
     if API_KEY and x_api_key != API_KEY:
         # Accept EITHER a logged-in web user OR a valid per-user API key
@@ -1891,10 +1937,22 @@ async def _save_body(
     elif oauth_enabled():
         web_user = current_user(request)
 
-    body = await request.body()
+    try:
+        body = await request.body()
+    except Exception as e:
+        # Client aborted mid-stream (dropped WiFi, TLS reset, chunked framing
+        # error). This is the smoking gun for "upload died partway".
+        _upload_event({"ev": "recv_error", "ip": _client_host, "kind": kind or "session",
+                       "session": x_session_id, "track": x_track_name,
+                       "err": f"{type(e).__name__}: {e}"})
+        raise HTTPException(status_code=400, detail=f"body read failed: {type(e).__name__}")
     if not body:
+        _upload_event({"ev": "reject", "ip": _client_host, "kind": kind or "session",
+                       "session": x_session_id, "reason": "empty body"})
         raise HTTPException(status_code=400, detail="empty body")
     if len(body) > MAX_BODY_BYTES:
+        _upload_event({"ev": "reject", "ip": _client_host, "kind": kind or "session",
+                       "session": x_session_id, "reason": "too large", "bytes": len(body)})
         raise HTTPException(status_code=413, detail="body too large")
 
     # Debug logs are our own event NDJSON ({"ev":"h",...}) — they don't carry the
@@ -1958,6 +2016,9 @@ async def _save_body(
     nl = int(validation["samples"])
     size = out_path.stat().st_size
 
+    _upload_event({"ev": "ok", "ip": _client_host, "kind": kind or "session",
+                   "session": sid, "track": track, "bytes": len(body), "lines": nl,
+                   "path": str(out_path.relative_to(DATA_DIR))})
     log.info(
         "received %s mode=%s email=%s session=%s%s track=%s bytes=%d lines=%d -> %s",
         request.client.host if request.client else "?",

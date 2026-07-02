@@ -348,8 +348,16 @@ SD,REC,<0|1>,<file>,<samples>   (+ SD,READY/FMT/NONE/ERR/ACTIVE status forms)
 CLD,<live_ok>,<queue_depth>
 CANSNIFF,<0|1>,<file>,<frames>  (CAN sniffer status / live frame count)
 TIME,<unix_epoch>               (RTC, 1 Hz)
+HLTH,<t_die_x10>,<t_mpu_x10>,<t_esp_x10>,<batt_x10>  (1 Hz device health)
 VER,teensy,<semver>
 ```
+- **`HLTH`** (1 Hz, ALWAYS, independent of recording/debug setting): heat/brownout
+  diagnostics. `t_die`=Teensy i.MX RT1062 die temp (`tempmonGetTemp()`), `t_mpu`=MPU-6050
+  temp (decoded from the IMU burst bytes 6-7 — enclosure ambient proxy), `t_esp`=dash ESP32-S3
+  temp (relayed back from its `DTEMP` line), `batt`=MS3 CAN battery volts. All ×10; `-9999`
+  temp / `-1` batt = n/a. Shown on the dash STATUS page HEALTH bar (RED >80 °C). Also folded
+  into the `.dbg` health line (`t_die`/`t_mpu`/`t_esp`/`batt`). This exists to catch a thermal
+  shutdown / brownout that kills the UART link.
 - `gps_status`: `0=OFF`, `1=RAW`, `2=OK`, `3=STALE` (see `gpsStatus()`)
 - **`ENG` rpm source depends on `sensor_type`**: Direct (0) = opto tach (FreqMeasure / `RPM_PULSES_PER_REV`); MegaSquirt (1) = MS3Pro CAN. `oil_psi_x10` is always the A2 ADC; `coolant_f_x10` is A3 NTC in Direct mode or CAN CLT in MS3 mode. The dash RPM bar always reads `eng.rpm`.
 - **`ECU`** carries the full MS3Pro CAN dataset; the dash uses it for coolant/AFR/MAP/TPS when `sensor_type == 1`. `-1` in any field = not-received / fault → dash shows `---`.
@@ -392,6 +400,10 @@ CFG,<key>,<value>  # push settings (incl. srctyp, cloud, inet, and sf = active
                    #   stamps "lap":N into NDJSON via line-crossing).
                    #   NOTE: cl_strm REMOVED in v0.1.66 (live "stream to cloud"
                    #   deleted). Teensy ignores cl_strm if an old dash sends it.
+CFG,dbg_on,<0|1>   # (part of CFG) debug logging master switch. 0 = Teensy writes
+                   #   NO .dbg health log for a session. NVS key dbg_on on the dash.
+CFG,srctyp,<0|1|2> # sensor source: 0=Direct, 1=MegaSquirt, 2=Bluetooth OBD-II
+DTEMP,<c>          # dash -> Teensy: dash ESP32-S3 die temp (1 Hz, for HLTH/.dbg)
 SETTIME,<unix>     # set Teensy RTC
 TZ,<id>            # timezone id (for SD filenames / metadata)
 SDFORMAT           # FAT32-format the SD card
@@ -430,6 +442,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
+| `dbg_on` | bool | **Debug logging master switch** (default ON). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log for a session. Toggle: Settings → "Debug logging (SD)". |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **Struct size changed, so pre-0.1.82 blobs are length-mismatched and ignored once (overrides reset — re-capture via SET S/F).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
 
 `clampInvariants()` enforces `rpm_min < rpm_max`, `alert1_rpm < alertmax_rpm`, `alert1_hz < alertmax_hz` after every mutation.

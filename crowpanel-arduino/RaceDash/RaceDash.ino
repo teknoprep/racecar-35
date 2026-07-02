@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.89"
+#define FIRMWARE_VERSION "0.1.90"
 
 #include <Preferences.h>
 #include <time.h>
@@ -69,6 +69,7 @@ enum SettingId : uint8_t {
     ST_TIMEZONE,    // ENUM: cycle through TIMEZONES[]
     ST_GPS_BAUD,    // ENUM: GPS UART baud (sent to Teensy as CFG,gpsbaud,<n>)
     ST_GPS_STATUS,  // INFO: Teensy's GPSBAUD report (locked baud + OK/NO DATA)
+    ST_DEBUG_LOG,   // TOGGLE: write on-SD .dbg diagnostic logs (CFG,dbg_on)
     ST_SET_TIME,    // action: open time-set page
     ST_COUNT,
     // Tool-page actions — NOT in the scrollable settings list. They live on
@@ -654,6 +655,11 @@ struct Settings {
     // LCD backlight brightness, 0-100 %. Applied board-specifically by
     // applyBrightness() (Advance: I2C 0x30 coprocessor; Basic: GPIO 2 PWM).
     uint8_t  brightness       = 100;
+
+    // Debug logging master switch. When ON the Teensy writes an on-SD
+    // "<session>.dbg.ndjson" health log per recording (uploaded best-effort as
+    // X-File-Kind: debug). OFF = no debug files at all. Sent as CFG,dbg_on.
+    bool     debug_enabled    = true;
 };
 static Settings s;
 
@@ -707,6 +713,13 @@ static uint8_t  gps_orig_hz      = 25;
 static bool     sensor_page_dirty = true;
 static bool     bt_scan_dirty     = true;
 static uint8_t  sensor_orig_type  = 0;   // snapshot for CANCEL on PAGE_SENSOR
+// Device health (heat/brownout diagnostics). Teensy temps + battery arrive via
+// the HLTH line; our own ESP32-S3 temp we read locally and report via DTEMP.
+static float    health_teensy_c   = NAN;
+static float    health_mpu_c      = NAN;
+static float    health_esp_c      = NAN;
+static float    health_batt_v     = NAN;
+static uint32_t health_last_hlth_ms = 0;   // millis() of last HLTH from Teensy
 
 // ---------------------------------------------------------------------------
 // Time zones with DST rules.
@@ -1104,6 +1117,7 @@ static void loadSettings() {
     s.oil_warn_psi       = prefs.getUShort("p_warn",   s.oil_warn_psi);
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
+    s.debug_enabled      = prefs.getBool  ("dbg_on",   s.debug_enabled);
     prefs.getString      ("bt_addr",  s.bt_addr, sizeof(s.bt_addr));
     s.bt_atype           = prefs.getUChar ("bt_atype", s.bt_atype);
     prefs.getString      ("bt_name",  s.bt_name, sizeof(s.bt_name));
@@ -1179,6 +1193,7 @@ static void saveSettings() {
     prefs.putUShort("p_warn",   s.oil_warn_psi);
     prefs.putUChar ("p_col",    s.oil_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
+    prefs.putBool  ("dbg_on",   s.debug_enabled);
     prefs.putString("bt_addr",  s.bt_addr);
     prefs.putUChar ("bt_atype", s.bt_atype);
     prefs.putString("bt_name",  s.bt_name);
@@ -1236,6 +1251,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,gpsbaud,%lu\n",  (unsigned long)s.gps_baud);
     Serial.printf("CFG,gpshz,%u\n",     (unsigned)s.gps_nav_hz);
     Serial.printf("CFG,rpmsm,%d\n",     (int)s.rpm_smooth);
+    Serial.printf("CFG,dbg_on,%d\n",    (int)s.debug_enabled);
     sendSfToTeensy(last_track_idx);     // active track's S/F line for lap stamping
 }
 
@@ -2576,6 +2592,22 @@ static bool parseLine(const String& line) {
         if (currentPage == PAGE_GPS) gps_page_dirty = true;
         return true;
     }
+    if (line.startsWith("HLTH,")) {
+        // HLTH,<t_die_x10>,<t_mpu_x10>,<t_esp_x10>,<batt_x10> — device temps + batt
+        // (-9999 = n/a temp; -1 = n/a battery). Used for heat/brownout diagnosis.
+        int p = 5, c; long v[4] = {0,0,0,0}; int idx = 0;
+        while (idx < 4) {
+            c = line.indexOf(',', p);
+            String tok = (c < 0) ? line.substring(p) : line.substring(p, c);
+            v[idx++] = tok.toInt();
+            if (c < 0) break; p = c + 1;
+        }
+        health_teensy_c = (v[0] > -9000) ? v[0] / 10.0f : NAN;
+        health_mpu_c    = (v[1] > -9000) ? v[1] / 10.0f : NAN;
+        health_batt_v   = (v[3] >= 0)    ? v[3] / 10.0f : NAN;
+        health_last_hlth_ms = millis();
+        return true;
+    }
     return false;
 }
 static void pumpUart() {
@@ -3824,6 +3856,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_REC_SD,        "Record to SD card",    SettingRow::TOGGLE  },
     { ST_REC_CLOUD,     "Record to cloud",      SettingRow::TOGGLE  },
     { ST_AUTO_TRACK,    "Auto select by GPS",   SettingRow::TOGGLE  },
+    { ST_DEBUG_LOG,     "Debug logging (SD)",   SettingRow::TOGGLE  },
     { ST_AUTO_START,    "Auto start recording", SettingRow::TOGGLE  },
     { ST_AUTO_START_MPH,"Auto start at (mph)",  SettingRow::NUMERIC },
     { ST_CL_HOST,      "Cloud host (DNS/IP)",   SettingRow::TEXT    },
@@ -3970,6 +4003,7 @@ static const char* boolValueOnRow(SettingId id) {
         case ST_REC_SD:      return s.record_sd         ? "ON" : "OFF";
         case ST_REC_CLOUD:   return s.record_cloud      ? "ON" : "OFF";
         case ST_AUTO_TRACK:  return s.auto_select_track ? "ON" : "OFF";
+        case ST_DEBUG_LOG:   return s.debug_enabled ? "ON" : "OFF";
         case ST_AUTO_START:  return s.auto_start        ? "ON" : "OFF";
         case ST_SHOW_TEMP:   return s.show_coolant      ? "ON" : "OFF";
         case ST_SHOW_PSI:    return s.show_oil_psi      ? "ON" : "OFF";
@@ -3983,6 +4017,7 @@ static bool boolValueOnState(SettingId id) {
         case ST_REC_SD:      return s.record_sd;
         case ST_REC_CLOUD:   return s.record_cloud;
         case ST_AUTO_TRACK:  return s.auto_select_track;
+        case ST_DEBUG_LOG:   return s.debug_enabled;
         case ST_AUTO_START:  return s.auto_start;
         case ST_SHOW_TEMP:   return s.show_coolant;
         case ST_SHOW_PSI:    return s.show_oil_psi;
@@ -4832,6 +4867,7 @@ static int rowGroup(SettingId id) {
         case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO:
         case ST_CL_AUTH_USER: case ST_CL_AUTH_PASS: return SG_CLOUD;
         case ST_TIMEZONE: case ST_GPS_BAUD: case ST_GPS_STATUS:
+        case ST_DEBUG_LOG:
         case ST_SET_TIME: return SG_TIME;
         default: return SG_DISPLAY;
     }
@@ -5176,6 +5212,8 @@ static void handleSettingsTap(int x, int y) {
                     case ST_REC_SD:     s.record_sd         = !s.record_sd;         break;
                     case ST_REC_CLOUD:  s.record_cloud      = !s.record_cloud;      break;
                     case ST_AUTO_TRACK: s.auto_select_track = !s.auto_select_track; break;
+                    case ST_DEBUG_LOG:  s.debug_enabled = !s.debug_enabled;
+                                        Serial.printf("CFG,dbg_on,%d\n", (int)s.debug_enabled); break;
                     case ST_AUTO_START: s.auto_start        = !s.auto_start;        break;
                     case ST_SHOW_TEMP:  s.show_coolant      = !s.show_coolant;      break;
                     case ST_SHOW_PSI:   s.show_oil_psi      = !s.show_oil_psi;      break;
@@ -8214,6 +8252,27 @@ static void drawStatusPage() {
         // No mismatch button — ensure any leftover paint is cleared. Cheap.
         tft.fillRect(410, 380, 360, 60, BG);
     }
+
+    // HEALTH bar — temps + battery for heat / brownout diagnosis. Full width
+    // above the footer. RED if either MCU is hot (>80 C), grey if the Teensy
+    // health line has gone stale (link down = the very failure we're chasing).
+    {
+        char t1[8], t2[8], t3[8], vb[10], hb[120];
+        if (isnan(health_teensy_c)) strcpy(t1, "--"); else sprintf(t1, "%.0f", health_teensy_c);
+        if (isnan(health_esp_c))    strcpy(t2, "--"); else sprintf(t2, "%.0f", health_esp_c);
+        if (isnan(health_mpu_c))    strcpy(t3, "--"); else sprintf(t3, "%.0f", health_mpu_c);
+        if (isnan(health_batt_v))   strcpy(vb, "--"); else sprintf(vb, "%.1fV", health_batt_v);
+        snprintf(hb, sizeof(hb), "HEALTH   Teensy %sC   Dash %sC   MPU %sC   Batt %s", t1, t2, t3, vb);
+        const bool hot = (!isnan(health_teensy_c) && health_teensy_c > 80.0f) ||
+                         (!isnan(health_esp_c)    && health_esp_c    > 80.0f);
+        const bool stale = (nowMs - health_last_hlth_ms > 4000);
+        tft.setFont(&fonts::Font2); tft.setTextSize(1);
+        tft.setTextDatum(textdatum_t::top_left);
+        tft.setTextColor(hot ? TFT_RED : (stale ? TFT_DARKGREY : TFT_GREEN), BG);
+        tft.setTextPadding(788);
+        tft.drawString(hb, 10, 438);
+        tft.setTextPadding(0);
+    }
 }
 
 static void handleStatusTap(int x, int y) {
@@ -8432,9 +8491,21 @@ void setup() {
     Serial.println("dash UI ready — listening on UART0");
 }
 
+// 1 Hz: read our ESP32-S3 die temp and report it to the Teensy (DTEMP) so both
+// MCUs' temps land in the same health line / .dbg log for heat diagnosis.
+static uint32_t dash_health_ms = 0;
+static void dashHealthTick() {
+    uint32_t now = millis();
+    if (now - dash_health_ms < 1000) return;
+    dash_health_ms = now;
+    health_esp_c = temperatureRead();   // ESP32-S3 internal temp sensor (°C)
+    Serial.printf("DTEMP,%.1f\n", health_esp_c);
+}
+
 void loop() {
     pumpUart();
     handleTouch();
+    dashHealthTick();  // 1 Hz ESP32 temp -> Teensy (heat diagnostics)
     wifiTick();   // WiFi state machine + one-shot NTP push to Teensy (1 Hz tick)
     uploadTick(); // Dash-initiated upload state machine (UF_*)
 
