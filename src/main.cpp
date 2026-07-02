@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.83"
+#define FIRMWARE_VERSION "0.1.84"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -558,6 +558,20 @@ static uint32_t dbg_sdwr_max_us = 0;
 static uint32_t dbg_fresh_1s    = 0;
 
 static uint32_t gps_baud_now = 0;   // baud we actually connected the module at
+static uint8_t  gps_nav_hz   = NAV_RATE_HZ;   // live nav rate (dash: CFG,gpshz,<n>)
+
+// Change the u-blox nav (PVT) rate on demand. Lower Hz = far less UART traffic
+// (10 Hz PVT is ~26% of 38400 vs ~65% at 25 Hz) = more headroom against stalls.
+static void applyGpsHz(uint8_t hz) {
+    if (hz < 1)  hz = 1;
+    if (hz > 25) hz = 25;
+    gps_nav_hz = hz;
+    if (gnss_lib_ok) {
+        myGNSS.setNavigationFrequency(hz);
+        gnss_last_fresh_ms = millis();   // grace so the watchdog doesn't trip on the reconfig
+    }
+    Serial.printf("[gps] nav rate -> %u Hz\n", (unsigned)hz);
+}
 static bool tryConnectGNSS(uint32_t baud) {
     GPS_SERIAL.begin(baud);
     delay(50);
@@ -600,7 +614,7 @@ static void gpsStaleWatchdog() {
         gnss_reinit_count++;
         if (myGNSS.begin(GPS_SERIAL)) {
             myGNSS.setUART1Output(COM_TYPE_UBX);
-            myGNSS.setNavigationFrequency(NAV_RATE_HZ);
+            myGNSS.setNavigationFrequency(gps_nav_hz);
             myGNSS.setAutoPVT(true);
             gnss_last_fresh_ms = millis();   // grace window so we don't re-trip instantly
             Serial.println(F("[gps] re-begin OK"));
@@ -619,30 +633,25 @@ static void applyGpsBaud(uint32_t target) {
     Serial.printf("[gps] applyGpsBaud -> %lu (from %lu)\n",
                   (unsigned long)target, (unsigned long)gps_baud_now);
     bool ok = false;
+    // One deliberate switch attempt at the requested baud.
     if (gnss_lib_ok) {
         myGNSS.setSerialRate(target);
         delay(150);
         GPS_SERIAL.begin(target);
-        delay(60);
+        delay(80);
         ok = myGNSS.begin(GPS_SERIAL);
         if (ok) gps_baud_now = target;
     }
+    // If the switch didn't take, DON'T keep hammering the target (that's what
+    // freaks the module out). Just recover to whatever baud the module is still
+    // really on, so GPS keeps working; report that actual baud back.
     if (!ok) {
-        // Recover: find the module at whatever baud it's actually at.
-        const uint32_t scan[] = { target, 230400, 115200, 38400, 9600, 460800 };
+        const uint32_t scan[] = { 230400, 115200, 38400, 9600, 460800 };
         for (uint32_t b : scan) { if (tryConnectGNSS(b)) { ok = true; break; } }
-        // Recovered but not at target -> try once more to move it to target.
-        if (ok && gps_baud_now != target) {
-            myGNSS.setSerialRate(target);
-            delay(150);
-            GPS_SERIAL.begin(target);
-            delay(60);
-            if (myGNSS.begin(GPS_SERIAL)) gps_baud_now = target;
-        }
     }
     if (ok) {
         myGNSS.setUART1Output(COM_TYPE_UBX);
-        myGNSS.setNavigationFrequency(NAV_RATE_HZ);
+        myGNSS.setNavigationFrequency(gps_nav_hz);
         myGNSS.setAutoPVT(true);
         gnss_lib_ok = true;
         gnss_last_fresh_ms = millis();   // grace so the watchdog doesn't instantly trip
@@ -2038,6 +2047,10 @@ static void handleCfgLine(const String& line) {
         else if (b == gps_baud_now) DASH_SERIAL.printf("GPSBAUD,%lu,%d\n",
                                     (unsigned long)gps_baud_now, (int)gnss_lib_ok);
     }
+    else if (key == "gpshz") {
+        const uint8_t hz = (uint8_t)val.toInt();
+        if (hz != gps_nav_hz) applyGpsHz(hz);
+    }
     else if (key == "sf") {
         // Active track's start/finish LINE: val = aLat,aLon,bLat,bLon.
         // (0,0,0,0) => no line known (dash falls back / not at a track).
@@ -2871,32 +2884,20 @@ void setup() {
     scanQueue();
     emitCloudStatus();
 
-    // Connect at whatever baud the module is currently at (TARGET if it already
-    // persisted, else the 38400 default, else the 9600 factory rate), THEN raise
-    // UART1 to the high TARGET baud so 25 Hz has real headroom (see GPS_BAUD_*).
-    if (tryConnectGNSS(GPS_BAUD_TARGET) || tryConnectGNSS(GPS_BAUD_PRIMARY) ||
-        tryConnectGNSS(GPS_BAUD_FALLBACK)) {
+    // Connect at the KNOWN-GOOD default baud (38400), then 9600 factory rate.
+    // We do NOT auto-raise the baud here: a failed silent switch used to leave
+    // the Teensy at a baud the module isn't on -> GPS permanently dead -> the
+    // stale watchdog re-begins every 10 s, blocking the loop and stuttering RPM.
+    // Higher baud is now an EXPLICIT, recoverable choice from the GPS settings
+    // page (CFG,gpsbaud -> applyGpsBaud, which verifies + scans back on failure).
+    if (tryConnectGNSS(GPS_BAUD_PRIMARY) || tryConnectGNSS(GPS_BAUD_FALLBACK)) {
         Serial.printf("u-blox connected @ %lu baud\n", (unsigned long)gps_baud_now);
-        if (gps_baud_now != GPS_BAUD_TARGET) {
-            // Reconfigure the module's UART1 to the target, then re-handshake
-            // on the Teensy side at the matching baud.
-            Serial.printf("[gps] raising module UART1 to %lu baud\n",
-                          (unsigned long)GPS_BAUD_TARGET);
-            myGNSS.setSerialRate(GPS_BAUD_TARGET);   // CFG the module UART1 baud
-            delay(150);
-            GPS_SERIAL.begin(GPS_BAUD_TARGET);       // match on the Teensy side
-            delay(60);
-            myGNSS.begin(GPS_SERIAL);                 // re-handshake at new baud
-            gps_baud_now = GPS_BAUD_TARGET;
-        }
         myGNSS.setUART1Output(COM_TYPE_UBX);     // we don't need NMEA on this link
-        myGNSS.setNavigationFrequency(NAV_RATE_HZ);
+        myGNSS.setNavigationFrequency(gps_nav_hz);
         myGNSS.setAutoPVT(true);
         gnss_lib_ok = true;
-        Serial.printf("u-blox ready: %u Hz PVT @ %lu baud\n",
-                      (unsigned)NAV_RATE_HZ, (unsigned long)GPS_BAUD_TARGET);
     } else {
-        Serial.println(F("u-blox NOT detected on Serial2 (tried 230400, 38400, 9600)"));
+        Serial.println(F("u-blox NOT detected on Serial2 (tried 38400 and 9600)"));
         // Leave Serial2 open at 9600 so we can still observe raw bytes flowing
         // from the module (most u-blox modules default-output NMEA at 9600).
         // The dash will report status=RAW or OFF depending on what we see.
@@ -3293,5 +3294,18 @@ void loop() {
     if (freshThisCall || millis() - lastEmit >= emit_interval_ms) {
         lastEmit = millis();
         emitToDash();
+    }
+
+    // 1 Hz GPS diagnostics for the dash GPS settings page:
+    // GPSDIAG,<baud>,<lib_ok>,<pvt_age_ms>,<light_recover>,<heavy_rebegin>
+    static uint32_t last_gpsdiag_ms = 0;
+    if (millis() - last_gpsdiag_ms >= 1000) {
+        last_gpsdiag_ms = millis();
+        const uint32_t age = (gnss_last_fresh_ms == 0) ? 999999u
+                             : (millis() - gnss_last_fresh_ms);
+        DASH_SERIAL.printf("GPSDIAG,%lu,%u,%lu,%lu,%lu,%u\n",
+                           (unsigned long)gps_baud_now, (unsigned)(gnss_lib_ok ? 1 : 0),
+                           (unsigned long)age, (unsigned long)gnss_recover_count,
+                           (unsigned long)gnss_reinit_count, (unsigned)gps_nav_hz);
     }
 }

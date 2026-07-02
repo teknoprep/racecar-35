@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.83"
+#define FIRMWARE_VERSION "0.1.84"
 
 #include <Preferences.h>
 #include <time.h>
@@ -601,10 +601,13 @@ struct Settings {
     // pressure input wired). AFR is only available in MegaSquirt mode.
     uint8_t  sensor_type        = 0;       // default Direct
 
-    // GPS UART baud (Teensy<->u-blox). 230400 gives 25 Hz PVT big headroom;
-    // sent to the Teensy as CFG,gpsbaud,<value>. Live-selectable from settings
-    // so you can A/B test on the bench and revert if a rate doesn't lock.
-    uint32_t gps_baud           = 230400;
+    // GPS UART baud (Teensy<->u-blox). Default 38400 = the KNOWN-GOOD rate the
+    // module ships at (do not auto-raise at boot). Higher rates are an explicit,
+    // recoverable choice on the GPS settings page (CFG,gpsbaud,<value>).
+    uint32_t gps_baud           = 38400;
+    // GPS nav (PVT) rate in Hz. Lower = far less UART traffic (10 Hz needs only
+    // ~26% of 38400 vs ~65% at 25 Hz) = more headroom against stalls.
+    uint8_t  gps_nav_hz         = 25;
 
     // Tach pulses/rev (the Direct-mode RPM divider), stored x10 so 0.5 is
     // representable. The number = how many tach pulses per crank revolution =
@@ -669,8 +672,27 @@ const uint32_t    GPS_BAUD_VALS[]  = {  9600,   38400,   115200,   230400,   460
 constexpr int N_GPS_BAUD = 5;
 static int gpsBaudIndex() {
     for (int i = 0; i < N_GPS_BAUD; ++i) if (GPS_BAUD_VALS[i] == s.gps_baud) return i;
-    return 3;  // default 230400
+    return 1;  // default 38400
 }
+const char* const GPS_HZ_NAMES[] = { "1", "5", "10", "25" };
+const uint8_t     GPS_HZ_VALS[]  = {  1,   5,   10,   25 };
+constexpr int N_GPS_HZ = 4;
+static int gpsHzIndex() {
+    for (int i = 0; i < N_GPS_HZ; ++i) if (GPS_HZ_VALS[i] == s.gps_nav_hz) return i;
+    return 3;  // default 25
+}
+
+// Live GPS diagnostics from the Teensy (GPSDIAG line), shown on PAGE_GPS.
+static uint32_t gps_diag_baud    = 0;
+static uint8_t  gps_diag_libok   = 0;
+static uint32_t gps_diag_age_ms  = 999999;
+static uint32_t gps_diag_recover = 0;
+static uint32_t gps_diag_reinit  = 0;
+static uint8_t  gps_diag_hz      = 0;
+static bool     gps_page_dirty   = true;
+// Snapshot taken on entry to PAGE_GPS so Cancel can revert baud/Hz + the module.
+static uint32_t gps_orig_baud    = 38400;
+static uint8_t  gps_orig_hz      = 25;
 
 // ---------------------------------------------------------------------------
 // Time zones with DST rules.
@@ -1070,6 +1092,7 @@ static void loadSettings() {
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
     s.rpm_ppr_x10        = prefs.getUShort("rpmppr",   s.rpm_ppr_x10);
     s.gps_baud           = prefs.getULong ("gpsbaud",  s.gps_baud);
+    s.gps_nav_hz         = prefs.getUChar ("gpshz",    s.gps_nav_hz);
     s.rpm_smooth         = prefs.getChar  ("rpmsm",    s.rpm_smooth);
     if (s.rpm_smooth < -10) s.rpm_smooth = -10;
     if (s.rpm_smooth >  10) s.rpm_smooth =  10;
@@ -1141,6 +1164,7 @@ static void saveSettings() {
     prefs.putUChar ("srctyp",   s.sensor_type);
     prefs.putUShort("rpmppr",   s.rpm_ppr_x10);
     prefs.putULong ("gpsbaud",  s.gps_baud);
+    prefs.putUChar ("gpshz",    s.gps_nav_hz);
     prefs.putChar  ("rpmsm",    s.rpm_smooth);
     prefs.putBool  ("s_afr",    s.show_afr);
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
@@ -1190,6 +1214,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,srctyp,%u\n",    (unsigned)s.sensor_type);
     Serial.printf("CFG,rpmppr,%u\n",    (unsigned)s.rpm_ppr_x10);
     Serial.printf("CFG,gpsbaud,%lu\n",  (unsigned long)s.gps_baud);
+    Serial.printf("CFG,gpshz,%u\n",     (unsigned)s.gps_nav_hz);
     Serial.printf("CFG,rpmsm,%d\n",     (int)s.rpm_smooth);
     sendSfToTeensy(last_track_idx);     // active track's S/F line for lap stamping
 }
@@ -1224,6 +1249,7 @@ enum Page : uint8_t {
     PAGE_OTA           = 10,  // full-screen modal during firmware update check / install
     PAGE_TOOLS         = 11,  // maintenance actions: Check for updates, Format SD
     PAGE_SESSIONS      = 12,  // queued NDJSON sessions: select + delete + delete all
+    PAGE_GPS           = 13,  // GPS baud selector + live GPS diagnostics
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -2492,8 +2518,29 @@ static bool parseLine(const String& line) {
             int  ok   = line.substring(c2 + 1).toInt();
             snprintf(gps_status_buf, sizeof(gps_status_buf), "%ld %s",
                      baud, ok ? "OK" : "NO DATA");
+            gps_diag_baud = (uint32_t)baud; gps_diag_libok = ok ? 1 : 0;
             settingsDirty = true;   // refresh the INFO row
+            gps_page_dirty = true;
         }
+        return true;
+    }
+    if (line.startsWith("GPSDIAG,")) {
+        // GPSDIAG,<baud>,<lib_ok>,<pvt_age_ms>,<light_recover>,<heavy_rebegin>,<hz>
+        int p = 8, c;
+        long v[6] = {0,0,0,0,0,0}; int idx = 0;
+        while (idx < 6) {
+            c = line.indexOf(',', p);
+            String tok = (c < 0) ? line.substring(p) : line.substring(p, c);
+            v[idx++] = tok.toInt();
+            if (c < 0) break; p = c + 1;
+        }
+        gps_diag_baud    = (uint32_t)v[0];
+        gps_diag_libok   = (uint8_t)v[1];
+        gps_diag_age_ms  = (uint32_t)v[2];
+        gps_diag_recover = (uint32_t)v[3];
+        gps_diag_reinit  = (uint32_t)v[4];
+        gps_diag_hz      = (uint8_t)v[5];
+        if (currentPage == PAGE_GPS) gps_page_dirty = true;
         return true;
     }
     return false;
@@ -2558,6 +2605,9 @@ static void openConfigPicker(int track_idx, bool from_auto, bool for_recording =
 static void handleConfigPickerTap(int x, int y);
 static void handleWifiScannerTap(int x, int y);
 static void drawWifiScannerPage();
+static void drawGpsPage();
+static void handleGpsPageTap(int x, int y);
+static void openGpsPage();
 static void drawUploadModal();
 static void handleUploadModalTap(int x, int y);
 static bool parseUploadLine(const String& line);
@@ -2643,7 +2693,7 @@ static void handleTouch() {
     }
     if (currentPage == PAGE_NUM_KB || currentPage == PAGE_TEXT_KB ||
         currentPage == PAGE_CONFIG_PICKER || currentPage == PAGE_TIME_SET ||
-        currentPage == PAGE_WIFI_SCAN) {
+        currentPage == PAGE_WIFI_SCAN || currentPage == PAGE_GPS) {
         if (now && !tt.active) {
             tt.startX = x; tt.startY = y;
             tt.lastX  = x; tt.lastY  = y;
@@ -2653,6 +2703,7 @@ static void handleTouch() {
             if      (currentPage == PAGE_CONFIG_PICKER) handleConfigPickerTap(tt.startX, tt.startY);
             else if (currentPage == PAGE_TIME_SET)      handleTimeSetTap(tt.startX, tt.startY);
             else if (currentPage == PAGE_WIFI_SCAN)     handleWifiScannerTap(tt.startX, tt.startY);
+            else if (currentPage == PAGE_GPS)           handleGpsPageTap(tt.startX, tt.startY);
             else                                        handleKeyboardTap(tt.startX, tt.startY);
             tt.active = false;
         } else if (now && tt.active) {
@@ -3738,7 +3789,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_CL_AUTH_USER, "User email",            SettingRow::TEXT    },
     { ST_CL_AUTH_PASS, "API key",               SettingRow::TEXT    },
     { ST_TIMEZONE,     "Time zone",              SettingRow::ENUM    },
-    { ST_GPS_BAUD,     "GPS baud",               SettingRow::ENUM    },
+    { ST_GPS_BAUD,     "GPS settings",           SettingRow::ENUM    },
     { ST_GPS_STATUS,   "GPS link",               SettingRow::INFO    },
     { ST_SET_TIME,     "Set time",                SettingRow::ACTION  },
 };
@@ -4285,6 +4336,152 @@ static void wifiForceReconfigure() {
     setWifiState(WS_OFF);   // next wifiTick (within 1 s) re-evaluates mode + creds
 }
 
+// ---------------------------------------------------------------------------
+// PAGE_GPS — GPS Settings: pick UART baud + nav rate (Hz) with LIVE feedback,
+// then DONE (save) or CANCEL (revert baud/Hz + the module to what they were on
+// entry). Tapping a value applies it immediately (CFG,gpsbaud / CFG,gpshz) so
+// you can see if data comes back; Cancel undoes it. Snapshot for revert is
+// taken in openGpsPage().
+// ---------------------------------------------------------------------------
+namespace {
+  constexpr int GPS_BTN_W = 140, GPS_BTN_H = 46, GPS_BTN_X0 = 26, GPS_BTN_DX = 152;
+  constexpr int GPS_BAUD_Y = 198, GPS_HZ_Y = 300;
+  constexpr int GPS_CANCEL_X = 60,  GPS_DONE_X = 440, GPS_FOOT_Y = 410, GPS_FOOT_W = 300, GPS_FOOT_H = 54;
+}
+
+static void openGpsPage() {
+    gps_orig_baud = s.gps_baud;
+    gps_orig_hz   = s.gps_nav_hz;
+    currentPage   = PAGE_GPS;
+    pageJustEntered = true;
+    gps_page_dirty  = true;
+}
+
+static void drawGpsSelBtn(int x, int y, const char* label, bool sel) {
+    const uint16_t fill = sel ? TFT_DARKGREEN : TFT_NAVY;
+    tft.fillRect(x, y, GPS_BTN_W, GPS_BTN_H, fill);
+    tft.drawRect(x, y, GPS_BTN_W, GPS_BTN_H, sel ? TFT_GREEN : TFT_DARKGREY);
+    tft.setFont(&fonts::Font2); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, fill);
+    tft.setTextPadding(GPS_BTN_W - 6);
+    tft.drawString(label, x + GPS_BTN_W / 2, y + GPS_BTN_H / 2);
+    tft.setTextPadding(0);
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void drawGpsPage() {
+    const uint16_t BG = TFT_BLACK;
+    if (pageJustEntered) { tft.fillScreen(BG); pageJustEntered = false; }
+    gps_page_dirty = false;
+
+    // Header
+    tft.setFont(&fonts::Font4); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::top_left);
+    tft.setTextColor(TFT_CYAN, BG); tft.setTextPadding(500);
+    tft.drawString("GPS SETTINGS", 20, 12);
+    tft.setTextPadding(0);
+
+    // Live status
+    tft.setFont(&fonts::Font2); tft.setTextSize(1);
+    tft.setTextPadding(760);
+    char buf[96];
+    const bool live = gps_diag_libok && gps_diag_age_ms < 1500;
+    snprintf(buf, sizeof(buf), "Link: %lu baud @ %u Hz   %s",
+             (unsigned long)gps_diag_baud, (unsigned)gps_diag_hz,
+             live ? "LIVE" : (gps_diag_libok ? "STALE" : "NO DATA"));
+    tft.setTextColor(live ? TFT_GREEN : TFT_RED, BG);
+    tft.drawString(buf, 20, 58);
+    tft.setTextColor(TFT_WHITE, BG);
+    snprintf(buf, sizeof(buf), "Fix: %d (%s)    Sats: %d",
+             (int)g.fix, fixName(g.fix), (int)g.sats);
+    tft.drawString(buf, 20, 84);
+    snprintf(buf, sizeof(buf), "PVT age: %lu ms    resync: %lu    re-begin: %lu",
+             (unsigned long)gps_diag_age_ms, (unsigned long)gps_diag_recover,
+             (unsigned long)gps_diag_reinit);
+    tft.drawString(buf, 20, 110);
+    tft.setTextPadding(0);
+
+    // UART baud
+    tft.setTextColor(TFT_LIGHTGREY, BG);
+    tft.drawString("UART BAUD", 26, 174);
+    for (int i = 0; i < N_GPS_BAUD; i++)
+        drawGpsSelBtn(GPS_BTN_X0 + i * GPS_BTN_DX, GPS_BAUD_Y, GPS_BAUD_NAMES[i],
+                      s.gps_baud == GPS_BAUD_VALS[i]);
+
+    // Nav rate
+    tft.setTextColor(TFT_LIGHTGREY, BG);
+    tft.drawString("NAV RATE (Hz)", 26, 276);
+    for (int i = 0; i < N_GPS_HZ; i++)
+        drawGpsSelBtn(GPS_BTN_X0 + i * GPS_BTN_DX, GPS_HZ_Y, GPS_HZ_NAMES[i],
+                      s.gps_nav_hz == GPS_HZ_VALS[i]);
+
+    // Hint
+    tft.setTextColor(TFT_DARKGREY, BG);
+    tft.drawString("Tap a value to try it live. DONE saves · CANCEL reverts.", 26, 362);
+
+    // Footer: CANCEL (revert) / DONE (save)
+    tft.fillRect(GPS_CANCEL_X, GPS_FOOT_Y, GPS_FOOT_W, GPS_FOOT_H, TFT_MAROON);
+    tft.drawRect(GPS_CANCEL_X, GPS_FOOT_Y, GPS_FOOT_W, GPS_FOOT_H, TFT_WHITE);
+    tft.fillRect(GPS_DONE_X,   GPS_FOOT_Y, GPS_FOOT_W, GPS_FOOT_H, TFT_DARKGREEN);
+    tft.drawRect(GPS_DONE_X,   GPS_FOOT_Y, GPS_FOOT_W, GPS_FOOT_H, TFT_WHITE);
+    tft.setFont(&fonts::Font4); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, TFT_MAROON);
+    tft.drawString("CANCEL", GPS_CANCEL_X + GPS_FOOT_W / 2, GPS_FOOT_Y + GPS_FOOT_H / 2);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    tft.drawString("DONE", GPS_DONE_X + GPS_FOOT_W / 2, GPS_FOOT_Y + GPS_FOOT_H / 2);
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleGpsPageTap(int x, int y) {
+    // Baud row
+    if (y >= GPS_BAUD_Y && y <= GPS_BAUD_Y + GPS_BTN_H) {
+        for (int i = 0; i < N_GPS_BAUD; i++) {
+            const int bx = GPS_BTN_X0 + i * GPS_BTN_DX;
+            if (x >= bx && x <= bx + GPS_BTN_W) {
+                if (s.gps_baud != GPS_BAUD_VALS[i]) {
+                    s.gps_baud = GPS_BAUD_VALS[i];
+                    Serial.printf("CFG,gpsbaud,%lu\n", (unsigned long)s.gps_baud);
+                }
+                gps_page_dirty = true; return;
+            }
+        }
+    }
+    // Hz row
+    if (y >= GPS_HZ_Y && y <= GPS_HZ_Y + GPS_BTN_H) {
+        for (int i = 0; i < N_GPS_HZ; i++) {
+            const int bx = GPS_BTN_X0 + i * GPS_BTN_DX;
+            if (x >= bx && x <= bx + GPS_BTN_W) {
+                if (s.gps_nav_hz != GPS_HZ_VALS[i]) {
+                    s.gps_nav_hz = GPS_HZ_VALS[i];
+                    Serial.printf("CFG,gpshz,%u\n", (unsigned)s.gps_nav_hz);
+                }
+                gps_page_dirty = true; return;
+            }
+        }
+    }
+    // Footer
+    if (y >= GPS_FOOT_Y && y <= GPS_FOOT_Y + GPS_FOOT_H) {
+        if (x >= GPS_CANCEL_X && x <= GPS_CANCEL_X + GPS_FOOT_W) {
+            // Revert: restore baud/Hz and re-apply the ORIGINAL to the module.
+            if (s.gps_baud != gps_orig_baud)
+                Serial.printf("CFG,gpsbaud,%lu\n", (unsigned long)gps_orig_baud);
+            if (s.gps_nav_hz != gps_orig_hz)
+                Serial.printf("CFG,gpshz,%u\n", (unsigned)gps_orig_hz);
+            s.gps_baud   = gps_orig_baud;
+            s.gps_nav_hz = gps_orig_hz;
+            currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true;
+            return;
+        }
+        if (x >= GPS_DONE_X && x <= GPS_DONE_X + GPS_FOOT_W) {
+            saveSettings();   // persist the current baud/Hz
+            currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true;
+            return;
+        }
+    }
+}
+
 static const char* enumValue(SettingId id) {
     switch (id) {
         case ST_INET_MODE:   return INET_MODE_NAMES[s.internet_mode % N_INET_MODE];
@@ -4292,7 +4489,12 @@ static const char* enumValue(SettingId id) {
         case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
         case ST_RPM_DIV:     return RPM_PPR_NAMES[rpmPprIndex()];
-        case ST_GPS_BAUD:    return GPS_BAUD_NAMES[gpsBaudIndex()];
+        case ST_GPS_BAUD: {
+            static char b[24];
+            snprintf(b, sizeof(b), "%s/%sHz",
+                     GPS_BAUD_NAMES[gpsBaudIndex()], GPS_HZ_NAMES[gpsHzIndex()]);
+            return b;
+        }
         default:             return "?";
     }
 }
@@ -4763,12 +4965,10 @@ static void handleSettingsTap(int x, int y) {
                     wifiForceReconfigure();
                     Serial.printf("CFG,inet,%u\n", (unsigned)s.internet_mode);
                 } else if (r.id == ST_GPS_BAUD) {
-                    int idx = (gpsBaudIndex() + 1) % N_GPS_BAUD;
-                    s.gps_baud = GPS_BAUD_VALS[idx];
-                    // Apply immediately so the user sees data return (or not).
-                    Serial.printf("CFG,gpsbaud,%lu\n", (unsigned long)s.gps_baud);
-                    snprintf(gps_status_buf, sizeof(gps_status_buf), "switching to %lu…",
-                             (unsigned long)s.gps_baud);
+                    // Don't cycle-on-tap (rapid module switches freak the GPS
+                    // out) — open the dedicated GPS page for deliberate selection.
+                    openGpsPage();
+                    return;
                 } else if (r.id == ST_SENSOR_TYPE) {
                     s.sensor_type = (s.sensor_type + 1) % N_SENSOR_TYPE;
                     // Reset stale ECU state on a source flip so the dash
@@ -8042,6 +8242,12 @@ void loop() {
         // visibly and the OTA gating subtext (WiFi connected? mode?) reflects
         // changes promptly. Cheap — only two buttons painted.
         if (pageJustEntered || now - lastDraw >= 250) { lastDraw = now; drawToolsPage(); }
+    } else if (currentPage == PAGE_GPS) {
+        // Redraw on entry, on any tap (gps_page_dirty), and 1 Hz for live status.
+        if (pageJustEntered || gps_page_dirty || now - lastDraw >= 1000) {
+            lastDraw = now;
+            drawGpsPage();
+        }
     } else if (currentPage == PAGE_SESSIONS) {
         // On entry, kick a Q,LIST so the page populates from the SD queue.
         if (pageJustEntered) {

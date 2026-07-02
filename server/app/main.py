@@ -1864,7 +1864,12 @@ async def _save_body(
     if len(body) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="body too large")
 
-    validation = validate_ndjson_body(body)
+    # Debug logs are our own event NDJSON ({"ev":"h",...}) — they don't carry the
+    # lat/lon/t sample keys the session validator requires, so skip it for them.
+    if kind == "debug":
+        validation = {"samples": body.count(b"\n")}
+    else:
+        validation = validate_ndjson_body(body)
 
     # A per-user API key (X-API-Key) namespaces the upload under its owner
     # when no explicit X-User-Email is supplied.
