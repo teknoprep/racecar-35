@@ -1841,8 +1841,11 @@ async def _save_body(
     x_track_name: Optional[str],
     *,
     mode: str,
+    kind: str = "",
 ) -> JSONResponse:
-    """Common body for /upload (mode='w') and /stream (mode='a')."""
+    """Common body for /upload (mode='w') and /stream (mode='a').
+    kind='debug' files a companion GPS/health log under debug/<user>/ instead of
+    overwriting the real session (same session-id+track)."""
     web_user = None
     if API_KEY and x_api_key != API_KEY:
         # Accept EITHER a logged-in web user OR a valid per-user API key
@@ -1897,8 +1900,14 @@ async def _save_body(
     if raw_track.startswith(f"{sid}_"):
         raw_track = raw_track[len(sid) + 1:]
     track = safe_name(raw_track, default="UNKNOWN")
-    filename = f"{sid}_{track}.ndjson"
-    out_path = session_dir_for(email) / filename
+    if kind == "debug":
+        filename = f"{sid}_{track}.dbg.ndjson"
+        ddir = DATA_DIR / "debug" / email
+        ddir.mkdir(parents=True, exist_ok=True)
+        out_path = ddir / filename
+    else:
+        filename = f"{sid}_{track}.ndjson"
+        out_path = session_dir_for(email) / filename
 
     # Open in the requested mode. 'wb' overwrites (AfterRace whole-file POSTs
     # so retries are idempotent), 'ab' appends (live streaming).
@@ -1945,6 +1954,7 @@ async def upload(
     x_user_email: Optional[str] = Header(None),
     x_session_id: Optional[str] = Header(None),
     x_track_name: Optional[str] = Header(None),
+    x_file_kind: Optional[str] = Header(None),
 ) -> JSONResponse:
     return await _save_body(
         request,
@@ -1953,6 +1963,7 @@ async def upload(
         x_session_id,
         x_track_name,
         mode="w",
+        kind=(x_file_kind or "").strip().lower(),
     )
 
 
@@ -2720,6 +2731,169 @@ async def session_laps(request: Request, user: str, filename: str) -> JSONRespon
             except Exception:
                 continue
     return JSONResponse(_detect_laps(samples))
+
+
+@app.get("/sessions/{user}/{filename}/gpsdiag")
+async def session_gpsdiag(request: Request, user: str, filename: str) -> JSONResponse:
+    """GPS-health diagnostics for a session (to debug 'GPS goes stale').
+    Open this URL while logged in and paste the JSON. Reports fix distribution,
+    frozen-position (stale) runs, inter-sample time gaps, and time-to-first-fix."""
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    ts = []; fixes = {}; lat = lon = None
+    n = 0; first_fix_t = None; t0 = None
+    stale_runs = []          # (start_t, dur_s, samples) for frozen-position runs
+    cur_start = None; cur_n = 0; last_t = None
+    gaps = []                # (t, dt) for dt > 0.5 s
+    prev_lat = prev_lon = None
+    with open(p, "rb") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            n += 1
+            t = o.get("t")
+            if not isinstance(t, (int, float)):
+                tm = o.get("t_ms")
+                t = (tm / 1000.0) if isinstance(tm, (int, float)) else None
+            if t0 is None and t is not None:
+                t0 = t
+            rt = (t - t0) if (t is not None and t0 is not None) else None
+            fx = o.get("fix")
+            fixes[str(fx)] = fixes.get(str(fx), 0) + 1
+            if first_fix_t is None and isinstance(fx, int) and fx >= 2 and rt is not None:
+                first_fix_t = round(rt, 1)
+            la, lo = o.get("lat"), o.get("lon")
+            # time gap
+            if last_t is not None and rt is not None and (rt - last_t) > 0.5:
+                gaps.append([round(last_t, 1), round(rt - last_t, 2)])
+            if rt is not None:
+                last_t = rt
+            # frozen-position run (identical lat/lon = stale)
+            frozen = (la == prev_lat and lo == prev_lon and la is not None)
+            if frozen:
+                if cur_start is None:
+                    cur_start = last_t; cur_n = 1
+                else:
+                    cur_n += 1
+            else:
+                if cur_start is not None and cur_n >= 3:
+                    stale_runs.append([round(cur_start, 1),
+                                       round((last_t or cur_start) - cur_start, 1), cur_n])
+                cur_start = None; cur_n = 0
+            prev_lat, prev_lon = la, lo
+    if cur_start is not None and cur_n >= 3:
+        stale_runs.append([round(cur_start, 1), round((last_t or cur_start) - cur_start, 1), cur_n])
+    stale_runs.sort(key=lambda r: r[1], reverse=True)
+    total_stale = round(sum(r[1] for r in stale_runs), 1)
+    gaps.sort(key=lambda g: g[1], reverse=True)
+    return JSONResponse({
+        "samples": n,
+        "duration_s": round(last_t, 1) if last_t else 0,
+        "fix_histogram": fixes,
+        "time_to_first_fix_s": first_fix_t,
+        "stale_runs_count": len(stale_runs),
+        "stale_seconds_total": total_stale,
+        "longest_stale_runs": stale_runs[:10],   # [start_s, dur_s, n_samples]
+        "biggest_time_gaps": gaps[:10],          # [at_s, gap_s]
+        "note": "stale_run = consecutive samples with an identical frozen lat/lon",
+    })
+
+
+def _debug_path_for(user: str, session_filename: str) -> pathlib.Path:
+    base = safe_name(session_filename, maxlen=256)
+    if base.endswith(".ndjson"):
+        base = base[: -len(".ndjson")]
+    if base.endswith(".dbg"):
+        base = base[: -len(".dbg")]
+    return DATA_DIR / "debug" / safe_name(user) / (base + ".dbg.ndjson")
+
+
+def _debug_diagnose(rows: list) -> list:
+    """Turn the Teensy health lines into a plain-english verdict on GPS loss."""
+    out = []
+    zero = [r for r in rows if r.get("fresh") == 0]
+    if not rows:
+        return ["no health lines in the debug log"]
+    if not zero:
+        out.append("GPS produced a fresh fix every second — no stalls in this session.")
+        return out
+    # Classify each zero-PVT second by what else was happening.
+    n_backlog = sum(1 for r in zero if (r.get("avail") or 0) > 400)
+    n_nodata  = sum(1 for r in zero if (r.get("avail") or 0) <= 400)
+    n_loop    = sum(1 for r in zero if (r.get("loop_ms") or 0) > 300)
+    max_loop  = max((r.get("loop_ms") or 0) for r in rows)
+    max_sdwr  = max((r.get("sdwr_ms") or 0) for r in rows)
+    out.append(f"{len(zero)} second(s) had ZERO fresh GPS fixes.")
+    if n_loop:
+        out.append(f"CODE/SD: {n_loop} of those had a loop stall >300 ms — the loop "
+                   f"blocked (worst loop {max_loop} ms, worst SD write {max_sdwr} ms), "
+                   f"starving the GPS UART. Fix is on the Teensy (SD latency / loop).")
+    if n_backlog:
+        out.append(f"CODE/PARSER: {n_backlog} had GPS bytes BACKLOGGED (avail>400) but no "
+                   f"parsed fix — data was arriving, the parser wasn't consuming it.")
+    if n_nodata:
+        out.append(f"PHYSICAL/MODULE: {n_nodata} had NO backlog and no fix — the module sent "
+                   f"nothing (wiring, power, antenna, or baud too low for the nav rate).")
+    return out
+
+
+@app.get("/sessions/{user}/{filename}/debug")
+async def session_debug(request: Request, user: str, filename: str) -> JSONResponse:
+    """Parsed summary + verdict from the Teensy's on-SD debug log for a session
+    (companion .dbg.ndjson uploaded alongside it). Open logged-in and read the
+    'diagnosis'. 404 if the session predates the debug logger / wasn't a cloud rec."""
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _debug_path_for(user, filename)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="no debug log for this session")
+    rows = []; events = []
+    for line in p.read_text("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("ev") == "h":
+            rows.append(o)
+        else:
+            events.append(o)
+
+    def mx(k):
+        vals = [r.get(k) for r in rows if isinstance(r.get(k), (int, float))]
+        return max(vals) if vals else None
+    zero_pvt = [r.get("t") for r in rows if r.get("fresh") == 0]
+    return JSONResponse({
+        "health_lines": len(rows),
+        "max_loop_ms": mx("loop_ms"),
+        "max_sdwr_ms": mx("sdwr_ms"),
+        "max_avail_bytes": mx("avail"),
+        "seconds_with_zero_pvt": len(zero_pvt),
+        "zero_pvt_at_s": zero_pvt[:60],
+        "total_flush_events": sum(r.get("flush", 0) or 0 for r in rows),
+        "total_rebegin_events": sum(r.get("rebegin", 0) or 0 for r in rows),
+        "events": events[:60],
+        "diagnosis": _debug_diagnose(rows),
+    })
+
+
+@app.get("/sessions/{user}/{filename}/debug/raw")
+async def session_debug_raw(request: Request, user: str, filename: str) -> Response:
+    """Raw text of the on-SD debug log (for eyeballing every health line)."""
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _debug_path_for(user, filename)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="no debug log for this session")
+    return Response(content=p.read_text("utf-8", "replace"), media_type="text/plain")
 
 
 @app.get("/ai/models")

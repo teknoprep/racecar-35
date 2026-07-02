@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.82"
+#define FIRMWARE_VERSION "0.1.83"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -81,6 +81,12 @@ extern "C" {
 namespace {
   HardwareSerial& GPS_SERIAL  = Serial2;            // pins 7 (RX2), 8 (TX2)
   HardwareSerial& DASH_SERIAL = Serial3;            // pin 14 (TX3) -> CrowPanel UART0 RX
+  constexpr uint32_t GPS_BAUD_TARGET   = 230400;    // RAISED (v0.1.83): 25 Hz UBX-NAV-PVT
+                                                    // is ~25 kbit/s; at 38400 that's ~65%
+                                                    // util (no headroom -> chronic backlog
+                                                    // after any loop stall = GPS STALE). At
+                                                    // 230400 it's ~11% -> a 32 KB backlog
+                                                    // drains in <1 s.
   constexpr uint32_t GPS_BAUD_PRIMARY  = 38400;     // SparkFun GPS-RTK boards default
   constexpr uint32_t GPS_BAUD_FALLBACK = 9600;      // u-blox factory default
   constexpr uint32_t DASH_BAUD         = 921600;   // up from 115200 — 8× faster for
@@ -539,12 +545,24 @@ constexpr uint32_t GPS_REINIT_MS           = 10000;
 constexpr uint32_t GPS_REINIT_INTERVAL_MS  = 10000;
 static uint32_t gnss_last_recover_ms = 0;
 static uint32_t gnss_last_reinit_ms  = 0;
-static uint32_t gnss_recover_count   = 0;
+static uint32_t gnss_recover_count   = 0;   // LIGHT flush/resync events
+static uint32_t gnss_reinit_count    = 0;   // HEAVY re-begin() events
 
+// ---- On-SD debug instrumentation (see dbg* below). These live up here (no
+// SdFat dependency) so loop()/watchdog/writeSessionSample can feed them; the
+// 1 Hz health line + file live in the SD section. dbg_loop_max_us catches loop
+// stalls (the suspected GPS-stale cause), dbg_sdwr_max_us catches SD latency
+// spikes, dbg_fresh_1s is the real PVT rate.
+static uint32_t dbg_loop_max_us = 0;
+static uint32_t dbg_sdwr_max_us = 0;
+static uint32_t dbg_fresh_1s    = 0;
+
+static uint32_t gps_baud_now = 0;   // baud we actually connected the module at
 static bool tryConnectGNSS(uint32_t baud) {
     GPS_SERIAL.begin(baud);
     delay(50);
-    return myGNSS.begin(GPS_SERIAL);
+    if (myGNSS.begin(GPS_SERIAL)) { gps_baud_now = baud; return true; }
+    return false;
 }
 
 // Status code matching the wire format documented at the top of the file.
@@ -579,6 +597,7 @@ static void gpsStaleWatchdog() {
     if (age >= GPS_REINIT_MS && now - gnss_last_reinit_ms >= GPS_REINIT_INTERVAL_MS) {
         gnss_last_reinit_ms = now;
         Serial.println(F("[gps] persistent STALE -> re-begin() GNSS link"));
+        gnss_reinit_count++;
         if (myGNSS.begin(GPS_SERIAL)) {
             myGNSS.setUART1Output(COM_TYPE_UBX);
             myGNSS.setNavigationFrequency(NAV_RATE_HZ);
@@ -589,6 +608,50 @@ static void gpsStaleWatchdog() {
             Serial.println(F("[gps] re-begin FAILED — will retry"));
         }
     }
+}
+
+// Change the GPS UART baud on demand (from the dash CFG,gpsbaud,<n>). Tells the
+// module to switch UART1, re-handshakes on the Teensy side, and if that fails
+// SCANS known bauds so a bad choice can never brick the link (the user can just
+// pick another rate). Reports GPSBAUD,<actual_baud>,<ok> back to the dash so the
+// settings page shows OK / NO DATA immediately.
+static void applyGpsBaud(uint32_t target) {
+    Serial.printf("[gps] applyGpsBaud -> %lu (from %lu)\n",
+                  (unsigned long)target, (unsigned long)gps_baud_now);
+    bool ok = false;
+    if (gnss_lib_ok) {
+        myGNSS.setSerialRate(target);
+        delay(150);
+        GPS_SERIAL.begin(target);
+        delay(60);
+        ok = myGNSS.begin(GPS_SERIAL);
+        if (ok) gps_baud_now = target;
+    }
+    if (!ok) {
+        // Recover: find the module at whatever baud it's actually at.
+        const uint32_t scan[] = { target, 230400, 115200, 38400, 9600, 460800 };
+        for (uint32_t b : scan) { if (tryConnectGNSS(b)) { ok = true; break; } }
+        // Recovered but not at target -> try once more to move it to target.
+        if (ok && gps_baud_now != target) {
+            myGNSS.setSerialRate(target);
+            delay(150);
+            GPS_SERIAL.begin(target);
+            delay(60);
+            if (myGNSS.begin(GPS_SERIAL)) gps_baud_now = target;
+        }
+    }
+    if (ok) {
+        myGNSS.setUART1Output(COM_TYPE_UBX);
+        myGNSS.setNavigationFrequency(NAV_RATE_HZ);
+        myGNSS.setAutoPVT(true);
+        gnss_lib_ok = true;
+        gnss_last_fresh_ms = millis();   // grace so the watchdog doesn't instantly trip
+    } else {
+        gnss_lib_ok = false;
+    }
+    DASH_SERIAL.printf("GPSBAUD,%lu,%d\n", (unsigned long)gps_baud_now, (int)ok);
+    Serial.printf("[gps] applyGpsBaud done: baud=%lu ok=%d\n",
+                  (unsigned long)gps_baud_now, (int)ok);
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,8 +1698,88 @@ static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf) 
 // ---------------------------------------------------------------------------
 static File32  session_file;
 static bool    session_file_open = false;
-static uint32_t session_samples       = 0;
+static uint32_t session_samples       = 0;   // (declared before the dbg block, which reads it)
 static uint32_t session_last_flush_ms = 0;
+
+// ---------------------------------------------------------------------------
+// On-SD debug log. A companion "<session>.dbg.ndjson" written alongside each
+// recording: a 1 Hz health line (loop stall ms, SD write ms, real PVT rate,
+// PVT age, GPS raw bytes, recover/re-begin counts, sample count) so a
+// GPS-stale session can be diagnosed offline. It sits in the SAME dir as the
+// session (=> /queue/ when cloud recording), so Q,LIST uploads it too; the dash
+// tags it X-File-Kind: debug and the server files it under debug/<user>/.
+// Writes are cached; sync only every 5 s so debug logging can't itself add the
+// SD latency we're trying to measure.
+// ---------------------------------------------------------------------------
+static File32   dbg_file;
+static bool     dbg_open = false;
+static char     dbg_path[152];
+static uint32_t dbg_last_flush_ms  = 0;
+static uint32_t dbg_last_health_ms = 0;
+static uint32_t dbg_prev_recover   = 0;
+static uint32_t dbg_prev_reinit    = 0;
+
+static void dbgOpen(const char* sessionPath) {
+    dbg_open = false; dbg_path[0] = '\0';
+    if (!sessionPath || !sessionPath[0]) return;
+    strncpy(dbg_path, sessionPath, sizeof(dbg_path) - 1);
+    dbg_path[sizeof(dbg_path) - 1] = '\0';
+    char* dot = strstr(dbg_path, ".ndjson");
+    if (dot) strcpy(dot, ".dbg.ndjson");
+    else strncat(dbg_path, ".dbg.ndjson", sizeof(dbg_path) - strlen(dbg_path) - 1);
+    if (!dbg_file.open(dbg_path, O_WRITE | O_CREAT | O_TRUNC)) {
+        Serial.printf("[dbg] open %s FAILED\n", dbg_path);
+        return;
+    }
+    dbg_open = true;
+    dbg_last_flush_ms = millis(); dbg_last_health_ms = millis();
+    dbg_prev_recover = gnss_recover_count; dbg_prev_reinit = gnss_reinit_count;
+    dbg_loop_max_us = dbg_sdwr_max_us = dbg_fresh_1s = 0;
+    char hdr[200];
+    int n = snprintf(hdr, sizeof(hdr),
+        "{\"ev\":\"open\",\"unix\":%lu,\"fw\":\"%s\",\"track\":\"%s\",\"rec_cl\":%d,\"inet\":%u}\n",
+        (unsigned long)session_start_unix, FIRMWARE_VERSION, current_track,
+        (int)g_cfg.rec_cl, (unsigned)g_cfg.inet);
+    if (n > 0) { dbg_file.write((const uint8_t*)hdr, n); dbg_file.sync(); }
+}
+
+// Call every loop(); self-rate-limits to 1 Hz. Emits one health line and
+// resets the per-window maxima.
+static void dbgHealth() {
+    if (!dbg_open) return;
+    const uint32_t now = millis();
+    if (now - dbg_last_health_ms < 1000) return;
+    dbg_last_health_ms = now;
+    const uint32_t rec_d = gnss_recover_count - dbg_prev_recover;
+    const uint32_t rei_d = gnss_reinit_count  - dbg_prev_reinit;
+    dbg_prev_recover = gnss_recover_count; dbg_prev_reinit = gnss_reinit_count;
+    const uint32_t pvt_age = (gnss_last_fresh_ms == 0) ? 999999u : (now - gnss_last_fresh_ms);
+    const int avail = GPS_SERIAL.available();   // GPS UART backlog RIGHT NOW
+    char line[260];
+    int n = snprintf(line, sizeof(line),
+        "{\"t\":%lu,\"ev\":\"h\",\"loop_ms\":%lu,\"sdwr_ms\":%lu,\"fresh\":%lu,\"avail\":%d,"
+        "\"pvt_age\":%lu,\"flush\":%lu,\"rebegin\":%lu,\"samp\":%lu,\"status\":%u,\"lib_ok\":%u}\n",
+        (unsigned long)((now - session_start_ms) / 1000),
+        (unsigned long)(dbg_loop_max_us / 1000), (unsigned long)(dbg_sdwr_max_us / 1000),
+        (unsigned long)dbg_fresh_1s, avail, (unsigned long)pvt_age,
+        (unsigned long)rec_d, (unsigned long)rei_d, (unsigned long)session_samples,
+        (unsigned)gpsStatus(), (unsigned)(gnss_lib_ok ? 1 : 0));
+    dbg_loop_max_us = 0; dbg_sdwr_max_us = 0; dbg_fresh_1s = 0;
+    if (n > 0) {
+        dbg_file.write((const uint8_t*)line, n);
+        if (now - dbg_last_flush_ms >= 5000) { dbg_file.sync(); dbg_last_flush_ms = now; }
+    }
+}
+
+static void dbgClose() {
+    if (dbg_open) {
+        const char* end = "{\"ev\":\"close\"}\n";
+        dbg_file.write((const uint8_t*)end, strlen(end));
+        dbg_file.sync();
+        dbg_file.close();
+    }
+    dbg_open = false;
+}
 static char    session_path[80]      = "";
 
 // Replace anything outside [A-Za-z0-9._-] with '_'. Truncates to outsize-1.
@@ -1713,6 +1856,7 @@ static void openSession() {
     }
     session_file_open = true;
     Serial.printf("[sd] opened %s\n", session_path);
+    dbgOpen(session_path);   // companion .dbg.ndjson health log for this session
     emitSessionStatus(true);
 }
 
@@ -1733,6 +1877,7 @@ static void closeSession() {
         session_file.close();
         session_file_open = false;
     }
+    dbgClose();
     emitSessionStatus(false);
 
     // Decide whether to upload now, queue for later, or do nothing.
@@ -1751,6 +1896,9 @@ static void closeSession() {
         // Q,LIST / Q,GET / Q,DEL when its UPLOAD button is tapped.
         if (strncmp(session_path, "/queue/", 7) != 0) {
             moveToQueue(session_path);
+            // Move the companion debug log alongside it so it uploads too.
+            if (dbg_path[0] && sdFat.exists(dbg_path) && strncmp(dbg_path, "/queue/", 7) != 0)
+                moveToQueue(dbg_path);
         }
         scanQueue();
         emitCloudStatus();
@@ -1816,6 +1964,7 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
         ax, ay, az, gx, gy, gz);
     if (n < 0 || n >= (int)sizeof(buf)) return;
 
+    const uint32_t _wr0 = micros();
     const int written = session_file.write((const uint8_t*)buf, (size_t)n);
     if (written != n) {
         Serial.printf("[sd] short write (%d/%d) — closing session\n", written, n);
@@ -1832,6 +1981,10 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
         session_file.sync();
         emitSessionStatus(true);   // sends SD,REC,1,<file>,<samples>
     }
+    // Track worst-case SD write+sync latency this second (debug log). This is
+    // the prime suspect for loop stalls -> GPS UART overflow -> STALE.
+    const uint32_t _wrd = micros() - _wr0;
+    if (_wrd > dbg_sdwr_max_us) dbg_sdwr_max_us = _wrd;
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,6 +2032,12 @@ static void handleCfgLine(const String& line) {
     else if (key == "cl_key")   { strncpy(g_cfg.api_key, val.c_str(), sizeof(g_cfg.api_key)-1); g_cfg.api_key[sizeof(g_cfg.api_key)-1]=0; }
     else if (key == "rec_sd")   { g_cfg.rec_sd = (val.toInt() != 0); }
     else if (key == "rec_cl")   { g_cfg.rec_cl = (val.toInt() != 0); }
+    else if (key == "gpsbaud") {
+        const uint32_t b = (uint32_t)val.toInt();
+        if (b >= 4800 && b <= 921600 && b != gps_baud_now) applyGpsBaud(b);
+        else if (b == gps_baud_now) DASH_SERIAL.printf("GPSBAUD,%lu,%d\n",
+                                    (unsigned long)gps_baud_now, (int)gnss_lib_ok);
+    }
     else if (key == "sf") {
         // Active track's start/finish LINE: val = aLat,aLon,bLat,bLon.
         // (0,0,0,0) => no line known (dash falls back / not at a track).
@@ -2712,15 +2871,32 @@ void setup() {
     scanQueue();
     emitCloudStatus();
 
-    // SparkFun RTK boards ship at 38400; bare modules at 9600 — try both.
-    if (tryConnectGNSS(GPS_BAUD_PRIMARY) || tryConnectGNSS(GPS_BAUD_FALLBACK)) {
-        Serial.println(F("u-blox connected"));
+    // Connect at whatever baud the module is currently at (TARGET if it already
+    // persisted, else the 38400 default, else the 9600 factory rate), THEN raise
+    // UART1 to the high TARGET baud so 25 Hz has real headroom (see GPS_BAUD_*).
+    if (tryConnectGNSS(GPS_BAUD_TARGET) || tryConnectGNSS(GPS_BAUD_PRIMARY) ||
+        tryConnectGNSS(GPS_BAUD_FALLBACK)) {
+        Serial.printf("u-blox connected @ %lu baud\n", (unsigned long)gps_baud_now);
+        if (gps_baud_now != GPS_BAUD_TARGET) {
+            // Reconfigure the module's UART1 to the target, then re-handshake
+            // on the Teensy side at the matching baud.
+            Serial.printf("[gps] raising module UART1 to %lu baud\n",
+                          (unsigned long)GPS_BAUD_TARGET);
+            myGNSS.setSerialRate(GPS_BAUD_TARGET);   // CFG the module UART1 baud
+            delay(150);
+            GPS_SERIAL.begin(GPS_BAUD_TARGET);       // match on the Teensy side
+            delay(60);
+            myGNSS.begin(GPS_SERIAL);                 // re-handshake at new baud
+            gps_baud_now = GPS_BAUD_TARGET;
+        }
         myGNSS.setUART1Output(COM_TYPE_UBX);     // we don't need NMEA on this link
         myGNSS.setNavigationFrequency(NAV_RATE_HZ);
         myGNSS.setAutoPVT(true);
         gnss_lib_ok = true;
+        Serial.printf("u-blox ready: %u Hz PVT @ %lu baud\n",
+                      (unsigned)NAV_RATE_HZ, (unsigned long)GPS_BAUD_TARGET);
     } else {
-        Serial.println(F("u-blox NOT detected on Serial2 (tried 38400 and 9600)"));
+        Serial.println(F("u-blox NOT detected on Serial2 (tried 230400, 38400, 9600)"));
         // Leave Serial2 open at 9600 so we can still observe raw bytes flowing
         // from the module (most u-blox modules default-output NMEA at 9600).
         // The dash will report status=RAW or OFF depending on what we see.
@@ -2984,6 +3160,15 @@ static void emitToDash() {
 }
 
 void loop() {
+    // Debug: worst loop() PERIOD in the current 1 s window. A long period == the
+    // loop stalled (SD/other), the prime suspect for GPS UART overflow -> STALE.
+    {
+        static uint32_t last_loop_us = 0;
+        const uint32_t nu = micros();
+        if (last_loop_us) { const uint32_t d = nu - last_loop_us; if (d > dbg_loop_max_us) dbg_loop_max_us = d; }
+        last_loop_us = nu;
+    }
+
     // Heartbeat LED so we can see at a glance the Teensy is alive.
     static unsigned long lastBlink = 0;
     if (millis() - lastBlink >= 500) {
@@ -3077,6 +3262,7 @@ void loop() {
         if (myGNSS.getPVT(0)) {       // non-blocking: returns true ONLY on fresh PVT
             gnss_last_fresh_ms = millis();
             freshThisCall = true;
+            dbg_fresh_1s++;           // real PVT rate for the debug health line
         }
     } else {
         // Drain raw bytes the lib never claimed. Doesn't try to interpret —
@@ -3090,6 +3276,9 @@ void loop() {
 
     // Auto-recover if the PVT stream ever goes stale (esp. mid-recording).
     gpsStaleWatchdog();
+
+    // On-SD debug health line (1 Hz, self-rate-limited; no-op when not recording).
+    dbgHealth();
 
     // Emit on every fresh PVT (== 25 Hz when GPS is reporting) plus a 1 Hz
     // heartbeat fallback so the dash's LINK indicator stays green even

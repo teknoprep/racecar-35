@@ -365,6 +365,23 @@ VER,teensy,<semver>
   `setNavigationFrequency` / `setAutoPVT` (blocking ~handshake but bounded; last resort, once / 10 s;
   the 32 KB ring covers the one-time stall). No-op until the first PVT, so it never trips during
   cold-start acquisition. Recovery events log `[gps] STALE …` / `[gps] re-begin …` to USB serial.
+- **GPS baud RAISED to 230400 (v0.1.83) — the real headroom fix.** 25 Hz UBX-NAV-PVT is ~25
+  kbit/s; at **38400 that's ~65 % util → zero headroom**, so after any loop stall the backlog
+  drains at only ~35 % spare and chronically lags = STALE. At **230400 it's ~11 %** → a full 32 KB
+  backlog clears in <1 s. `setup()` connects at whatever baud the module is at (230400/38400/9600),
+  then `setSerialRate(230400)` + re-`begin()`. **Live-selectable from the dash** (Settings → *GPS
+  baud*, NVS `gpsbaud`, `CFG,gpsbaud,<n>`): the Teensy `applyGpsBaud()` switches the module,
+  re-handshakes, and if that fails SCANS known bauds so a bad pick can't brick the link; it replies
+  `GPSBAUD,<actual>,<ok>` which the dash shows in the *GPS link* INFO row (`230400 OK` / `NO DATA`).
+- **On-SD debug log (v0.1.83) — to actually diagnose stale, not guess.** Each recording writes a
+  companion `…​.dbg.ndjson` (same dir → `/queue/` when cloud → auto-uploads via `Q,LIST`, tagged
+  `X-File-Kind: debug`, filed under `debug/<user>/` on the server). 1 Hz health line:
+  `loop_ms` (worst loop-period = stall), `sdwr_ms` (worst SD write+sync), `fresh` (real PVT/s),
+  `avail` (GPS UART backlog), `pvt_age`, `flush`/`rebegin` counts, `samp`. Writes are cached,
+  synced only every 5 s so the log can't add the very SD latency it measures. **Server verdict:**
+  `GET /sessions/<u>/<f>/debug` returns `_debug_diagnose()` — `fresh=0 & avail≈0` → PHYSICAL/module;
+  `fresh=0 & avail high` → CODE/parser; `loop_ms`/`sdwr_ms` spikes → CODE/SD stall. Raw at
+  `…/debug/raw`; session GPS-freeze summary at `…/gpsdiag`.
 
 ### CrowPanel → Teensy (control)
 ```

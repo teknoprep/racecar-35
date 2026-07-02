@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.82"
+#define FIRMWARE_VERSION "0.1.83"
 
 #include <Preferences.h>
 #include <time.h>
@@ -66,6 +66,8 @@ enum SettingId : uint8_t {
     ST_AUTO_TRACK,
     ST_AUTO_START, ST_AUTO_START_MPH,   // auto-start recording + its speed threshold
     ST_TIMEZONE,    // ENUM: cycle through TIMEZONES[]
+    ST_GPS_BAUD,    // ENUM: GPS UART baud (sent to Teensy as CFG,gpsbaud,<n>)
+    ST_GPS_STATUS,  // INFO: Teensy's GPSBAUD report (locked baud + OK/NO DATA)
     ST_SET_TIME,    // action: open time-set page
     ST_COUNT,
     // Tool-page actions — NOT in the scrollable settings list. They live on
@@ -452,6 +454,8 @@ static uint32_t sd_format_arm_ms = 0;
 // parseSdLine() can set it on status change. The settings page checks it
 // each draw cycle to decide whether to repaint.
 static bool settingsDirty = true;
+static char gps_status_buf[48] = "";   // Teensy GPSBAUD report (settings INFO row);
+                                       // declared early: parseLine() writes it.
 
 // RTC epoch received from the Teensy's TIME, line (0 = not yet received).
 static uint32_t rtc_epoch = 0;
@@ -597,6 +601,11 @@ struct Settings {
     // pressure input wired). AFR is only available in MegaSquirt mode.
     uint8_t  sensor_type        = 0;       // default Direct
 
+    // GPS UART baud (Teensy<->u-blox). 230400 gives 25 Hz PVT big headroom;
+    // sent to the Teensy as CFG,gpsbaud,<value>. Live-selectable from settings
+    // so you can A/B test on the bench and revert if a rate doesn't lock.
+    uint32_t gps_baud           = 230400;
+
     // Tach pulses/rev (the Direct-mode RPM divider), stored x10 so 0.5 is
     // representable. The number = how many tach pulses per crank revolution =
     // how much the raw opto-tach frequency is divided to get RPM. 20 = 2.0
@@ -651,6 +660,17 @@ static int rpmPprIndex() {
 }
 const char* const INET_MODE_NAMES[]   = { "Ethernet", "WiFi" };
 constexpr int N_INET_MODE   = 2;
+// GPS UART baud choices. Higher = more headroom for 25 Hz PVT (25 kbit/s);
+// 38400 is only ~65% util (chronic backlog after loop stalls -> GPS STALE).
+// Sent to the Teensy as CFG,gpsbaud,<value>; it switches the module + reports
+// back GPSBAUD,<baud>,<ok> so you can tell instantly if data comes back.
+const char* const GPS_BAUD_NAMES[] = { "9600", "38400", "115200", "230400", "460800" };
+const uint32_t    GPS_BAUD_VALS[]  = {  9600,   38400,   115200,   230400,   460800 };
+constexpr int N_GPS_BAUD = 5;
+static int gpsBaudIndex() {
+    for (int i = 0; i < N_GPS_BAUD; ++i) if (GPS_BAUD_VALS[i] == s.gps_baud) return i;
+    return 3;  // default 230400
+}
 
 // ---------------------------------------------------------------------------
 // Time zones with DST rules.
@@ -1049,6 +1069,7 @@ static void loadSettings() {
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
     s.rpm_ppr_x10        = prefs.getUShort("rpmppr",   s.rpm_ppr_x10);
+    s.gps_baud           = prefs.getULong ("gpsbaud",  s.gps_baud);
     s.rpm_smooth         = prefs.getChar  ("rpmsm",    s.rpm_smooth);
     if (s.rpm_smooth < -10) s.rpm_smooth = -10;
     if (s.rpm_smooth >  10) s.rpm_smooth =  10;
@@ -1119,6 +1140,7 @@ static void saveSettings() {
     prefs.putUChar ("p_col",    s.oil_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
     prefs.putUShort("rpmppr",   s.rpm_ppr_x10);
+    prefs.putULong ("gpsbaud",  s.gps_baud);
     prefs.putChar  ("rpmsm",    s.rpm_smooth);
     prefs.putBool  ("s_afr",    s.show_afr);
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
@@ -1167,6 +1189,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,inet,%u\n",      (unsigned)s.internet_mode);
     Serial.printf("CFG,srctyp,%u\n",    (unsigned)s.sensor_type);
     Serial.printf("CFG,rpmppr,%u\n",    (unsigned)s.rpm_ppr_x10);
+    Serial.printf("CFG,gpsbaud,%lu\n",  (unsigned long)s.gps_baud);
     Serial.printf("CFG,rpmsm,%d\n",     (int)s.rpm_smooth);
     sendSfToTeensy(last_track_idx);     // active track's S/F line for lap stamping
 }
@@ -1906,6 +1929,10 @@ static bool ufOpenStream(uint32_t content_length, bool chunked = false) {
     uf.tcp->printf("X-User-Email: %s\r\n",    s.cloud_auth_user);
     uf.tcp->printf("X-Session-Id: %ld\r\n",   sid);
     uf.tcp->printf("X-Track-Name: %s\r\n",    track);
+    // Companion debug logs ("<session>.dbg.ndjson") get filed under debug/ on
+    // the server instead of overwriting the real session (same id+track).
+    if (strstr(uf.files[uf.files_idx].name, ".dbg."))
+        uf.tcp->printf("X-File-Kind: debug\r\n");
     uf.tcp->printf("Connection: close\r\n");
     uf.tcp->printf("\r\n");
     uf.expected_size = content_length;
@@ -2456,6 +2483,19 @@ static bool parseLine(const String& line) {
     if (line.startsWith("TEST,"))   return parseTestLine(line);
     if (line.startsWith("WUP,"))    return parseWupLine(line);
     if (line.startsWith("Q,"))     return parseQLine(line);
+    if (line.startsWith("GPSBAUD,")) {
+        // GPSBAUD,<baud>,<ok>  (ok=1 => module locked + PVT flowing at that baud)
+        int c1 = line.indexOf(',');
+        int c2 = line.indexOf(',', c1 + 1);
+        if (c1 > 0 && c2 > c1) {
+            long baud = line.substring(c1 + 1, c2).toInt();
+            int  ok   = line.substring(c2 + 1).toInt();
+            snprintf(gps_status_buf, sizeof(gps_status_buf), "%ld %s",
+                     baud, ok ? "OK" : "NO DATA");
+            settingsDirty = true;   // refresh the INFO row
+        }
+        return true;
+    }
     return false;
 }
 static void pumpUart() {
@@ -3698,6 +3738,8 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_CL_AUTH_USER, "User email",            SettingRow::TEXT    },
     { ST_CL_AUTH_PASS, "API key",               SettingRow::TEXT    },
     { ST_TIMEZONE,     "Time zone",              SettingRow::ENUM    },
+    { ST_GPS_BAUD,     "GPS baud",               SettingRow::ENUM    },
+    { ST_GPS_STATUS,   "GPS link",               SettingRow::INFO    },
     { ST_SET_TIME,     "Set time",                SettingRow::ACTION  },
 };
 
@@ -4250,6 +4292,7 @@ static const char* enumValue(SettingId id) {
         case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
         case ST_RPM_DIV:     return RPM_PPR_NAMES[rpmPprIndex()];
+        case ST_GPS_BAUD:    return GPS_BAUD_NAMES[gpsBaudIndex()];
         default:             return "?";
     }
 }
@@ -4332,7 +4375,8 @@ static int rowGroup(SettingId id) {
         case ST_AUTO_START: case ST_AUTO_START_MPH: return SG_RECORDING;
         case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO:
         case ST_CL_AUTH_USER: case ST_CL_AUTH_PASS: return SG_CLOUD;
-        case ST_TIMEZONE: case ST_SET_TIME: return SG_TIME;
+        case ST_TIMEZONE: case ST_GPS_BAUD: case ST_GPS_STATUS:
+        case ST_SET_TIME: return SG_TIME;
         default: return SG_DISPLAY;
     }
 }
@@ -4563,6 +4607,7 @@ static void drawSettingsPage() {
             tft.setTextDatum(textdatum_t::middle_left);
             const char* shown = "";
             if (r.id == ST_WIFI_STATUS) shown = wifi_status_buf[0] ? wifi_status_buf : "-";
+            if (r.id == ST_GPS_STATUS)  shown = gps_status_buf[0]  ? gps_status_buf  : "-";
             tft.drawString(shown, INFO_X + 10, y + SETTINGS_ROW_HEIGHT / 2);
             tft.setTextDatum(textdatum_t::top_left);
         } else { // TEXT — tap-to-edit field. Used for cloud_host (string,
@@ -4717,6 +4762,13 @@ static void handleSettingsTap(int x, int y) {
                     s.internet_mode = (s.internet_mode + 1) % N_INET_MODE;
                     wifiForceReconfigure();
                     Serial.printf("CFG,inet,%u\n", (unsigned)s.internet_mode);
+                } else if (r.id == ST_GPS_BAUD) {
+                    int idx = (gpsBaudIndex() + 1) % N_GPS_BAUD;
+                    s.gps_baud = GPS_BAUD_VALS[idx];
+                    // Apply immediately so the user sees data return (or not).
+                    Serial.printf("CFG,gpsbaud,%lu\n", (unsigned long)s.gps_baud);
+                    snprintf(gps_status_buf, sizeof(gps_status_buf), "switching to %lu…",
+                             (unsigned long)s.gps_baud);
                 } else if (r.id == ST_SENSOR_TYPE) {
                     s.sensor_type = (s.sensor_type + 1) % N_SENSOR_TYPE;
                     // Reset stale ECU state on a source flip so the dash
