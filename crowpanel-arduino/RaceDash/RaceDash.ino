@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.84"
+#define FIRMWARE_VERSION "0.1.85"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2047,7 +2047,9 @@ static bool parseQLine(const String& line) {
     const char* p = line.c_str() + 2;   // skip 'Q,'
 
     // PAGE_SESSIONS consumer (preferred when it's actively listing/deleting).
-    if (strncmp(p, "FILE,", 5) == 0 && sl.state == SL_LISTING) {
+    // Yields to an active UPLOAD listing so a stuck/lingering SL_LISTING can't
+    // hijack the upload's Q,FILE/Q,END responses (-> upload sees an empty queue).
+    if (strncmp(p, "FILE,", 5) == 0 && sl.state == SL_LISTING && uf.state != UF_LISTING) {
         const char* rest = p + 5;
         const char* comma = strchr(rest, ',');
         if (!comma || sl.count >= SESSIONS_MAX_FILES) return true;
@@ -2061,7 +2063,7 @@ static bool parseQLine(const String& line) {
         sl.dirty = true;
         return true;
     }
-    if (strncmp(p, "END", 3) == 0 && sl.state == SL_LISTING) {
+    if (strncmp(p, "END", 3) == 0 && sl.state == SL_LISTING && uf.state != UF_LISTING) {
         slEnter(SL_IDLE);
         return true;
     }
@@ -2336,6 +2338,15 @@ static void uploadTick() {
                     snprintf(uf.last_err, sizeof(uf.last_err), "no http response");
                 }
                 uf.failed++;
+                // Debug logs are BEST-EFFORT: if the server rejects one (e.g.
+                // it hasn't been redeployed to accept X-File-Kind: debug), drop
+                // it (fire-and-forget delete) so a rejected .dbg file can NEVER
+                // clog the queue and block session uploads. Sessions are kept
+                // for retry. The Q,DEL,OK reply is ignored (state != DELETING).
+                if (strstr(uf.files[uf.files_idx].name, ".dbg.")) {
+                    Serial.printf("Q,DEL,%s\n", uf.files[uf.files_idx].name);
+                    Serial.flush();
+                }
                 ufNextFile();
             }
         }

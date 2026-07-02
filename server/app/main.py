@@ -1729,6 +1729,39 @@ async def canbus_review(request: Request, file: str) -> Response:
                         .replace("__FILE__", html.escape(p.name)))
 
 
+@app.get("/admin/debug/list")
+async def admin_debug_list(request: Request,
+                          x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    """List uploaded Teensy debug logs (firmware-key gated, so tooling/agents can
+    pull them without a browser session)."""
+    if not FIRMWARE_KEY or x_api_key != FIRMWARE_KEY:
+        raise HTTPException(status_code=401, detail="firmware key required")
+    root = DATA_DIR / "debug"
+    out = []
+    if root.exists():
+        for ud in sorted(root.iterdir()):
+            if ud.is_dir():
+                for f in sorted(ud.iterdir()):
+                    if f.is_file():
+                        st = f.stat()
+                        out.append({"user": ud.name, "file": f.name,
+                                    "size": st.st_size, "mtime": int(st.st_mtime)})
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return JSONResponse({"debug_files": out})
+
+
+@app.get("/admin/debug/get")
+async def admin_debug_get(request: Request, user: str, file: str,
+                         x_api_key: Optional[str] = Header(None)) -> Response:
+    """Raw contents of one uploaded debug log (firmware-key gated)."""
+    if not FIRMWARE_KEY or x_api_key != FIRMWARE_KEY:
+        raise HTTPException(status_code=401, detail="firmware key required")
+    p = DATA_DIR / "debug" / safe_name(user) / safe_name(file, maxlen=256)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(content=p.read_text("utf-8", "replace"), media_type="text/plain")
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": SERVICE_NAME, "data_dir": str(DATA_DIR)}
