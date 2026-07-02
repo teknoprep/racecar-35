@@ -19,13 +19,14 @@
 #include <HTTPClient.h>         // wraps WiFiClientSecure with a simple GET/POST API
 #include <Update.h>             // partition-swap OTA writer
 #include <esp_log.h>       // for esp_log_level_set("wifi", ESP_LOG_NONE)
+#include <esp_system.h>    // esp_reset_reason() for BLE crash forensics
 #include <mbedtls/sha256.h>     // OTA artifact integrity check vs manifest sha256
 
 // Compile-time firmware version. Bump via the release process when shipping
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.91"
+#define FIRMWARE_VERSION "0.1.92"
 
 #include <Preferences.h>
 #include <time.h>
@@ -720,6 +721,23 @@ static float    health_mpu_c      = NAN;
 static float    health_esp_c      = NAN;
 static float    health_batt_v     = NAN;
 static uint32_t health_last_hlth_ms = 0;   // millis() of last HLTH from Teensy
+// If a prior BLE init reset the board, this holds the human-readable reason
+// (captured on boot from esp_reset_reason() + the obd breadcrumb).
+static char     ble_diag[96]      = "";
+static const char* resetReasonStr(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "power-on";
+        case ESP_RST_SW:        return "sw-reset";
+        case ESP_RST_PANIC:     return "PANIC (crash)";
+        case ESP_RST_INT_WDT:   return "int-watchdog";
+        case ESP_RST_TASK_WDT:  return "task-watchdog";
+        case ESP_RST_WDT:       return "watchdog";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT (power)";
+        case ESP_RST_DEEPSLEEP: return "deepsleep";
+        case ESP_RST_EXT:       return "ext-reset";
+        default:                return "unknown";
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Time zones with DST rules.
@@ -4578,6 +4596,7 @@ namespace {
 static void applySensorSource(uint8_t t) {
     s.sensor_type = t % N_SENSOR_TYPE;
     if (s.sensor_type == 2) {                 // Bluetooth OBD-II
+        obd::setBlocked(false);   // explicit user action -> allow the (re)try even after a prior crash
         obd::begin();
         if (s.bt_addr[0]) obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
     } else {
@@ -4629,6 +4648,11 @@ static void drawSensorPage() {
         snprintf(buf, sizeof(buf), "Status: %s%s", obd::stateStr(), cbuf);
         tft.setTextColor(conn ? TFT_GREEN : TFT_YELLOW, BG);
         tft.drawString(buf, 30, by + 26);
+        // If a prior BLE init reset the board, show the captured reason in red.
+        if (ble_diag[0]) {
+            tft.setTextColor(TFT_RED, BG);
+            tft.drawString(ble_diag, 30, by + 52);
+        }
 
         // SCAN button
         tft.fillRect(SS_SCAN_X, SS_SCAN_Y, SS_SCAN_W, SS_SCAN_H, TFT_NAVY);
@@ -8476,10 +8500,30 @@ void setup() {
     // Push the cloud/record config so the Teensy knows where to POST etc.
     sendCfgToTeensy();
 
+    // BLE crash forensics: if the obd breadcrumb is still set, a prior BLE init
+    // RESET the board. Capture the reset reason (brownout / panic / wdt) to show
+    // the user, and BLOCK auto-init this boot so BT-as-saved-source can't boot
+    // loop. The user can still retry from the Sensor page (which clears it).
+    {
+        Preferences p;
+        if (p.begin("blediag", false)) {
+            if (p.getBool("try", false)) {
+                esp_reset_reason_t rr = esp_reset_reason();
+                snprintf(ble_diag, sizeof(ble_diag), "BT init reset the board: %s", resetReasonStr(rr));
+                obd::setBlocked(true);
+                Serial.printf("[ble] %s -> BLE auto-init BLOCKED this boot\n", ble_diag);
+                p.putBool("try", false);
+            }
+            p.end();
+        }
+    }
+    Serial.printf("[boot] reset reason: %s\n", resetReasonStr(esp_reset_reason()));
+
     // If Bluetooth is the saved sensor source, bring up the BLE OBD-II client
     // and (re)connect to the paired dongle. All BLE work runs on its own core-0
-    // task, so this never blocks the UI here or in loop().
-    if (s.sensor_type == 2 && s.bt_addr[0]) {
+    // task, so this never blocks the UI here or in loop(). Skipped if a prior
+    // BLE init crashed the board (obd::blocked()).
+    if (s.sensor_type == 2 && s.bt_addr[0] && !obd::blocked()) {
         obd::begin();
         obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
     }

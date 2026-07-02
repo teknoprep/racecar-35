@@ -48,7 +48,18 @@ struct ScanItem { char name[24]; char addr[18]; uint8_t atype; int8_t rssi; };
 // ---- shared state (task writes, UI reads; scalars = lock-free enough) -------
 static volatile State    g_state   = OFF;
 static bool              g_inited  = false;   // NimBLE + task started
+static bool              g_blocked = false;   // app sets this if a prior BLE init crashed the board
 static TaskHandle_t      g_task    = nullptr;
+
+// Breadcrumb so a crash DURING BLE init is attributable on the next boot. Set
+// "try"=1 right before NimBLEDevice::init() and clear it right after; if the
+// board resets in between, the app finds "try" still set on boot and reads the
+// reset reason (brownout / panic / wdt). Separate NVS namespace so it can never
+// race the settings namespace.
+static void bleBreadcrumb(bool trying) {
+  Preferences p;
+  if (p.begin("blediag", false)) { p.putBool("try", trying); p.end(); }
+}
 
 // live data — sentinel -1 (or 0 for rpm) until a valid reading arrives
 static volatile int16_t  d_coolant_f_x10 = -1;
@@ -227,7 +238,11 @@ static void pollOnce() {
 static void obdTask(void*) {
   // Heavy BLE stack init on the task's own stack (never the UI stack).
   NimBLEDevice::init("racedash");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // 1.4.x takes esp_power_level_t
+  // LOW TX power: the radio powering to full +9dBm draws a current spike that
+  // can brown out a marginal supply (suspected BT crash cause). N0 = 0 dBm is
+  // plenty for an OBD dongle a few inches away and much gentler on the rail.
+  NimBLEDevice::setPower(ESP_PWR_LVL_N0);   // 1.4.x takes esp_power_level_t
+  bleBreadcrumb(false);   // init survived -> clear the crash breadcrumb
   g_state = IDLE;
   for (;;) {
     if (g_req_stop) {
@@ -263,9 +278,10 @@ static void obdTask(void*) {
 
 // ---- public API (called from the UI / setup / loop, core 1) ----------------
 static void begin() {
-  if (g_inited) return;
+  if (g_inited || g_blocked) return;
   g_inited = true;
   g_state  = IDLE;
+  bleBreadcrumb(true);   // cleared by the task once init survives (see obdTask)
   // Create the task FIRST and do NimBLEDevice::init() INSIDE it (see obdTask).
   // Doing the heavy BLE init here would run it on the shallow UI/tap-handler
   // stack (core 1) — that overflowed and crash-rebooted the board. On the task
@@ -274,6 +290,8 @@ static void begin() {
   xTaskCreatePinnedToCore(obdTask, "obd", 8192, nullptr, 1, &g_task, 0);
 }
 
+static void setBlocked(bool b) { g_blocked = b; }
+static bool blocked()          { return g_blocked; }
 static void startScan()  { if (g_inited) g_req_scan = true; }
 static bool scanning()   { return g_scanning; }
 static uint8_t scanCount(){ return g_scan_n; }
