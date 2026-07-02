@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.79"
+#define FIRMWARE_VERSION "0.1.80"
 
 #include <Preferences.h>
 #include <time.h>
@@ -857,6 +857,9 @@ static const TrackInfo TRACKS[] = {
     { "VIR South",     36.5620f,  -79.2100f, 1.2f,  36.5620f,  -79.2100f, nullptr,         0 },
     { "VIR Patriot",   36.5660f,  -79.2120f, 1.0f,  36.5660f,  -79.2120f, nullptr,         0 },
     { "Watkins Glen",  42.3417f,  -76.9272f, 2.5f,  42.3369f,  -76.9272f, WGL_CFGS,        2 },
+    // Appended (TRACKS[] is append-only — keeps NVS sf_ovr indices stable).
+    // S/F is approximate; capture the real line on-site via STATUS → SET START/FINISH.
+    { "Thompson",      41.9877f,  -71.8316f, 1.5f,  41.9866f,  -71.8332f, nullptr,         0 },
 };
 constexpr int N_TRACKS = sizeof(TRACKS) / sizeof(TRACKS[0]);
 
