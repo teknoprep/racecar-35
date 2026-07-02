@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.87"
+#define FIRMWARE_VERSION "0.1.88"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -737,13 +737,21 @@ static void pumpTach() {
         rpm_ring_head = (rpm_ring_head + 1) % RPM_MEDIAN_N;
         if (rpm_ring_fill < RPM_MEDIAN_N) rpm_ring_fill++;
         // Stage 3: smoothing, trimmed by the dash's RPM-smoothing slider
-        // (g_cfg.rpm_smooth, -10..+10): <0 = raw latest sample (skip median) +
-        // EMA off (snappiest/jumpy); 0 = median + EMA off (RPM_EMA_ALPHA baseline);
-        // >0 = median + EMA with alpha 0.91..0.10 (progressively smoother).
-        const int    sm    = g_cfg.rpm_smooth;
-        const double med   = (sm < 0) ? inst : rpmRingMedian();
-        float        alpha = (sm <= 0) ? RPM_EMA_ALPHA : (RPM_EMA_ALPHA - sm * 0.09f);
-        if (alpha < 0.1f) alpha = 0.1f;
+        // (g_cfg.rpm_smooth, -10..+10) — GENTLE / scaled-down so each step is a
+        // small nudge, not a drastic jump (the old 0.09/step down to alpha 0.10
+        // was way too harsh; going negative also did a hard median->raw flip):
+        //    0  = median + EMA off  (crisp baseline — the sweet spot)
+        //   >0  = median + LIGHT EMA, ~4.5%/step, floored at alpha 0.5 (moderate
+        //         even at +10, never molasses)
+        //   <0  = blend the raw latest sample INTO the median, 10%/step, so it
+        //         gets snappier gradually instead of flipping straight to raw.
+        const int    sm     = g_cfg.rpm_smooth;
+        const double median = rpmRingMedian();
+        double       med;
+        if (sm < 0) { const double f = (double)(-sm) / 10.0; med = inst * f + median * (1.0 - f); }
+        else        { med = median; }
+        float        alpha  = (sm <= 0) ? RPM_EMA_ALPHA : (RPM_EMA_ALPHA - sm * 0.045f);
+        if (alpha < 0.5f) alpha = 0.5f;
         if (rpm_ema <= 0.0f) rpm_ema = (float)med;
         else                 rpm_ema += alpha * ((float)med - rpm_ema);
         rpm_last_pulse_ms = millis();
@@ -3301,17 +3309,17 @@ void loop() {
     // On-SD debug health line (1 Hz, self-rate-limited; no-op when not recording).
     dbgHealth();
 
-    // Emit on every fresh PVT (== 25 Hz when GPS is reporting) plus a 1 Hz
-    // heartbeat fallback so the dash's LINK indicator stays green even
-    // without a GPS fix.
-    // Emit cadence:
-    //   - Real GPS:  every fresh PVT (== 25 Hz when locked), with a 1 Hz
-    //                heartbeat fallback when PVT is stale or absent.
-    //   - Test mode: synthetic data at a fixed 25 Hz so the dash UI animates
-    //                smoothly and the SD/cloud pipeline sees realistic load.
+    // Emit cadence: on every fresh GPS PVT (== the nav rate, up to 25 Hz), BUT
+    // never slower than a 25 Hz FLOOR regardless of GPS. RPM/ENG/IMU come from
+    // the tach/CAN/IMU and are INDEPENDENT of GPS — the old 1 Hz fallback made
+    // the dash RPM bar update only once/sec whenever GPS went stale (the
+    // "RPM haywire" symptom). A steady 40 ms floor keeps RPM smooth even when
+    // GPS is silent; when GPS is stale the (frozen) position just repeats,
+    // which the dash already renders as STALE. ~25 Hz over the 921600 link is
+    // ~6 KB/s = trivial.
     static unsigned long lastEmit = 0;
-    const unsigned long emit_interval_ms = test_mode_active ? 40UL : 1000UL;
-    if (freshThisCall || millis() - lastEmit >= emit_interval_ms) {
+    const unsigned long emit_floor_ms = 40UL;   // 25 Hz floor, GPS-independent
+    if (freshThisCall || millis() - lastEmit >= emit_floor_ms) {
         lastEmit = millis();
         emitToDash();
     }
