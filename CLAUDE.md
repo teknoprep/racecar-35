@@ -373,6 +373,20 @@ VER,teensy,<semver>
   `setNavigationFrequency` / `setAutoPVT` (blocking ~handshake but bounded; last resort, once / 10 s;
   the 32 KB ring covers the one-time stall). No-op until the first PVT, so it never trips during
   cold-start acquisition. Recovery events log `[gps] STALE …` / `[gps] re-begin …` to USB serial.
+- **HEAVY re-begin bounded to ~1.3 s (v0.1.91).** The old "scan all 5 bauds + re-config at
+  default ~1.1 s maxWaits" froze the loop **up to ~9.3 s per recovery** (0.1.88 debug logs). A
+  glitched/reset module almost always returns at the SAME baud, so the HEAVY path now tries only
+  the current baud (600 ms) + reasserts config at 250 ms maxWaits (~1.3 s); the full 5-baud scan
+  runs only after 3 consecutive failures (rare, real baud change).
+- **STALE ROOT CAUSE + fix (v0.1.93).** Debug logs show the module going **silent** (`avail=0`,
+  not a baud/parser issue) for ~10 s repeatedly, then recovering — i.e. the module is **resetting**
+  (most likely a **brownout**; same power thread as the BT reboot + Teensy comms death) and coming
+  back in its DEFAULT **NMEA** mode, so the Teensy sees no UBX PVT until the watchdog re-asserts
+  UBX. Fix: **`myGNSS.saveConfiguration()`** after the initial GPS setup (and after each live
+  baud/Hz change) persists UBX-output + nav-rate + auto-PVT + baud to the module's **flash + BBR**,
+  so a reset reboots STRAIGHT into UBX auto-PVT and resumes in ~1-2 s instead of ~10 s. Doesn't fix
+  the underlying reset (that's power) but kills the long stale. **Confirm brownout via the v0.1.90
+  `HLTH` battery voltage** on the STATUS page: if `Batt` dips when GPS goes stale, it's power.
 - **GPS baud RAISED to 230400 (v0.1.83) — the real headroom fix.** 25 Hz UBX-NAV-PVT is ~25
   kbit/s; at **38400 that's ~65 % util → zero headroom**, so after any loop stall the backlog
   drains at only ~35 % spare and chronically lags = STALE. At **230400 it's ~11 %** → a full 32 KB

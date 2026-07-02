@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.92"
+#define FIRMWARE_VERSION "0.1.93"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -582,6 +582,7 @@ static void applyGpsHz(uint8_t hz) {
     gps_nav_hz = hz;
     if (gnss_lib_ok) {
         myGNSS.setNavigationFrequency(hz);
+        myGNSS.saveConfiguration();      // persist so a reset restores this rate + UBX
         gnss_last_fresh_ms = millis();   // grace so the watchdog doesn't trip on the reconfig
     }
     Serial.printf("[gps] nav rate -> %u Hz\n", (unsigned)hz);
@@ -692,6 +693,7 @@ static void applyGpsBaud(uint32_t target) {
         myGNSS.setUART1Output(COM_TYPE_UBX);
         myGNSS.setNavigationFrequency(gps_nav_hz);
         myGNSS.setAutoPVT(true);
+        myGNSS.saveConfiguration();      // persist new baud+config so a reset restores it (stale fix)
         gnss_lib_ok = true;
         gnss_last_fresh_ms = millis();   // grace so the watchdog doesn't instantly trip
     } else {
@@ -2979,6 +2981,17 @@ void setup() {
         myGNSS.setUART1Output(COM_TYPE_UBX);     // we don't need NMEA on this link
         myGNSS.setNavigationFrequency(gps_nav_hz);
         myGNSS.setAutoPVT(true);
+        // Persist this config (UBX out + nav rate + auto-PVT + baud) to the
+        // module's flash + BBR. THE STALE FIX: the debug logs show the module
+        // going silent for ~10s repeatedly (a reset, most likely a brownout) and
+        // coming back in its DEFAULT NMEA mode, so the Teensy sees no UBX PVT
+        // until the stale watchdog re-asserts UBX. With the config saved, a reset
+        // reboots STRAIGHT into UBX auto-PVT and resumes almost immediately — no
+        // ~10s silent gap. (Doesn't fix the underlying reset, but kills the stale.)
+        if (myGNSS.saveConfiguration())
+            Serial.println(F("[gps] config saved to flash/BBR (reset-resilient)"));
+        else
+            Serial.println(F("[gps] saveConfiguration FAILED"));
         gnss_lib_ok = true;
     } else {
         Serial.println(F("u-blox NOT detected on Serial2 (tried 38400 and 9600)"));
