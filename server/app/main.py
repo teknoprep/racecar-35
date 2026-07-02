@@ -1937,6 +1937,8 @@ async def _save_body(
         raw_track = raw_track[len("session_"):]
     if raw_track.startswith(f"{sid}_"):
         raw_track = raw_track[len(sid) + 1:]
+    if kind == "debug" and raw_track.lower().endswith(".dbg"):
+        raw_track = raw_track[: -len(".dbg")]   # avoid ...dbg.dbg.ndjson
     track = safe_name(raw_track, default="UNKNOWN")
     if kind == "debug":
         filename = f"{sid}_{track}.dbg.ndjson"

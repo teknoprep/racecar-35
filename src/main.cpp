@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.85"
+#define FIRMWARE_VERSION "0.1.86"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -559,6 +559,10 @@ static uint32_t dbg_fresh_1s    = 0;
 
 static uint32_t gps_baud_now = 0;   // baud we actually connected the module at
 static uint8_t  gps_nav_hz   = NAV_RATE_HZ;   // live nav rate (dash: CFG,gpshz,<n>)
+// begin() blocks up to maxWait waiting for the module. Keep it SHORT off the
+// boot path (watchdog re-begin / live baud scan) so a failed attempt can't
+// freeze the 25 Hz loop for seconds (that blocking IS what causes GPS-stale).
+static constexpr uint16_t GPS_BEGIN_WAIT_FAST = 600;
 
 // Change the u-blox nav (PVT) rate on demand. Lower Hz = far less UART traffic
 // (10 Hz PVT is ~26% of 38400 vs ~65% at 25 Hz) = more headroom against stalls.
@@ -572,10 +576,10 @@ static void applyGpsHz(uint8_t hz) {
     }
     Serial.printf("[gps] nav rate -> %u Hz\n", (unsigned)hz);
 }
-static bool tryConnectGNSS(uint32_t baud) {
+static bool tryConnectGNSS(uint32_t baud, uint16_t maxWait = 1100) {
     GPS_SERIAL.begin(baud);
     delay(50);
-    if (myGNSS.begin(GPS_SERIAL)) { gps_baud_now = baud; return true; }
+    if (myGNSS.begin(GPS_SERIAL, maxWait)) { gps_baud_now = baud; return true; }
     return false;
 }
 
@@ -612,7 +616,7 @@ static void gpsStaleWatchdog() {
         gnss_last_reinit_ms = now;
         Serial.println(F("[gps] persistent STALE -> re-begin() GNSS link"));
         gnss_reinit_count++;
-        if (myGNSS.begin(GPS_SERIAL)) {
+        if (myGNSS.begin(GPS_SERIAL, GPS_BEGIN_WAIT_FAST)) {   // bounded so we don't freeze the loop
             myGNSS.setUART1Output(COM_TYPE_UBX);
             myGNSS.setNavigationFrequency(gps_nav_hz);
             myGNSS.setAutoPVT(true);
@@ -636,18 +640,18 @@ static void applyGpsBaud(uint32_t target) {
     // One deliberate switch attempt at the requested baud.
     if (gnss_lib_ok) {
         myGNSS.setSerialRate(target);
-        delay(150);
+        delay(120);
         GPS_SERIAL.begin(target);
-        delay(80);
-        ok = myGNSS.begin(GPS_SERIAL);
+        delay(60);
+        ok = myGNSS.begin(GPS_SERIAL, GPS_BEGIN_WAIT_FAST);
         if (ok) gps_baud_now = target;
     }
     // If the switch didn't take, DON'T keep hammering the target (that's what
-    // freaks the module out). Just recover to whatever baud the module is still
-    // really on, so GPS keeps working; report that actual baud back.
+    // freaks the module out). Recover to whatever baud the module is still on,
+    // with SHORT waits so the whole scan is bounded (~3 s worst case, not ~16 s).
     if (!ok) {
         const uint32_t scan[] = { 230400, 115200, 38400, 9600, 460800 };
-        for (uint32_t b : scan) { if (tryConnectGNSS(b)) { ok = true; break; } }
+        for (uint32_t b : scan) { if (tryConnectGNSS(b, GPS_BEGIN_WAIT_FAST)) { ok = true; break; } }
     }
     if (ok) {
         myGNSS.setUART1Output(COM_TYPE_UBX);
