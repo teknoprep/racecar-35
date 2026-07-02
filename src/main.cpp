@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.93"
+#define FIRMWARE_VERSION "0.1.94"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -637,15 +637,19 @@ static void gpsStaleWatchdog() {
         //     once in a while. This bounds the per-attempt loop stall.
         static uint8_t heavy_fail_streak = 0;
         // tryConnectGNSS re-inits Serial2 too, so this also clears a UART framing
-        // glitch, not just a module reset.
-        bool reok = tryConnectGNSS(gps_baud_now ? gps_baud_now : GPS_BAUD_PRIMARY,
-                                   GPS_BEGIN_WAIT_FAST);
-        if (!reok && heavy_fail_streak >= 3) {
-            // Rare path: maybe the module full-reset to a different baud.
-            const uint32_t scan[] = { 38400, 9600, 115200, 230400, 460800 };
+        // glitch, not just a module reset. NOTE: SparkFun begin() polls TWICE
+        // internally, so effective block ~= 2x maxWait. Keep maxWait SMALL (400)
+        // because a genuinely DEAD module (the 0.1.91 logs: it goes fully silent
+        // once hot and can't be revived in SW) would otherwise freeze the loop
+        // ~9 s per attempt for nothing — that froze RPM/logging too.
+        bool reok = tryConnectGNSS(gps_baud_now ? gps_baud_now : GPS_BAUD_PRIMARY, 400);
+        if (!reok && heavy_fail_streak >= 6) {
+            // Rare path: a full reset MAY have changed the baud. Only the two
+            // u-blox defaults, short waits, so a dead module can't cost ~9 s.
+            const uint32_t scan[] = { 38400, 9600 };
             for (uint32_t b : scan) {
                 if (b == gps_baud_now) continue;
-                if (tryConnectGNSS(b, GPS_BEGIN_WAIT_FAST)) { reok = true; break; }
+                if (tryConnectGNSS(b, 400)) { reok = true; break; }
             }
             heavy_fail_streak = 0;
         }
