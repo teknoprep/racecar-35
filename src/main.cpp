@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.90"
+#define FIRMWARE_VERSION "0.1.91"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -624,32 +624,41 @@ static void gpsStaleWatchdog() {
     // HEAVY: module may have glitched — re-establish the link. Blocking but bounded.
     if (age >= GPS_REINIT_MS && now - gnss_last_reinit_ms >= GPS_REINIT_INTERVAL_MS) {
         gnss_last_reinit_ms = now;
-        Serial.println(F("[gps] persistent STALE -> re-begin (scan bauds)"));
         gnss_reinit_count++;
-        // The module may have RESET (brownout / loose power) and come back at a
-        // DIFFERENT baud (or NMEA output) — that's why a plain re-begin at the
-        // current baud never recovers. Try the current baud first, then SCAN the
-        // common ones so we re-lock no matter what it came back as. Each attempt
-        // is bounded (600 ms) so a genuinely-dead module doesn't freeze us long.
-        // tryConnectGNSS re-inits Serial2 (GPS_SERIAL.begin) too, so this also
-        // clears a UART-level framing glitch, not just a module reset.
+        // COST CONTROL (0.1.91): the old "scan all 5 bauds + re-config" every
+        // heavy attempt froze the loop up to ~9 s per recovery (the 0.1.88 debug
+        // logs). A module that just glitched/reset almost always comes back at
+        // the SAME baud (BBR preserved), so:
+        //   - try ONLY the current baud (600 ms) + reassert config with SHORT
+        //     (250 ms) maxWaits  => normal recovery ~1.3 s, not 9 s.
+        //   - only after several consecutive failures (likely a real baud change
+        //     from a full power loss) do the expensive 5-baud scan, and at most
+        //     once in a while. This bounds the per-attempt loop stall.
+        static uint8_t heavy_fail_streak = 0;
+        // tryConnectGNSS re-inits Serial2 too, so this also clears a UART framing
+        // glitch, not just a module reset.
         bool reok = tryConnectGNSS(gps_baud_now ? gps_baud_now : GPS_BAUD_PRIMARY,
                                    GPS_BEGIN_WAIT_FAST);
-        if (!reok) {
+        if (!reok && heavy_fail_streak >= 3) {
+            // Rare path: maybe the module full-reset to a different baud.
             const uint32_t scan[] = { 38400, 9600, 115200, 230400, 460800 };
             for (uint32_t b : scan) {
                 if (b == gps_baud_now) continue;
                 if (tryConnectGNSS(b, GPS_BEGIN_WAIT_FAST)) { reok = true; break; }
             }
+            heavy_fail_streak = 0;
         }
         if (reok) {
-            myGNSS.setUART1Output(COM_TYPE_UBX);
-            myGNSS.setNavigationFrequency(gps_nav_hz);
-            myGNSS.setAutoPVT(true);
+            heavy_fail_streak = 0;
+            myGNSS.setUART1Output(COM_TYPE_UBX, 250);
+            myGNSS.setNavigationFrequency(gps_nav_hz, 250);
+            myGNSS.setAutoPVT(true, (uint16_t)250);
             gnss_last_fresh_ms = millis();   // grace window so we don't re-trip instantly
             Serial.printf("[gps] re-begin OK @ %lu baud\n", (unsigned long)gps_baud_now);
         } else {
-            Serial.println(F("[gps] re-begin FAILED (module silent) — will retry"));
+            heavy_fail_streak++;
+            Serial.printf("[gps] re-begin FAILED (module silent) streak=%u\n",
+                          (unsigned)heavy_fail_streak);
         }
     }
 }

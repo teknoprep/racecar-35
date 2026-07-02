@@ -727,12 +727,18 @@ post-processing side, not the Teensy (keep the logged stream calibrated-but-raw)
   `arduino-cli lib install "TAMC_GT911"`.
 - **`FlexCAN_T4`** — ships with the Teensy core (no `lib_deps` entry needed). `FreqMeasureMulti`
   is also a Teensy-core lib.
-- **`NimBLE-Arduino`** (Arduino registry, v2.5.0) — lightweight BLE stack for the CrowPanel's
-  BLE OBD-II client (`obd_ble.h`, `sensor_type==2`). Installed via `arduino-cli lib install
-  "NimBLE-Arduino"`. Chosen over stock Bluedroid because it's ~180 KB (vs ~400 KB) — critical:
-  the 4M dash binary is now ~94 % of the 1.25 MB OTA slot. **The ESP32-S3 is BLE-only (no
-  classic BT/SPP), so the OBD dongle MUST be a BLE ELM327** (e.g. Vgate iCar Pro BLE), not a
-  classic-Bluetooth one.
+- **`NimBLE-Arduino` v1.4.3** (Arduino registry) — lightweight BLE stack for the CrowPanel's
+  BLE OBD-II client (`obd_ble.h`, `sensor_type==2`). Install the EXACT version:
+  `arduino-cli lib install "NimBLE-Arduino@1.4.3"`. **DO NOT use 2.x** — NimBLE 2.x targets the
+  arduino-esp32 **3.x** core (IDF 5); on our **2.0.14** core (IDF 4.4) it compiles but
+  **crash-reboots the board on BLE init** (v0.1.90 shipped with 2.5.0 and did exactly this).
+  1.4.3 is the battle-tested match for 2.0.14. (API differs from 2.x: scan `start()` returns
+  results in SECONDS, `getDevice()` by value, `getServices/getCharacteristics` return POINTERS,
+  `onDisconnect` has no reason arg, `setPower(esp_power_level_t)`.) Also: NimBLE init is done
+  **inside the OBD task**, not the caller — running it on the shallow UI/tap-handler stack was a
+  second crash vector. Chosen over stock Bluedroid because it's ~180 KB (vs ~400 KB) — the 4M
+  dash binary is ~94 % of the 1.25 MB OTA slot. **The ESP32-S3 is BLE-only (no classic BT/SPP),
+  so the OBD dongle MUST be a BLE ELM327** (e.g. Vgate iCar Pro BLE), not a classic one.
 
 ## Toolchain note (Linux build host)
 

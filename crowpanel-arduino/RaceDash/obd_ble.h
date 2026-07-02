@@ -18,6 +18,12 @@
 // the common "Vgate iCar Pro BLE", "Viecar", generic FFE0/FFF0 clones, etc.
 //
 // ELM327 flow: ATZ, ATE0, ATL0, ATS0, ATH0, ATSP0 then poll PIDs round-robin.
+//
+// NimBLE version: **1.4.x** (NOT 2.x). 2.x targets the arduino-esp32 3.x core
+// (IDF 5); on this board's 2.0.14 core (IDF 4.4) it compiles but crash-reboots
+// on BLE init. 1.4.3 is the battle-tested match for 2.0.14. API differs from 2.x
+// (scan start() returns results in SECONDS, getDevice() by value, getServices/
+// getCharacteristics return POINTERS, onDisconnect has no reason arg).
 // ===========================================================================
 #pragma once
 #include <Arduino.h>
@@ -124,9 +130,9 @@ static void snapResp(char* out, size_t outsz) {
   portEXIT_CRITICAL(&g_mux);
 }
 
-// ---- client callbacks ------------------------------------------------------
+// ---- client callbacks (NimBLE 1.4.x: onDisconnect has no reason arg) --------
 class ClientCB : public NimBLEClientCallbacks {
-  void onDisconnect(NimBLEClient*, int) override {
+  void onDisconnect(NimBLEClient*) override {
     g_tx = g_rx = nullptr;
     // only auto-reconnect if the user still wants BT (not a deliberate stop)
     if (g_state != OFF && !g_req_stop) g_state = RECONNECT;
@@ -141,20 +147,19 @@ static void doScan() {
   sc->setActiveScan(true);
   sc->setMaxResults(24);
   sc->clearResults();
-  NimBLEScanResults res = sc->getResults(6000, false);   // blocks ~6 s (this task only)
+  NimBLEScanResults res = sc->start(6, false);   // 6 s, blocking on THIS task only
   uint8_t n = 0;
   for (int i = 0; i < res.getCount() && n < 16; i++) {
-    const NimBLEAdvertisedDevice* d = res.getDevice(i);
-    if (!d) continue;
-    std::string nm = d->getName();
-    std::string ad = d->getAddress().toString();
+    NimBLEAdvertisedDevice d = res.getDevice(i);   // 1.4.x: by value
+    std::string nm = d.getName();
+    std::string ad = d.getAddress().toString();
     // keep named devices first-class; unnamed still listed by address
     strncpy(g_scan[n].name, nm.empty() ? "(unnamed)" : nm.c_str(), sizeof(g_scan[n].name) - 1);
     g_scan[n].name[sizeof(g_scan[n].name) - 1] = 0;
     strncpy(g_scan[n].addr, ad.c_str(), sizeof(g_scan[n].addr) - 1);
     g_scan[n].addr[sizeof(g_scan[n].addr) - 1] = 0;
-    g_scan[n].atype = d->getAddressType();
-    g_scan[n].rssi  = d->getRSSI();
+    g_scan[n].atype = d.getAddressType();
+    g_scan[n].rssi  = d.getRSSI();
     n++;
   }
   g_scan_n = n;
@@ -173,9 +178,10 @@ static bool connectAndInit() {
 
   g_state = DISCOVER;
   g_tx = g_rx = nullptr;
-  const std::vector<NimBLERemoteService*>& svcs = g_client->getServices(true);
-  for (auto svc : svcs) {
-    for (auto ch : svc->getCharacteristics(true)) {
+  std::vector<NimBLERemoteService*>* svcs = g_client->getServices(true);   // 1.4.x: pointer
+  if (svcs) for (auto svc : *svcs) {
+    std::vector<NimBLERemoteCharacteristic*>* chs = svc->getCharacteristics(true);
+    if (chs) for (auto ch : *chs) {
       if (!g_rx && (ch->canNotify() || ch->canIndicate())) g_rx = ch;
       if (!g_tx && (ch->canWrite()  || ch->canWriteNoResponse())) g_tx = ch;
     }
@@ -219,6 +225,10 @@ static void pollOnce() {
 }
 
 static void obdTask(void*) {
+  // Heavy BLE stack init on the task's own stack (never the UI stack).
+  NimBLEDevice::init("racedash");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);   // 1.4.x takes esp_power_level_t
+  g_state = IDLE;
   for (;;) {
     if (g_req_stop) {
       g_req_stop = false;
@@ -254,12 +264,14 @@ static void obdTask(void*) {
 // ---- public API (called from the UI / setup / loop, core 1) ----------------
 static void begin() {
   if (g_inited) return;
-  NimBLEDevice::init("racedash");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   g_inited = true;
   g_state  = IDLE;
-  // core 0 (BT/WiFi core) so blocking BLE work never touches the UI loop (core 1)
-  xTaskCreatePinnedToCore(obdTask, "obd", 6144, nullptr, 1, &g_task, 0);
+  // Create the task FIRST and do NimBLEDevice::init() INSIDE it (see obdTask).
+  // Doing the heavy BLE init here would run it on the shallow UI/tap-handler
+  // stack (core 1) — that overflowed and crash-rebooted the board. On the task
+  // it runs on the task's own 8 KB stack, on core 0 (the BT/WiFi core), so it
+  // never touches the UI loop.
+  xTaskCreatePinnedToCore(obdTask, "obd", 8192, nullptr, 1, &g_task, 0);
 }
 
 static void startScan()  { if (g_inited) g_req_scan = true; }
