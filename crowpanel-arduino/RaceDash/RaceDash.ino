@@ -25,7 +25,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.88"
+#define FIRMWARE_VERSION "0.1.89"
 
 #include <Preferences.h>
 #include <time.h>
@@ -35,6 +35,7 @@
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
 #include "board_config.h"   // per-panel RGB pin map + timing (DASH_BOARD 7|5)
+#include "obd_ble.h"       // Bluetooth-LE OBD-II (ELM327) client for sensor_type==2
 
 // ---------------------------------------------------------------------------
 // Forward type decls — Arduino IDE auto-injects function prototypes at the
@@ -597,9 +598,18 @@ struct Settings {
     // and others as MS3 CAN comes online):
     //   0 = Direct     — Teensy ADCs on A2/A3 (the wiring we built in §5b/5c)
     //   1 = MegaSquirt — MS3 CAN broadcast, forwarded by Teensy as ECU,...
+    //   2 = Bluetooth  — BLE OBD-II (ELM327) dongle on the CrowPanel for SLOW
+    //                    readings (coolant/IAT/voltage). RPM still comes from
+    //                    the Teensy opto tach (BT is too slow for the RPM bar).
     // Oil PSI stays direct regardless (MS3 typically doesn't have an oil
     // pressure input wired). AFR is only available in MegaSquirt mode.
     uint8_t  sensor_type        = 0;       // default Direct
+
+    // Bluetooth OBD-II (ELM327 BLE) dongle — the paired device we reconnect to
+    // when sensor_type == 2. Empty until one is chosen on PAGE_BT_SCAN.
+    char     bt_addr[18]        = {0};     // "aa:bb:cc:dd:ee:ff"
+    uint8_t  bt_atype           = 0;       // BLE address type (public/random)
+    char     bt_name[24]        = {0};     // friendly name for the UI
 
     // GPS UART baud (Teensy<->u-blox). Default 38400 = the KNOWN-GOOD rate the
     // module ships at (do not auto-raise at boot). Higher rates are an explicit,
@@ -650,8 +660,8 @@ static Settings s;
 // Names for ENUM-style settings (cycle-on-tap).
 const char* const PROTOCOL_NAMES[] = { "HTTP", "HTTPS", "FTP" };
 constexpr int N_PROTOCOL = 3;
-const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt" };
-constexpr int N_SENSOR_TYPE = 2;
+const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt", "Bluetooth" };
+constexpr int N_SENSOR_TYPE = 3;
 // Tach pulses/rev choices (the Direct-mode RPM divider). Value shown = pulses
 // per crank rev = divider. Stored x10 so 0.5 works. Sent as CFG,rpmppr,<x10>.
 const char* const RPM_PPR_NAMES[] = { "0.5", "1", "2", "3", "4", "6", "8" };
@@ -693,6 +703,10 @@ static bool     gps_page_dirty   = true;
 // Snapshot taken on entry to PAGE_GPS so Cancel can revert baud/Hz + the module.
 static uint32_t gps_orig_baud    = 38400;
 static uint8_t  gps_orig_hz      = 25;
+// Sensor-source page + BT-scan page repaint flags.
+static bool     sensor_page_dirty = true;
+static bool     bt_scan_dirty     = true;
+static uint8_t  sensor_orig_type  = 0;   // snapshot for CANCEL on PAGE_SENSOR
 
 // ---------------------------------------------------------------------------
 // Time zones with DST rules.
@@ -1090,6 +1104,9 @@ static void loadSettings() {
     s.oil_warn_psi       = prefs.getUShort("p_warn",   s.oil_warn_psi);
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
+    prefs.getString      ("bt_addr",  s.bt_addr, sizeof(s.bt_addr));
+    s.bt_atype           = prefs.getUChar ("bt_atype", s.bt_atype);
+    prefs.getString      ("bt_name",  s.bt_name, sizeof(s.bt_name));
     s.rpm_ppr_x10        = prefs.getUShort("rpmppr",   s.rpm_ppr_x10);
     s.gps_baud           = prefs.getULong ("gpsbaud",  s.gps_baud);
     s.gps_nav_hz         = prefs.getUChar ("gpshz",    s.gps_nav_hz);
@@ -1162,6 +1179,9 @@ static void saveSettings() {
     prefs.putUShort("p_warn",   s.oil_warn_psi);
     prefs.putUChar ("p_col",    s.oil_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
+    prefs.putString("bt_addr",  s.bt_addr);
+    prefs.putUChar ("bt_atype", s.bt_atype);
+    prefs.putString("bt_name",  s.bt_name);
     prefs.putUShort("rpmppr",   s.rpm_ppr_x10);
     prefs.putULong ("gpsbaud",  s.gps_baud);
     prefs.putUChar ("gpshz",    s.gps_nav_hz);
@@ -1250,6 +1270,8 @@ enum Page : uint8_t {
     PAGE_TOOLS         = 11,  // maintenance actions: Check for updates, Format SD
     PAGE_SESSIONS      = 12,  // queued NDJSON sessions: select + delete + delete all
     PAGE_GPS           = 13,  // GPS baud selector + live GPS diagnostics
+    PAGE_SENSOR        = 14,  // Sensor source picker (Direct/MegaSquirt/Bluetooth) + BT status
+    PAGE_BT_SCAN       = 15,  // BLE OBD-II device scan + select
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -2619,6 +2641,12 @@ static void drawWifiScannerPage();
 static void drawGpsPage();
 static void handleGpsPageTap(int x, int y);
 static void openGpsPage();
+static void drawSensorPage();
+static void handleSensorPageTap(int x, int y);
+static void openSensorPage();
+static void drawBtScanPage();
+static void handleBtScanTap(int x, int y);
+static void openBtScan();
 static void drawUploadModal();
 static void handleUploadModalTap(int x, int y);
 static bool parseUploadLine(const String& line);
@@ -2704,7 +2732,8 @@ static void handleTouch() {
     }
     if (currentPage == PAGE_NUM_KB || currentPage == PAGE_TEXT_KB ||
         currentPage == PAGE_CONFIG_PICKER || currentPage == PAGE_TIME_SET ||
-        currentPage == PAGE_WIFI_SCAN || currentPage == PAGE_GPS) {
+        currentPage == PAGE_WIFI_SCAN || currentPage == PAGE_GPS ||
+        currentPage == PAGE_SENSOR || currentPage == PAGE_BT_SCAN) {
         if (now && !tt.active) {
             tt.startX = x; tt.startY = y;
             tt.lastX  = x; tt.lastY  = y;
@@ -2715,6 +2744,8 @@ static void handleTouch() {
             else if (currentPage == PAGE_TIME_SET)      handleTimeSetTap(tt.startX, tt.startY);
             else if (currentPage == PAGE_WIFI_SCAN)     handleWifiScannerTap(tt.startX, tt.startY);
             else if (currentPage == PAGE_GPS)           handleGpsPageTap(tt.startX, tt.startY);
+            else if (currentPage == PAGE_SENSOR)        handleSensorPageTap(tt.startX, tt.startY);
+            else if (currentPage == PAGE_BT_SCAN)       handleBtScanTap(tt.startX, tt.startY);
             else                                        handleKeyboardTap(tt.startX, tt.startY);
             tt.active = false;
         } else if (now && tt.active) {
@@ -3422,8 +3453,12 @@ static void drawDashPage() {
     // Oil PSI stays direct regardless — MS3 typically has no oil-PSI input.
     {
         const bool    fromMs3   = (s.sensor_type == 1);
-        const int16_t coolant   = fromMs3 ? ecu.coolant_f_x10 : eng.coolant_f_x10;
-        const bool    fault     = (coolant < 0) || (fromMs3 && ecuStale);
+        const bool    fromBt    = (s.sensor_type == 2);   // BLE OBD-II dongle
+        const int16_t coolant   = fromBt  ? obd::coolantF_x10()
+                                : fromMs3 ? ecu.coolant_f_x10
+                                          : eng.coolant_f_x10;
+        const bool    fault     = (coolant < 0) || (fromMs3 && ecuStale)
+                                  || (fromBt && !obd::dataFresh());
         const bool    warn_active = s.show_coolant && !fault
                                     && (coolant >= (int)s.coolant_warn_f * 10);
         const uint32_t tag = ((uint32_t)s.show_coolant << 24)
@@ -4493,6 +4528,214 @@ static void handleGpsPageTap(int x, int y) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PAGE_SENSOR — Sensor Source picker (Direct / MegaSquirt / Bluetooth), modeled
+// on the GPS page. For Bluetooth it also shows the paired OBD-II dongle + its
+// live connection status and a SCAN button. DONE saves, CANCEL reverts.
+// ---------------------------------------------------------------------------
+namespace {
+  constexpr int SS_BTN_W = 232, SS_BTN_H = 56, SS_BTN_X0 = 30, SS_BTN_DX = 246, SS_BTN_Y = 96;
+  constexpr int SS_SCAN_X = 30,  SS_SCAN_Y = 300, SS_SCAN_W = 300, SS_SCAN_H = 54;
+  constexpr int SS_CANCEL_X = 60, SS_DONE_X = 440, SS_FOOT_Y = 410, SS_FOOT_W = 300, SS_FOOT_H = 54;
+}
+
+// Apply a sensor-source choice live: bring up / tear down the BLE OBD client.
+static void applySensorSource(uint8_t t) {
+    s.sensor_type = t % N_SENSOR_TYPE;
+    if (s.sensor_type == 2) {                 // Bluetooth OBD-II
+        obd::begin();
+        if (s.bt_addr[0]) obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
+    } else {
+        obd::stop();
+    }
+}
+
+static void openSensorPage() {
+    sensor_orig_type  = s.sensor_type;
+    currentPage       = PAGE_SENSOR;
+    pageJustEntered   = true;
+    sensor_page_dirty = true;
+}
+
+static void drawSensorPage() {
+    const uint16_t BG = TFT_BLACK;
+    if (pageJustEntered) { tft.fillScreen(BG); pageJustEntered = false; }
+    sensor_page_dirty = false;
+
+    tft.setFont(&fonts::Font4); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::top_left);
+    tft.setTextColor(TFT_CYAN, BG); tft.setTextPadding(500);
+    tft.drawString("SENSOR SOURCE", 20, 12);
+    tft.setTextPadding(0);
+
+    tft.setFont(&fonts::Font2); tft.setTextSize(1);
+    tft.setTextColor(TFT_LIGHTGREY, BG);
+    tft.drawString("RPM always comes from the tach/CAN via the Teensy.", 30, 64);
+
+    // Three source buttons (one row)
+    for (int i = 0; i < N_SENSOR_TYPE; i++)
+        drawGpsSelBtn(SS_BTN_X0 + i * SS_BTN_DX, SS_BTN_Y, SENSOR_TYPE_NAMES[i], s.sensor_type == i);
+
+    // Bluetooth detail block (only when BT is the chosen source)
+    const int by = 250;
+    tft.setFont(&fonts::Font2); tft.setTextSize(1);
+    tft.setTextPadding(740);
+    if (s.sensor_type == 2) {
+        char buf[128];
+        tft.setTextColor(TFT_WHITE, BG);
+        snprintf(buf, sizeof(buf), "Device: %s",
+                 s.bt_name[0] ? s.bt_name : (s.bt_addr[0] ? s.bt_addr : "(none selected)"));
+        tft.drawString(buf, 30, by);
+
+        const bool conn = obd::connected();
+        char cbuf[64] = {0};
+        if (obd::coolantF_x10() >= 0)
+            snprintf(cbuf, sizeof(cbuf), "   coolant %d F", (int)((obd::coolantF_x10() + 5) / 10));
+        snprintf(buf, sizeof(buf), "Status: %s%s", obd::stateStr(), cbuf);
+        tft.setTextColor(conn ? TFT_GREEN : TFT_YELLOW, BG);
+        tft.drawString(buf, 30, by + 26);
+
+        // SCAN button
+        tft.fillRect(SS_SCAN_X, SS_SCAN_Y, SS_SCAN_W, SS_SCAN_H, TFT_NAVY);
+        tft.drawRect(SS_SCAN_X, SS_SCAN_Y, SS_SCAN_W, SS_SCAN_H, TFT_WHITE);
+        tft.setFont(&fonts::Font2); tft.setTextSize(1);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.drawString("SCAN FOR DEVICES", SS_SCAN_X + SS_SCAN_W / 2, SS_SCAN_Y + SS_SCAN_H / 2);
+        tft.setTextDatum(textdatum_t::top_left);
+    }
+    tft.setTextPadding(0);
+
+    // Footer: CANCEL / DONE
+    tft.fillRect(SS_CANCEL_X, SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_MAROON);
+    tft.drawRect(SS_CANCEL_X, SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_WHITE);
+    tft.fillRect(SS_DONE_X,   SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_DARKGREEN);
+    tft.drawRect(SS_DONE_X,   SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_WHITE);
+    tft.setFont(&fonts::Font4); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, TFT_MAROON);
+    tft.drawString("CANCEL", SS_CANCEL_X + SS_FOOT_W / 2, SS_FOOT_Y + SS_FOOT_H / 2);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    tft.drawString("DONE", SS_DONE_X + SS_FOOT_W / 2, SS_FOOT_Y + SS_FOOT_H / 2);
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleSensorPageTap(int x, int y) {
+    // Source buttons
+    if (y >= SS_BTN_Y && y <= SS_BTN_Y + SS_BTN_H) {
+        for (int i = 0; i < N_SENSOR_TYPE; i++) {
+            const int bx = SS_BTN_X0 + i * SS_BTN_DX;
+            if (x >= bx && x <= bx + SS_BTN_W) {
+                if (s.sensor_type != i) applySensorSource((uint8_t)i);
+                sensor_page_dirty = true; return;
+            }
+        }
+    }
+    // SCAN (BT mode only)
+    if (s.sensor_type == 2 && y >= SS_SCAN_Y && y <= SS_SCAN_Y + SS_SCAN_H &&
+        x >= SS_SCAN_X && x <= SS_SCAN_X + SS_SCAN_W) { openBtScan(); return; }
+    // Footer
+    if (y >= SS_FOOT_Y && y <= SS_FOOT_Y + SS_FOOT_H) {
+        if (x >= SS_CANCEL_X && x <= SS_CANCEL_X + SS_FOOT_W) {
+            if (s.sensor_type != sensor_orig_type) applySensorSource(sensor_orig_type);
+            currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true; return;
+        }
+        if (x >= SS_DONE_X && x <= SS_DONE_X + SS_FOOT_W) {
+            saveSettings();   // persists sensor_type + bt_* and re-syncs CFG,srctyp to Teensy
+            currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true; return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PAGE_BT_SCAN — scan for BLE OBD-II dongles, tap one to pair it.
+// ---------------------------------------------------------------------------
+namespace {
+  constexpr int BT_ROW_Y0 = 92, BT_ROW_H = 52, BT_ROWS_MAX = 5;
+  constexpr int BT_RESCAN_X = 60, BT_BACK_X = 440, BT_FOOT_Y = 410, BT_FOOT_W = 300, BT_FOOT_H = 54;
+}
+
+static void openBtScan() {
+    obd::begin();
+    obd::startScan();
+    currentPage     = PAGE_BT_SCAN;
+    pageJustEntered = true;
+    bt_scan_dirty   = true;
+}
+
+static void selectBtDevice(int i) {
+    const obd::ScanItem* it = obd::scanItem(i);
+    if (!it) return;
+    strncpy(s.bt_addr, it->addr, sizeof(s.bt_addr) - 1); s.bt_addr[sizeof(s.bt_addr) - 1] = 0;
+    s.bt_atype = it->atype;
+    strncpy(s.bt_name, it->name, sizeof(s.bt_name) - 1); s.bt_name[sizeof(s.bt_name) - 1] = 0;
+    s.sensor_type = 2;
+    saveSettings();
+    obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
+    currentPage = PAGE_SENSOR; pageJustEntered = true; sensor_page_dirty = true;
+}
+
+static void drawBtScanPage() {
+    const uint16_t BG = TFT_BLACK;
+    if (pageJustEntered) { tft.fillScreen(BG); pageJustEntered = false; }
+    bt_scan_dirty = false;
+
+    tft.setFont(&fonts::Font4); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::top_left);
+    tft.setTextColor(TFT_CYAN, BG); tft.setTextPadding(600);
+    tft.drawString("BLUETOOTH DEVICES", 20, 12);
+
+    tft.setFont(&fonts::Font2); tft.setTextSize(1);
+    tft.setTextColor(obd::scanning() ? TFT_YELLOW : TFT_LIGHTGREY, BG);
+    tft.drawString(obd::scanning() ? "Scanning..." :
+                   (obd::scanCount() ? "Tap your OBD dongle to pair:"
+                                     : "No devices found. RESCAN to retry."), 20, 60);
+    tft.setTextPadding(0);
+
+    const int n = obd::scanCount();
+    for (int i = 0; i < BT_ROWS_MAX; i++) {
+        const int ry = BT_ROW_Y0 + i * BT_ROW_H;
+        tft.fillRect(20, ry, 760, BT_ROW_H - 6, (i < n) ? TFT_NAVY : BG);
+        if (i < n) {
+            const obd::ScanItem* it = obd::scanItem(i);
+            if (!it) continue;
+            tft.drawRect(20, ry, 760, BT_ROW_H - 6, TFT_DARKGREY);
+            tft.setFont(&fonts::Font2); tft.setTextSize(1);
+            tft.setTextColor(TFT_WHITE, TFT_NAVY);
+            tft.drawString(it->name, 32, ry + 4);
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s   %d dBm", it->addr, (int)it->rssi);
+            tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+            tft.drawString(buf, 32, ry + 24);
+        }
+    }
+
+    // Footer: RESCAN / BACK
+    tft.fillRect(BT_RESCAN_X, BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_NAVY);
+    tft.drawRect(BT_RESCAN_X, BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_WHITE);
+    tft.fillRect(BT_BACK_X,   BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_DARKGREEN);
+    tft.drawRect(BT_BACK_X,   BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_WHITE);
+    tft.setFont(&fonts::Font4); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.drawString("RESCAN", BT_RESCAN_X + BT_FOOT_W / 2, BT_FOOT_Y + BT_FOOT_H / 2);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    tft.drawString("BACK", BT_BACK_X + BT_FOOT_W / 2, BT_FOOT_Y + BT_FOOT_H / 2);
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handleBtScanTap(int x, int y) {
+    const int n = obd::scanCount();
+    for (int i = 0; i < BT_ROWS_MAX && i < n; i++) {
+        const int ry = BT_ROW_Y0 + i * BT_ROW_H;
+        if (y >= ry && y <= ry + BT_ROW_H - 6) { selectBtDevice(i); return; }
+    }
+    if (y >= BT_FOOT_Y && y <= BT_FOOT_Y + BT_FOOT_H) {
+        if (x >= BT_RESCAN_X && x <= BT_RESCAN_X + BT_FOOT_W) { obd::startScan(); bt_scan_dirty = true; return; }
+        if (x >= BT_BACK_X   && x <= BT_BACK_X   + BT_FOOT_W) { currentPage = PAGE_SENSOR; pageJustEntered = true; sensor_page_dirty = true; return; }
+    }
+}
+
 static const char* enumValue(SettingId id) {
     switch (id) {
         case ST_INET_MODE:   return INET_MODE_NAMES[s.internet_mode % N_INET_MODE];
@@ -4981,11 +5224,12 @@ static void handleSettingsTap(int x, int y) {
                     openGpsPage();
                     return;
                 } else if (r.id == ST_SENSOR_TYPE) {
-                    s.sensor_type = (s.sensor_type + 1) % N_SENSOR_TYPE;
-                    // Reset stale ECU state on a source flip so the dash
-                    // doesn't show stale CAN data right after switching to
-                    // MegaSquirt, or stale direct data after switching back.
-                    ecu = EcuState{};
+                    // Open the dedicated Sensor Source page (Direct/MegaSquirt/
+                    // Bluetooth) instead of cycling — Bluetooth needs a device
+                    // picker + status, which a cycle-on-tap can't do.
+                    ecu = EcuState{};   // clear stale ECU on any source change
+                    openSensorPage();
+                    return;
                 }
                 settingsDirty = true;
                 return;
@@ -8173,6 +8417,14 @@ void setup() {
     // Push the cloud/record config so the Teensy knows where to POST etc.
     sendCfgToTeensy();
 
+    // If Bluetooth is the saved sensor source, bring up the BLE OBD-II client
+    // and (re)connect to the paired dongle. All BLE work runs on its own core-0
+    // task, so this never blocks the UI here or in loop().
+    if (s.sensor_type == 2 && s.bt_addr[0]) {
+        obd::begin();
+        obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
+    }
+
     pageJustEntered = true;
     // Ask Teensy for its firmware version. If Teensy booted earlier we missed
     // its VER,teensy,... line on its setup(). This nudge prompts a fresh emit.
@@ -8258,6 +8510,18 @@ void loop() {
         if (pageJustEntered || gps_page_dirty || now - lastDraw >= 1000) {
             lastDraw = now;
             drawGpsPage();
+        }
+    } else if (currentPage == PAGE_SENSOR) {
+        // 2 Hz refresh so the live BT connection status updates.
+        if (pageJustEntered || sensor_page_dirty || now - lastDraw >= 500) {
+            lastDraw = now;
+            drawSensorPage();
+        }
+    } else if (currentPage == PAGE_BT_SCAN) {
+        // Frequent refresh so the scanning spinner + result list populate live.
+        if (pageJustEntered || bt_scan_dirty || now - lastDraw >= 400) {
+            lastDraw = now;
+            drawBtScanPage();
         }
     } else if (currentPage == PAGE_SESSIONS) {
         // On entry, kick a Q,LIST so the page populates from the SD queue.

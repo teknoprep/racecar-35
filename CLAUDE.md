@@ -425,7 +425,8 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `wssid` / `wpass` | string | WiFi SSID / PSK |
 | `s_temp` / `t_warn` / `t_col` | bool/uint16/uint8 | Coolant show / warn-°F / warn-colour |
 | `s_psi` / `p_warn` / `p_col` | bool/uint16/uint8 | Oil-PSI show / warn-PSI / warn-colour |
-| `srctyp` | uint8 | **Sensor source: 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN)** |
+| `srctyp` | uint8 | **Sensor source: 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN), 2=Bluetooth (BLE OBD-II dongle for slow readings)** |
+| `bt_addr` / `bt_atype` / `bt_name` | string/uint8/string | **Paired BLE OBD-II (ELM327) dongle**: address `"aa:bb:.."`, BLE address type, friendly name. Used when `srctyp==2` to auto-reconnect on boot. Set from PAGE_BT_SCAN. |
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
@@ -443,6 +444,25 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `PAGE_NUM_KB` | tap on cloud port value | Numeric keypad (3 cols × 4 rows + DONE/CANCEL) |
 | `PAGE_TEXT_KB` | tap on cloud host / auth user / auth pass | Full lowercase keyboard (10 × 4 letters/digits + .-_/ + BACK/SPACE/DONE/CANCEL) |
 | `PAGE_TRACK_PICKER` | tap START button (when not auto-confirming) | Modal list of tracks; closest GPS match auto-bumped to top with distance label |
+| `PAGE_SENSOR` | tap the **Sensor data source** settings row | Dedicated picker: Direct / MegaSquirt / **Bluetooth** buttons (like the GPS page). In Bluetooth mode shows the paired OBD-II dongle + live BLE status + a SCAN button. DONE saves, CANCEL reverts. |
+| `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). RESCAN / BACK. |
+
+### Bluetooth OBD-II (ELM327 BLE) — `sensor_type == 2`
+`obd_ble.h` is a self-contained NimBLE client for a **BLE ELM327** dongle in the
+car's OBD-II port. Used for **slow** readings only (coolant temp, IAT, module
+voltage) — **NOT RPM** (RPM stays on the opto tach / MS3 CAN via the Teensy; BLE
+is far too slow for the RPM bar). Hard rule (same lesson as the GPS-stale saga):
+**ALL BLE work runs on a dedicated FreeRTOS task pinned to core 0** so blocking
+calls (connect, GATT discovery, waiting for ELM `>` prompts, PID polling) can
+never stall the 60 fps UI loop on core 1 — the UI only sets request flags and
+reads plain volatile values. GATT layout is **auto-discovered** (walk every
+service/char, pick first notify = RX, first writable = TX) so it works across
+`0xFFF0`/`0xFFE0`/vendor-UUID dongle variants. ELM init: `ATZ ATE0 ATL0 ATS0
+ATH0 ATSP0`, then round-robin `0105` (coolant), `010F` (IAT), `ATRV` (voltage)
+at ~1 Hz each. Auto-reconnects on link loss. The dash overrides its coolant
+readout with `obd::coolantF_x10()` when `sensor_type==2`. **NimBLE adds ~180 KB
+of flash → the 4M dash binary is now ~94% of the 1.25 MB OTA slot (still fits;
+watch this headroom before adding more).**
 
 ### Track picker
 Pre-seeded with 15 common US road courses (`TRACKS[]` near the top of `RaceDash.ino`). To add tracks, extend that array (TODO: editable from settings).
@@ -579,12 +599,16 @@ Software (`src/main.cpp`): `FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;` at
 resets fields to `-1` if the bus goes silent. **FreqMeasureMulti (opto tach) is kept alongside CAN**
 — both RPM sources are always running; `emitToDash()` picks one based on `sensor_type`.
 
-### sensor_type switch (Direct vs MegaSquirt)
-`Settings → Sensor Type` (NVS key `srctyp`, synced to Teensy via `CFG,srctyp,<0|1>` in
-`sendCfgToTeensy()`):
+### sensor_type switch (Direct / MegaSquirt / Bluetooth)
+`Settings → Sensor data source` opens **PAGE_SENSOR** (NVS key `srctyp`, synced to Teensy via
+`CFG,srctyp,<0|1|2>` in `sendCfgToTeensy()`):
 - **0 = Direct**: RPM from opto tach (pin 9), coolant from A3 NTC. Oil PSI always from A2.
 - **1 = MegaSquirt**: RPM + coolant + AFR + MAP + TPS + IAT + battery from CAN. AFR is only
   shown in MS3 mode. Oil PSI still from A2 (MS3Pro typically has no oil-pressure input).
+- **2 = Bluetooth**: coolant (+IAT/voltage) from a **BLE OBD-II (ELM327) dongle** on the
+  CrowPanel (see the PAGE_BT_SCAN / `obd_ble.h` section above). **RPM still comes from the
+  Teensy opto tach** — the Teensy treats `srctyp==2` like Direct (`use_can = (srctyp==1) ||
+  can_live`), and the dash just overrides its coolant readout with the OBD value.
 
 ### ✅ Broadcast byte offsets — VERIFIED (2026-06-03)
 Layout confirmed against the **official MegaSquirt CAN Broadcast spec**
@@ -690,6 +714,12 @@ post-processing side, not the Teensy (keep the logged stream calibrated-but-raw)
   `arduino-cli lib install "TAMC_GT911"`.
 - **`FlexCAN_T4`** — ships with the Teensy core (no `lib_deps` entry needed). `FreqMeasureMulti`
   is also a Teensy-core lib.
+- **`NimBLE-Arduino`** (Arduino registry, v2.5.0) — lightweight BLE stack for the CrowPanel's
+  BLE OBD-II client (`obd_ble.h`, `sensor_type==2`). Installed via `arduino-cli lib install
+  "NimBLE-Arduino"`. Chosen over stock Bluedroid because it's ~180 KB (vs ~400 KB) — critical:
+  the 4M dash binary is now ~94 % of the 1.25 MB OTA slot. **The ESP32-S3 is BLE-only (no
+  classic BT/SPP), so the OBD dongle MUST be a BLE ELM327** (e.g. Vgate iCar Pro BLE), not a
+  classic-Bluetooth one.
 
 ## Toolchain note (Linux build host)
 
@@ -809,6 +839,7 @@ src/main.cpp                              Teensy: GNSS + tach + REC/TRACK consum
 platformio.ini                            Teensy build (do NOT add a CrowPanel env)
 crowpanel-arduino/RaceDash/RaceDash.ino   CrowPanel: dash UI + settings + keyboards + track picker + GT911 touch (LIVE, panel-agnostic)
 crowpanel-arduino/RaceDash/board_config.h Per-panel RGB pin map/timing/backlight/touch (DASH_BOARD 7|5); 7"=crowpanel7, 5"=crowpanel5
+crowpanel-arduino/RaceDash/obd_ble.h      BLE OBD-II (ELM327) client — NimBLE on a core-0 task; coolant/IAT/voltage for sensor_type==2 (NOT RPM)
 crowpanel-arduino/RaceDash_v0139_orig/    Pre-touch-rework backup of RaceDash (swap/revert screens easily)
 crowpanel-arduino/PanelTest/PanelTest.ino Bare panel bring-up sketch — display only, NO touch (not a touch baseline)
 crowpanel-baseline/                       Dead PIO experiments — do not touch

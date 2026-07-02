@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.88"
+#define FIRMWARE_VERSION "0.1.89"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2096,12 +2096,14 @@ static void handleCfgLine(const String& line) {
     else if (key == "inet") {
         g_cfg.inet = (uint8_t)val.toInt();
     } else if (key == "srctyp") {
-        // Sensor source: 0=Direct (opto tach + ADC sensors), 1=MegaSquirt (CAN).
-        // Controls which RPM source emitToDash() uses and which coolant/AFR
-        // values are put into the ENG line.
+        // Sensor source: 0=Direct (opto tach + ADC sensors), 1=MegaSquirt (CAN),
+        // 2=Bluetooth (dash-side BLE OBD-II for slow readings). 2 behaves like
+        // Direct on the Teensy (RPM from the opto tach; the dash overrides
+        // coolant with the OBD value) unless CAN happens to be live.
         g_cfg.sensor_type = (uint8_t)val.toInt();
         Serial.printf("[cfg] sensor_type = %s\n",
-                      g_cfg.sensor_type == 0 ? "Direct" : "MegaSquirt");
+                      g_cfg.sensor_type == 0 ? "Direct" :
+                      g_cfg.sensor_type == 1 ? "MegaSquirt" : "Bluetooth");
     }
     else if (key == "rpmppr") {
         // Tach pulses/rev x10 (the Direct-mode RPM divider). 0 is invalid —
