@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.94"
+#define FIRMWARE_VERSION "0.1.95"
 
 #include <Preferences.h>
 #include <time.h>
@@ -448,6 +448,7 @@ static uint32_t cloud_queue_depth  = 0;
 // Teensy version arrives via VER,teensy,<ver> on Teensy boot, and on demand
 // when the dash sends "VER?\n" (dash boot + status page entry).
 static char     teensy_fw_version[16] = "?";
+static char     teensy_reset_reason[24] = "";   // Teensy's last reset cause (RST,teensy,..)
 
 // Two-tap arming for the SD format action in settings.
 static bool     sd_format_armed  = false;
@@ -2624,6 +2625,13 @@ static bool parseLine(const String& line) {
         health_mpu_c    = (v[1] > -9000) ? v[1] / 10.0f : NAN;
         health_batt_v   = (v[3] >= 0)    ? v[3] / 10.0f : NAN;
         health_last_hlth_ms = millis();
+        return true;
+    }
+    if (line.startsWith("RST,teensy,")) {
+        // Teensy's last reset cause (POR/brownout/watchdog/lockup/overtemp/swrst)
+        // — shown on the STATUS HEALTH bar for the comms-death diagnosis.
+        strncpy(teensy_reset_reason, line.substring(11).c_str(), sizeof(teensy_reset_reason) - 1);
+        teensy_reset_reason[sizeof(teensy_reset_reason) - 1] = 0;
         return true;
     }
     return false;
@@ -8286,7 +8294,9 @@ static void drawStatusPage() {
         if (isnan(health_esp_c))    strcpy(t2, "--"); else sprintf(t2, "%.0f", health_esp_c);
         if (isnan(health_mpu_c))    strcpy(t3, "--"); else sprintf(t3, "%.0f", health_mpu_c);
         if (isnan(health_batt_v))   strcpy(vb, "--"); else sprintf(vb, "%.1fV", health_batt_v);
-        snprintf(hb, sizeof(hb), "HEALTH   Teensy %sC   Dash %sC   MPU %sC   Batt %s", t1, t2, t3, vb);
+        char rr[40] = "";
+        if (teensy_reset_reason[0]) snprintf(rr, sizeof(rr), "   Trst:%s", teensy_reset_reason);
+        snprintf(hb, sizeof(hb), "HEALTH   Teensy %sC   Dash %sC   MPU %sC   Batt %s%s", t1, t2, t3, vb, rr);
         const bool hot = (!isnan(health_teensy_c) && health_teensy_c > 80.0f) ||
                          (!isnan(health_esp_c)    && health_esp_c    > 80.0f);
         const bool stale = (nowMs - health_last_hlth_ms > 4000);

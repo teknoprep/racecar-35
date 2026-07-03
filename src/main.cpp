@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.94"
+#define FIRMWARE_VERSION "0.1.95"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -203,6 +203,29 @@ static struct {
 // ESP32-S3 dash temp, reported by the dash via the DTEMP line (heat diagnostics).
 // Declared here (before handleDashCommand) so the command parser can set it.
 static float dash_temp_c = -999.0f;
+
+// Teensy reset-cause forensics (SRC_SRSR). Captured once at boot, then the
+// sticky bits are cleared. Distinguishes a power/brownout reset (POR) from a
+// watchdog, CPU lockup, overtemp, or the software reset a FlasherX OTA does —
+// directly relevant to the "Teensy stopped communicating" mystery: if it keeps
+// coming back as POR mid-session, the Teensy is browning out.
+static char teensy_reset_reason[24] = "unknown";
+static void captureResetReason() {
+    uint32_t s = SRC_SRSR;
+    SRC_SRSR = s;   // write-1-to-clear so the next boot reflects the NEXT reset
+    const char* r = "unknown";
+    if      (s & SRC_SRSR_TEMPSENSE_RST_B)    r = "OVERTEMP";
+    else if (s & SRC_SRSR_WDOG_RST_B)         r = "watchdog";
+    else if (s & SRC_SRSR_WDOG3_RST_B)        r = "watchdog3";
+    else if (s & SRC_SRSR_LOCKUP_SYSRESETREQ) r = "lockup/swrst";
+    else if (s & SRC_SRSR_IPP_USER_RESET_B)   r = "reset-pin";
+    else if (s & SRC_SRSR_JTAG_SW_RST)        r = "jtag-sw";
+    else if (s & SRC_SRSR_JTAG_RST_B)         r = "jtag";
+    else if (s & SRC_SRSR_CSU_RESET_B)        r = "csu";
+    else if (s & SRC_SRSR_IPP_RESET_B)        r = "POR(power)";
+    strncpy(teensy_reset_reason, r, sizeof(teensy_reset_reason) - 1);
+    teensy_reset_reason[sizeof(teensy_reset_reason) - 1] = 0;
+}
 
 // ---------------------------------------------------------------------------
 // Start/finish LINE + lap counter. The dash pushes the active track's S/F line
@@ -1802,9 +1825,9 @@ static void dbgOpen(const char* sessionPath) {
     dbg_loop_max_us = dbg_sdwr_max_us = dbg_fresh_1s = 0;
     char hdr[200];
     int n = snprintf(hdr, sizeof(hdr),
-        "{\"ev\":\"open\",\"unix\":%lu,\"fw\":\"%s\",\"track\":\"%s\",\"rec_cl\":%d,\"inet\":%u}\n",
+        "{\"ev\":\"open\",\"unix\":%lu,\"fw\":\"%s\",\"track\":\"%s\",\"rec_cl\":%d,\"inet\":%u,\"reset\":\"%s\"}\n",
         (unsigned long)session_start_unix, FIRMWARE_VERSION, current_track,
-        (int)g_cfg.rec_cl, (unsigned)g_cfg.inet);
+        (int)g_cfg.rec_cl, (unsigned)g_cfg.inet, teensy_reset_reason);
     if (n > 0) { dbg_file.write((const uint8_t*)hdr, n); dbg_file.sync(); }
 }
 
@@ -2858,6 +2881,7 @@ static void cloudTick() {
 
 
 void setup() {
+    captureResetReason();   // read SRC_SRSR FIRST, before anything can reset/clear it
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.begin(115200);
     DASH_SERIAL.begin(DASH_BAUD);
@@ -2899,6 +2923,8 @@ void setup() {
     unsigned long start = millis();
     while (!Serial && millis() - start < 1500) { /* spin */ }
     Serial.printf("racecar-35 dash teensy boot, firmware v%s\n", FIRMWARE_VERSION);
+    Serial.printf("[boot] Teensy last reset: %s\n", teensy_reset_reason);
+    DASH_SERIAL.printf("RST,teensy,%s\n", teensy_reset_reason);   // dash shows it on STATUS
     // FlasherX check_flash_id() will search the staged OTA image for this
     // literal (FLASH_ID == "fw_teensy41" on Teensy 4.1, defined in FlashTxx.h).
     // We print it here so the linker keeps the string in our image too — the

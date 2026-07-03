@@ -282,6 +282,12 @@ sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" src/ma
 sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" crowpanel-arduino/RaceDash/RaceDash.ino
 
 # 2. build Teensy -> firmware/teensy41-dash.hex
+#    ⚠️ BUILD THE TEENSY *AFTER* THE sed VERSION BUMP. Bug that shipped 0.1.94:
+#    the Teensy hex was copied from a build made BEFORE the bump, so the manifest
+#    said 0.1.94 but the binary reported 0.1.93 -> the dash re-flashed the Teensy
+#    forever (version never matched). ALWAYS verify the version string is
+#    actually inside the hex before publishing:
+#      python3 -c "import re;print(sorted(set(re.findall(rb'0[.]1[.][0-9][0-9]', open('firmware/teensy41-dash.hex','rb').read()))))"
 ~/.local/bin/pio run && cp .pio/build/teensy41/firmware.hex firmware/teensy41-dash.hex
 
 # 3. build ALL THREE dash variants (APP bin RaceDash.ino.bin). Distinct --build-path each.
@@ -349,8 +355,15 @@ CLD,<live_ok>,<queue_depth>
 CANSNIFF,<0|1>,<file>,<frames>  (CAN sniffer status / live frame count)
 TIME,<unix_epoch>               (RTC, 1 Hz)
 HLTH,<t_die_x10>,<t_mpu_x10>,<t_esp_x10>,<batt_x10>  (1 Hz device health)
+RST,teensy,<reason>             (once at boot: Teensy reset cause)
 VER,teensy,<semver>
 ```
+- **`RST,teensy,<reason>`** (once at boot): the Teensy's own reset cause, decoded from `SRC_SRSR`
+  (`captureResetReason()`): `POR(power)` / `watchdog` / `lockup/swrst` / `OVERTEMP` / `reset-pin`
+  / etc. Shown on the dash STATUS HEALTH bar as `Trst:<reason>` and stamped into the `.dbg` open
+  line (`"reset":"..."`). Diagnoses the "Teensy stopped communicating" mystery: a `POR(power)`
+  mid-session = the Teensy is **browning out**; `watchdog`/`lockup` = a firmware hang. (FlasherX
+  OTA reboots show as `lockup/swrst`.)
 - **`HLTH`** (1 Hz, ALWAYS, independent of recording/debug setting): heat/brownout
   diagnostics. `t_die`=Teensy i.MX RT1062 die temp (`tempmonGetTemp()`), `t_mpu`=MPU-6050
   temp (decoded from the IMU burst bytes 6-7 — enclosure ambient proxy), `t_esp`=dash ESP32-S3
