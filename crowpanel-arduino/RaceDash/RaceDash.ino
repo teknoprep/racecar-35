@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.102"
+#define FIRMWARE_VERSION "0.1.103"
 
 #include <Preferences.h>
 #include <time.h>
@@ -687,7 +687,9 @@ struct Settings {
     // Debug logging master switch. When ON the Teensy writes an on-SD
     // "<session>.dbg.ndjson" health log per recording (uploaded best-effort as
     // X-File-Kind: debug). OFF = no debug files at all. Sent as CFG,dbg_on.
-    bool     debug_enabled    = true;
+    // DEFAULT OFF since v0.1.103 (GPS saga solved — the JST connector): debug
+    // logging is a diagnostic tool now, turned on from Settings when needed.
+    bool     debug_enabled    = false;
 };
 static Settings s;
 
@@ -1166,7 +1168,10 @@ static void loadSettings() {
     s.oil_warn_psi       = prefs.getUShort("p_warn",   s.oil_warn_psi);
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
-    s.debug_enabled      = prefs.getBool  ("dbg_on",   s.debug_enabled);
+    // NVS key renamed dbg_on -> dbg2 in v0.1.103 to force the new OFF default
+    // onto already-deployed units (old key had ON persisted; keys are
+    // append-only — the orphaned dbg_on is ignored, never repurposed).
+    s.debug_enabled      = prefs.getBool  ("dbg2",     s.debug_enabled);
     prefs.getString      ("bt_addr",  s.bt_addr, sizeof(s.bt_addr));
     s.bt_atype           = prefs.getUChar ("bt_atype", s.bt_atype);
     prefs.getString      ("bt_name",  s.bt_name, sizeof(s.bt_name));
@@ -1243,7 +1248,7 @@ static void saveSettings() {
     prefs.putUShort("p_warn",   s.oil_warn_psi);
     prefs.putUChar ("p_col",    s.oil_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
-    prefs.putBool  ("dbg_on",   s.debug_enabled);
+    prefs.putBool  ("dbg2",     s.debug_enabled);
     prefs.putString("bt_addr",  s.bt_addr);
     prefs.putUChar ("bt_atype", s.bt_atype);
     prefs.putString("bt_name",  s.bt_name);

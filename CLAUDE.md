@@ -472,7 +472,9 @@ CFG,<key>,<value>  # push settings (incl. srctyp, cloud, inet, and sf = active
                    #   NOTE: cl_strm REMOVED in v0.1.66 (live "stream to cloud"
                    #   deleted). Teensy ignores cl_strm if an old dash sends it.
 CFG,dbg_on,<0|1>   # (part of CFG) debug logging master switch. 0 = Teensy writes
-                   #   NO .dbg health log for a session. NVS key dbg_on on the dash.
+                   #   NO .dbg health log for a session. NVS key dbg2 on the dash
+                   #   (renamed from dbg_on in v0.1.103 to force the new OFF default;
+                   #   wire key stays dbg_on).
 CFG,srctyp,<0|1|2> # sensor source: 0=Direct, 1=MegaSquirt, 2=Bluetooth OBD-II
 DTEMP,<c>          # dash -> Teensy: dash ESP32-S3 die temp (1 Hz, for HLTH/.dbg)
 SETTIME,<unix>     # set Teensy RTC
@@ -514,7 +516,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `rpmspk` | uint8 | **RPM spike filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2). Sent as `CFG,rpmspk,<v>`; Teensy slew-gates tach pulses (see "RPM spike filter" note above). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
-| `dbg_on` | bool | **Debug logging master switch** (default ON). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log for a session. Toggle: Settings → "Debug logging (SD)". |
+| `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **Struct size changed, so pre-0.1.82 blobs are length-mismatched and ignored once (overrides reset — re-capture via SET S/F).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
 
 `clampInvariants()` enforces `rpm_min < rpm_max`, `alert1_rpm < alertmax_rpm`, `alert1_hz < alertmax_hz` after every mutation.

@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.102"
+#define FIRMWARE_VERSION "0.1.103"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -197,7 +197,9 @@ static struct {
     int8_t   rpm_smooth  = 0;     // RPM display smoothing trim from the dash slider
     uint8_t  rpm_spike   = 2;     // spike filter: 0=Off 1=Mild 2=Normal 3=Strong (CFG,rpmspk)
                                   // (-10..+10): <0 raw/jumpy, 0 baseline, >0 smoother.
-    bool     debug_enabled = true;// dash CFG,dbg_on. When false, NO on-SD .dbg
+    bool     debug_enabled = false;// dash CFG,dbg_on. Default OFF (v0.1.103) —
+                                  // diagnostic tool, enabled from Settings when
+                                  // needed. When false, NO on-SD .dbg
                                   // health log is written for a session.
 } g_cfg;
 
