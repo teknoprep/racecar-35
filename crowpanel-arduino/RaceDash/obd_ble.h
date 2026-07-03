@@ -236,6 +236,9 @@ static void pollOnce() {
 }
 
 static void obdTask(void*) {
+  // Let the system settle a beat before bringing up the BT controller (the
+  // radio/coex init alongside a live WiFi link is the delicate moment).
+  vTaskDelay(pdMS_TO_TICKS(150));
   // Heavy BLE stack init on the task's own stack (never the UI stack).
   NimBLEDevice::init("racedash");
   // LOW TX power: the radio powering to full +9dBm draws a current spike that
@@ -285,9 +288,10 @@ static void begin() {
   // Create the task FIRST and do NimBLEDevice::init() INSIDE it (see obdTask).
   // Doing the heavy BLE init here would run it on the shallow UI/tap-handler
   // stack (core 1) — that overflowed and crash-rebooted the board. On the task
-  // it runs on the task's own 8 KB stack, on core 0 (the BT/WiFi core), so it
-  // never touches the UI loop.
-  xTaskCreatePinnedToCore(obdTask, "obd", 8192, nullptr, 1, &g_task, 0);
+  // it runs on the task's own stack, on core 0 (the BT/WiFi core), so it never
+  // touches the UI loop. 16 KB stack: NimBLE init + the BT/coex bring-up is
+  // stack-heavy; 8 KB was marginal (a possible crash cause).
+  xTaskCreatePinnedToCore(obdTask, "obd", 16384, nullptr, 1, &g_task, 0);
 }
 
 static void setBlocked(bool b) { g_blocked = b; }

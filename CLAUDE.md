@@ -286,8 +286,9 @@ sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" crowpa
 #    the Teensy hex was copied from a build made BEFORE the bump, so the manifest
 #    said 0.1.94 but the binary reported 0.1.93 -> the dash re-flashed the Teensy
 #    forever (version never matched). ALWAYS verify the version string is
-#    actually inside the hex before publishing:
-#      python3 -c "import re;print(sorted(set(re.findall(rb'0[.]1[.][0-9][0-9]', open('firmware/teensy41-dash.hex','rb').read()))))"
+#    actually inside the hex before publishing (Intel HEX = hex-encoded, so you
+#    MUST decode the data records first; a raw grep finds nothing):
+#      python3 -c "d=bytearray()\nfor l in open('firmware/teensy41-dash.hex'):\n l=l.strip()\n if l[:1]!=':' or int(l[7:9],16)!=0: continue\n n=int(l[1:3],16)\n d+=bytes(int(l[9+i*2:11+i*2],16) for i in range(n))\nimport re;print(sorted(set(m.group().decode() for m in re.finditer(rb'0[.]1[.]\\d\\d',bytes(d)))))"
 ~/.local/bin/pio run && cp .pio/build/teensy41/firmware.hex firmware/teensy41-dash.hex
 
 # 3. build ALL THREE dash variants (APP bin RaceDash.ino.bin). Distinct --build-path each.

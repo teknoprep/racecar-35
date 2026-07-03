@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.95"
+#define FIRMWARE_VERSION "0.1.96"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4633,6 +4633,12 @@ static void drawSensorPage() {
     tft.setFont(&fonts::Font2); tft.setTextSize(1);
     tft.setTextColor(TFT_LIGHTGREY, BG);
     tft.drawString("RPM always comes from the tach/CAN via the Teensy.", 30, 64);
+    // Show a prior BLE-init crash reason ALWAYS (source reverts off BT after a
+    // crash, so this can't live in the BT-only block or it'd never be seen).
+    tft.setTextPadding(760);
+    if (ble_diag[0]) { tft.setTextColor(TFT_RED, BG); tft.drawString(ble_diag, 30, 82); }
+    else             { tft.setTextColor(BG, BG);      tft.drawString(" ", 30, 82); }
+    tft.setTextPadding(0);
 
     // Three source buttons (one row)
     for (int i = 0; i < N_SENSOR_TYPE; i++)
@@ -4656,11 +4662,6 @@ static void drawSensorPage() {
         snprintf(buf, sizeof(buf), "Status: %s%s", obd::stateStr(), cbuf);
         tft.setTextColor(conn ? TFT_GREEN : TFT_YELLOW, BG);
         tft.drawString(buf, 30, by + 26);
-        // If a prior BLE init reset the board, show the captured reason in red.
-        if (ble_diag[0]) {
-            tft.setTextColor(TFT_RED, BG);
-            tft.drawString(ble_diag, 30, by + 52);
-        }
 
         // SCAN button
         tft.fillRect(SS_SCAN_X, SS_SCAN_Y, SS_SCAN_W, SS_SCAN_H, TFT_NAVY);
