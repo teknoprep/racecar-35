@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.99"
+#define FIRMWARE_VERSION "0.1.101"
 
 #include <Preferences.h>
 #include <time.h>
@@ -443,6 +443,30 @@ static char     upload_result_msg[180]   = "";       // banner after DONE: statu
 // Cloud state — updated from CLD,<live_ok>,<queue_depth> lines.
 static bool     cloud_live_ok      = false;
 static uint32_t cloud_queue_depth  = 0;
+
+// ---------------------------------------------------------------------------
+// WiFi <-> BLE radio TIME-SHARING arbiter. WiFi and Bluetooth may NEVER run at
+// the same time on this core (arduino-esp32 2.0.14 / IDF 4.4): enabling the BT
+// controller with WiFi up aborts in coex_core_enable, and the WiFi ppTask can
+// panic when BT flips coex state under it (both decoded from live backtraces;
+// confirmed on the bench: WiFi off -> BT works). Ownership:
+//   NET_WIFI    - WiFi may run (wifiTick free to connect). BLE fully down.
+//   NET_TO_WIFI - BLE draining (disconnect + NimBLE deinit on the obd task);
+//                 WiFi stays hard-off until obd::isDown(), then -> NET_WIFI.
+//   NET_BT      - BLE owns the radio; wifiTick holds WiFi hard-off.
+// POLICY (user-chosen): BT owns the radio ONLY WHILE RECORDING (that's when
+// coolant matters), plus while the user is on the sensor/scan pages pairing.
+// All paddock time = WiFi: uploads, OTA, NTP just work, no manual handover.
+// netOwnerTick watches the `recording` edges: REC start -> radio to BT +
+// dongle reconnect; REC stop -> BLE full shutdown, WiFi back within seconds.
+// Tapping UPLOAD while BT somehow owns the radio still auto-hands to WiFi.
+// ---------------------------------------------------------------------------
+#define NET_WIFI    0
+#define NET_TO_WIFI 1
+#define NET_BT      2
+static uint8_t  net_owner          = NET_WIFI;
+static bool     net_pending_upload = false;   // start upload flow once WiFi connects
+static uint32_t net_owner_ms       = 0;
 
 // Firmware version tracking. Dash version is compile-time (FIRMWARE_VERSION).
 // Teensy version arrives via VER,teensy,<ver> on Teensy boot, and on demand
@@ -2483,6 +2507,13 @@ static void closeUploadModal() {
     settingsDirty      = true;
     invalidateAll();
     ufReset();   // ensure UPLOAD button next tap starts a fresh flow
+    // If a session is RECORDING (auto-start can begin one mid-upload), BT
+    // needs the radio back for coolant; otherwise WiFi keeps it (paddock).
+    if (recording && s.sensor_type == 2 && s.bt_addr[0] && !obd::blocked()) {
+        btAcquireRadio();
+        obd::begin();
+        obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
+    }
 }
 
 static bool parseVerLine(const String& line) {
@@ -2987,8 +3018,17 @@ static void handleDashTap(int x, int y) {
             // Dash-initiated upload (v0.1.34+). Pop the modal locally and
             // kick the state machine, which sends Q,LIST to the Teensy and
             // drives the rest of the upload flow.
-            openUploadModal("", 0);
-            ufStartListing();
+            if (net_owner != NET_WIFI) {
+                // Bluetooth owns the radio — hand it to WiFi first (running
+                // both crashes the core). netOwnerTick starts the upload once
+                // WiFi connects; closeUploadModal hands the radio back to BT.
+                openUploadModal("waiting for WiFi (BT paused)...", 0);
+                net_pending_upload = true;
+                btReleaseRadio();
+            } else {
+                openUploadModal("", 0);
+                ufStartListing();
+            }
         }
         return;
     }
@@ -4326,8 +4366,21 @@ static void wifiTickNtp() {
 
 static void wifiTick() {
     static uint32_t last_tick_ms = 0;
-    if (millis() - last_tick_ms < 1000) { wifiTickNtp(); return; }
+    if (millis() - last_tick_ms < 1000) { if (net_owner == NET_WIFI) wifiTickNtp(); return; }
     last_tick_ms = millis();
+
+    // Radio time-share: while Bluetooth owns (or is releasing) the radio, WiFi
+    // stays hard-off — running both crashes the core (see arbiter comment).
+    if (net_owner != NET_WIFI) {
+        if (wifi_state != WS_OFF) {
+            WiFi.disconnect(true, true);
+            WiFi.mode(WIFI_OFF);
+            wifi_ip[0]    = '\0';
+            wifi_ntp_done = false;
+            setWifiState(WS_OFF);
+        }
+        return;
+    }
 
     if (s.internet_mode != 1) {
         if (wifi_state != WS_OFF) {
@@ -4450,6 +4503,74 @@ static void wifiForceReconfigure() {
     wifi_ip[0]    = '\0';
     wifi_ntp_done = false;
     setWifiState(WS_OFF);   // next wifiTick (within 1 s) re-evaluates mode + creds
+}
+
+// --- radio time-share arbiter (see the NET_* comment block up top) ----------
+// Take the radio for BLE. Synchronous WiFi hard-off FIRST — the crash is the
+// BT controller enabling while WiFi runs, so sequencing is everything (the obd
+// task also waits 150 ms before NimBLEDevice::init as margin).
+static void btAcquireRadio() {
+    if (net_owner == NET_BT) return;
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);   // esp_wifi_stop is synchronous — radio is off on return
+    wifi_ip[0]    = '\0';
+    wifi_ntp_done = false;
+    setWifiState(WS_OFF);
+    net_owner    = NET_BT;
+    net_owner_ms = millis();
+    Serial.println("[net] radio -> BT (WiFi off)");
+}
+// Give the radio back to WiFi. Async: BLE must fully deinit on the obd task
+// first; netOwnerTick() flips to NET_WIFI when obd::isDown() (or 12 s failsafe
+// — covers a scan in flight (<=8 s) and the parked low-heap task, which never
+// enabled the controller and is safe to run WiFi over).
+static void btReleaseRadio() {
+    if (net_owner == NET_WIFI) return;
+    obd::requestShutdown();
+    net_owner    = NET_TO_WIFI;
+    net_owner_ms = millis();
+    Serial.println("[net] radio -> WiFi (BLE draining)");
+}
+static void netOwnerTick() {
+    // Recording-edge watcher (single choke point — catches the START button,
+    // auto-start, Teensy-side stops, everything that flips `recording`).
+    static bool prev_rec = false;
+    if (recording != prev_rec) {
+        prev_rec = recording;
+        if (recording) {
+            if (s.sensor_type == 2 && s.bt_addr[0] && !obd::blocked() && !upload_active) {
+                btAcquireRadio();
+                obd::begin();
+                obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
+            }
+        } else {
+            // Session over — give WiFi the radio back (uploads/OTA), unless
+            // the user is mid-pairing on the sensor/scan pages.
+            if (currentPage != PAGE_SENSOR && currentPage != PAGE_BT_SCAN)
+                btReleaseRadio();
+        }
+    }
+    if (net_owner == NET_TO_WIFI) {
+        if (obd::isDown() || millis() - net_owner_ms > 12000) {
+            net_owner    = NET_WIFI;
+            net_owner_ms = millis();
+            wifiForceReconfigure();   // wifiTick brings the link up within ~1 s
+            Serial.println("[net] radio -> WiFi (BLE down, connecting)");
+        }
+        return;
+    }
+    if (net_owner == NET_WIFI && net_pending_upload) {
+        if (wifiConnectedNow()) {
+            net_pending_upload = false;
+            ufStartListing();         // modal is already open ("waiting for WiFi")
+        } else if (millis() - net_owner_ms > 45000) {
+            // WiFi never came up — abort the pending upload; closeUploadModal's
+            // hook hands the radio back to BT if that's still the source.
+            net_pending_upload = false;
+            snprintf(upload_result_msg, sizeof(upload_result_msg), "WiFi didn't connect");
+            closeUploadModal();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4614,10 +4735,11 @@ static void applySensorSource(uint8_t t) {
     s.sensor_type = t % N_SENSOR_TYPE;
     if (s.sensor_type == 2) {                 // Bluetooth OBD-II
         obd::setBlocked(false);   // explicit user action -> allow the (re)try even after a prior crash
+        btAcquireRadio();         // WiFi hard-off BEFORE any BLE init (coex crash)
         obd::begin();
         if (s.bt_addr[0]) obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
     } else {
-        obd::stop();
+        btReleaseRadio();         // full BLE shutdown -> arbiter restores WiFi
     }
 }
 
@@ -4671,6 +4793,10 @@ static void drawSensorPage() {
         snprintf(buf, sizeof(buf), "Status: %s%s", obd::stateStr(), cbuf);
         tft.setTextColor(conn ? TFT_GREEN : TFT_YELLOW, BG);
         tft.drawString(buf, 30, by + 26);
+        if (obd::lastErr()[0]) {   // e.g. "BT skipped: low heap (..KB free)"
+            tft.setTextColor(TFT_YELLOW, BG);
+            tft.drawString(obd::lastErr(), 30, by + 52);
+        }
 
         // SCAN button
         tft.fillRect(SS_SCAN_X, SS_SCAN_Y, SS_SCAN_W, SS_SCAN_H, TFT_NAVY);
@@ -4715,10 +4841,12 @@ static void handleSensorPageTap(int x, int y) {
     if (y >= SS_FOOT_Y && y <= SS_FOOT_Y + SS_FOOT_H) {
         if (x >= SS_CANCEL_X && x <= SS_CANCEL_X + SS_FOOT_W) {
             if (s.sensor_type != sensor_orig_type) applySensorSource(sensor_orig_type);
+            if (!recording) btReleaseRadio();   // leaving pairing UI: WiFi gets the radio back
             currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true; return;
         }
         if (x >= SS_DONE_X && x <= SS_DONE_X + SS_FOOT_W) {
             saveSettings();   // persists sensor_type + bt_* and re-syncs CFG,srctyp to Teensy
+            if (!recording) btReleaseRadio();   // leaving pairing UI: WiFi gets the radio back
             currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true; return;
         }
     }
@@ -4736,6 +4864,7 @@ static void openBtScan() {
     // Explicit user action: clear a prior-crash block too, else after a BLE
     // crash the SCAN button silently did nothing (begin() no-ops when blocked).
     obd::setBlocked(false);
+    btAcquireRadio();   // WiFi hard-off BEFORE any BLE init (coex crash)
     obd::begin();
     obd::startScan();
     currentPage     = PAGE_BT_SCAN;
@@ -8527,18 +8656,31 @@ void setup() {
     // Push the cloud/record config so the Teensy knows where to POST etc.
     sendCfgToTeensy();
 
-    // BLE crash forensics: if the obd breadcrumb is still set, a prior BLE init
-    // RESET the board. Capture the reset reason (brownout / panic / wdt) to show
-    // the user, and BLOCK auto-init this boot so BT-as-saved-source can't boot
-    // loop. The user can still retry from the Sensor page (which clears it).
+    // BLE crash forensics: the obd PHASE breadcrumb records which BLE phase
+    // was active (1=init 2=scan 3=connect 4=connected). If it's still set AND
+    // the reset reason is a crash (brownout/panic/watchdog), that BLE phase
+    // reset the board: show exactly which one + why, and BLOCK auto-init this
+    // boot so a BT-as-saved-source can't boot-loop. A phase left behind by a
+    // normal power cycle (reason = power-on / sw reset) is cleared silently —
+    // being connected when the ignition goes off is not a crash.
     {
         Preferences p;
         if (p.begin("blediag", false)) {
-            if (p.getBool("try", false)) {
+            uint8_t ph = p.getUChar("ph", 0);
+            if (!ph && p.getBool("try", false)) ph = 1;   // legacy 0.1.92 key
+            if (ph) {
                 esp_reset_reason_t rr = esp_reset_reason();
-                snprintf(ble_diag, sizeof(ble_diag), "BT init reset the board: %s", resetReasonStr(rr));
-                obd::setBlocked(true);
-                Serial.printf("[ble] %s -> BLE auto-init BLOCKED this boot\n", ble_diag);
+                const bool crashy = (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
+                                     rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT ||
+                                     rr == ESP_RST_BROWNOUT);
+                if (crashy) {
+                    static const char* PH[] = { "?", "init", "scan", "connect", "link" };
+                    snprintf(ble_diag, sizeof(ble_diag), "BT %s reset the board: %s",
+                             PH[ph <= 4 ? ph : 0], resetReasonStr(rr));
+                    obd::setBlocked(true);
+                    Serial.printf("[ble] %s -> BLE auto-init BLOCKED this boot\n", ble_diag);
+                }
+                p.putUChar("ph", 0);
                 p.putBool("try", false);
             }
             p.end();
@@ -8550,10 +8692,9 @@ void setup() {
     // and (re)connect to the paired dongle. All BLE work runs on its own core-0
     // task, so this never blocks the UI here or in loop(). Skipped if a prior
     // BLE init crashed the board (obd::blocked()).
-    if (s.sensor_type == 2 && s.bt_addr[0] && !obd::blocked()) {
-        obd::begin();
-        obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
-    }
+    // NOTE (radio policy): BT is NOT brought up at boot even when it's the
+    // saved source — WiFi owns the radio until recording starts (see the
+    // NET_* arbiter comment). The dongle connects a few seconds after REC,1.
 
     pageJustEntered = true;
     // Ask Teensy for its firmware version. If Teensy booted earlier we missed
@@ -8577,6 +8718,7 @@ void loop() {
     pumpUart();
     handleTouch();
     dashHealthTick();  // 1 Hz ESP32 temp -> Teensy (heat diagnostics)
+    netOwnerTick();   // WiFi<->BLE radio time-share arbiter (must run before wifiTick)
     wifiTick();   // WiFi state machine + one-shot NTP push to Teensy (1 Hz tick)
     uploadTick(); // Dash-initiated upload state machine (UF_*)
 

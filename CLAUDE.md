@@ -336,6 +336,15 @@ lockstep** — keep all four (+ the legacy alias) equal.
   - **Pin 5**: W5500 `/INT` (planned)
   - **Pin 6**: W5500 `/RESET` (planned)
   - **SDIO (built-in)**: SD card (pins are dedicated, not on the header)
+- **FlasherX OTA staging vs Teensy 4.1 EEPROM emulation (v0.1.99).** PJRC's EEPROM emulation
+  lives in flash `0x607C0000..0x607FF000` (63 sectors) and we write it nearly every boot (IMU
+  cal). FlasherX's `firmware_buffer_init()` scans DOWN from the top for the first non-erased
+  word — with the stock 16 KB `FLASH_RESERVE` it stopped at the topmost EEPROM record and
+  squeezed the OTA staging buffer into the ~224 KB (shrinking) sliver above it; when the image
+  outgrew that, Teensy OTA aborted with `FW,ERR,addr_too_large`. Fix in `lib/FlasherX/FlashTxx.h`:
+  `FLASH_RESERVE = 64*FLASH_SECTOR_SIZE` (256 KB) so the buffer lands in the ~7.5 MB between code
+  and the EEPROM region. (0.1.99 itself shipped `-Os`-trimmed to fit through the old broken
+  updater; builds are back to `-O2` since 0.1.100.)
 - **Optocoupler tach front-end** — PC817-class is fine for typical 4-cyl × 2-pulse-per-rev (≤ 270 Hz at 8 k RPM). The Teensy side needs a 4.7–10 kΩ pull-up from `3V3` to pin 9. Output is *inverted* but `FreqMeasureMulti` counts edges either way. **The signal at pin 9 must be a clean 0→3.3 V logic swing referenced to Teensy GND**: LOW must drop below ~0.8 V (opto transistor fully saturating) and HIGH above ~2.3 V, and it must never go negative. A symptom we hit: the opto not pulling fully low (line sitting ~1.5 V), which reads as a constant HIGH and RPM=0 even though a scope shows a waveform — verify the LOW level and a common ground, not just "there's a signal."
 
 ## Wire protocol (Teensy ↔ CrowPanel UART)
@@ -528,7 +537,35 @@ prior BLE crash.) ⚠️ The dongle MUST be a **BLE** ELM327 (e.g. Vgate iCar Pr
 never appear in a scan. ELM init: `ATZ ATE0 ATL0 ATS0
 ATH0 ATSP0`, then round-robin `0105` (coolant), `010F` (IAT), `ATRV` (voltage)
 at ~1 Hz each. Auto-reconnects on link loss. The dash overrides its coolant
-readout with `obd::coolantF_x10()` when `sensor_type==2`. **NimBLE adds ~180 KB
+readout with `obd::coolantF_x10()` when `sensor_type==2`.
+
+**⚠️ WiFi + BLE may NEVER run at the same time (v0.1.101).** On this core
+(arduino-esp32 2.0.14 / IDF 4.4, ESP32-S3) enabling the BT controller with
+WiFi up **aborts in `coex_core_enable`**, and the WiFi `ppTask` can panic
+(`pm_set_sleep_type`) when BLE flips coex state under it — both decoded from
+live bench backtraces; confirmed by test (WiFi off → BT works). Fix: a radio
+**time-share arbiter** in RaceDash.ino (`net_owner`: `NET_WIFI` /
+`NET_TO_WIFI` / `NET_BT`; `btAcquireRadio()` / `btReleaseRadio()` /
+`netOwnerTick()`; `wifiTick()` holds WiFi hard-off unless `NET_WIFI`).
+**Policy: BT owns the radio ONLY while `recording`** (that's when coolant
+matters) **or while the user is on PAGE_SENSOR/PAGE_BT_SCAN pairing** — all
+paddock time is WiFi (uploads/OTA/NTP just work). `netOwnerTick()` watches the
+`recording` edges: REC start → WiFi hard-off (synchronous) → BLE up + dongle
+reconnect; REC stop → `obd::requestShutdown()` (disconnect + **full
+`NimBLEDevice::deinit`** on the obd task — a mere disconnect leaves the
+controller running and coex still asserts) → when `obd::isDown()` (12 s
+failsafe) → WiFi reconnects. Tapping UPLOAD if BT somehow holds the radio
+auto-hands to WiFi (pending-upload path) and back. Sequencing is everything:
+WiFi.mode(WIFI_OFF) is synchronous and MUST precede any BLE init.
+
+Other BLE hardening (v0.1.100/101): crash-forensics **phase breadcrumb** (NVS
+`blediag`/`ph`: 1=init 2=scan 3=connect 4=connected; boot reader attributes
+only crashy reset reasons — a power cycle while connected is ignored); scan is
+**passive + ~20% duty** (interval 100 ms / window 20 ms, 8 s — NimBLE default
+is a CONTINUOUS active scan, ~+90 mA; passive may list some dongles as
+"(unnamed)" — still pairable by address); TX power 0 dBm for conn/adv/scan;
+~64 KB free-internal-heap guard before controller init (parks the task with a
+visible reason via `obd::lastErr()` instead of crashing). **NimBLE adds ~180 KB
 of flash → the 4M dash binary is now ~94% of the 1.25 MB OTA slot (still fits;
 watch this headroom before adding more).**
 

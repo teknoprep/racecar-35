@@ -28,6 +28,7 @@
 #pragma once
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <esp_heap_caps.h>
 
 namespace obd {
 
@@ -51,15 +52,24 @@ static bool              g_inited  = false;   // NimBLE + task started
 static bool              g_blocked = false;   // app sets this if a prior BLE init crashed the board
 static TaskHandle_t      g_task    = nullptr;
 
-// Breadcrumb so a crash DURING BLE init is attributable on the next boot. Set
-// "try"=1 right before NimBLEDevice::init() and clear it right after; if the
-// board resets in between, the app finds "try" still set on boot and reads the
-// reset reason (brownout / panic / wdt). Separate NVS namespace so it can never
-// race the settings namespace.
-static void bleBreadcrumb(bool trying) {
+// Crash-forensics PHASE breadcrumb (NVS "blediag"/"ph"): records which BLE
+// phase is active so a crash during ANY of them is attributable on next boot:
+//   0=inactive  1=init  2=scan  3=connect/discover/ELM-init  4=connected
+// The v0.1.92 breadcrumb only covered init and was cleared right after — a
+// crash during SCAN (which is when the radio really starts working) left no
+// trace and didn't block the next auto-init. Written only on state
+// transitions (a handful of NVS writes per session, wear-safe). The boot-side
+// reader cross-checks esp_reset_reason() and only attributes crashy reasons
+// (brownout/panic/wdt) — a normal power-off mid-session leaves the phase set
+// but reads as POWERON and is cleared silently.
+static void blePhase(uint8_t ph) {
   Preferences p;
-  if (p.begin("blediag", false)) { p.putBool("try", trying); p.end(); }
+  if (p.begin("blediag", false)) { p.putUChar("ph", ph); p.end(); }
 }
+
+// last human-readable BLE error (shown on the Sensor page)
+static char g_last_err[48] = {0};
+static const char* lastErr() { return g_last_err; }
 
 // live data — sentinel -1 (or 0 for rpm) until a valid reading arrives
 static volatile int16_t  d_coolant_f_x10 = -1;
@@ -73,9 +83,10 @@ static volatile uint8_t  g_scan_n   = 0;
 static volatile bool     g_scanning = false;
 
 // UI -> task requests
-static volatile bool     g_req_scan    = false;
-static volatile bool     g_req_connect = false;
-static volatile bool     g_req_stop    = false;
+static volatile bool     g_req_scan     = false;
+static volatile bool     g_req_connect  = false;
+static volatile bool     g_req_stop     = false;
+static volatile bool     g_req_shutdown = false;   // FULL teardown incl. NimBLE deinit (radio handover to WiFi)
 
 // chosen device (the one we (re)connect to)
 static char              g_target_addr[18] = {0};
@@ -156,11 +167,22 @@ static ClientCB g_clientCB;
 // ---- the worker task -------------------------------------------------------
 static void doScan() {
   g_scanning = true; g_scan_n = 0;
+  blePhase(2);
   NimBLEScan* sc = NimBLEDevice::getScan();
-  sc->setActiveScan(true);
+  // GENTLE scan (brownout mitigation). NimBLE's defaults are a CONTINUOUS
+  // active scan: radio RX ~100% duty (+~90 mA sustained on top of WiFi + LCD)
+  // plus SCAN_REQ TX bursts — the board rebooted ~200 ms after scan start,
+  // i.e. right when the radio went to work. PASSIVE (no TX at all) + 20 ms
+  // window per 100 ms interval = ~20% duty ≈ ~18 mA average instead. Longer
+  // 8 s duration compensates the lower duty for discovery odds. (Passive
+  // means some dongles' names only arrive via scan-response and may list as
+  // "(unnamed)" — still pairable by address.)
+  sc->setActiveScan(false);
+  sc->setInterval(100);   // ms
+  sc->setWindow(20);      // ms of each interval actually listening
   sc->setMaxResults(24);
   sc->clearResults();
-  NimBLEScanResults res = sc->start(6, false);   // 6 s, blocking on THIS task only
+  NimBLEScanResults res = sc->start(8, false);   // 8 s, blocking on THIS task only
   uint8_t n = 0;
   for (int i = 0; i < res.getCount() && n < 16; i++) {
     NimBLEAdvertisedDevice d = res.getDevice(i);   // 1.4.x: by value
@@ -177,17 +199,19 @@ static void doScan() {
   }
   g_scan_n = n;
   g_scanning = false;
+  blePhase(0);
 }
 
 static bool connectAndInit() {
   if (!g_target_addr[0]) return false;
   g_state = CONNECTING;
+  blePhase(3);
   if (!g_client) {
     g_client = NimBLEDevice::createClient();
     g_client->setClientCallbacks(&g_clientCB, false);
   }
   NimBLEAddress addr(std::string(g_target_addr), g_target_atype);
-  if (!g_client->isConnected() && !g_client->connect(addr)) { g_state = FAILED; return false; }
+  if (!g_client->isConnected() && !g_client->connect(addr)) { g_state = FAILED; blePhase(0); return false; }
 
   g_state = DISCOVER;
   g_tx = g_rx = nullptr;
@@ -215,7 +239,7 @@ static bool connectAndInit() {
     if (!g_rx && rx) g_rx = rx;   // fallbacks if no single service has both
     if (!g_tx && tx) g_tx = tx;
   }
-  if (!g_tx || !g_rx) { g_state = FAILED; g_client->disconnect(); return false; }
+  if (!g_tx || !g_rx) { g_state = FAILED; g_client->disconnect(); blePhase(0); return false; }
   // Subscribe with the mode the characteristic actually supports — subscribing
   // for notifications (CCCD=1) on an indicate-only char silently gets nothing.
   g_rx->subscribe(g_rx->canNotify(), notifyCB);
@@ -229,6 +253,7 @@ static bool connectAndInit() {
   elmCmd("ATSP0", 1000);  // auto protocol
   d_last_ms = millis();
   g_state = POLL;
+  blePhase(4);   // connected — stays set while linked (power-off reads POWERON = ignored)
   return true;
 }
 
@@ -259,21 +284,55 @@ static void obdTask(void*) {
   // Let the system settle a beat before bringing up the BT controller (the
   // radio/coex init alongside a live WiFi link is the delicate moment).
   vTaskDelay(pdMS_TO_TICKS(150));
+  // Refuse to bring up the BT controller without headroom: it needs ~50-64 KB
+  // of INTERNAL heap; starting it into a nearly-full heap crashes instead of
+  // failing politely. Park the task with a visible reason instead.
+  const size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  if (free_int < 64 * 1024) {
+    snprintf(g_last_err, sizeof(g_last_err), "BT skipped: low heap (%uKB free)",
+             (unsigned)(free_int / 1024));
+    blePhase(0);
+    g_state = FAILED;
+    for (;;) vTaskDelay(pdMS_TO_TICKS(1000));   // parked — no BLE this boot
+  }
   // Heavy BLE stack init on the task's own stack (never the UI stack).
   NimBLEDevice::init("racedash");
-  // LOW TX power: the radio powering to full +9dBm draws a current spike that
-  // can brown out a marginal supply (suspected BT crash cause). N0 = 0 dBm is
-  // plenty for an OBD dongle a few inches away and much gentler on the rail.
+  // LOW TX power EVERYWHERE (default/conn + adv + scan-req): the radio going
+  // to full +9dBm draws a current spike that can brown out a marginal supply
+  // (suspected BT crash cause). N0 = 0 dBm is plenty for an OBD dongle a few
+  // inches away and much gentler on the rail.
   NimBLEDevice::setPower(ESP_PWR_LVL_N0);   // 1.4.x takes esp_power_level_t
-  bleBreadcrumb(false);   // init survived -> clear the crash breadcrumb
+  NimBLEDevice::setPower(ESP_PWR_LVL_N0, ESP_BLE_PWR_TYPE_ADV);
+  NimBLEDevice::setPower(ESP_PWR_LVL_N0, ESP_BLE_PWR_TYPE_SCAN);
+  blePhase(0);   // init survived -> phase back to inactive
   g_state = IDLE;
   for (;;) {
+    if (g_req_shutdown) {
+      // FULL radio release for the WiFi<->BLE time-share (see RaceDash.ino
+      // netOwnerTick): running both radios crashes this 2.0.14/IDF-4.4 core
+      // (decoded backtraces: abort() in coex_core_enable when BT enables with
+      // WiFi up, and a ppTask/pm_set_sleep_type panic from the WiFi side).
+      // WiFi may only start after the BT controller is fully DEINITED — a mere
+      // disconnect leaves the controller running and coex still asserts.
+      g_req_shutdown = false;
+      if (g_client && g_client->isConnected()) { g_client->disconnect(); vTaskDelay(pdMS_TO_TICKS(300)); }
+      NimBLEDevice::deinit(true);   // stops host+controller, frees clients
+      g_client = nullptr; g_tx = g_rx = nullptr;
+      d_coolant_f_x10 = d_iat_f_x10 = d_volt_x10 = -1;
+      g_scan_n = 0; g_scanning = false;
+      blePhase(0);
+      g_state  = OFF;
+      g_task   = nullptr;
+      g_inited = false;   // begin() may re-create us later (radio handed back)
+      vTaskDelete(nullptr);   // task ends here
+    }
     if (g_req_stop) {
       g_req_stop = false;
       if (g_client && g_client->isConnected()) g_client->disconnect();
       g_tx = g_rx = nullptr;
       d_coolant_f_x10 = d_iat_f_x10 = d_volt_x10 = -1;
       g_state = OFF;
+      blePhase(0);
     }
     if (g_req_scan) { g_req_scan = false; State prev = g_state; g_state = SCANNING; doScan(); if (prev == POLL) g_state = POLL; else g_state = IDLE; }
     if (g_req_connect) { g_req_connect = false; connectAndInit(); }
@@ -304,7 +363,7 @@ static void begin() {
   if (g_inited || g_blocked) return;
   g_inited = true;
   g_state  = IDLE;
-  bleBreadcrumb(true);   // cleared by the task once init survives (see obdTask)
+  blePhase(1);   // covers init; the task moves the phase along (see blePhase)
   // Create the task FIRST and do NimBLEDevice::init() INSIDE it (see obdTask).
   // Doing the heavy BLE init here would run it on the shallow UI/tap-handler
   // stack (core 1) — that overflowed and crash-rebooted the board. On the task
@@ -330,6 +389,11 @@ static void connectTo(const char* addr, uint8_t atype, const char* name) {
 }
 static void reconnectSaved() { if (g_target_addr[0]) { if (!g_inited) begin(); g_req_connect = true; } }
 static void stop() { if (g_inited) g_req_stop = true; }
+// Radio handover to WiFi: request a FULL teardown (disconnect + NimBLE deinit
+// + task exit). Poll isDown() before starting WiFi. Processed after any
+// in-flight blocking scan finishes (<= ~8 s) — callers keep a timeout.
+static void requestShutdown() { if (g_inited) g_req_shutdown = true; }
+static bool isDown()          { return !g_inited; }
 
 static State    state()        { return g_state; }
 static bool     connected()    { return g_state == POLL && (g_client && g_client->isConnected()); }
