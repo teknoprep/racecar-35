@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.103"
+#define FIRMWARE_VERSION "0.1.104"
 
 #include <Preferences.h>
 #include <time.h>
@@ -50,7 +50,7 @@ enum SettingId : uint8_t {
     ST_BRIGHTNESS = 0,            // LCD backlight slider — top of the settings list
     ST_INET_MODE,
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
-    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_RPM_SPIKE, ST_ALERTS,
+    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_RPM_SPIKE, ST_LAP_OVERLAY, ST_ALERTS,
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
     ST_AM_RPM, ST_AM_COL, ST_AM_HZ,
     // Coolant temp warn-color + oil PSI warn-color. Each has a master
@@ -269,9 +269,9 @@ static void setupDashSprites() {
         mk(spr_fix,        110, 24)  &&
         mk(spr_sats,        60, 24)  &&
         mk(spr_gps,        110, 24)  &&
-        mk(spr_pred,       110, 24)  &&
-        mk(spr_lap,        110, 24)  &&
-        mk(spr_delta,      110, 24)  &&
+        mk(spr_pred,       150, 28)  &&
+        mk(spr_lap,        150, 28)  &&
+        mk(spr_delta,      150, 28)  &&
         mk(spr_track_name, 320, 22)  &&
         mk(spr_recbtn,     160, 70)  &&
         mk(spr_upbtn,      180, 70);
@@ -534,6 +534,14 @@ struct LapTimer {
 };
 static LapTimer lapTimer;
 
+// Finish-line lap-time popup: when a lap completes, its time is shown HUGE
+// over everything below the RPM bar for s.lap_overlay_s seconds (0 = off).
+// The RPM warning flash takes precedence (popup hides while the bg flashes).
+static uint32_t lap_overlay_lap_ms   = 0;   // completed lap time to display
+static uint32_t lap_overlay_until_ms = 0;   // popup deadline (0 = inactive)
+static int      lap_overlay_lapn     = 0;   // completed lap number
+static bool     lap_overlay_is_best  = false;
+
 constexpr float    LAP_RADIUS_KM = 0.075f;   // 75 m start/finish detection radius
 constexpr uint32_t MIN_LAP_MS    = 15000;    // minimum lap time before a crossing counts
 constexpr int32_t  DELTA_SAME_MS = 50;       // |delta| <= this -> "same pace" (white)
@@ -659,6 +667,7 @@ struct Settings {
     // -ve = rawer/snappier (numbers jump), +ve = heavier smoothing.
     int8_t   rpm_smooth         = 0;
     uint8_t  rpm_spike          = 2;    // 0=Off 1=Mild 2=Normal 3=Strong (CFG,rpmspk)
+    uint8_t  lap_overlay_s      = 3;    // finish-line lap-time popup duration, 0-9 s (0 = off)
 
     // AFR (Air/Fuel Ratio) — only meaningful in MegaSquirt sensor mode.
     // Two-sided warn band: too rich (< afr_warn_lo) and too lean (> afr_warn_hi)
@@ -1182,6 +1191,8 @@ static void loadSettings() {
     if (s.rpm_smooth < -10) s.rpm_smooth = -10;
     if (s.rpm_smooth >  10) s.rpm_smooth =  10;
     s.rpm_spike          = prefs.getUChar ("rpmspk",   s.rpm_spike) % N_SPIKE_FILTER;
+    s.lap_overlay_s      = prefs.getUChar ("lapov",    s.lap_overlay_s);
+    if (s.lap_overlay_s > 9) s.lap_overlay_s = 9;
     s.show_afr           = prefs.getBool  ("s_afr",    s.show_afr);
     s.afr_warn_lo_x10    = prefs.getUShort("afr_lo",   s.afr_warn_lo_x10);
     s.afr_warn_hi_x10    = prefs.getUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -1257,6 +1268,7 @@ static void saveSettings() {
     prefs.putUChar ("gpshz",    s.gps_nav_hz);
     prefs.putChar  ("rpmsm",    s.rpm_smooth);
     prefs.putUChar ("rpmspk",   s.rpm_spike);
+    prefs.putUChar ("lapov",    s.lap_overlay_s);
     prefs.putBool  ("s_afr",    s.show_afr);
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
     prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -1554,6 +1566,13 @@ static void updateLapTimer() {
                 memcpy(lapRefBt, lapCurBt, sizeof(uint32_t) * (size_t)nb);
                 lapTimer.ref_buckets = nb;
                 lapTimer.ref_valid   = true;
+            }
+            // Arm the finish-line lap-time popup (drawn by drawDashPage).
+            if (s.lap_overlay_s > 0) {
+                lap_overlay_lap_ms   = elapsed;
+                lap_overlay_lapn     = lapTimer.lap_number - 1;   // just-completed lap
+                lap_overlay_is_best  = (lapTimer.best_lap_ms == elapsed);
+                lap_overlay_until_ms = now + (uint32_t)s.lap_overlay_s * 1000UL;
             }
         } else {
             lapTimer.lap_number = 1;          // first crossing -> begin lap 1
@@ -3289,9 +3308,11 @@ static void drawDashPage() {
         // x=264 (not 255): clears the bottom-left TEMP/PSI/AFR sensor sprites,
         // which span x=20..260 and were re-painting bg over the first letter
         // (P/L/D) of these labels each time a sensor value updated.
-        tft.drawString("PRED", 264, 380);    // middle column — predictive lap time
-        tft.drawString("LAP",  264, 405);    // middle column — last completed lap time
-        tft.drawString("DELTA",264, 430);    // middle column — predictive delta vs best lap
+        // Middle-column rows moved to a 28 px pitch: the VALUES are Font4 now
+        // (26 px, "slightly bigger" per driver request) — labels stay Font2.
+        tft.drawString("PRED", 264, 378);    // middle column — predictive lap time
+        tft.drawString("LAP",  264, 406);    // middle column — last completed lap time
+        tft.drawString("DELTA",264, 434);    // middle column — predictive delta vs best lap
         tft.drawString("FIX",  620, 380);
         tft.drawString("SATS", 620, 405);
         tft.drawString("GPS",  620, 430);
@@ -3365,6 +3386,53 @@ static void drawDashPage() {
             tft.setTextPadding(0);
         }
         ld.rpm_text = eng.rpm;
+    }
+
+    // ---- Finish-line lap-time popup ----
+    // Shows the just-completed lap time HUGE over everything BELOW the RPM
+    // bar + RPM number (driver keeps the live bar). The RPM warning flash
+    // takes precedence: while the alert bg is flashing (bg != black) the
+    // popup hides; if the popup window is still open when the flash ends it
+    // re-draws. Ends after s.lap_overlay_s seconds -> full clean repaint.
+    {
+        static bool popup_on = false;
+        const bool alert_flashing = (bg != TFT_BLACK);
+        const bool want = (lap_overlay_until_ms != 0)
+                          && (millis() < lap_overlay_until_ms)
+                          && !alert_flashing;
+        if (want) {
+            if (!popup_on) {
+                popup_on = true;
+                const int top = RPM_BAR_Y + RPM_BAR_H + 26;   // below bar + RPM number
+                tft.fillRect(0, top, 800, 480 - top, TFT_BLACK);
+                char cap[24];
+                snprintf(cap, sizeof(cap), lap_overlay_is_best ? "LAP %d  -  BEST" : "LAP %d",
+                         lap_overlay_lapn > 0 ? lap_overlay_lapn : 1);
+                tft.setTextDatum(textdatum_t::middle_center);
+                tft.setFont(&fonts::Font4);
+                tft.setTextSize(1);
+                tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+                tft.drawString(cap, 400, top + 30);
+                char buf[16];
+                formatLapTime(lap_overlay_lap_ms, buf, sizeof(buf));
+                tft.setFont(&fonts::Font7);
+                tft.setTextSize(2);
+                tft.setTextColor(lap_overlay_is_best ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+                tft.drawString(buf, 400, top + (480 - top) / 2 + 20);
+                tft.setTextSize(1);
+                tft.setTextDatum(textdatum_t::top_left);
+            }
+            return;   // freeze the rest of the dash under the popup
+        }
+        if (popup_on) {
+            popup_on = false;
+            // Natural expiry clears the popup; an ALERT-FLASH interruption
+            // keeps the window armed so the popup returns when the flash ends
+            // (crossing the line at high RPM is the common case).
+            if (millis() >= lap_overlay_until_ms) lap_overlay_until_ms = 0;
+            pageJustEntered = true;   // full clean repaint on the next pass
+            return;
+        }
     }
 
     // ---- HUGE speed number — Font7 size 4 ----
@@ -3791,18 +3859,18 @@ static void drawDashPage() {
             }
             if (dash_sprites_ready) {
                 spr_pred.fillSprite(bg);
-                spr_pred.setFont(&fonts::Font2);
+                spr_pred.setFont(&fonts::Font4);
                 spr_pred.setTextSize(1);
                 spr_pred.setTextDatum(textdatum_t::top_left);
                 spr_pred.setTextColor(col);
                 spr_pred.drawString(buf, 0, 0);
-                spr_pred.pushSprite(325, 380);
+                spr_pred.pushSprite(325, 372);
             } else {
-                tft.setFont(&fonts::Font2);
+                tft.setFont(&fonts::Font4);
                 tft.setTextDatum(textdatum_t::top_left);
-                tft.setTextPadding(100);
+                tft.setTextPadding(150);
                 tft.setTextColor(col, bg);
-                tft.drawString(buf, 325, 380);
+                tft.drawString(buf, 325, 372);
                 tft.setTextPadding(0);
             }
             ld.pred_lap_cs = cs;
@@ -3816,18 +3884,18 @@ static void drawDashPage() {
             else                           formatLapTime(lapTimer.last_lap_ms, buf, sizeof(buf));
             if (dash_sprites_ready) {
                 spr_lap.fillSprite(bg);
-                spr_lap.setFont(&fonts::Font2);
+                spr_lap.setFont(&fonts::Font4);
                 spr_lap.setTextSize(1);
                 spr_lap.setTextDatum(textdatum_t::top_left);
                 spr_lap.setTextColor(TFT_WHITE);
                 spr_lap.drawString(buf, 0, 0);
-                spr_lap.pushSprite(325, 405);
+                spr_lap.pushSprite(325, 400);
             } else {
-                tft.setFont(&fonts::Font2);
+                tft.setFont(&fonts::Font4);
                 tft.setTextDatum(textdatum_t::top_left);
-                tft.setTextPadding(100);
+                tft.setTextPadding(150);
                 tft.setTextColor(TFT_WHITE, bg);
-                tft.drawString(buf, 325, 405);
+                tft.drawString(buf, 325, 400);
                 tft.setTextPadding(0);
             }
             ld.last_lap_cs = cs;
@@ -3858,18 +3926,18 @@ static void drawDashPage() {
             }
             if (dash_sprites_ready) {
                 spr_delta.fillSprite(bg);
-                spr_delta.setFont(&fonts::Font2);
+                spr_delta.setFont(&fonts::Font4);
                 spr_delta.setTextSize(1);
                 spr_delta.setTextDatum(textdatum_t::top_left);
                 spr_delta.setTextColor(col);
                 spr_delta.drawString(buf, 0, 0);
-                spr_delta.pushSprite(325, 430);
+                spr_delta.pushSprite(325, 428);
             } else {
-                tft.setFont(&fonts::Font2);
+                tft.setFont(&fonts::Font4);
                 tft.setTextDatum(textdatum_t::top_left);
-                tft.setTextPadding(100);
+                tft.setTextPadding(150);
                 tft.setTextColor(col, bg);
-                tft.drawString(buf, 325, 430);
+                tft.drawString(buf, 325, 428);
                 tft.setTextPadding(0);
             }
             ld.delta_cs = cs;
@@ -3926,6 +3994,7 @@ struct SettingRow {
 };
 static const SettingRow ROWS[ST_COUNT] = {
     { ST_BRIGHTNESS,   "Brightness",            SettingRow::SLIDER  },
+    { ST_LAP_OVERLAY,  "Lap time popup (sec)",  SettingRow::NUMERIC },
     { ST_INET_MODE,    "Internet",              SettingRow::ENUM    },
     { ST_WIFI_SSID,    "WiFi network (SSID)",   SettingRow::TEXT    },
     { ST_WIFI_PASS,    "WiFi password",         SettingRow::TEXT    },
@@ -4005,6 +4074,7 @@ static NumBounds numBounds(SettingId id) {
         case ST_AFR_WARN_LO:  return {  80, 200, 1 };
         case ST_AFR_WARN_HI:  return {  80, 200, 1 };
         case ST_AUTO_START_MPH: return { 5, 150, 5 };  // speed to trigger auto-record
+        case ST_LAP_OVERLAY:    return { 0,   9, 1 };  // lap popup seconds (0 = off)
         default:         return {    0,     0,   0 };
     }
 }
@@ -4023,6 +4093,7 @@ static uint16_t getNum(SettingId id) {
         case ST_AFR_WARN_LO:  return s.afr_warn_lo_x10;
         case ST_AFR_WARN_HI:  return s.afr_warn_hi_x10;
         case ST_AUTO_START_MPH: return s.auto_start_mph;
+        case ST_LAP_OVERLAY:    return s.lap_overlay_s;
         default:         return 0;
     }
 }
@@ -4040,6 +4111,7 @@ static void setNum(SettingId id, uint16_t v) {
         case ST_AFR_WARN_LO:  s.afr_warn_lo_x10 = v; break;
         case ST_AFR_WARN_HI:  s.afr_warn_hi_x10 = v; break;
         case ST_AUTO_START_MPH: s.auto_start_mph = v; break;
+        case ST_LAP_OVERLAY:    s.lap_overlay_s  = (uint8_t)(v > 9 ? 9 : v); break;
         default: break;
     }
 }
@@ -5054,7 +5126,7 @@ static bool rowShouldShow(SettingId id) {
 enum SettingsGroup : int { SG_DISPLAY, SG_NET, SG_RPM, SG_SENSORS, SG_RECORDING, SG_CLOUD, SG_TIME };
 static int rowGroup(SettingId id) {
     switch (id) {
-        case ST_BRIGHTNESS:  return SG_DISPLAY;
+        case ST_BRIGHTNESS: case ST_LAP_OVERLAY: return SG_DISPLAY;
         case ST_INET_MODE:
         case ST_WIFI_SSID: case ST_WIFI_PASS: case ST_WIFI_STATUS: return SG_NET;
         case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_RPM_SPIKE: case ST_ALERTS:

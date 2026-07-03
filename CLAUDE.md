@@ -516,6 +516,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `rpmspk` | uint8 | **RPM spike filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2). Sent as `CFG,rpmspk,<v>`; Teensy slew-gates tach pulses (see "RPM spike filter" note above). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
+| `lapov` | uint8 | **Finish-line lap-time popup duration** in seconds, 0–9 (default 3, 0 = off). Dash-only (no CFG). Settings → "Lap time popup (sec)". |
 | `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **Struct size changed, so pre-0.1.82 blobs are length-mismatched and ignored once (overrides reset — re-capture via SET S/F).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
 
@@ -629,6 +630,16 @@ crossing).
   scalar reset (a ~10 KB temporary on the loopTask stack would risk overflow).
 - **Colours (PRED + DELTA): green/white/red** = faster / same (within
   `DELTA_SAME_MS` = 50 ms) / slower; grey `--` until a ghost lap exists.
+- **Middle-column values are Font4** (v0.1.104, rows at 28 px pitch, sprites 150×28); labels
+  stay Font2.
+- **Finish-line lap-time popup (v0.1.104).** On lap completion the completed time is drawn HUGE
+  (Font7×2, green if session best else yellow, with a "LAP n" caption) over everything BELOW the
+  RPM bar + RPM number — the live RPM bar stays visible, and the **RPM alert flash takes
+  precedence** (popup hides while `bg != TFT_BLACK` flashes and RE-ARMS when the flash ends —
+  only natural expiry clears `lap_overlay_until_ms`). Duration = NVS `lapov` (0–9 s, default 3,
+  0 = off). While the popup is up, `drawDashPage()` returns early (dash under it is frozen but
+  fully covered); expiry sets `pageJustEntered = true` for a clean full repaint. Armed in
+  `updateLapTimer()` at the lap-record point (`lap_overlay_*` globals next to `lapTimer`).
 - The **baked `sf_lat/sf_lon` are approximate** — use the STATUS-page SET
   START/FINISH capture (NVS `sf_ovr`) to pin the real line per track on-site.
 
