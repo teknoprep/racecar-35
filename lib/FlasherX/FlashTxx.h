@@ -55,14 +55,28 @@
   #define FLASH_SIZE		(0x200000)		// 2MB program flash
   #define FLASH_SECTOR_SIZE	(0x1000)		// 4KB sector size
   #define FLASH_WRITE_SIZE	(4)			// 4-byte/32-bit writes
-  #define FLASH_RESERVE		(4*FLASH_SECTOR_SIZE)	// reserve top of flash
+  // Reserve must cover the PJRC EEPROM emulation (0x601F0000, 15 sectors) —
+  // see the T4.1 comment below. 16 sectors = 0x601F0000..top.
+  #define FLASH_RESERVE		(16*FLASH_SECTOR_SIZE)	// reserve top of flash + EEPROM emu
   #define FLASH_BASE_ADDR	(0x60000000)		// code starts here
 #elif defined(__IMXRT1062__) && defined(ARDUINO_TEENSY41)
   #define FLASH_ID		"fw_teensy41"		// target ID (in code)
   #define FLASH_SIZE		(0x800000)		// 8MB
   #define FLASH_SECTOR_SIZE	(0x1000)		// 4KB sector size
   #define FLASH_WRITE_SIZE	(4)			// 4-byte/32-bit writes    
-  #define FLASH_RESERVE		(4*FLASH_SECTOR_SIZE)	// reserve top of flash 
+  // ⚠️ MUST cover the PJRC EEPROM emulation region! The Teensy 4.1 core's
+  // eeprom.c writes wear-leveled records into flash 0x607C0000..0x607FF000
+  // (63 sectors) — we use EEPROM for the IMU cal, written nearly every boot.
+  // firmware_buffer_init() scans DOWN from (top - FLASH_RESERVE) for the first
+  // non-erased word and puts the OTA staging buffer ABOVE it: with the stock
+  // 16 KB reserve the scan stopped at the topmost EEPROM record, squeezing the
+  // staging buffer into the sliver above the EEPROM write pointer (~224 KB and
+  // shrinking with every cal write). When the firmware image outgrew that
+  // sliver, OTA aborted with FW,ERR,addr_too_large — and successful older OTAs
+  // were silently staging THROUGH the EEPROM sectors. 64 sectors = 256 KB
+  // covers 0x607C0000..0x60800000, so the buffer lands in the ~7.5 MB of clean
+  // flash between the code and the EEPROM region.
+  #define FLASH_RESERVE		(64*FLASH_SECTOR_SIZE)	// top of flash + EEPROM emu
   #define FLASH_BASE_ADDR	(0x60000000)		// code starts here
 #elif defined(__IMXRT1062__) && defined(ARDUINO_TEENSY_MICROMOD)
   #define FLASH_ID		"fw_teensyMM"		// target ID (in code)
