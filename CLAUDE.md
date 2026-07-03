@@ -378,6 +378,22 @@ VER,teensy,<semver>
 - The dash parser tolerates short forms for back-compat (e.g. `ENG` with 1 or 3 fields).
 - **Rate-limiting**: emit only when `myGNSS.getPVT(0)` returns true OR every 1 s. `getPVT(0)` is non-blocking — never use the blocking variant or the 25 Hz loop chokes.
 - **GPS UART RX buffer (v0.1.66 fix) — DO NOT remove.** Serial2's default RX ring is only tens of bytes — SMALLER than one ~100-byte UBX-NAV-PVT frame. GPS is parsed by *polling* `getPVT()` in `loop()` (RPM is NOT — CAN + `FreqMeasureMulti` are interrupt/FIFO-driven). So any loop stall >~25 ms overflows the ring, desyncs the autoPVT stream, and with a sub-frame buffer it can NEVER re-sync → GPS "freezes at last position" (STALE) while RPM keeps running. The stalls come from **SD `sync()`/`write()` latency during recording** (this is why it only happened once a session started, after "half a lap or two"). Fix: `Serial2.addMemoryForRead(gpsRxBuf, 32768)` in `setup()` BEFORE `begin()` (mirrors the dash Serial3 buffer) — ~8.5 s of slack at 38400 baud so the parser rides through SD spikes. `addMemoryForRead()` is on the concrete `Serial2`, not the `HardwareSerial&` alias.
+- **GPS dead-at-boot recovery + boot baud scan (v0.1.97 review fixes).** (1) If the boot-time
+  connect fails, `gnss_lib_ok=false` used to mean NOTHING ever retried — GPS stayed OFF for the
+  whole session (proven on track: two sessions with bogus 2019 epochs = no time source from
+  power-on). `gpsStaleWatchdog()` now retries a dead-at-boot GPS every 30 s (bounded ~0.9 s;
+  wider baud scan every 6th try) and re-asserts UBX/rate/autoPVT + `saveConfiguration()` on a
+  late connect. (2) **Baud landmine**: `saveConfiguration()` (0.1.93) persists a dash-selected
+  baud to MODULE flash, so the boot scan must include **230400/115200/460800** too — scanning
+  only 38400+9600 left a module saved at 230400 permanently unreachable at every power-up.
+- **RPM spike filter (v0.1.98)** — dash setting `RPM spike filter` (ENUM Off/Mild/Normal/Strong,
+  NVS `rpmspk`, `CFG,rpmspk,<0-3>`, default Normal). Teensy `pumpTach()` stage 1.5: rejects tach
+  pulses implying a faster-than-physics jump from the current filtered RPM (slew limit
+  20000/10000/5000 RPM/s for Mild/Normal/Strong, allowance grows with time since last accepted
+  pulse, floor 250 RPM). Kills noise BURSTS and plausible-value spikes that the 12 k absolute
+  gate + median-of-3 let through. Escape hatch: after 120/200/300 ms of continuous rejection the
+  filter resets and accepts the new level — a genuine fast shift lands within ~¼ s, so it can
+  never lock out a real RPM change. Tach path only (MS3 CAN RPM is digital/CRC-protected).
 - **GPS stale auto-recovery watchdog (v0.1.68).** Belt-and-suspenders net on top of the buffer:
   `gpsStaleWatchdog()` runs every `loop()` and, once the link is up, watches the age of the last
   fresh PVT. **LIGHT** (>2.5 s stale): flush the Serial2 RX ring (non-blocking) so the UBX parser
@@ -468,6 +484,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `srctyp` | uint8 | **Sensor source: 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN), 2=Bluetooth (BLE OBD-II dongle for slow readings)** |
 | `bt_addr` / `bt_atype` / `bt_name` | string/uint8/string | **Paired BLE OBD-II (ELM327) dongle**: address `"aa:bb:.."`, BLE address type, friendly name. Used when `srctyp==2` to auto-reconnect on boot. Set from PAGE_BT_SCAN. |
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
+| `rpmspk` | uint8 | **RPM spike filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2). Sent as `CFG,rpmspk,<v>`; Teensy slew-gates tach pulses (see "RPM spike filter" note above). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
 | `dbg_on` | bool | **Debug logging master switch** (default ON). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log for a session. Toggle: Settings → "Debug logging (SD)". |
@@ -496,9 +513,19 @@ is far too slow for the RPM bar). Hard rule (same lesson as the GPS-stale saga):
 **ALL BLE work runs on a dedicated FreeRTOS task pinned to core 0** so blocking
 calls (connect, GATT discovery, waiting for ELM `>` prompts, PID polling) can
 never stall the 60 fps UI loop on core 1 — the UI only sets request flags and
-reads plain volatile values. GATT layout is **auto-discovered** (walk every
-service/char, pick first notify = RX, first writable = TX) so it works across
-`0xFFF0`/`0xFFE0`/vendor-UUID dongle variants. ELM init: `ATZ ATE0 ATL0 ATS0
+reads plain volatile values. GATT layout is **auto-discovered**, and since the
+v0.1.97 review fix the discovery **skips the standard GAP/GATT/DeviceInfo
+services (0x1800/0x1801/0x180A) and prefers a service containing BOTH a
+notify-ish char (RX) and a writable char (TX)** — the vendor-UART pattern every
+BLE ELM327 uses. (The old "first notify anywhere" pick latched onto 0x1801's
+indicate-capable *Service Changed* char, which enumerates before the vendor
+services on nearly every dongle → subscribed to a dead char → ELM replies never
+arrived → init timed out forever. Also fixed: write mode follows the char's
+caps, subscribe uses notifications vs indications per the char, and
+`openBtScan()` clears the crash-block so SCAN isn't a silent no-op after a
+prior BLE crash.) ⚠️ The dongle MUST be a **BLE** ELM327 (e.g. Vgate iCar Pro
+*BLE*) — the ESP32-S3 has no Classic BT/SPP, so a classic-only ELM327 will
+never appear in a scan. ELM init: `ATZ ATE0 ATL0 ATS0
 ATH0 ATSP0`, then round-robin `0105` (coolant), `010F` (IAT), `ATRV` (voltage)
 at ~1 Hz each. Auto-reconnects on link loss. The dash overrides its coolant
 readout with `obd::coolantF_x10()` when `sensor_type==2`. **NimBLE adds ~180 KB

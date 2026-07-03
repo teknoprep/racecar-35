@@ -128,7 +128,9 @@ static bool elmCmd(const char* cmd, uint32_t timeout_ms) {
   portENTER_CRITICAL(&g_mux); g_rx_len = 0; g_prompt = false; g_rx_buf[0] = 0; portEXIT_CRITICAL(&g_mux);
   char b[24];
   int n = snprintf(b, sizeof(b), "%s\r", cmd);
-  g_tx->writeValue((uint8_t*)b, n, false);   // no-response write (works for both types)
+  // Use the write mode the characteristic supports: a write-WITH-response-only
+  // char silently ignores ATT Write Commands (review fix).
+  g_tx->writeValue((uint8_t*)b, n, !g_tx->canWriteNoResponse());
   uint32_t t0 = millis();
   while (!g_prompt && (millis() - t0) < timeout_ms) vTaskDelay(pdMS_TO_TICKS(10));
   return g_prompt;
@@ -189,16 +191,34 @@ static bool connectAndInit() {
 
   g_state = DISCOVER;
   g_tx = g_rx = nullptr;
+  // REVIEW FIX: the old "first notify anywhere + first writable anywhere" pick
+  // latched onto the STANDARD Generic-Attribute service's "Service Changed"
+  // characteristic (0x1801/0x2A05, indicate-capable, and it enumerates BEFORE
+  // the vendor services on nearly every dongle) — we then subscribed to a dead
+  // characteristic, ELM replies never arrived, and init timed out forever
+  // (state stuck failed/reconnecting). Skip the standard GAP/GATT/DeviceInfo
+  // services and PREFER a service that contains BOTH a notify-ish char and a
+  // writable char — the vendor-UART pattern every BLE ELM327 uses.
+  const NimBLEUUID SVC_GAP((uint16_t)0x1800), SVC_GATT((uint16_t)0x1801), SVC_DIS((uint16_t)0x180A);
   std::vector<NimBLERemoteService*>* svcs = g_client->getServices(true);   // 1.4.x: pointer
   if (svcs) for (auto svc : *svcs) {
+    if (svc->getUUID() == SVC_GAP || svc->getUUID() == SVC_GATT || svc->getUUID() == SVC_DIS)
+      continue;   // standard housekeeping services — never the ELM UART
+    NimBLERemoteCharacteristic* rx = nullptr;
+    NimBLERemoteCharacteristic* tx = nullptr;
     std::vector<NimBLERemoteCharacteristic*>* chs = svc->getCharacteristics(true);
     if (chs) for (auto ch : *chs) {
-      if (!g_rx && (ch->canNotify() || ch->canIndicate())) g_rx = ch;
-      if (!g_tx && (ch->canWrite()  || ch->canWriteNoResponse())) g_tx = ch;
+      if (!rx && (ch->canNotify() || ch->canIndicate())) rx = ch;
+      if (!tx && (ch->canWrite()  || ch->canWriteNoResponse())) tx = ch;
     }
+    if (rx && tx) { g_rx = rx; g_tx = tx; break; }   // same-service pair = the UART
+    if (!g_rx && rx) g_rx = rx;   // fallbacks if no single service has both
+    if (!g_tx && tx) g_tx = tx;
   }
   if (!g_tx || !g_rx) { g_state = FAILED; g_client->disconnect(); return false; }
-  g_rx->subscribe(true, notifyCB);
+  // Subscribe with the mode the characteristic actually supports — subscribing
+  // for notifications (CCCD=1) on an indicate-only char silently gets nothing.
+  g_rx->subscribe(g_rx->canNotify(), notifyCB);
 
   g_state = INIT;
   elmCmd("ATZ", 2000); vTaskDelay(pdMS_TO_TICKS(200));   // reset

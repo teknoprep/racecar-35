@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.96"
+#define FIRMWARE_VERSION "0.1.98"
 
 #include <Preferences.h>
 #include <time.h>
@@ -50,7 +50,7 @@ enum SettingId : uint8_t {
     ST_BRIGHTNESS = 0,            // LCD backlight slider — top of the settings list
     ST_INET_MODE,
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
-    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_ALERTS,
+    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_RPM_SPIKE, ST_ALERTS,
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
     ST_AM_RPM, ST_AM_COL, ST_AM_HZ,
     // Coolant temp warn-color + oil PSI warn-color. Each has a master
@@ -633,6 +633,7 @@ struct Settings {
     // Teensy as CFG,rpmsm,<level>; it maps the level to its EMA strength:
     // -ve = rawer/snappier (numbers jump), +ve = heavier smoothing.
     int8_t   rpm_smooth         = 0;
+    uint8_t  rpm_spike          = 2;    // 0=Off 1=Mild 2=Normal 3=Strong (CFG,rpmspk)
 
     // AFR (Air/Fuel Ratio) — only meaningful in MegaSquirt sensor mode.
     // Two-sided warn band: too rich (< afr_warn_lo) and too lean (> afr_warn_hi)
@@ -669,6 +670,10 @@ static Settings s;
 const char* const PROTOCOL_NAMES[] = { "HTTP", "HTTPS", "FTP" };
 constexpr int N_PROTOCOL = 3;
 const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt", "Bluetooth" };
+// RPM spike filter (Teensy-side slew gate): rejects tach pulses implying a
+// physically impossible RPM jump from the current value (electrical noise).
+const char* const SPIKE_FILTER_NAMES[] = { "Off", "Mild", "Normal", "Strong" };
+constexpr int N_SPIKE_FILTER = 4;
 constexpr int N_SENSOR_TYPE = 3;
 // Tach pulses/rev choices (the Direct-mode RPM divider). Value shown = pulses
 // per crank rev = divider. Stored x10 so 0.5 works. Sent as CFG,rpmppr,<x10>.
@@ -1146,6 +1151,7 @@ static void loadSettings() {
     s.rpm_smooth         = prefs.getChar  ("rpmsm",    s.rpm_smooth);
     if (s.rpm_smooth < -10) s.rpm_smooth = -10;
     if (s.rpm_smooth >  10) s.rpm_smooth =  10;
+    s.rpm_spike          = prefs.getUChar ("rpmspk",   s.rpm_spike) % N_SPIKE_FILTER;
     s.show_afr           = prefs.getBool  ("s_afr",    s.show_afr);
     s.afr_warn_lo_x10    = prefs.getUShort("afr_lo",   s.afr_warn_lo_x10);
     s.afr_warn_hi_x10    = prefs.getUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -1220,6 +1226,7 @@ static void saveSettings() {
     prefs.putULong ("gpsbaud",  s.gps_baud);
     prefs.putUChar ("gpshz",    s.gps_nav_hz);
     prefs.putChar  ("rpmsm",    s.rpm_smooth);
+    prefs.putUChar ("rpmspk",   s.rpm_spike);
     prefs.putBool  ("s_afr",    s.show_afr);
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
     prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -1270,6 +1277,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,gpsbaud,%lu\n",  (unsigned long)s.gps_baud);
     Serial.printf("CFG,gpshz,%u\n",     (unsigned)s.gps_nav_hz);
     Serial.printf("CFG,rpmsm,%d\n",     (int)s.rpm_smooth);
+    Serial.printf("CFG,rpmspk,%u\n",    (unsigned)s.rpm_spike);
     Serial.printf("CFG,dbg_on,%d\n",    (int)s.debug_enabled);
     sendSfToTeensy(last_track_idx);     // active track's S/F line for lap stamping
 }
@@ -3861,6 +3869,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_RPM_MAX,    "Max RPM display",      SettingRow::NUMERIC },
     { ST_RPM_DIV,    "Tach pulses/rev",      SettingRow::NUMERIC },
     { ST_RPM_SMOOTH, "RPM smoothing",        SettingRow::SLIDER  },
+    { ST_RPM_SPIKE,  "RPM spike filter",     SettingRow::ENUM    },
     { ST_ALERTS,     "Enable RPM alerts",    SettingRow::TOGGLE  },
     { ST_A1_RPM,     "Alert 1 RPM",          SettingRow::NUMERIC },
     { ST_A1_COL,     "Alert 1 color",        SettingRow::COLOR   },
@@ -4724,6 +4733,9 @@ namespace {
 }
 
 static void openBtScan() {
+    // Explicit user action: clear a prior-crash block too, else after a BLE
+    // crash the SCAN button silently did nothing (begin() no-ops when blocked).
+    obd::setBlocked(false);
     obd::begin();
     obd::startScan();
     currentPage     = PAGE_BT_SCAN;
@@ -4810,6 +4822,7 @@ static const char* enumValue(SettingId id) {
         case ST_CL_PROTO:    return PROTOCOL_NAMES[s.cloud_protocol % N_PROTOCOL];
         case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
+        case ST_RPM_SPIKE:   return SPIKE_FILTER_NAMES[s.rpm_spike % N_SPIKE_FILTER];
         case ST_RPM_DIV:     return RPM_PPR_NAMES[rpmPprIndex()];
         case ST_GPS_BAUD: {
             static char b[24];
@@ -4888,7 +4901,7 @@ static int rowGroup(SettingId id) {
         case ST_BRIGHTNESS:  return SG_DISPLAY;
         case ST_INET_MODE:
         case ST_WIFI_SSID: case ST_WIFI_PASS: case ST_WIFI_STATUS: return SG_NET;
-        case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_ALERTS:
+        case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_RPM_SPIKE: case ST_ALERTS:
         case ST_A1_RPM: case ST_A1_COL: case ST_A1_HZ:
         case ST_AM_RPM: case ST_AM_COL: case ST_AM_HZ: return SG_RPM;
         case ST_SENSOR_TYPE:
@@ -5294,6 +5307,9 @@ static void handleSettingsTap(int x, int y) {
                     // out) — open the dedicated GPS page for deliberate selection.
                     openGpsPage();
                     return;
+                } else if (r.id == ST_RPM_SPIKE) {
+                    s.rpm_spike = (s.rpm_spike + 1) % N_SPIKE_FILTER;
+                    Serial.printf("CFG,rpmspk,%u\n", (unsigned)s.rpm_spike);
                 } else if (r.id == ST_SENSOR_TYPE) {
                     // Open the dedicated Sensor Source page (Direct/MegaSquirt/
                     // Bluetooth) instead of cycling — Bluetooth needs a device

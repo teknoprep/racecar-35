@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.96"
+#define FIRMWARE_VERSION "0.1.98"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -195,6 +195,7 @@ static struct {
     uint16_t rpm_ppr_x10 = 20;    // tach pulses/rev x10 (20 = 2.0). Divides the
                                   // opto-tach frequency into RPM in Direct mode.
     int8_t   rpm_smooth  = 0;     // RPM display smoothing trim from the dash slider
+    uint8_t  rpm_spike   = 2;     // spike filter: 0=Off 1=Mild 2=Normal 3=Strong (CFG,rpmspk)
                                   // (-10..+10): <0 raw/jumpy, 0 baseline, >0 smoother.
     bool     debug_enabled = true;// dash CFG,dbg_on. When false, NO on-SD .dbg
                                   // health log is written for a session.
@@ -492,6 +493,10 @@ static void handleDashCommand(const String& line) {
         // page does this whenever it opens, so a freshly-booted dash that
         // missed our boot-time emit can catch up immediately.
         DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
+        // Re-announce the reset cause too — the boot-time RST emit is easy for
+        // a slower-booting dash to miss (both power up together; the dash takes
+        // seconds longer through WiFi init). VER? is sent on STATUS-page open.
+        DASH_SERIAL.printf("RST,teensy,%s\n", teensy_reset_reason);
     } else if (line == "FWUPDATE") {
         // Dash kicking off a Teensy OTA over Serial3. We're about to hand the
         // UART to the FlasherX hex-receive loop, which is BLOCKING until EOF
@@ -629,7 +634,37 @@ static uint8_t gpsStatus() {
 // GPS_STALE_* constants above. No-op until the link is up and has produced at
 // least one PVT, so it never fires during cold-start acquisition.
 static void gpsStaleWatchdog() {
-    if (!gnss_lib_ok || gnss_last_fresh_ms == 0) return;
+    // DEAD-AT-BOOT RECOVERY (review fix): if the boot-time connect failed,
+    // gnss_lib_ok is false and — before this — NOTHING ever retried: GPS stayed
+    // OFF for the entire session. The two bogus-2019-epoch sessions at Thompson
+    // (no time source = GPS dead from power-on) prove this happened on track.
+    // A module that was cranky at power-on (brownout sag during startup, hot
+    // restart, etc.) is now picked up as soon as it recovers: retry every 30 s
+    // (~0.9 s bounded stall), with a wider baud scan every 6th try (covers a
+    // module whose SAVED baud isn't 38400/9600 — see the boot-scan note).
+    if (!gnss_lib_ok) {
+        static uint32_t last_late_try_ms = 0;
+        static uint8_t  late_tries = 0;
+        const uint32_t nowl = millis();
+        if (nowl - last_late_try_ms < 30000 || nowl < 15000) return;
+        last_late_try_ms = nowl;
+        bool ok = tryConnectGNSS(GPS_BAUD_PRIMARY, 400);
+        if (!ok && (++late_tries % 6) == 0) {
+            const uint32_t scan[] = { 9600, 230400, 115200, 460800 };
+            for (uint32_t b : scan) if (tryConnectGNSS(b, 400)) { ok = true; break; }
+        }
+        if (ok) {
+            myGNSS.setUART1Output(COM_TYPE_UBX, 250);
+            myGNSS.setNavigationFrequency(gps_nav_hz, 250);
+            myGNSS.setAutoPVT(true, (uint16_t)250);
+            myGNSS.saveConfiguration(250);
+            gnss_lib_ok = true;
+            Serial.printf("[gps] LATE connect @ %lu baud (dead at boot, recovered)\n",
+                          (unsigned long)gps_baud_now);
+        }
+        return;
+    }
+    if (gnss_last_fresh_ms == 0) return;
     const uint32_t now = millis();
     const uint32_t age = now - gnss_last_fresh_ms;
     if (age < GPS_STALE_RECOVER_MS) return;            // healthy — nothing to do
@@ -756,6 +791,7 @@ static uint8_t  rpm_ring_head     = 0;
 static uint8_t  rpm_ring_fill     = 0;
 static float    rpm_ema           = 0.0f;
 static uint32_t rpm_last_pulse_ms = 0;
+static uint32_t rpm_spike_rej_ms  = 0;   // first-rejection time of the current spike streak
 
 static double rpmRingMedian() {
     if (rpm_ring_fill == 0) return 0.0;
@@ -780,6 +816,35 @@ static void pumpTach() {
         const double inst = (freq_hz * 60.0) / ppr;
         // Stage 1: glitch gate — drop noise spikes / nonsense periods outright.
         if (inst <= 0.0 || inst > (double)RPM_MAX_PLAUSIBLE) continue;
+        // Stage 1.5: SLEW/SPIKE GATE (dash "RPM spike filter", CFG,rpmspk).
+        // The absolute gate + median only kill SINGLE outliers above 12 k; a
+        // noise BURST (several spurious edges) or a spike at a plausible value
+        // (e.g. 8 k while the engine's at 3 k) sailed through and slammed the
+        // bar. Physics: an engine can't change speed faster than ~a few 1000
+        // RPM/s, but noise "jumps" instantly — so reject any pulse implying a
+        // change from the current filtered value faster than the level's max
+        // slew. Escape hatches so a REAL level shift can never be locked out:
+        // (a) the allowance grows with time since the last ACCEPTED pulse, and
+        // (b) after CONFIRM ms of continuous rejection the filter resets and
+        // accepts the new level (a genuine jump lands within ~0.2–0.3 s).
+        if (g_cfg.rpm_spike > 0 && rpm_ema > 400.0f) {
+            static constexpr float    SLEW_RPM_S[4] = { 0.f, 20000.f, 10000.f, 5000.f };
+            static constexpr uint16_t CONFIRM_MS[4] = { 0, 120, 200, 300 };
+            const uint8_t  sp    = (g_cfg.rpm_spike > 3) ? 3 : g_cfg.rpm_spike;
+            const uint32_t nowms = millis();
+            float allow = SLEW_RPM_S[sp] * (float)(nowms - rpm_last_pulse_ms) * 0.001f;
+            if (allow < 250.0f) allow = 250.0f;   // floor: normal pulse-to-pulse jitter
+            if (fabs(inst - (double)rpm_ema) > (double)allow) {
+                if (rpm_spike_rej_ms == 0) rpm_spike_rej_ms = nowms;
+                if (nowms - rpm_spike_rej_ms < CONFIRM_MS[sp]) continue;   // reject pulse
+                // Sustained — it's real. Reset the filter so it re-seeds at the
+                // new level immediately instead of slewing there.
+                rpm_ring_head = 0; rpm_ring_fill = 0; rpm_ema = 0.0f;
+                rpm_spike_rej_ms = 0;
+            } else {
+                rpm_spike_rej_ms = 0;
+            }
+        }
         // Stage 2: feed the median ring.
         rpm_inst_ring[rpm_ring_head] = inst;
         rpm_ring_head = (rpm_ring_head + 1) % RPM_MEDIAN_N;
@@ -810,7 +875,7 @@ static uint16_t computeRpmAndReset() {
     if (millis() - rpm_last_pulse_ms > RPM_TIMEOUT_MS) {
         // Engine stopped / signal lost — reset the filter so it ramps cleanly
         // from zero on the next pulse rather than EMA-decaying from a stale value.
-        rpm_ring_head = 0; rpm_ring_fill = 0; rpm_ema = 0.0f;
+        rpm_ring_head = 0; rpm_ring_fill = 0; rpm_ema = 0.0f; rpm_spike_rej_ms = 0;
         return 0;
     }
     if (rpm_ema < 0.0f)         return 0;
@@ -2205,6 +2270,14 @@ static void handleCfgLine(const String& line) {
             Serial.printf("[cfg] rpm smoothing = %d\n", (int)g_cfg.rpm_smooth);
         }
     }
+    else if (key == "rpmspk") {
+        uint8_t v = (uint8_t)val.toInt();
+        if (v > 3) v = 3;
+        if (v != g_cfg.rpm_spike) {
+            g_cfg.rpm_spike = v;
+            Serial.printf("[cfg] rpm spike filter = %u\n", (unsigned)v);
+        }
+    }
     else {
         Serial.printf("[cfg] unknown key %s\n", key.c_str());
         return;
@@ -3006,7 +3079,15 @@ void setup() {
     // stale watchdog re-begins every 10 s, blocking the loop and stuttering RPM.
     // Higher baud is now an EXPLICIT, recoverable choice from the GPS settings
     // page (CFG,gpsbaud -> applyGpsBaud, which verifies + scans back on failure).
-    if (tryConnectGNSS(GPS_BAUD_PRIMARY) || tryConnectGNSS(GPS_BAUD_FALLBACK)) {
+    // ⚠️ BAUD LANDMINE FIX (review): saveConfiguration() (0.1.93) persists a
+    // dash-selected baud (e.g. 230400) to the MODULE's flash — so on the next
+    // power-up the module boots at that baud, and a boot scan of only 38400 +
+    // 9600 would NEVER connect => GPS permanently dead every boot. The boot
+    // scan must include every rate the GPS settings page offers.
+    if (tryConnectGNSS(GPS_BAUD_PRIMARY) || tryConnectGNSS(GPS_BAUD_FALLBACK)
+        || tryConnectGNSS(230400, GPS_BEGIN_WAIT_FAST)
+        || tryConnectGNSS(115200, GPS_BEGIN_WAIT_FAST)
+        || tryConnectGNSS(460800, GPS_BEGIN_WAIT_FAST)) {
         Serial.printf("u-blox connected @ %lu baud\n", (unsigned long)gps_baud_now);
         myGNSS.setUART1Output(COM_TYPE_UBX);     // we don't need NMEA on this link
         myGNSS.setNavigationFrequency(gps_nav_hz);
@@ -3024,7 +3105,7 @@ void setup() {
             Serial.println(F("[gps] saveConfiguration FAILED"));
         gnss_lib_ok = true;
     } else {
-        Serial.println(F("u-blox NOT detected on Serial2 (tried 38400 and 9600)"));
+        Serial.println(F("u-blox NOT detected on Serial2 (tried 38400/9600/230400/115200/460800; will keep retrying every 30 s)"));
         // Leave Serial2 open at 9600 so we can still observe raw bytes flowing
         // from the module (most u-blox modules default-output NMEA at 9600).
         // The dash will report status=RAW or OFF depending on what we see.
