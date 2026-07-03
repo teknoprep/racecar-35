@@ -600,8 +600,10 @@ The `Auto select by GPS` toggle determines whether the picker actually opens or 
 - Closest track is **highlighted green at the top** of the picker with a `closest · X.X km` distance label
 
 ### Lap timer / predictive / delta / LAP COUNTER (S/F LINE-crossing, v0.1.82)
-Lap timing runs in `RaceDash.ino` (`updateLapTimer()`) whenever there's a GPS fix
-at a known track regardless of REC state. Middle dash column shows `PRED` / `LAP`
+Lap timing runs in `RaceDash.ino` (`updateLapTimer()`) — **only WHILE RECORDING since v0.1.105**:
+START resets `lapTimer` for a fresh session (rising-edge reset also avoids a stale `prev_gps_ms`
+distance jump on restart); STOP freezes it and PRED/DELTA draw as grey `--` (the LAP row keeps
+the last completed time as a static fact). Middle dash column shows `PRED` / `LAP`
 (time) / `DELTA`; a **LAP COUNTER** (`"LAP N"`, yellow Font4) is drawn near the
 speed, just above the FIX/SATS/GPS column (current lap; `LAP --` until the first
 crossing).

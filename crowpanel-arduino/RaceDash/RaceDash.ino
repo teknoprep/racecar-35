@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.104"
+#define FIRMWARE_VERSION "0.1.105"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1493,6 +1493,14 @@ static void resetLapTimer() {
 // lap timing is based purely on GPS position vs the known S/F line for
 // whatever track the car is at. START/STOP only controls data recording.
 static void updateLapTimer() {
+    // Lap timing only runs WHILE RECORDING (v0.1.105): PRED/DELTA ticking on
+    // the cooldown lap / in the paddock is noise. STOP freezes the timer (the
+    // LAP row keeps the last time as a static fact); START begins a fresh
+    // session — resetting on the rising edge also avoids a stale prev_gps_ms
+    // producing a huge dt/distance jump on the first update after a restart.
+    static bool was_recording = false;
+    if (!recording) { was_recording = false; return; }
+    if (!was_recording) { lapTimer = LapTimer{}; was_recording = true; }
     if (g.fix < 2) return;    // no usable fix — pause, don't reset
 
     const int tIdx = closestTrackIdx();
@@ -3840,7 +3848,8 @@ static void drawDashPage() {
     // PRED is green when on pace for a faster lap, white when ~even, red when
     // slower, grey until there's a ghost lap. LAP is white — a static fact.
     {
-        const uint32_t predMs = predictiveLapMs();
+        // Blank (grey --) when not recording — lap timing is session-only.
+        const uint32_t predMs = recording ? predictiveLapMs() : 0;
         const uint32_t cs = predMs / 10;
         if (cs != ld.pred_lap_cs) {
             char buf[12];
@@ -3906,7 +3915,8 @@ static void drawDashPage() {
     // Green when ahead of best pace, white when within DELTA_SAME_MS (even),
     // red when behind, grey until a ghost (best) lap has been recorded.
     {
-        const int32_t deltaMs = predictiveDeltaMs();
+        // Blank (grey --) when not recording — lap timing is session-only.
+        const int32_t deltaMs = recording ? predictiveDeltaMs() : INT32_MIN;
         const int32_t cs = (deltaMs == INT32_MIN) ? INT32_MIN : deltaMs / 10;
         if (cs != ld.delta_cs) {
             char buf[12];
