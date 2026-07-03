@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.101"
+#define FIRMWARE_VERSION "0.1.102"
 
 #include <Preferences.h>
 #include <time.h>
@@ -466,6 +466,7 @@ static uint32_t cloud_queue_depth  = 0;
 #define NET_BT      2
 static uint8_t  net_owner          = NET_WIFI;
 static bool     net_pending_upload = false;   // start upload flow once WiFi connects
+static bool     net_pending_sel    = false;   // pending upload is "selected files" (Sessions page)
 static uint32_t net_owner_ms       = 0;
 
 // Firmware version tracking. Dash version is compile-time (FIRMWARE_VERSION).
@@ -1917,6 +1918,7 @@ static void ufStartListing() {
     Serial.flush();
 }
 
+
 static void ufStartCurrentFile() {
     if (uf.files_idx >= uf.files_n) {
         ufEnter(UF_DONE);
@@ -2094,6 +2096,24 @@ static void slEnter(SessionsListState st) {
     sl.state = st;
     sl.state_entered_ms = millis();
     sl.dirty = true;
+}
+
+// Upload ONLY the files selected on the Sessions page (skip the Q,LIST phase
+// entirely — we already know the names/sizes). Lets the user push a single
+// small .dbg file up without waiting behind a 4 MB session file. Defined here
+// (not next to ufStartListing) because it needs the `sl` global above.
+static void ufStartSelected() {
+    ufReset();
+    for (int i = 0; i < sl.count && uf.files_n < (int)(sizeof(uf.files) / sizeof(uf.files[0])); ++i) {
+        if (!sl.selected[i]) continue;
+        strncpy(uf.files[uf.files_n].name, sl.files[i], sizeof(uf.files[0].name) - 1);
+        uf.files[uf.files_n].name[sizeof(uf.files[0].name) - 1] = '\0';
+        uf.files[uf.files_n].size = sl.sizes[i];
+        uf.files_n++;
+    }
+    if (uf.files_n == 0) { ufEnter(UF_DONE); return; }
+    uf.files_idx = 0;
+    ufStartCurrentFile();   // sends Q,GET for the first selected file
 }
 
 static void sessionsRequestList() {
@@ -4562,11 +4582,13 @@ static void netOwnerTick() {
     if (net_owner == NET_WIFI && net_pending_upload) {
         if (wifiConnectedNow()) {
             net_pending_upload = false;
-            ufStartListing();         // modal is already open ("waiting for WiFi")
+            if (net_pending_sel) { net_pending_sel = false; ufStartSelected(); }
+            else                 { ufStartListing(); }   // modal is already open
         } else if (millis() - net_owner_ms > 45000) {
             // WiFi never came up — abort the pending upload; closeUploadModal's
             // hook hands the radio back to BT if that's still the source.
             net_pending_upload = false;
+            net_pending_sel    = false;
             snprintf(upload_result_msg, sizeof(upload_result_msg), "WiFi didn't connect");
             closeUploadModal();
         }
@@ -7768,9 +7790,10 @@ namespace {
     constexpr int SES_SIZE_X       = 670;   // right-aligned size
     constexpr int SES_FOOT_Y       = 408;
     constexpr int SES_FOOT_H       = 64;
-    constexpr int SES_BTN_DEL_X    = 40;
-    constexpr int SES_BTN_DELALL_X = 440;
-    constexpr int SES_BTN_W        = 320;
+    constexpr int SES_BTN_UP_X     = 16;    // Upload (n) — selected files only
+    constexpr int SES_BTN_DEL_X    = 280;
+    constexpr int SES_BTN_DELALL_X = 544;
+    constexpr int SES_BTN_W        = 240;
     constexpr int SES_BTN_H        = SES_FOOT_H;
 }
 
@@ -7852,12 +7875,17 @@ static void drawSessionsPage() {
         }
     }
 
-    // Footer: Delete selected (only enabled if any selected) and Delete All.
+    // Footer: Upload selected / Delete selected / Delete All.
     const int selected_n = sessions_selected_count();
+    const bool up_enabled   = sl.state == SL_IDLE && selected_n > 0;
     const bool del_enabled  = sl.state == SL_IDLE && selected_n > 0;
     const bool dall_enabled = sl.state == SL_IDLE && sl.count > 0;
+    const uint16_t up_fill   = up_enabled   ? TFT_DARKGREEN : TFT_DARKGREY;
     const uint16_t del_fill  = del_enabled  ? TFT_MAROON : TFT_DARKGREY;
     const uint16_t dall_fill = dall_enabled ? TFT_RED    : TFT_DARKGREY;
+    tft.fillRect(SES_BTN_UP_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, up_fill);
+    tft.drawRect(SES_BTN_UP_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, TFT_WHITE);
+    tft.drawRect(SES_BTN_UP_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
     tft.fillRect(SES_BTN_DEL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, del_fill);
     tft.drawRect(SES_BTN_DEL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, TFT_WHITE);
     tft.drawRect(SES_BTN_DEL_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
@@ -7866,10 +7894,15 @@ static void drawSessionsPage() {
     tft.drawRect(SES_BTN_DELALL_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
     tft.setFont(&fonts::Font4);
     tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, up_fill);
+    char upLabel[40];
+    if (selected_n > 0) snprintf(upLabel, sizeof(upLabel), "Upload (%d)", selected_n);
+    else                snprintf(upLabel, sizeof(upLabel), "Upload");
+    tft.drawString(upLabel, SES_BTN_UP_X + SES_BTN_W / 2, SES_FOOT_Y + SES_BTN_H / 2);
     tft.setTextColor(TFT_WHITE, del_fill);
     char delLabel[40];
     if (selected_n > 0) snprintf(delLabel, sizeof(delLabel), "Delete (%d)", selected_n);
-    else                snprintf(delLabel, sizeof(delLabel), "Delete selected");
+    else                snprintf(delLabel, sizeof(delLabel), "Delete");
     tft.drawString(delLabel, SES_BTN_DEL_X + SES_BTN_W / 2, SES_FOOT_Y + SES_BTN_H / 2);
     tft.setTextColor(TFT_WHITE, dall_fill);
     tft.drawString("Delete all", SES_BTN_DELALL_X + SES_BTN_W / 2, SES_FOOT_Y + SES_BTN_H / 2);
@@ -7879,6 +7912,21 @@ static void drawSessionsPage() {
 static void handleSessionsTap(int x, int y) {
     // Footer buttons first.
     if (y >= SES_FOOT_Y && y <= SES_FOOT_Y + SES_FOOT_H) {
+        if (x >= SES_BTN_UP_X && x < SES_BTN_UP_X + SES_BTN_W) {
+            if (sl.state == SL_IDLE && sessions_selected_count() > 0 && !upload_active) {
+                if (net_owner != NET_WIFI) {
+                    // BT owns the radio — hand over first (coex), then upload.
+                    openUploadModal("waiting for WiFi (BT paused)...", 0);
+                    net_pending_upload = true;
+                    net_pending_sel    = true;
+                    btReleaseRadio();
+                } else {
+                    openUploadModal("", 0);
+                    ufStartSelected();
+                }
+            }
+            return;
+        }
         if (x >= SES_BTN_DEL_X && x < SES_BTN_DEL_X + SES_BTN_W) {
             if (sl.state == SL_IDLE && sessions_selected_count() > 0) {
                 slStartDelete(/*delete_all=*/false);

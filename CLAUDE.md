@@ -387,6 +387,24 @@ VER,teensy,<semver>
 - The dash parser tolerates short forms for back-compat (e.g. `ENG` with 1 or 3 fields).
 - **Rate-limiting**: emit only when `myGNSS.getPVT(0)` returns true OR every 1 s. `getPVT(0)` is non-blocking — never use the blocking variant or the 25 Hz loop chokes.
 - **GPS UART RX buffer (v0.1.66 fix) — DO NOT remove.** Serial2's default RX ring is only tens of bytes — SMALLER than one ~100-byte UBX-NAV-PVT frame. GPS is parsed by *polling* `getPVT()` in `loop()` (RPM is NOT — CAN + `FreqMeasureMulti` are interrupt/FIFO-driven). So any loop stall >~25 ms overflows the ring, desyncs the autoPVT stream, and with a sub-frame buffer it can NEVER re-sync → GPS "freezes at last position" (STALE) while RPM keeps running. The stalls come from **SD `sync()`/`write()` latency during recording** (this is why it only happened once a session started, after "half a lap or two"). Fix: `Serial2.addMemoryForRead(gpsRxBuf, 32768)` in `setup()` BEFORE `begin()` (mirrors the dash Serial3 buffer) — ~8.5 s of slack at 38400 baud so the parser rides through SD spikes. `addMemoryForRead()` is on the concrete `Serial2`, not the `HardwareSerial&` alias.
+- **GPS module-reset forensics (v0.1.102).** Auto **UBX-NAV-STATUS** (every 5th nav solution)
+  rides the PVT stream; its `msss` (ms since MODULE startup) feeds `navStatusCB()` — if msss goes
+  BACKWARDS the u-blox rebooted (power glitch), counted in `gps_module_resets` and logged in the
+  `.dbg` health line as `msss`/`mrst`. Requires `myGNSS.checkCallbacks()` in loop(). Re-asserted
+  on every re-begin path. Context: the racing-only stales show `avail=0` (module silent, 51% of
+  the 1783087863 session, 8-min outages, fine when parked) — mrst>0 = reboots (power/wiring),
+  mrst==0 with msss advancing = module alive but mute (UART wire/antenna path).
+- **Upload speed: sliding-window ARQ (v0.1.102).** `handleQGet()` streams with a **go-back-N
+  window (QGET_WIN=16 lines in flight, cumulative ACKs)** instead of stop-and-wait — the old
+  one-line-per-round-trip paid the dash's 5–30 ms UI-loop latency per ~220-byte line (20k-line
+  session = many minutes); now it's wire-limited (~90 KB/s at 921600, 4 MB ≈ 1 min). The dash
+  side needed NO protocol change (it already ACKs the highest CONTIGUOUS seq — a gap re-acks the
+  last good one = natural NAK; 32 KB RX ring; window ~5 KB ≪ ring so TCP-flush backpressure just
+  stalls the window). `qPumpAcksOnce()` keeps STATIC parse state — ack lines straddle calls now.
+- **Sessions page "Upload (n)" (v0.1.102).** Third footer button uploads ONLY the checkbox-
+  selected files (`ufStartSelected()` skips Q,LIST) — e.g. push a 300 KB `.dbg` up without
+  waiting behind a 4 MB session. Same radio-handover guard as the dash UPLOAD button
+  (`net_pending_sel`).
 - **GPS dead-at-boot recovery + boot baud scan (v0.1.97 review fixes).** (1) If the boot-time
   connect fails, `gnss_lib_ok=false` used to mean NOTHING ever retried — GPS stayed OFF for the
   whole session (proven on track: two sessions with bogus 2019 epochs = no time source from

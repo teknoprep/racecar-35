@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.101"
+#define FIRMWARE_VERSION "0.1.102"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -602,6 +602,25 @@ static uint8_t  gps_nav_hz   = NAV_RATE_HZ;   // live nav rate (dash: CFG,gpshz,
 // freeze the 25 Hz loop for seconds (that blocking IS what causes GPS-stale).
 static constexpr uint16_t GPS_BEGIN_WAIT_FAST = 600;
 
+// MODULE-RESET FORENSICS (v0.1.102). UBX-NAV-STATUS rides the same auto stream
+// as PVT and carries msss = milliseconds since MODULE startup/reset. If msss
+// ever goes BACKWARDS, the u-blox rebooted — decisive, courtroom-grade proof
+// of a power glitch (vs UART/parser trouble). Logged in the .dbg health line
+// as msss/mrst. The racing-only stales all show avail=0 (module electrically
+// silent) — this counter settles whether those are module reboots.
+static volatile uint32_t gps_msss          = 0;
+static volatile uint32_t gps_module_resets = 0;
+static void navStatusCB(UBX_NAV_STATUS_data_t *d) {
+    const uint32_t m = d->msss;
+    if (gps_msss > 3000 && m + 1000 < gps_msss) {   // clock went backwards = reboot
+        gps_module_resets++;
+        Serial.printf("[gps] MODULE RESET detected: msss %lu -> %lu (reset #%lu)\n",
+                      (unsigned long)gps_msss, (unsigned long)m,
+                      (unsigned long)gps_module_resets);
+    }
+    gps_msss = m;
+}
+
 // Change the u-blox nav (PVT) rate on demand. Lower Hz = far less UART traffic
 // (10 Hz PVT is ~26% of 38400 vs ~65% at 25 Hz) = more headroom against stalls.
 static void applyGpsHz(uint8_t hz) {
@@ -657,6 +676,7 @@ static void gpsStaleWatchdog() {
             myGNSS.setUART1Output(COM_TYPE_UBX, 250);
             myGNSS.setNavigationFrequency(gps_nav_hz, 250);
             myGNSS.setAutoPVT(true, (uint16_t)250);
+            myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB, 250);
             myGNSS.saveConfiguration(250);
             gnss_lib_ok = true;
             Serial.printf("[gps] LATE connect @ %lu baud (dead at boot, recovered)\n",
@@ -716,6 +736,7 @@ static void gpsStaleWatchdog() {
             myGNSS.setUART1Output(COM_TYPE_UBX, 250);
             myGNSS.setNavigationFrequency(gps_nav_hz, 250);
             myGNSS.setAutoPVT(true, (uint16_t)250);
+            myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB, 250);   // keep reset forensics alive
             gnss_last_fresh_ms = millis();   // grace window so we don't re-trip instantly
             Serial.printf("[gps] re-begin OK @ %lu baud\n", (unsigned long)gps_baud_now);
         } else {
@@ -755,6 +776,7 @@ static void applyGpsBaud(uint32_t target) {
         myGNSS.setUART1Output(COM_TYPE_UBX);
         myGNSS.setNavigationFrequency(gps_nav_hz);
         myGNSS.setAutoPVT(true);
+        myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB, 250);
         myGNSS.saveConfiguration();      // persist new baud+config so a reset restores it (stale fix)
         gnss_lib_ok = true;
         gnss_last_fresh_ms = millis();   // grace so the watchdog doesn't instantly trip
@@ -1914,13 +1936,14 @@ static void dbgHealth() {
     int n = snprintf(line, sizeof(line),
         "{\"t\":%lu,\"ev\":\"h\",\"loop_ms\":%lu,\"sdwr_ms\":%lu,\"fresh\":%lu,\"avail\":%d,"
         "\"pvt_age\":%lu,\"flush\":%lu,\"rebegin\":%lu,\"samp\":%lu,\"status\":%u,\"lib_ok\":%u,"
-        "\"t_die\":%.1f,\"t_mpu\":%.1f,\"t_esp\":%.1f,\"batt\":%.1f}\n",
+        "\"t_die\":%.1f,\"t_mpu\":%.1f,\"t_esp\":%.1f,\"batt\":%.1f,\"msss\":%lu,\"mrst\":%lu}\n",
         (unsigned long)((now - session_start_ms) / 1000),
         (unsigned long)(dbg_loop_max_us / 1000), (unsigned long)(dbg_sdwr_max_us / 1000),
         (unsigned long)dbg_fresh_1s, avail, (unsigned long)pvt_age,
         (unsigned long)rec_d, (unsigned long)rei_d, (unsigned long)session_samples,
         (unsigned)gpsStatus(), (unsigned)(gnss_lib_ok ? 1 : 0),
-        t_die, imu_temp_c, dash_temp_c, batt);
+        t_die, imu_temp_c, dash_temp_c, batt,
+        (unsigned long)gps_msss, (unsigned long)gps_module_resets);
     dbg_loop_max_us = 0; dbg_sdwr_max_us = 0; dbg_fresh_1s = 0;
     if (n > 0) {
         dbg_file.write((const uint8_t*)line, n);
@@ -2728,28 +2751,31 @@ static void handleQList() {
 // Wait for a sequence-numbered ack 'Q,A,<seq>' from the dash. Returns the
 // acked seq (>=0) or -1 on timeout. The dash acks the HIGHEST contiguous line
 // seq it has applied, so any ack >= the line we just sent confirms delivery.
-static long qWaitForAckSeq(uint32_t timeout_ms) {
-    char line[24];
-    size_t n = 0;
-    const uint32_t end = millis() + timeout_ms;
-    while ((int32_t)(end - millis()) > 0) {
-        while (DASH_SERIAL.available()) {
-            const char c = (char)DASH_SERIAL.read();
-            if (c == '\r') continue;
-            if (c == '\n') {
-                line[n] = '\0';
-                n = 0;
-                if (strncmp(line, "Q,A,", 4) == 0) return strtol(line + 4, nullptr, 10);
-                // bare "Q,A" (older dash, no seq): treat as ack-of-anything
-                if (strncmp(line, "Q,A", 3) == 0) return 0x7fffffffL;
-                continue;   // ignore telemetry / stray lines
+// Drain any pending ACK lines (non-blocking) and return the highest cumulative
+// ack seen so far. Parse state is STATIC because with a windowed sender an ack
+// line can straddle two calls — the old per-call locals silently dropped the
+// partial and lost acks. Interleaved telemetry lines from the dash are ignored.
+static long qPumpAcksOnce(long best) {
+    static char   line[24];
+    static size_t n = 0;
+    while (DASH_SERIAL.available()) {
+        const char c = (char)DASH_SERIAL.read();
+        if (c == '\r') continue;
+        if (c == '\n') {
+            line[n] = '\0';
+            n = 0;
+            if (strncmp(line, "Q,A,", 4) == 0) {
+                const long v = strtol(line + 4, nullptr, 10);
+                if (v > best) best = v;
+            } else if (strncmp(line, "Q,A", 3) == 0) {
+                best = 0x7fffffffL;   // bare ack (ancient dash): everything acked
             }
-            if (n + 1 < sizeof(line)) line[n++] = c;
-            else n = 0;
+            continue;   // ignore telemetry / stray lines
         }
-        delay(0);
+        if (n + 1 < sizeof(line)) line[n++] = c;
+        else n = 0;
     }
-    return -1;
+    return best;
 }
 
 static void handleQGet(const char* basename) {
@@ -2771,45 +2797,66 @@ static void handleQGet(const char* basename) {
     const uint32_t sz = f.fileSize();
     DASH_SERIAL.printf("Q,DATA,%s,%lu\n", basename, (unsigned long)sz);
     DASH_SERIAL.flush();
-    // Stream line-by-line with per-line ACK. Each ndjson line goes out as
-    // 'Q,L,<line>\n' and we wait for 'Q,A\n' from the dash before sending the
-    // next one. This keeps Teensy's pace strictly tied to the dash's actual
-    // throughput so we never out-run the dash regardless of UART buffer size
-    // or TCP write speed on the dash's WiFi link.
-    // Stop-and-wait ARQ with sequence numbers. Each ndjson line goes out as
-    // 'Q,L,<seq>,<line>\n'; the dash applies it and replies 'Q,A,<seq>'. If a
-    // line OR its ack is lost/corrupted on the (long, noisy) UART wire, the
-    // ack times out and we RETRANSMIT the same seq — the dash dedups by seq, so
-    // a dropped byte costs one retransmit instead of aborting the whole upload.
+    // SLIDING-WINDOW ARQ (v0.1.102; go-back-N, cumulative ACKs). The old
+    // stop-and-wait sent ONE line then blocked for its ack — every ~220-byte
+    // line paid a full round trip including the dash's UI-loop latency
+    // (5-30 ms while it draws), so a 20k-line session took many minutes while
+    // the wire could do it in under a minute. Now we keep up to QGET_WIN lines
+    // in flight; the dash already ACKs the highest CONTIGUOUS seq it applied
+    // (a gap simply re-acks the last good seq), so on an ack stall we
+    // retransmit everything unacked (go-back-N) and the dash dedups by seq.
+    // Window sized so max in-flight (~5 KB) stays well under the dash's 32 KB
+    // UART RX ring even while it blocks flushing a TCP chunk (backpressure:
+    // no acks -> window fills -> we wait).
+    constexpr uint32_t QGET_WIN = 16;
+    static char     wtext[QGET_WIN][320];   // retransmit ring (static: ~5 KB, off the stack)
+    static uint16_t wlen[QGET_WIN];
     char     line[320];
     size_t   line_n = 0;
     uint32_t seq = 0;
+    long     last_acked = 0;
     uint32_t retransmits = 0;
     bool     ack_fail = false;
-    while (true) {
+
+    auto sendSeq = [&](uint32_t s2) {
+        DASH_SERIAL.printf("Q,L,%lu,", (unsigned long)s2);
+        DASH_SERIAL.write((const uint8_t*)wtext[s2 % QGET_WIN], wlen[s2 % QGET_WIN]);
+        DASH_SERIAL.write('\n');
+    };
+    // Block until the cumulative ack advances. On a 2 s stall, go-back-N
+    // retransmit of everything in flight; 8 stalls in a row = link dead.
+    auto waitAckProgress = [&]() -> bool {
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const long   before = last_acked;
+            const uint32_t t0   = millis();
+            while (millis() - t0 < 2000) {
+                last_acked = qPumpAcksOnce(last_acked);
+                if (last_acked > before) return true;
+                delay(1);
+            }
+            retransmits += (uint32_t)(seq - (uint32_t)last_acked);
+            for (uint32_t s2 = (uint32_t)last_acked + 1; s2 <= seq; ++s2) sendSeq(s2);
+        }
+        return false;
+    };
+
+    while (!ack_fail) {
         const int c = f.read();
         if (c < 0 && line_n == 0) break;          // EOF, no partial
         if (c == '\r') continue;
         if (c == '\n' || c < 0) {
             line[line_n] = '\0';
             if (line_n > 0) {
+                // Window full? Wait for acks (with go-back-N on stall).
+                while ((uint32_t)(seq - (uint32_t)last_acked) >= QGET_WIN) {
+                    if (!waitAckProgress()) { ack_fail = true; break; }
+                }
+                if (ack_fail) break;
                 seq++;
-                bool acked = false;
-                // ~30 s worst case per line (15 * 2 s) before declaring the
-                // link dead; a transient glitch clears on the first retry.
-                for (int attempt = 0; attempt < 15 && !acked; ++attempt) {
-                    if (attempt > 0) retransmits++;
-                    DASH_SERIAL.printf("Q,L,%lu,", (unsigned long)seq);
-                    DASH_SERIAL.write((const uint8_t*)line, line_n);
-                    DASH_SERIAL.write('\n');
-                    if (qWaitForAckSeq(2000) >= (long)seq) acked = true;
-                }
-                if (!acked) {
-                    Serial.printf("[Q] GET %s: ACK timeout at seq %lu\n",
-                                  basename, (unsigned long)seq);
-                    ack_fail = true;
-                    break;
-                }
+                memcpy(wtext[seq % QGET_WIN], line, line_n);
+                wlen[seq % QGET_WIN] = (uint16_t)line_n;
+                sendSeq(seq);
+                last_acked = qPumpAcksOnce(last_acked);   // opportunistic, non-blocking
             }
             line_n = 0;
             if (c < 0) break;
@@ -2818,6 +2865,13 @@ static void handleQGet(const char* basename) {
         if (line_n + 1 < sizeof(line)) line[line_n++] = (char)c;
         else line[sizeof(line) - 1] = '\0';
     }
+    // Drain the tail of the window.
+    while (!ack_fail && last_acked < (long)seq) {
+        if (!waitAckProgress()) ack_fail = true;
+    }
+    if (ack_fail)
+        Serial.printf("[Q] GET %s: ACK stall at seq %lu (acked %ld)\n",
+                      basename, (unsigned long)seq, last_acked);
     f.close();
     if (ack_fail) {
         DASH_SERIAL.println(F("Q,ERR,ack_timeout"));
@@ -3092,6 +3146,10 @@ void setup() {
         myGNSS.setUART1Output(COM_TYPE_UBX);     // we don't need NMEA on this link
         myGNSS.setNavigationFrequency(gps_nav_hz);
         myGNSS.setAutoPVT(true);
+        // Module-reset forensics: auto NAV-STATUS (every 5th nav solution = 5 Hz
+        // at 25 Hz nav rate — ~120 B/s, minimal UART cost) with msss callback.
+        myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB);
+        myGNSS.setAutoNAVSTATUSrate(5);
         // Persist this config (UBX out + nav rate + auto-PVT + baud) to the
         // module's flash + BBR. THE STALE FIX: the debug logs show the module
         // going silent for ~10s repeatedly (a reset, most likely a brownout) and
@@ -3474,6 +3532,7 @@ void loop() {
             freshThisCall = true;
             dbg_fresh_1s++;           // real PVT rate for the debug health line
         }
+        myGNSS.checkCallbacks();      // dispatch NAV-STATUS msss callback (reset forensics)
     } else {
         // Drain raw bytes the lib never claimed. Doesn't try to interpret —
         // we just want to know SOMETHING is on the GPS UART.
