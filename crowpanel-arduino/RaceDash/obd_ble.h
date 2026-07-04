@@ -214,6 +214,22 @@ static void doScan() {
   blePhase(0);
 }
 
+// Consecutive connect/discover failures. After a few, the NimBLE client is
+// deleted and recreated — a client object can wedge internally (half-open
+// handles) and then every connect() fails forever; a fresh client recovers.
+static uint8_t g_conn_fails = 0;
+
+static bool connFail() {   // shared failure path for connectAndInit
+  g_state = FAILED;
+  blePhase(0);
+  if (++g_conn_fails >= 3 && g_client) {
+    NimBLEDevice::deleteClient(g_client);   // recreate fresh on next attempt
+    g_client = nullptr;
+    g_conn_fails = 0;
+  }
+  return false;
+}
+
 static bool connectAndInit() {
   if (!g_target_addr[0]) return false;
   g_state = CONNECTING;
@@ -221,9 +237,13 @@ static bool connectAndInit() {
   if (!g_client) {
     g_client = NimBLEDevice::createClient();
     g_client->setClientCallbacks(&g_clientCB, false);
+    // Default connect timeout is 30 s — with the dongle out of range every
+    // reconnect attempt wedged the task for half a minute, which is why
+    // reconnection felt broken. 5 s keeps the retry loop responsive.
+    g_client->setConnectTimeout(5);
   }
   NimBLEAddress addr(std::string(g_target_addr), g_target_atype);
-  if (!g_client->isConnected() && !g_client->connect(addr)) { g_state = FAILED; blePhase(0); return false; }
+  if (!g_client->isConnected() && !g_client->connect(addr)) return connFail();
 
   g_state = DISCOVER;
   g_tx = g_rx = nullptr;
@@ -251,7 +271,7 @@ static bool connectAndInit() {
     if (!g_rx && rx) g_rx = rx;   // fallbacks if no single service has both
     if (!g_tx && tx) g_tx = tx;
   }
-  if (!g_tx || !g_rx) { g_state = FAILED; g_client->disconnect(); blePhase(0); return false; }
+  if (!g_tx || !g_rx) { g_client->disconnect(); return connFail(); }
   // Subscribe with the mode the characteristic actually supports — subscribing
   // for notifications (CCCD=1) on an indicate-only char silently gets nothing.
   g_rx->subscribe(g_rx->canNotify(), notifyCB);
@@ -292,6 +312,7 @@ static bool connectAndInit() {
     g_last_resp[sizeof(g_last_resp) - 1] = 0;
   }
   d_last_ms = millis();
+  g_conn_fails = 0;   // clean link — reset the client-recycle counter
   g_state = POLL;
   blePhase(4);   // connected — stays set while linked (power-off reads POWERON = ignored)
   return true;
@@ -386,16 +407,27 @@ static void obdTask(void*) {
       case OFF:       vTaskDelay(pdMS_TO_TICKS(250)); break;
       case IDLE:      vTaskDelay(pdMS_TO_TICKS(150)); break;
       case POLL:
-        if (g_client && g_client->isConnected()) { pollOnce(); vTaskDelay(pdMS_TO_TICKS(350)); }
+        if (g_client && g_client->isConnected()) {
+          // WEDGE WATCHDOG: "connected" but nothing answering for 20 s means
+          // the ELM (or the GATT link) is hung — ATRV succeeds whenever the
+          // dongle itself is alive (even ignition-off), so a stalled d_last_ms
+          // is a dead LINK, not a sleeping ECU. Tear it down and reconnect:
+          // the fresh connect re-runs ATZ, which hard-resets the ELM.
+          if (d_last_ms && millis() - d_last_ms > 20000) {
+            snprintf(g_last_err, sizeof(g_last_err), "BT link wedged - resetting");
+            g_client->disconnect();
+            g_state = RECONNECT;
+          } else { pollOnce(); vTaskDelay(pdMS_TO_TICKS(350)); }
+        }
         else { g_state = RECONNECT; }
         break;
       case RECONNECT:
         d_coolant_f_x10 = d_iat_f_x10 = d_volt_x10 = -1;
-        vTaskDelay(pdMS_TO_TICKS(2500));
+        vTaskDelay(pdMS_TO_TICKS(1500));   // was 2.5 s — snappier retry
         connectAndInit();
         break;
       case FAILED:
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(1500));   // was 3 s (+2.5 s) between attempts
         if (g_state == FAILED) g_state = RECONNECT;
         break;
       default:        vTaskDelay(pdMS_TO_TICKS(50)); break;   // SCANNING/CONNECTING/etc handled above

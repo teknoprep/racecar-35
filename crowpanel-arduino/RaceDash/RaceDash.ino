@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.106"
+#define FIRMWARE_VERSION "0.1.107"
 
 #include <Preferences.h>
 #include <time.h>
@@ -755,6 +755,18 @@ static uint8_t  gps_orig_hz      = 25;
 // Sensor-source page + BT-scan page repaint flags.
 static bool     sensor_page_dirty = true;
 static bool     bt_scan_dirty     = true;
+// PAGE_BT_SCAN layout + scroll state. Constants live up here (not in the
+// page's anonymous namespace) because handleTouch() needs them for drag-scroll.
+static constexpr int BT_ROW_Y0 = 92, BT_ROW_H = 52;
+static constexpr int BT_RESCAN_X = 60, BT_BACK_X = 440, BT_FOOT_Y = 410, BT_FOOT_W = 300, BT_FOOT_H = 54;
+static constexpr int BT_VIEW_H = BT_FOOT_Y - 10 - BT_ROW_Y0;   // scrollable body height
+static int      bt_scan_scroll    = 0;   // px; active scan can return 16 rows > viewport
+static void clampBtScanScroll() {
+    int maxS = obd::scanCount() * BT_ROW_H - BT_VIEW_H;
+    if (maxS < 0) maxS = 0;
+    if (bt_scan_scroll < 0)    bt_scan_scroll = 0;
+    if (bt_scan_scroll > maxS) bt_scan_scroll = maxS;
+}
 static uint8_t  sensor_orig_type  = 0;   // snapshot for CANCEL on PAGE_SENSOR
 // Device health (heat/brownout diagnostics). Teensy temps + battery arrive via
 // the HLTH line; our own ESP32-S3 temp we read locally and report via DTEMP.
@@ -2879,10 +2891,39 @@ static void handleTouch() {
         }
         return;
     }
+    if (currentPage == PAGE_BT_SCAN) {
+        // Tap to pair + vertical drag to scroll (active scan returns up to 16
+        // devices — more than fit the viewport).
+        if (now && !tt.active) {
+            tt.startX = x; tt.startY = y;
+            tt.lastX  = x; tt.lastY  = y;
+            tt.startMs = millis();
+            tt.active  = true;
+            tt.gesture = GESTURE_NONE;
+            tt.scrollAtStart = bt_scan_scroll;
+        } else if (now && tt.active) {
+            const int dx = x - tt.startX;
+            const int dy = y - tt.startY;
+            if (tt.gesture == GESTURE_NONE
+                && (abs(dx) > GESTURE_THRESH || abs(dy) > GESTURE_THRESH)) {
+                tt.gesture = (abs(dy) > abs(dx)) ? GESTURE_DRAG_V : GESTURE_SWIPE_H;
+            }
+            if (tt.gesture == GESTURE_DRAG_V) {
+                bt_scan_scroll = tt.scrollAtStart - dy;
+                clampBtScanScroll();
+                bt_scan_dirty = true;
+            }
+            tt.lastX = x; tt.lastY = y;
+        } else if (!now && tt.active) {
+            if (tt.gesture == GESTURE_NONE) handleBtScanTap(tt.startX, tt.startY);
+            tt.active = false;
+        }
+        return;
+    }
     if (currentPage == PAGE_NUM_KB || currentPage == PAGE_TEXT_KB ||
         currentPage == PAGE_CONFIG_PICKER || currentPage == PAGE_TIME_SET ||
         currentPage == PAGE_WIFI_SCAN || currentPage == PAGE_GPS ||
-        currentPage == PAGE_SENSOR || currentPage == PAGE_BT_SCAN) {
+        currentPage == PAGE_SENSOR) {
         if (now && !tt.active) {
             tt.startX = x; tt.startY = y;
             tt.lastX  = x; tt.lastY  = y;
@@ -2894,7 +2935,6 @@ static void handleTouch() {
             else if (currentPage == PAGE_WIFI_SCAN)     handleWifiScannerTap(tt.startX, tt.startY);
             else if (currentPage == PAGE_GPS)           handleGpsPageTap(tt.startX, tt.startY);
             else if (currentPage == PAGE_SENSOR)        handleSensorPageTap(tt.startX, tt.startY);
-            else if (currentPage == PAGE_BT_SCAN)       handleBtScanTap(tt.startX, tt.startY);
             else                                        handleKeyboardTap(tt.startX, tt.startY);
             tt.active = false;
         } else if (now && tt.active) {
@@ -4980,10 +5020,8 @@ static void handleSensorPageTap(int x, int y) {
 // ---------------------------------------------------------------------------
 // PAGE_BT_SCAN — scan for BLE OBD-II dongles, tap one to pair it.
 // ---------------------------------------------------------------------------
-namespace {
-  constexpr int BT_ROW_Y0 = 92, BT_ROW_H = 52, BT_ROWS_MAX = 5;
-  constexpr int BT_RESCAN_X = 60, BT_BACK_X = 440, BT_FOOT_Y = 410, BT_FOOT_W = 300, BT_FOOT_H = 54;
-}
+// (BT_* layout constants + bt_scan_scroll live near bt_scan_dirty, up top,
+//  so handleTouch() can drag-scroll this page.)
 
 static void openBtScan() {
     // Explicit user action: clear a prior-crash block too, else after a BLE
@@ -4995,6 +5033,7 @@ static void openBtScan() {
     currentPage     = PAGE_BT_SCAN;
     pageJustEntered = true;
     bt_scan_dirty   = true;
+    bt_scan_scroll  = 0;
 }
 
 static void selectBtDevice(int i) {
@@ -5021,28 +5060,48 @@ static void drawBtScanPage() {
 
     tft.setFont(&fonts::Font2); tft.setTextSize(1);
     tft.setTextColor(obd::scanning() ? TFT_YELLOW : TFT_LIGHTGREY, BG);
-    tft.drawString(obd::scanning() ? "Scanning..." :
-                   (obd::scanCount() ? "Tap your OBD dongle to pair:"
-                                     : "No devices found. RESCAN to retry."), 20, 60);
+    {
+        const int n0 = obd::scanCount();
+        char sub[64];
+        if      (obd::scanning()) strncpy(sub, "Scanning...", sizeof(sub));
+        else if (!n0)             strncpy(sub, "No devices found. RESCAN to retry.", sizeof(sub));
+        else if (n0 * BT_ROW_H > BT_VIEW_H)
+            snprintf(sub, sizeof(sub), "%d devices - drag to scroll, tap to pair:", n0);
+        else
+            snprintf(sub, sizeof(sub), "Tap your OBD dongle to pair:");
+        tft.drawString(sub, 20, 60);
+    }
     tft.setTextPadding(0);
 
+    // Scrollable device list. Clip to the body band so partially-visible rows
+    // at the edges can't spill into the header/footer; every pixel of the band
+    // is painted exactly once per frame (rows + gap strips + tail) — no
+    // wipe-then-draw flash.
     const int n = obd::scanCount();
-    for (int i = 0; i < BT_ROWS_MAX; i++) {
-        const int ry = BT_ROW_Y0 + i * BT_ROW_H;
-        tft.fillRect(20, ry, 760, BT_ROW_H - 6, (i < n) ? TFT_NAVY : BG);
-        if (i < n) {
-            const obd::ScanItem* it = obd::scanItem(i);
-            if (!it) continue;
-            tft.drawRect(20, ry, 760, BT_ROW_H - 6, TFT_DARKGREY);
-            tft.setFont(&fonts::Font2); tft.setTextSize(1);
-            tft.setTextColor(TFT_WHITE, TFT_NAVY);
-            tft.drawString(it->name, 32, ry + 4);
-            char buf[64];
-            snprintf(buf, sizeof(buf), "%s   %d dBm", it->addr, (int)it->rssi);
-            tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
-            tft.drawString(buf, 32, ry + 24);
-        }
+    clampBtScanScroll();
+    tft.setClipRect(20, BT_ROW_Y0, 760, BT_VIEW_H);
+    int lastBottom = BT_ROW_Y0;
+    for (int i = 0; i < n; i++) {
+        const int ry = BT_ROW_Y0 + i * BT_ROW_H - bt_scan_scroll;
+        if (ry + BT_ROW_H <= BT_ROW_Y0 || ry >= BT_ROW_Y0 + BT_VIEW_H) continue;
+        tft.fillRect(20, ry, 760, BT_ROW_H - 6, TFT_NAVY);
+        tft.fillRect(20, ry + BT_ROW_H - 6, 760, 6, BG);   // gap strip below row
+        const obd::ScanItem* it = obd::scanItem(i);
+        if (!it) continue;
+        tft.drawRect(20, ry, 760, BT_ROW_H - 6, TFT_DARKGREY);
+        tft.setFont(&fonts::Font2); tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        tft.drawString(it->name, 32, ry + 4);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s   %d dBm", it->addr, (int)it->rssi);
+        tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+        tft.drawString(buf, 32, ry + 24);
+        if (ry + BT_ROW_H > lastBottom) lastBottom = ry + BT_ROW_H;
     }
+    // Blank whatever the rows didn't cover (short lists, scrolled past end).
+    if (lastBottom < BT_ROW_Y0 + BT_VIEW_H)
+        tft.fillRect(20, lastBottom, 760, BT_ROW_Y0 + BT_VIEW_H - lastBottom, BG);
+    tft.clearClipRect();
 
     // Footer: RESCAN / BACK
     tft.fillRect(BT_RESCAN_X, BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_NAVY);
@@ -5060,9 +5119,10 @@ static void drawBtScanPage() {
 
 static void handleBtScanTap(int x, int y) {
     const int n = obd::scanCount();
-    for (int i = 0; i < BT_ROWS_MAX && i < n; i++) {
-        const int ry = BT_ROW_Y0 + i * BT_ROW_H;
-        if (y >= ry && y <= ry + BT_ROW_H - 6) { selectBtDevice(i); return; }
+    if (y >= BT_ROW_Y0 && y < BT_ROW_Y0 + BT_VIEW_H) {
+        const int rel = y - BT_ROW_Y0 + bt_scan_scroll;   // scroll-aware hit test
+        const int i   = rel / BT_ROW_H;
+        if (i >= 0 && i < n && (rel % BT_ROW_H) < BT_ROW_H - 6) { selectBtDevice(i); return; }
     }
     if (y >= BT_FOOT_Y && y <= BT_FOOT_Y + BT_FOOT_H) {
         if (x >= BT_RESCAN_X && x <= BT_RESCAN_X + BT_FOOT_W) { obd::startScan(); bt_scan_dirty = true; return; }
@@ -8300,8 +8360,9 @@ static void drawStatusPage() {
 
         // Labels (left)
         tft.setTextColor(LBL, BG);
-        tft.drawString("UART",    15,  68);
-        tft.drawString("IP",      15,  88);
+        tft.drawString("UART",    15,  64);
+        tft.drawString("IP",      15,  81);
+        tft.drawString("BT",      15,  98);
         tft.drawString("FIX",     15, 132);
         tft.drawString("SATS",    15, 152);
         tft.drawString("LAT",     15, 172);
@@ -8357,12 +8418,37 @@ static void drawStatusPage() {
     {
         const bool live = (g.last_ms != 0) && (nowMs - g.last_ms < 2000);
         tft.setTextColor(live ? TFT_GREEN : TFT_RED, BG);
-        tft.drawString(live ? "LIVE" : "STALE", LV, 68);
+        tft.drawString(live ? "LIVE" : "STALE", LV, 64);
     }
     // IP
     {
         tft.setTextColor(VAL, BG);
-        tft.drawString(active_ip, LV, 88);
+        tft.drawString(active_ip, LV, 81);
+    }
+    // BT — OBD dongle link (only meaningful with sensor source = Bluetooth)
+    {
+        char buf[40]; uint16_t col;
+        if (s.sensor_type != 2) {
+            strncpy(buf, "OFF", sizeof(buf)); col = TFT_DARKGREY;
+        } else if (obd::connected()) {
+            const char* nm = s.bt_name[0] ? s.bt_name : s.bt_addr;
+            if (obd::coolantF_x10() >= 0 && obd::dataFresh()) {
+                snprintf(buf, sizeof(buf), "%.14s  %dF", nm,
+                         (int)((obd::coolantF_x10() + 5) / 10));
+                col = TFT_GREEN;
+            } else {
+                snprintf(buf, sizeof(buf), "%.14s  no ECU data", nm);
+                col = TFT_YELLOW;
+            }
+        } else if (net_owner != NET_BT) {
+            strncpy(buf, "waiting (BT on at REC)", sizeof(buf)); col = TFT_DARKGREY;
+        } else {
+            snprintf(buf, sizeof(buf), "%.24s...", obd::stateStr());
+            col = TFT_YELLOW;
+        }
+        buf[sizeof(buf) - 1] = '\0';
+        tft.setTextColor(col, BG);
+        tft.drawString(buf, LV, 98);
     }
     // GPS
     {
@@ -8973,7 +9059,9 @@ void loop() {
         }
     } else if (currentPage == PAGE_BT_SCAN) {
         // Frequent refresh so the scanning spinner + result list populate live.
-        if (pageJustEntered || bt_scan_dirty || now - lastDraw >= 400) {
+        // Drag-scroll sets bt_scan_dirty every touch sample — cap at ~30 Hz so
+        // the LCD gets clean scan windows between renders (anti-tearing rule).
+        if (pageJustEntered || ((bt_scan_dirty || now - lastDraw >= 400) && now - lastDraw >= 33)) {
             lastDraw = now;
             drawBtScanPage();
         }

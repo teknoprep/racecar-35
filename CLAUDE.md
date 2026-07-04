@@ -285,6 +285,10 @@ reads the bare `crowpanel` key) can still OTA forward; keep it pointing at the 7
 
 Full publish procedure (Linux host; `$HOME` is unset in this shell — prefix git ops with
 `HOME=/root` OR push to an explicit token URL):
+**⚠️ Publishing now uses a STAGING dir** — `RACECAR_FW_DIR=/tmp/fwstage
+./server/publish_firmware.sh <ver>` after copying fresh builds there. The repo
+`firmware/` dir is the frozen GitHub bridge and must not be overwritten.
+
 ```bash
 NEW=0.1.63   # pick the next version
 
@@ -583,7 +587,21 @@ answering. **Scan is ACTIVE again since v0.1.106** (names live in the scan
 response; safe because the radio time-share keeps WiFi hard-off during scans),
 results are RSSI-sorted (strongest first), and after connect the GAP Device
 Name (0x1800/0x2A00 — mandatory on every BLE device) is read as a name
-fallback and adopted into the saved pairing (`dashHealthTick`). ⚠️ Car-side
+fallback and adopted into the saved pairing (`dashHealthTick`).
+**Scan page scrolls (v0.1.107)**: vertical drag (constants `BT_ROW_Y0`/`BT_VIEW_H`
++ `bt_scan_scroll` live near `bt_scan_dirty` up top so `handleTouch()` can see
+them; clip-rect render, scroll-aware hit test, ~30 Hz drag redraw cap).
+**Reconnect hardening (v0.1.107)**: `setConnectTimeout(5)` (NimBLE default 30 s
+wedged every retry — the "reconnect sucks" root cause), NimBLE client deleted +
+recreated after 3 consecutive connect failures (a wedged client fails forever),
+retry cadence 1.5 s (was 2.5–5.5 s), and a POLL **wedge watchdog**: connected
+but d_last_ms stalled >20 s = hung ELM/GATT link (ATRV answers whenever the
+dongle is alive, so a stall is a dead LINK not a sleeping ECU) → disconnect →
+reconnect (ATZ hard-resets the ELM). **STATUS page (page 3) has a BT row** in
+the LINK section: OFF (source≠BT) / "waiting (BT on at REC)" / state while
+connecting / green `<name> <temp>F` when data flows / yellow `<name> no ECU
+data`. **PID mapping is fixed to coolant 0105 for now** — a user-selectable
+"which PID is coolant" / generic data-point mapper is planned but deferred. ⚠️ Car-side
 prerequisite: something must ANSWER OBD2 on the port — an MS3Pro needs
 "OBD-II over CAN (ISO 15765)" enabled in TunerStudio; a 90–95 NA Miata has no
 OBD2 at all.

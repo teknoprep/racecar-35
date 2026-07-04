@@ -18,9 +18,19 @@ VER="${1:?usage: publish_firmware.sh <version> [base_url]}"
 BASE="${2:-https://racecar.api.blueuc.com}"
 KEY="${RACECAR_API_KEY:?set RACECAR_API_KEY to match the server RACECAR_API_KEY env}"
 
-# repo-root/firmware regardless of where we're called from
+# Artifact dir. Default was the repo's firmware/ dir, but that is now FROZEN
+# as the GitHub legacy-OTA bridge (teensy 0.1.99 / dash 0.1.98 — see CLAUDE.md)
+# and must never be overwritten by a release. Stage fresh builds elsewhere and
+# point RACECAR_FW_DIR at them, e.g.:
+#   mkdir -p /tmp/fwstage && cp .pio/build/teensy41/firmware.hex /tmp/fwstage/teensy41-dash.hex && ...
+#   RACECAR_FW_DIR=/tmp/fwstage RACECAR_API_KEY=... ./server/publish_firmware.sh <ver>
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FW="$ROOT/firmware"
+FW="${RACECAR_FW_DIR:-$ROOT/firmware}"
+if [ -z "${RACECAR_FW_DIR:-}" ]; then
+  echo "WARNING: RACECAR_FW_DIR not set - using $FW, which is the FROZEN GitHub"
+  echo "         bridge (teensy 0.1.99 / dash 0.1.98). If you are publishing a"
+  echo "         NEW release you almost certainly want a staging dir instead."
+fi
 
 declare -A BOARD=(
   [teensy41-dash.hex]=teensy
