@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.111"
+#define FIRMWARE_VERSION "0.1.112"
 
 #include <Preferences.h>
 #include <time.h>
@@ -109,6 +109,7 @@ enum UploadFlowState : uint8_t {
     UF_POSTING,         // whole file staged; writing it to the TLS socket
     UF_STREAM_FINISH,   // body sent, draining HTTP response from socket
     UF_DELETING,        // Q,DEL sent, awaiting Q,DEL,OK
+    UF_RETRY_WAIT,      // stream failed once; brief pause, then re-Q,GET same file
     UF_DONE,
 };
 enum SessionsListState : uint8_t {
@@ -1588,6 +1589,20 @@ static void updateLapTimer() {
     // back to the legacy radius method (point-only tracks).
     float aLat, aLon, bLat, bLon; bool hasLine;
     effectiveSfLine(tIdx, &aLat, &aLon, &bLat, &bLon, &hasLine);
+    // Once per 20 s: "why aren't laps ticking" breadcrumb (echoed to the
+    // Teensy USB console). d_sf should sweep down near 0 every lap; if it
+    // never does, the S/F (override?) is in the wrong place — STATUS page
+    // shows the same distance live, CLR S/F resets it.
+    {
+        static uint32_t last_lap_dbg = 0;
+        if (now - last_lap_dbg >= 20000) {
+            last_lap_dbg = now;
+            const int dm = (int)(trackDistanceKm(g.lat_deg, g.lon_deg, aLat, aLon) * 1000.0f);
+            Serial.printf("DBG,lap trk=%s ovr=%d line=%d d_sf=%dm armed=%d laps=%d\n",
+                          TRACKS[tIdx].name, (int)sfOverride[tIdx].used, (int)hasLine,
+                          dm, (int)lapTimer.timing_started, (int)lapTimer.lap_number);
+        }
+    }
     bool crossed = false;
     if (hasLine) {
         if (lapTimer.have_prev) {
@@ -1839,7 +1854,12 @@ static bool parseCanDiagLine(const String& line) {
 }
 
 // Pop the modal full-screen, save the current page so we can restore it after.
+static void btReleaseRadio();   // defined in the radio-arbiter section below
 static void openUploadModal(const char* filename, uint32_t total) {
+    // Uploads need every scrap of WiFi throughput — a live BLE link (or its
+    // 1.5 s-cadence reconnect attempts) time-slices the single 2.4 GHz radio
+    // and stretches TCP writes past the Teensy's UART-ack patience. BLE off.
+    btReleaseRadio();
     strncpy(upload_file, filename, sizeof(upload_file) - 1);
     upload_file[sizeof(upload_file) - 1] = '\0';
     upload_total       = total;
@@ -1902,6 +1922,8 @@ struct UploadFlow {
     char       response[1024];  // accumulated HTTP response (headers + body)
     size_t     response_len;
     char       last_err[180];
+    uint8_t    file_retries;    // per-file retry count (1 automatic retry max)
+    uint32_t   retry_at_ms;     // when UF_RETRY_WAIT re-sends Q,GET
     // Whole-file staging buffer (PSRAM). The complete session file is pulled
     // off the Teensy/SD into here FIRST, then POSTed to the cloud in one clean
     // request (see UF_POSTING). Staging fully decouples the UART transfer from
@@ -2010,7 +2032,29 @@ static void ufNextFile() {
     ufCloseTcp();
     ufFreeBuf();
     uf.files_idx++;
+    uf.file_retries = 0;
     ufStartCurrentFile();
+}
+
+// Fail the current file OR schedule ONE automatic retry of it (fresh Q,GET +
+// fresh TCP). v0.1.112 — before this, ANY mid-stream hiccup (WiFi stall, ack
+// timeout) burned the file until the next manual drain, which is why uploads
+// felt spotty. sendAbort=true also tells the Teensy to bail out of its (now
+// 60 s patient) go-back-N retransmit loop FIRST — otherwise our retry's Q,GET
+// line would be eaten as a stray inside its ack-pump and the retry would hang.
+static void ufFailOrRetry(bool sendAbort) {
+    ufCloseTcp();
+    if (sendAbort) { Serial.printf("Q,ABORT\n"); Serial.flush(); }
+    if (uf.file_retries < 1 && uf.files_idx < uf.files_n) {
+        uf.file_retries++;
+        Serial.printf("DBG,uf_retry file=%s err=%s\n",
+                      uf.files[uf.files_idx].name, uf.last_err);
+        uf.retry_at_ms = millis() + 800;   // let the Teensy exit its loop + settle
+        ufEnter(UF_RETRY_WAIT);
+    } else {
+        uf.failed++;
+        ufNextFile();
+    }
 }
 
 // Parse the unix-epoch session id out of a 'session_<epoch>_<track>.ndjson'
@@ -2405,11 +2449,14 @@ static bool parseQLine(const String& line) {
         return true;
     }
     if (strncmp(p, "ERR,", 4) == 0) {
+        // Stale errors (e.g. the Teensy's ack_timeout arriving after WE already
+        // aborted and scheduled a retry) must not kill the retry — only act on
+        // an error for a stream we're actively in.
+        if (uf.state != UF_STREAMING && uf.state != UF_FETCH_HEAD) return true;
         snprintf(uf.last_err, sizeof(uf.last_err), "%s", p + 4);
         Serial.printf("DBG,uf_err from_teensy=%s at buflen=%lu lines=%lu\n",
                       p + 4, (unsigned long)uf.buflen, (unsigned long)uf.lines_recv);
-        uf.failed++;
-        ufNextFile();
+        ufFailOrRetry(false);   // Teensy already exited its loop — no abort needed
         return true;
     }
     if (strncmp(p, "DEL,", 4) == 0 && uf.state == UF_DELETING) {
@@ -2455,6 +2502,11 @@ static int ufParseResponse(char* body_snip, size_t body_snip_sz) {
 }
 
 static void uploadTick() {
+    // Scheduled single-retry of the current file (see ufFailOrRetry).
+    if (uf.state == UF_RETRY_WAIT) {
+        if ((int32_t)(millis() - uf.retry_at_ms) >= 0) ufStartCurrentFile();
+        return;
+    }
     if (uf.state == UF_IDLE) return;
     const uint32_t now = millis();
 
@@ -2590,9 +2642,12 @@ static void uploadTick() {
         }
         Serial.printf("DBG,uf_timeout state=%u %s\n",
                       (unsigned)uf.state, uf.last_err);
-        ufCloseTcp();
-        if (uf.state == UF_LISTING) ufEnter(UF_DONE);
-        else { uf.failed++; ufNextFile(); }
+        if (uf.state == UF_LISTING) { ufCloseTcp(); ufEnter(UF_DONE); }
+        else if (uf.state == UF_STREAMING || uf.state == UF_STREAM_FINISH) {
+            // Mid-stream stall: abort the Teensy's sender + retry once.
+            ufFailOrRetry(true);
+        }
+        else { ufCloseTcp(); uf.failed++; ufNextFile(); }
     }
 }
 
@@ -8997,9 +9052,27 @@ static void drawStatusPage() {
         if      (haveMsg)  snprintf(lbl, sizeof(lbl), "%s", sf_set_msg);
         else if (tIdx < 0) snprintf(lbl, sizeof(lbl), "SET S/F - not at a known track");
         else if (armed)    snprintf(lbl, sizeof(lbl), "TAP AGAIN: set S/F @ %s", TRACKS[tIdx].name);
-        else               snprintf(lbl, sizeof(lbl), "SET START/FINISH @ %s%s",
-                                    TRACKS[tIdx].name, sfOverride[tIdx].used ? " (custom)" : "");
+        else {
+            // Live distance to the EFFECTIVE S/F (override if set, else baked)
+            // — the trackside "why aren't laps ticking" diagnostic. If this
+            // number never gets small while you lap, the S/F is in the wrong
+            // place (bad capture / wrong pin): hit CLR S/F.
+            float aLat, aLon, bLat, bLon; bool hasLine;
+            effectiveSfLine(tIdx, &aLat, &aLon, &bLat, &bLon, &hasLine);
+            const int dm = (int)(trackDistanceKm(g.lat_deg, g.lon_deg, aLat, aLon) * 1000.0f);
+            snprintf(lbl, sizeof(lbl), "SET S/F @ %s (%s, %dm)",
+                     TRACKS[tIdx].name, sfOverride[tIdx].used ? "custom" : "default", dm);
+        }
         tft.drawString(lbl, bx + bw / 2, by + bh / 2);
+        // CLR S/F sub-button — only when a custom override exists to clear.
+        if (tIdx >= 0 && sfOverride[tIdx].used && !armed && !haveMsg) {
+            tft.fillRect(330, by, 74, bh, TFT_MAROON);
+            tft.drawRect(330, by, 74, bh, TFT_WHITE);
+            tft.setTextColor(TFT_WHITE, TFT_MAROON);
+            tft.drawString("CLR S/F", 330 + 37, by + bh / 2);
+        } else {
+            tft.fillRect(330, by, 74, bh, TFT_BLACK);
+        }
         tft.setTextDatum(textdatum_t::top_left);
     }
 
@@ -9075,6 +9148,20 @@ static void drawStatusPage() {
 }
 
 static void handleStatusTap(int x, int y) {
+    // CLR S/F button (left of SET): wipe this track's custom S/F override and
+    // fall back to the baked line — the trackside escape hatch for a bad
+    // capture (which used to silently kill lap timing with no way out).
+    if (x >= 330 && x <= 404 && y >= 344 && y <= 376) {
+        const int tIdx = closestTrackIdx();
+        if (tIdx >= 0 && sfOverride[tIdx].used) {
+            sfOverride[tIdx] = SfOverride{};
+            saveSfOverrides();
+            sendSfToTeensy(tIdx);
+            snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F reset to default: %s", TRACKS[tIdx].name);
+            sf_set_msg_ms = millis();
+        }
+        return;
+    }
     // SET START/FINISH button (handled first so it works regardless of the
     // version-match early-return below). Two-tap: first tap arms, second tap
     // within 5 s stores the current GPS position as this track's S/F override.
@@ -9088,23 +9175,38 @@ static void handleStatusTap(int x, int y) {
         const bool wasArmed = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
         if (wasArmed) {
             sf_set_armed = false;
-            // Build a start/finish LINE perpendicular to the current heading,
-            // centred on the car (+/- ~30 m), so lap detection is a precise
-            // line crossing (not a radius). Do this while rolling through S/F.
-            const float D2R = (float)M_PI / 180.0f;
-            const float H  = g.hdg_deg * D2R;
-            const float lE = -cosf(H), lN = sinf(H);      // left-of-travel (E,N)
-            const float half_m = 30.0f;
-            const float dLat = half_m / 111320.0f;
-            const float dLon = half_m / (111320.0f * cosf(g.lat_deg * D2R));
-            sfOverride[tIdx].used = 1;
-            sfOverride[tIdx].lat  = g.lat_deg + lN * dLat;
-            sfOverride[tIdx].lon  = g.lon_deg + lE * dLon;
-            sfOverride[tIdx].lat2 = g.lat_deg - lN * dLat;
-            sfOverride[tIdx].lon2 = g.lon_deg - lE * dLon;
+            if (g.mph < 5.0f) {
+                // PARKED capture (v0.1.112 fix): GPS heading is GARBAGE at
+                // rest, so the old code built a "line" pointing anywhere — a
+                // parked capture silently killed lap detection for the whole
+                // track until cleared. Parked = store a POINT: the 75 m
+                // radius-crossing method (the documented "park on the line"
+                // flow). Roll through S/F above 5 mph to capture a true line.
+                sfOverride[tIdx].used = 1;
+                sfOverride[tIdx].lat  = g.lat_deg;
+                sfOverride[tIdx].lon  = g.lon_deg;
+                sfOverride[tIdx].lat2 = 0.0f;
+                sfOverride[tIdx].lon2 = 0.0f;
+                snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F POINT SET: %s (parked)", TRACKS[tIdx].name);
+            } else {
+                // Rolling capture: build a start/finish LINE perpendicular to
+                // the (now trustworthy) heading, centred on the car (± ~30 m),
+                // so lap detection is a precise line crossing.
+                const float D2R = (float)M_PI / 180.0f;
+                const float H  = g.hdg_deg * D2R;
+                const float lE = -cosf(H), lN = sinf(H);      // left-of-travel (E,N)
+                const float half_m = 30.0f;
+                const float dLat = half_m / 111320.0f;
+                const float dLon = half_m / (111320.0f * cosf(g.lat_deg * D2R));
+                sfOverride[tIdx].used = 1;
+                sfOverride[tIdx].lat  = g.lat_deg + lN * dLat;
+                sfOverride[tIdx].lon  = g.lon_deg + lE * dLon;
+                sfOverride[tIdx].lat2 = g.lat_deg - lN * dLat;
+                sfOverride[tIdx].lon2 = g.lon_deg - lE * dLon;
+                snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F LINE SET: %s", TRACKS[tIdx].name);
+            }
             saveSfOverrides();
             sendSfToTeensy(tIdx);        // Teensy stamps lap #s into the NDJSON
-            snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F LINE SET: %s", TRACKS[tIdx].name);
             sf_set_msg_ms = millis();
         } else {
             sf_set_armed  = true;

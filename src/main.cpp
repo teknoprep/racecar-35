@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.111"
+#define FIRMWARE_VERSION "0.1.112"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2809,6 +2809,7 @@ static void handleQList() {
 // ack seen so far. Parse state is STATIC because with a windowed sender an ack
 // line can straddle two calls — the old per-call locals silently dropped the
 // partial and lost acks. Interleaved telemetry lines from the dash are ignored.
+static volatile bool q_abort = false;   // dash sent Q,ABORT: bail out of the stream NOW
 static long qPumpAcksOnce(long best) {
     static char   line[24];
     static size_t n = 0;
@@ -2818,7 +2819,13 @@ static long qPumpAcksOnce(long best) {
         if (c == '\n') {
             line[n] = '\0';
             n = 0;
-            if (strncmp(line, "Q,A,", 4) == 0) {
+            if (strncmp(line, "Q,ABORT", 7) == 0) {
+                // MUST be checked before the bare "Q,A" prefix below, which
+                // would otherwise read Q,ABORT as "everything acked". The dash
+                // sends this when it gives up on a stream so we exit fast and
+                // its retry's fresh Q,GET isn't eaten as a stray line here.
+                q_abort = true;
+            } else if (strncmp(line, "Q,A,", 4) == 0) {
                 const long v = strtol(line + 4, nullptr, 10);
                 if (v > best) best = v;
             } else if (strncmp(line, "Q,A", 3) == 0) {
@@ -2871,6 +2878,7 @@ static void handleQGet(const char* basename) {
     long     last_acked = 0;
     uint32_t retransmits = 0;
     bool     ack_fail = false;
+    q_abort = false;   // fresh stream — clear any stale abort
 
     auto sendSeq = [&](uint32_t s2) {
         DASH_SERIAL.printf("Q,L,%lu,", (unsigned long)s2);
@@ -2878,13 +2886,19 @@ static void handleQGet(const char* basename) {
         DASH_SERIAL.write('\n');
     };
     // Block until the cumulative ack advances. On a 2 s stall, go-back-N
-    // retransmit of everything in flight; 8 stalls in a row = link dead.
+    // retransmit of everything in flight; 30 stalls in a row (60 s) = link
+    // dead. ⚠️ Patience MUST exceed the dash's worst TCP stall: while the dash
+    // blocks flushing an HTTP chunk over weak WiFi it CANNOT ack, and the old
+    // 8×2 s = 16 s ceiling made us declare the link dead mid-upload — the
+    // server saw ClientDisconnect, the dash then timed out waiting for data
+    // ("no data for 30s"), and the file never uploaded (v0.1.112 fix).
     auto waitAckProgress = [&]() -> bool {
-        for (int attempt = 0; attempt < 8; ++attempt) {
+        for (int attempt = 0; attempt < 30; ++attempt) {
             const long   before = last_acked;
             const uint32_t t0   = millis();
             while (millis() - t0 < 2000) {
                 last_acked = qPumpAcksOnce(last_acked);
+                if (q_abort) return false;
                 if (last_acked > before) return true;
                 delay(1);
             }
@@ -2911,6 +2925,7 @@ static void handleQGet(const char* basename) {
                 wlen[seq % QGET_WIN] = (uint16_t)line_n;
                 sendSeq(seq);
                 last_acked = qPumpAcksOnce(last_acked);   // opportunistic, non-blocking
+                if (q_abort) { ack_fail = true; break; }
             }
             line_n = 0;
             if (c < 0) break;
@@ -2928,7 +2943,10 @@ static void handleQGet(const char* basename) {
                       basename, (unsigned long)seq, last_acked);
     f.close();
     if (ack_fail) {
-        DASH_SERIAL.println(F("Q,ERR,ack_timeout"));
+        // A dash-initiated abort needs no error reply (the dash already moved
+        // on to its retry; a stray Q,ERR here could kill that retry).
+        if (!q_abort) DASH_SERIAL.println(F("Q,ERR,ack_timeout"));
+        else Serial.printf("[Q] GET %s: aborted by dash at seq %lu\n", basename, (unsigned long)seq);
         return;
     }
     DASH_SERIAL.printf("Q,EOF,%lu\n", (unsigned long)seq);
