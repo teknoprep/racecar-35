@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.110"
+#define FIRMWARE_VERSION "0.1.111"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4432,6 +4432,7 @@ static const char* boolValueOnRow(SettingId id) {
         case ST_DEBUG_LOG:   return s.debug_enabled ? "ON" : "OFF";
         case ST_AUTO_START:  return s.auto_start        ? "ON" : "OFF";
         case ST_SHOW_TEMP:   return s.show_coolant      ? "ON" : "OFF";
+        case ST_SHOW_VOLT:   return s.show_volt         ? "ON" : "OFF";
         case ST_SHOW_PSI:    return s.show_oil_psi      ? "ON" : "OFF";
         case ST_SHOW_AFR:    return s.show_afr          ? "ON" : "OFF";
         default:             return "?";
@@ -4446,6 +4447,7 @@ static bool boolValueOnState(SettingId id) {
         case ST_DEBUG_LOG:   return s.debug_enabled;
         case ST_AUTO_START:  return s.auto_start;
         case ST_SHOW_TEMP:   return s.show_coolant;
+        case ST_SHOW_VOLT:   return s.show_volt;
         case ST_SHOW_PSI:    return s.show_oil_psi;
         case ST_SHOW_AFR:    return s.show_afr;
         default:             return false;
@@ -5954,6 +5956,7 @@ static void handleSettingsTap(int x, int y) {
                                         Serial.printf("CFG,dbg_on,%d\n", (int)s.debug_enabled); break;
                     case ST_AUTO_START: s.auto_start        = !s.auto_start;        break;
                     case ST_SHOW_TEMP:  s.show_coolant      = !s.show_coolant;      break;
+                    case ST_SHOW_VOLT:  s.show_volt         = !s.show_volt;         break;
                     case ST_SHOW_PSI:   s.show_oil_psi      = !s.show_oil_psi;      break;
                     case ST_SHOW_AFR:   s.show_afr          = !s.show_afr;          break;
                     default: break;
