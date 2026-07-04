@@ -247,14 +247,25 @@ auth). `$HOME=/home/chris` here; push with an explicit token URL
 `https://teknoprep:<token>@github.com/teknoprep/racecar-35.git` (the token is supplied in chat by
 the user each session — do not hardcode it into files).
 
-**Two channels, deliberately:** the GitHub `firmware/manifest.json` is frozen
-at **0.1.73** (the transition build whose `OTA_MANIFEST_URL` is the server) so
-any panel still on ≤0.1.72 can OTA that far from GitHub and then hop to the
-server. Everything **0.1.74+ ships server-only** via `publish_firmware.sh`;
-those versions are NOT added to the GitHub manifest, and the GitHub `firmware/`
-binaries stay at the 0.1.73 build to match its frozen manifest. The lockstep
-rules below still apply (bump BOTH `FIRMWARE_VERSION` defines, build ALL FOUR,
-same version) — only the publish destination changed.
+**Two channels, deliberately:** the GitHub `firmware/manifest.json` is a **frozen
+bridge** so any panel still on ≤0.1.72 can OTA from GitHub and then hop to the
+server. The bridge was re-pinned from 0.1.73 to **Teensy 0.1.99 + dash 0.1.98**
+(commit `a299699`, immutable pinned URLs): the 0.1.73 Teensy hex still had the
+BROKEN FlasherX `FLASH_RESERVE` — a unit bridging through 0.1.73 would exit with
+a Teensy whose updater can't accept any modern (≥~224 KB) image from the server
+(`addr_too_large`, stuck forever). The 0.1.99 Teensy is the `-Os` rescue build
+(204,800 B flash image — fits THROUGH the broken updater) that CONTAINS the
+FLASH_RESERVE fix, so bridged units can then take current-size images. The dash
+entries are the 0.1.98 bins (the a299699 rescue commit only rebuilt the Teensy)
+— any ≥0.1.73 dash reads the server, which is all the bridge needs.
+Everything current ships **server-only** via `publish_firmware.sh`; new versions
+are NOT added to the GitHub manifest, and **the repo `firmware/` binaries must
+STAY at the bridge build to match its frozen manifest — do NOT `git add
+firmware/` in release commits** (pre-0.1.71 units fetch the main-branch paths
+and sha-verify against the frozen manifest; committing new artifacts there
+breaks them). The lockstep rules below still apply (bump BOTH
+`FIRMWARE_VERSION` defines, build ALL FOUR, same version) — only the publish
+destination changed.
 
 ## OTA release (GitHub path — used through v0.1.73; server path above supersedes it) — ⚠️ ALWAYS bump ALL FOUR artifacts to the SAME version
 
