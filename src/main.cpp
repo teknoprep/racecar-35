@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.112"
+#define FIRMWARE_VERSION "0.1.113"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2839,7 +2839,23 @@ static long qPumpAcksOnce(long best) {
     return best;
 }
 
-static void handleQGet(const char* basename) {
+static void handleQGet(const char* args) {
+    // v0.1.113: args = "<basename>[,<skip_lines>]". skip_lines lets the dash
+    // pull the file in PSRAM-sized SEGMENTS (store-and-forward upload): it
+    // aborts the stream when its segment buffer fills, POSTs the segment with
+    // the network alone, then re-GETs from the first line it didn't apply.
+    char namebuf[96];
+    uint32_t skip = 0;
+    strncpy(namebuf, args, sizeof(namebuf) - 1);
+    namebuf[sizeof(namebuf) - 1] = '\0';
+    {
+        char* comma = strrchr(namebuf, ',');
+        if (comma && comma[1] >= '0' && comma[1] <= '9') {
+            skip = (uint32_t)strtoul(comma + 1, nullptr, 10);
+            *comma = '\0';
+        }
+    }
+    const char* basename = namebuf;
     if (!sdReady()) {
         DASH_SERIAL.println(F("Q,ERR,nosd"));
         return;
@@ -2879,6 +2895,33 @@ static void handleQGet(const char* basename) {
     uint32_t retransmits = 0;
     bool     ack_fail = false;
     q_abort = false;   // fresh stream — clear any stale abort
+
+    // Segmented pull: skip already-uploaded lines (buffered — a per-byte read
+    // of several MB would take far too long) and continue the seq numbering
+    // from there so the dash's next_seq lines up (first sent seq = skip+1).
+    if (skip > 0) {
+        uint32_t skipped = 0;
+        uint32_t pos = 0;
+        static uint8_t sb[4096];
+        bool done = false;
+        while (!done) {
+            const int rn = f.read(sb, sizeof(sb));
+            if (rn <= 0) break;
+            for (int i = 0; i < rn; ++i) {
+                if (sb[i] == '\n' && ++skipped == skip) {
+                    pos += (uint32_t)i + 1;
+                    done = true;
+                    break;
+                }
+            }
+            if (!done) pos += (uint32_t)rn;
+        }
+        f.seekSet(pos);
+        seq        = skip;   // dash acks are absolute line numbers
+        last_acked = (long)skip;
+        Serial.printf("[Q] GET %s: segment from line %lu (byte %lu)\n",
+                      basename, (unsigned long)skip, (unsigned long)pos);
+    }
 
     auto sendSeq = [&](uint32_t s2) {
         DASH_SERIAL.printf("Q,L,%lu,", (unsigned long)s2);

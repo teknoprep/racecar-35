@@ -518,6 +518,27 @@ SDFORMAT           # FAT32-format the SD card
 CANSNIFF,<0|1>     # start/stop raw CAN capture to SD (see "CAN sniffer")
 TESTSTART/TESTSTOP # synthetic-data session for pipeline testing
 Q,LIST / Q,GET / Q,DEL / QUEUE,DRAIN / UPLOAD,CANCEL   # cloud queue control
+                   # ⚠️ UPLOAD ARCHITECTURE (v0.1.113): STORE-AND-FORWARD. The old design
+                   #   streamed Q,L lines straight into a chunked HTTP body — coupling the
+                   #   UART and WiFi links so either one's stall killed the other (server
+                   #   log: chunked uploads died ClientDisconnect while a plain sized POST
+                   #   of the same file did ~850 KB/s). Now: (1) STAGE a segment of the
+                   #   file into PSRAM over UART, network idle (segment = whole file if it
+                   #   fits, else up to 4 MB — ps_malloc with halving fallback);
+                   #   (2) POST the staged bytes with Content-Length — UART idle — to
+                   #   /upload (first segment, mode=w) or /stream (later segments,
+                   #   mode=a); (3) repeat via Q,GET,<name>,<skip_lines> until EOF.
+                   #   POST failures re-send the STAGED segment (post_tries≤2, no UART);
+                   #   then one whole-file retry (ufFailOrRetry/UF_RETRY_WAIT). Chunked
+                   #   encoding is GONE. openUploadModal() forces BLE off (btReleaseRadio).
+Q,GET,<name>[,<skip_lines>]   # skip_lines (v0.1.113) = segmented pull: Teensy does a
+                   #   buffered line-skip, then streams with seq starting at skip+1 (acks
+                   #   are absolute line numbers; Teensy inits last_acked=skip).
+Q,ABORT            # dash aborts an in-flight Q,GET stream (v0.1.112). Teensy's ack pump
+                   #   (qPumpAcksOnce) MUST match this BEFORE the bare "Q,A" prefix (else
+                   #   it parses as ack-everything). Exits handleQGet fast, WITHOUT a
+                   #   Q,ERR reply (a stray error would kill the dash's scheduled retry).
+                   #   Teensy ack patience: 30×2 s = 60 s (was 8×2 s — too short).
 FWUPDATE / VER?    # OTA + version query
 ```
 Parsed in `handleDashCommand()` ([src/main.cpp](src/main.cpp)).
