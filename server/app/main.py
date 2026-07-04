@@ -116,6 +116,7 @@ def ai_resolve_model(requested: Optional[str]) -> str:
 # alongside the session data and is trivially deleted with its session.
 AI_HISTORY_DIR = DATA_DIR / "ai_history"
 VIDEO_META_DIR = DATA_DIR / "video_meta"   # per-session YouTube link + sync offset
+SHARE_DIR = DATA_DIR / "shares"            # public view-only overlay tokens
 
 # Google OAuth is optional. If GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are
 # blank, the server stays in open dev mode. Once configured, all browser UI
@@ -2828,6 +2829,12 @@ async def session_data(
     gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
 
+    return JSONResponse(_session_data_payload(p, stride, target))
+
+
+def _session_data_payload(p: pathlib.Path, stride: int, target: int) -> dict:
+    """Core of /data — shared by the authenticated route and the public
+    /shared/<token>/data route (view-only overlay links)."""
     total = 0
     eff_stride = max(1, stride)
     if target > 0:
@@ -2876,10 +2883,23 @@ async def session_data(
     bounds = (
         [[min_lat, min_lon], [max_lat, max_lon]] if has_geo else None
     )
-    return JSONResponse(
-        {"count": len(samples), "total": total, "stride": eff_stride,
-         "bounds": bounds, "samples": samples}
-    )
+    return {"count": len(samples), "total": total, "stride": eff_stride,
+            "bounds": bounds, "samples": samples}
+
+
+def _laps_payload(p: pathlib.Path) -> dict:
+    """Core of /laps — shared by the authenticated route and /shared/<token>/laps."""
+    samples: list = []
+    with open(p, "rb") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                samples.append(json.loads(raw))
+            except Exception:
+                continue
+    return _detect_laps(samples)
 
 
 @app.get("/sessions/{user}/{filename}/laps")
@@ -2895,17 +2915,7 @@ async def session_laps(request: Request, user: str, filename: str) -> JSONRespon
     require_web_user(request)
     gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
-    samples: list = []
-    with open(p, "rb") as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                samples.append(json.loads(raw))
-            except Exception:
-                continue
-    return JSONResponse(_detect_laps(samples))
+    return JSONResponse(_laps_payload(p))
 
 
 @app.get("/sessions/{user}/{filename}/gpsdiag")
@@ -3271,8 +3281,137 @@ async def overlay(request: Request, user: str, filename: str) -> Response:
         return login_redirect(request)
     gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
-    return HTMLResponse(_OVERLAY_HTML.replace("__USER__", safe_name(user))
-                                     .replace("__FILE__", p.name))
+    u = safe_name(user)
+    return HTMLResponse(_OVERLAY_HTML
+                        .replace("__API__", f"/sessions/{u}/{p.name}")
+                        .replace("__BACK__", f"/review/{u}/{p.name}")
+                        .replace("__FILE__", p.name)
+                        .replace("__RO__", "0"))
+
+
+# ---------------------------------------------------------------------------
+# Public view-only share links for the overlay.
+#
+# An opaque token (secrets.token_urlsafe) maps to {user, filename} via a json
+# file in /data/shares/. The /shared/<token>/* routes need NO authentication
+# and are ALL read-only GETs: the overlay page they serve hides every sync/
+# save control (__RO__=1), and mutation endpoints (/video POST, share create/
+# revoke, delete) remain behind the normal owner-or-admin auth — so a leaked
+# link can only ever LOOK at this one session. Revoking deletes the token and
+# kills the link immediately.
+# ---------------------------------------------------------------------------
+def _share_lookup(token: str) -> tuple[str, str]:
+    tp = SHARE_DIR / (safe_name(token, maxlen=64) + ".json")
+    if not tp.exists():
+        raise HTTPException(status_code=404, detail="unknown or revoked share link")
+    try:
+        meta = json.loads(tp.read_text("utf-8"))
+        return str(meta["user"]), str(meta["filename"])
+    except Exception:
+        raise HTTPException(status_code=404, detail="unknown or revoked share link")
+
+
+def _share_token_for(user: str, filename: str) -> Optional[str]:
+    if not SHARE_DIR.exists():
+        return None
+    for f in SHARE_DIR.glob("*.json"):
+        try:
+            meta = json.loads(f.read_text("utf-8"))
+        except Exception:
+            continue
+        if meta.get("user") == user and meta.get("filename") == filename:
+            return f.stem
+    return None
+
+
+@app.get("/sessions/{user}/{filename}/share")
+async def get_share(request: Request, user: str, filename: str) -> JSONResponse:
+    """Current share token for a session (owner-or-admin — the token IS access)."""
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    tok = _share_token_for(safe_name(user), p.name)
+    return JSONResponse({"token": tok, "url": (f"/shared/{tok}" if tok else None)})
+
+
+@app.post("/sessions/{user}/{filename}/share")
+async def create_share(request: Request, user: str, filename: str) -> JSONResponse:
+    """Create (idempotent) a public view-only overlay link. Owner-or-admin."""
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    u = safe_name(user)
+    tok = _share_token_for(u, p.name)
+    if not tok:
+        tok = secrets.token_urlsafe(16)
+        SHARE_DIR.mkdir(parents=True, exist_ok=True)
+        (SHARE_DIR / (tok + ".json")).write_text(json.dumps({
+            "user": u, "filename": p.name, "created": int(time.time()),
+            "by": str((current_user(request) or {}).get("email", "")),
+        }), "utf-8")
+        log.info("share created %s/%s -> %s", u, p.name, tok)
+    return JSONResponse({"token": tok, "url": f"/shared/{tok}"})
+
+
+@app.post("/sessions/{user}/{filename}/share/revoke")
+async def revoke_share(request: Request, user: str, filename: str) -> JSONResponse:
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    u = safe_name(user)
+    n = 0
+    tok = _share_token_for(u, p.name)
+    while tok:   # defensive: clear duplicates too
+        (SHARE_DIR / (tok + ".json")).unlink(missing_ok=True)
+        n += 1
+        tok = _share_token_for(u, p.name)
+    log.info("share revoked %s/%s (%d token(s))", u, p.name, n)
+    return JSONResponse({"ok": True, "revoked": n})
+
+
+@app.get("/shared/{token}", response_class=HTMLResponse)
+async def shared_overlay(token: str) -> Response:
+    """PUBLIC read-only overlay viewer. No auth; sync/save UI hidden."""
+    user, filename = _share_lookup(token)
+    p = _resolve_session(user, filename)
+    return HTMLResponse(_OVERLAY_HTML
+                        .replace("__API__", f"/shared/{safe_name(token, maxlen=64)}")
+                        .replace("__BACK__", "#")
+                        .replace("__FILE__", p.name)
+                        .replace("__RO__", "1"))
+
+
+@app.get("/shared/{token}/data")
+async def shared_data(
+    token: str,
+    stride: int = Query(1, ge=1, le=100),
+    target: int = Query(0, ge=0, le=200000),
+) -> JSONResponse:
+    user, filename = _share_lookup(token)
+    p = _resolve_session(user, filename)
+    return JSONResponse(_session_data_payload(p, stride, target))
+
+
+@app.get("/shared/{token}/laps")
+async def shared_laps(token: str) -> JSONResponse:
+    user, filename = _share_lookup(token)
+    p = _resolve_session(user, filename)
+    return JSONResponse(_laps_payload(p))
+
+
+@app.get("/shared/{token}/video")
+async def shared_video(token: str) -> JSONResponse:
+    user, filename = _share_lookup(token)
+    p = _resolve_session(user, filename)
+    mp = _video_meta_path(user, p.name)
+    meta = {}
+    if mp.exists():
+        try:
+            meta = json.loads(mp.read_text("utf-8"))
+        except Exception:
+            meta = {}
+    return JSONResponse({"id": meta.get("id"), "url": "",   # url withheld: id is enough to play
+                         "offset_ms": int(meta.get("offset_ms", 0) or 0)})
 
 
 # ---------------------------------------------------------------------------
@@ -4428,6 +4567,7 @@ _REVIEW_HTML = (
          autocomplete="off" style="width:190px">
   <button id="yt-save" class="btn">link video</button>
   <a id="yt-view" class="btn" target="_blank" style="display:none">&#9654; overlay</a>
+  <button id="yt-share" class="btn" style="display:none">share</button>
 </header>
 <main>
   <div id="loading" class="loading">loading session\u2026</div>
@@ -5455,8 +5595,14 @@ _REVIEW_HTML = (
   const url = document.getElementById('yt-url');
   const save = document.getElementById('yt-save');
   const view = document.getElementById('yt-view');
-  const base = '/sessions/'+enc('__USER__')+'/'+enc('__FILE__')+'/video';
+  const share = document.getElementById('yt-share');
+  const base  = '/sessions/'+enc('__USER__')+'/'+enc('__FILE__')+'/video';
+  const sbase = '/sessions/'+enc('__USER__')+'/'+enc('__FILE__')+'/share';
   let offset_ms = 0;
+  let shareTok = null;
+  function reflectShare(){
+    share.textContent = shareTok ? 'shared \u2713' : 'share';
+  }
   function reflect(j){
     offset_ms = (j&&j.offset_ms)||0;
     if (j && j.id){
@@ -5464,12 +5610,36 @@ _REVIEW_HTML = (
       view.style.display = '';
       view.href = '/overlay/__USER__/__FILE__';
       save.textContent = 'update';
+      share.style.display = '';
     } else {
       view.style.display = 'none';
+      share.style.display = 'none';
       save.textContent = 'link video';
     }
   }
   try { reflect(await (await fetch(base)).json()); } catch(e){}
+  // Share state is owner-or-admin; a 403 just means the button acts as create-on-click.
+  try { const r=await fetch(sbase); if (r.ok){ shareTok=(await r.json()).token; reflectShare(); } } catch(e){}
+  share.addEventListener('click', async ()=>{
+    if (shareTok){
+      const full = location.origin + '/shared/' + shareTok;
+      const revoke = !prompt('PUBLIC view-only overlay link (anyone with it can watch \u2014 nothing can be changed):\\n\\nCopy it, or clear this box and press OK to REVOKE the link.', full);
+      if (revoke && confirm('Revoke the public link? It stops working immediately.')){
+        try {
+          const r=await fetch(sbase+'/revoke',{method:'POST'});
+          if (r.ok){ shareTok=null; reflectShare(); }
+        } catch(e){}
+      }
+      return;
+    }
+    try {
+      const r=await fetch(sbase,{method:'POST'});
+      const j=await r.json().catch(()=>({}));
+      if (!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
+      shareTok=j.token; reflectShare();
+      prompt('PUBLIC view-only overlay link created \u2014 copy it:', location.origin+j.url);
+    } catch(e){ alert('share failed: '+e.message); }
+  });
   save.addEventListener('click', async ()=>{
     save.disabled = true;
     try {
@@ -5564,7 +5734,7 @@ _OVERLAY_HTML = (
   <div id="bar">
     <button id="pp">play</button>
     <button id="fs">fullscreen</button>
-    <span style="color:#888;font:600 12px system-ui">SYNC</span>
+    <span class="synclbl" style="color:#888;font:600 12px system-ui">SYNC</span>
     <button data-n="-10">-10s</button>
     <button data-n="-1">-1s</button>
     <button data-n="-0.05">-.05</button>
@@ -5575,16 +5745,21 @@ _OVERLAY_HTML = (
     <input type="range" id="coarse" min="-300" max="300" step="0.1" value="0">
     <button id="launch" class="acc" title="Scrub the video to the moment the car starts moving, then click">SYNC @ LAUNCH</button>
     <button id="save" class="acc">SAVE</button>
-    <a href="/review/__USER__/__FILE__">back</a>
+    <a href="__BACK__" id="backlink">back</a>
   </div>
   <div id="msg"></div>
   <div id="toast"></div>
 </div>
 <script>
 (function(){
-  const USER='__USER__', FILE='__FILE__';
+  // API base: '/sessions/<user>/<file>' (authed) or '/shared/<token>' (public
+  // view-only link — RO hides every control that could change anything).
+  const API='__API__', RO=('__RO__'==='1');
   const el = id => document.getElementById(id);
-  const enc = encodeURIComponent;
+  if (RO){
+    ['launch','save','coarse','off','backlink'].forEach(id=>{ const x=el(id); if(x) x.style.display='none'; });
+    document.querySelectorAll('#bar [data-n], #bar .synclbl').forEach(x=>x.style.display='none');
+  }
   let S=[], T=[], laps=[], bestLapS=null, meta={}, offset=0, player=null, ready=false;
   let rpmMax=8000, bounds=null;
 
@@ -5601,9 +5776,9 @@ _OVERLAY_HTML = (
     let d, l, v;
     try {
       [d,l,v] = await Promise.all([
-        fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/data?target=20000').then(r=>r.json()),
-        fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/laps').then(r=>r.json()),
-        fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/video').then(r=>r.json()),
+        fetch(API+'/data?target=20000').then(r=>r.json()),
+        fetch(API+'/laps').then(r=>r.json()),
+        fetch(API+'/video').then(r=>r.json()),
       ]);
     } catch(e){
       el('msg').style.display='block';
@@ -5752,8 +5927,9 @@ _OVERLAY_HTML = (
     toast('synced: data launch = this video moment. Fine-tune then SAVE.');
   });
   el('save').addEventListener('click',async ()=>{
+    if (RO) return;
     try{
-      const r=await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/video',{
+      const r=await fetch(API+'/video',{
         method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({url:meta.url||meta.id, offset_ms:Math.round(offset*1000)})});
       if(!r.ok) throw new Error('HTTP '+r.status);
