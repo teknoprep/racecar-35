@@ -232,6 +232,14 @@ total sign-ins, active 7d/30d, sign-ins 7d/30d, new users 30d) + a per-user tabl
   ±0.05/1/10 s, **SYNC @ LAUNCH** (scrub video to the car launching, click — offset pinned
   to the data's first sustained >15 mph), SAVE persists. HUD ticks 20 Hz off
   `player.getCurrentTime()` + binary-search sample lookup.
+- **Public share links** (`/shared/<token>`): review-page **share** button (visible once a
+  video is linked) mints an opaque token (`/data/shares/<token>.json` → {user, filename});
+  `GET /shared/<token>` serves the overlay **read-only** (`__RO__=1` hides all sync/save UI)
+  and `/shared/<token>/{data,laps,video}` feed it with **no auth**. Read-only is structural:
+  everything under /shared is GET-only and all mutating endpoints stay behind owner-or-admin
+  auth. Create/read/revoke of the token itself = owner-or-admin (`gate_delete_dir`); revoke
+  kills the link instantly (404). Data/laps logic shared with the authed routes via
+  `_session_data_payload()`/`_laps_payload()`.
 - **Delete is owner-only however you authenticate** (security fix): per-user API keys now
   pass `can_delete_dir(key_owner, dir)` — a viewer's own key can no longer delete other
   users' sessions. Firmware/master key stays exempt (dash deletes its own uploads).
