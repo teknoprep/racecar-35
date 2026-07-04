@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.109"
+#define FIRMWARE_VERSION "0.1.110"
 
 #include <Preferences.h>
 #include <time.h>
@@ -57,6 +57,10 @@ enum SettingId : uint8_t {
     // show toggle, a threshold (°F or PSI), and the warning palette colour.
     ST_SHOW_TEMP, ST_TEMP_WARN_F, ST_TEMP_WARN_COL,
     ST_SHOW_PSI,  ST_PSI_WARN_PSI, ST_PSI_WARN_COL,
+    // Battery/alternator voltage (BT dongle ATRV or MS3 CAN bat). Display +
+    // warning are gated on the ENGINE RUNNING (parked ignition-on reads ~12.4 V
+    // — that's normal, not a failing alternator).
+    ST_SHOW_VOLT, ST_VOLT_WARN, ST_VOLT_WARN_COL,
     // Sensor data source (Direct / MegaSquirt) + AFR display (MS3 mode only).
     // AFR has both a "too rich" (low) and "too lean" (high) warn threshold;
     // either fires the same colour.
@@ -628,6 +632,12 @@ struct Settings {
     bool     show_oil_psi       = true;
     uint16_t oil_warn_psi       = 20;      // PSI — typical 20 PSI low-oil floor
     uint8_t  oil_warn_col       = 0;       // RED
+    // Voltage display/warn — only meaningful while the engine is running
+    // (alternator should hold ~13.5-14.5 V; at/below the warn level while
+    // running = failing alternator/belt).
+    bool     show_volt          = false;
+    uint16_t volt_warn_x10      = 128;     // warn at/below 12.8 V (×10)
+    uint8_t  volt_warn_col      = 0;       // RED
 
     // Sensor data source. Selects which UART line type the dash trusts for
     // engine telemetry that exists in both pipelines (coolant temp today; RPM
@@ -1200,6 +1210,9 @@ static void loadSettings() {
     s.show_oil_psi       = prefs.getBool  ("s_psi",    s.show_oil_psi);
     s.oil_warn_psi       = prefs.getUShort("p_warn",   s.oil_warn_psi);
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
+    s.show_volt          = prefs.getBool  ("s_volt",   s.show_volt);
+    s.volt_warn_x10      = prefs.getUShort("v_warn",   s.volt_warn_x10);
+    s.volt_warn_col      = prefs.getUChar ("v_col",    s.volt_warn_col);
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
     // NVS key renamed dbg_on -> dbg2 in v0.1.103 to force the new OFF default
     // onto already-deployed units (old key had ON persisted; keys are
@@ -1285,6 +1298,9 @@ static void saveSettings() {
     prefs.putBool  ("s_psi",    s.show_oil_psi);
     prefs.putUShort("p_warn",   s.oil_warn_psi);
     prefs.putUChar ("p_col",    s.oil_warn_col);
+    prefs.putBool  ("s_volt",   s.show_volt);
+    prefs.putUShort("v_warn",   s.volt_warn_x10);
+    prefs.putUChar ("v_col",    s.volt_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
     prefs.putBool  ("dbg2",     s.debug_enabled);
     prefs.putString("bt_addr",  s.bt_addr);
@@ -3241,6 +3257,53 @@ static uint16_t rpmBarColor(uint16_t rpm) {
 //   * TFT_BLACK if alerts disabled, RPM below alert1, or "off" half of blink.
 //   * Alert1 color or alertmax color during the "on" half.
 // Blink rate lerps from alert1_hz at alert1_rpm to alertmax_hz at alertmax_rpm.
+// Engine-running threshold for the voltage display/warning: below this RPM
+// the alternator isn't spinning meaningfully and 12.x V is normal, not a fault.
+static constexpr uint16_t ENGINE_RUNNING_RPM = 500;
+
+// Highest-priority ACTIVE sensor warning — drives the full-screen warning
+// flash with the warning NAME (v0.1.110). Priority: OIL (engine-killing) >
+// TEMP > VOLT > AFR. Mirrors the per-line warn_active conditions in
+// drawDashPage; returns false when nothing is warning.
+static bool activeSensorWarning(const char** label, uint16_t* color) {
+    const uint32_t nowMs   = millis();
+    const bool             fromMs3  = (s.sensor_type == 1);
+    const bool             fromBt   = (s.sensor_type == 2);
+    const bool             ecuStale = (ecu.last_ms == 0) || (nowMs - ecu.last_ms > 2000);
+    // OIL — low pressure (direct A2 transducer in every mode)
+    if (s.show_oil_psi && eng.oil_psi_x10 >= 0
+        && eng.oil_psi_x10 <= (int)s.oil_warn_psi * 10) {
+        *label = "OIL"; *color = PALETTE[s.oil_warn_col]; return true;
+    }
+    // TEMP — coolant over threshold (source per sensor_type)
+    {
+        const int16_t coolant = fromBt  ? obd::coolantF_x10()
+                              : fromMs3 ? ecu.coolant_f_x10 : eng.coolant_f_x10;
+        const bool fault = (coolant < 0) || (fromMs3 && ecuStale)
+                           || (fromBt && !obd::dataFresh());
+        if (s.show_coolant && !fault && coolant >= (int)s.coolant_warn_f * 10) {
+            *label = "TEMP"; *color = PALETTE[s.coolant_warn_col]; return true;
+        }
+    }
+    // VOLT — low system voltage WHILE RUNNING (failing alternator/belt).
+    // Gated on RPM so a parked car with ignition on (12.x V) never warns.
+    if (s.show_volt && eng.rpm >= ENGINE_RUNNING_RPM) {
+        int16_t v = -1;
+        if (fromBt && obd::dataFresh() && obd::voltX10() > 0) v = obd::voltX10();
+        else if (fromMs3 && !ecuStale && ecu.bat_x10 > 0)     v = ecu.bat_x10;
+        if (v > 0 && v <= (int)s.volt_warn_x10) {
+            *label = "VOLT"; *color = PALETTE[s.volt_warn_col]; return true;
+        }
+    }
+    // AFR — out of band (MS3 mode only)
+    if (s.show_afr && fromMs3 && !ecuStale && ecu.afr_x10 >= 0
+        && (ecu.afr_x10 < (int)s.afr_warn_lo_x10
+            || ecu.afr_x10 > (int)s.afr_warn_hi_x10)) {
+        *label = "AFR"; *color = PALETTE[s.afr_warn_col]; return true;
+    }
+    return false;
+}
+
 static uint16_t computeBgColor() {
     if (!s.alerts_enabled) return TFT_BLACK;
     if (eng.rpm < s.alert1_rpm) return TFT_BLACK;
@@ -3293,6 +3356,8 @@ struct LastDrawn {
     uint32_t psi_col_tag  = UINT32_MAX;
     int32_t  afr_x10     = INT32_MIN;
     uint32_t afr_col_tag  = UINT32_MAX;
+    int32_t  volt_x10     = INT32_MIN;   // VOLT line (shares the AFR row)
+    uint32_t volt_col_tag = UINT32_MAX;
     // REC badge state: composite tag of (dash recording bit, teensy ack bit,
     // mismatch-warning bit), plus the last-drawn sample count and queue depth.
     uint8_t  rec_badge_tag = 0xFF;
@@ -3317,6 +3382,7 @@ static void invalidateAll() {
     ld.temp_x10 = INT32_MIN; ld.temp_col_tag = UINT32_MAX;
     ld.psi_x10  = INT32_MIN; ld.psi_col_tag  = UINT32_MAX;
     ld.afr_x10  = INT32_MIN; ld.afr_col_tag  = UINT32_MAX;
+    ld.volt_x10 = INT32_MIN; ld.volt_col_tag = UINT32_MAX;
 }
 
 static void drawRecordButton() {
@@ -3380,6 +3446,38 @@ static void drawDashPage() {
     }
 
     const uint16_t bg = computeBgColor();
+
+    // ---- full-screen sensor warning flash (v0.1.110) -----------------------
+    // When a sensor warning (OIL / TEMP / VOLT / AFR) is active, the WHOLE
+    // screen flashes its warn color at 2 Hz with the warning NAME huge in the
+    // middle — a glance tells you WHAT is wrong, not just that something is.
+    // The ON phase suppresses the normal dash render (like the lap popup);
+    // the OFF phase falls through to it (so the RPM shift flash still shows
+    // interleaved). Transitions force a full repaint via pageJustEntered.
+    {
+        static bool        warn_shown = false;   // colored label frame on screen
+        static const char* warn_drawn = nullptr;
+        const char* wl = nullptr; uint16_t wc = 0;
+        const bool  wactive = activeSensorWarning(&wl, &wc);
+        if (wactive && (((millis() / 250) & 1) == 0)) {   // 2 Hz, ON phase
+            if (!warn_shown || warn_drawn != wl) {
+                tft.fillScreen(wc);
+                tft.setFont(&fonts::Font4);
+                tft.setTextSize(6);                        // ~156 px tall
+                tft.setTextDatum(textdatum_t::middle_center);
+                tft.setTextColor(TFT_BLACK, wc);
+                tft.drawString(wl, 400, 240);
+                tft.setTextSize(1);
+                tft.setTextDatum(textdatum_t::top_left);
+                warn_shown = true; warn_drawn = wl;
+            }
+            return;
+        }
+        if (warn_shown) {   // leaving the ON phase (or warning cleared)
+            warn_shown = false; warn_drawn = nullptr;
+            pageJustEntered = true;
+        }
+    }
 
     // Full repaint when bg state flips OR we just entered the page. After
     // that, every other element only repaints when its value changed —
@@ -3891,6 +3989,59 @@ static void drawDashPage() {
         }
     }
 
+    // ---- Voltage line (v0.1.110) ----
+    // Shares the AFR row (no free row below it). Renders only when the AFR
+    // line isn't visible (AFR is MS3-only; voltage matters most in BT mode),
+    // the engine is RUNNING, and a live source exists (BT ATRV / MS3 CAN bat).
+    {
+        const bool afrVisible = s.show_afr && (s.sensor_type == 1);
+        int16_t v = -1;
+        if (s.sensor_type == 2 && obd::dataFresh() && obd::voltX10() > 0) v = obd::voltX10();
+        else if (s.sensor_type == 1 && !ecuStale && ecu.bat_x10 > 0)      v = ecu.bat_x10;
+        const bool visible     = s.show_volt && !afrVisible
+                                 && (eng.rpm >= ENGINE_RUNNING_RPM) && (v > 0);
+        const bool warn_active = visible && v <= (int)s.volt_warn_x10;
+        if (afrVisible) {
+            // AFR owns the row — never draw, and invalidate so a later mode
+            // flip forces our repaint.
+            ld.volt_x10 = INT32_MIN; ld.volt_col_tag = UINT32_MAX;
+        } else {
+            const uint32_t tag = ((uint32_t)visible << 24)
+                               | ((uint32_t)s.volt_warn_col << 16)
+                               | ((uint32_t)warn_active);
+            const int32_t  val = visible ? (int32_t)v : INT32_MIN + 1;
+            if (val != ld.volt_x10 || tag != ld.volt_col_tag) {
+                char buf[24] = "";
+                uint16_t col = TFT_WHITE;
+                if (visible) {
+                    snprintf(buf, sizeof(buf), "VOLT: %d.%d", v / 10, v % 10);
+                    col = warn_active ? PALETTE[s.volt_warn_col] : TFT_WHITE;
+                }
+                if (dash_sprites_ready) {
+                    spr_afr.fillSprite(bg);   // shared row sprite
+                    if (visible && buf[0]) {
+                        spr_afr.setFont(&fonts::Font4);
+                        spr_afr.setTextSize(1);
+                        spr_afr.setTextDatum(textdatum_t::top_left);
+                        spr_afr.setTextColor(col);
+                        spr_afr.drawString(buf, 0, 0);
+                    }
+                    spr_afr.pushSprite(SENS_X, SENS_AFR_Y);
+                } else {
+                    tft.fillRect(SENS_X, SENS_AFR_Y, SENS_W, SENS_H, bg);
+                    if (visible && buf[0]) {
+                        tft.setFont(&fonts::Font4);
+                        tft.setTextSize(1);
+                        tft.setTextDatum(textdatum_t::top_left);
+                        drawValue(SENS_X, SENS_AFR_Y, buf, col);
+                    }
+                }
+                ld.volt_x10     = val;
+                ld.volt_col_tag = tag;
+            }
+        }
+    }
+
     // Restore the small font so the FIX/SATS/GPS block below renders correctly.
     tft.setFont(&fonts::Font2);
     tft.setTextDatum(textdatum_t::top_left);
@@ -4114,6 +4265,9 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_SHOW_PSI,     "Show oil pressure",     SettingRow::TOGGLE  },
     { ST_PSI_WARN_PSI, "Oil low-warn (PSI)",    SettingRow::NUMERIC },
     { ST_PSI_WARN_COL, "Oil warn color",        SettingRow::COLOR   },
+    { ST_SHOW_VOLT,    "Show voltage (engine on)", SettingRow::TOGGLE  },
+    { ST_VOLT_WARN,    "Voltage low-warn (x10)",   SettingRow::NUMERIC },
+    { ST_VOLT_WARN_COL,"Voltage warn color",       SettingRow::COLOR   },
     { ST_SENSOR_TYPE,  "Sensor data source",    SettingRow::ENUM    },
     { ST_SHOW_AFR,     "Show AFR (MS3 only)",   SettingRow::TOGGLE  },
     { ST_AFR_WARN_LO,  "AFR rich-warn (x10)",   SettingRow::NUMERIC },
@@ -4168,6 +4322,7 @@ static NumBounds numBounds(SettingId id) {
         case ST_PSI_WARN_PSI: return {   5, 100, 1 };  // low-oil thresholds
         // AFR thresholds are stored as AFR × 10; step 1 = 0.1 AFR per tap.
         // Range 8.0–20.0 spans every realistic operating point on gasoline.
+        case ST_VOLT_WARN:    return {  80, 160, 1 };  // 8.0-16.0 V, ×10
         case ST_AFR_WARN_LO:  return {  80, 200, 1 };
         case ST_AFR_WARN_HI:  return {  80, 200, 1 };
         case ST_AUTO_START_MPH: return { 5, 150, 5 };  // speed to trigger auto-record
@@ -4187,6 +4342,7 @@ static uint16_t getNum(SettingId id) {
         case ST_CL_PORT: return s.cloud_port;
         case ST_TEMP_WARN_F:  return s.coolant_warn_f;
         case ST_PSI_WARN_PSI: return s.oil_warn_psi;
+        case ST_VOLT_WARN:    return s.volt_warn_x10;
         case ST_AFR_WARN_LO:  return s.afr_warn_lo_x10;
         case ST_AFR_WARN_HI:  return s.afr_warn_hi_x10;
         case ST_AUTO_START_MPH: return s.auto_start_mph;
@@ -4205,6 +4361,7 @@ static void setNum(SettingId id, uint16_t v) {
         case ST_CL_PORT: s.cloud_port   = v; break;
         case ST_TEMP_WARN_F:  s.coolant_warn_f = v; break;
         case ST_PSI_WARN_PSI: s.oil_warn_psi   = v; break;
+        case ST_VOLT_WARN:    s.volt_warn_x10 = v; break;
         case ST_AFR_WARN_LO:  s.afr_warn_lo_x10 = v; break;
         case ST_AFR_WARN_HI:  s.afr_warn_hi_x10 = v; break;
         case ST_AUTO_START_MPH: s.auto_start_mph = v; break;
@@ -5399,6 +5556,8 @@ static bool rowShouldShow(SettingId id) {
         // Coolant warn threshold + colour only when the gauge is shown.
         case ST_TEMP_WARN_F:
         case ST_TEMP_WARN_COL: return s.show_coolant;
+        case ST_VOLT_WARN:
+        case ST_VOLT_WARN_COL: return s.show_volt;
 
         // Oil-pressure warn threshold + colour only when the gauge is shown.
         case ST_PSI_WARN_PSI:
@@ -5438,7 +5597,8 @@ static int rowGroup(SettingId id) {
         case ST_SENSOR_TYPE:
         case ST_SHOW_TEMP: case ST_TEMP_WARN_F: case ST_TEMP_WARN_COL:
         case ST_SHOW_PSI:  case ST_PSI_WARN_PSI: case ST_PSI_WARN_COL:
-        case ST_SHOW_AFR:  case ST_AFR_WARN_LO: case ST_AFR_WARN_HI: case ST_AFR_WARN_COL: return SG_SENSORS;
+        case ST_SHOW_AFR:  case ST_AFR_WARN_LO: case ST_AFR_WARN_HI: case ST_AFR_WARN_COL:
+        case ST_SHOW_VOLT: case ST_VOLT_WARN: case ST_VOLT_WARN_COL: return SG_SENSORS;
         case ST_REC_SD: case ST_REC_CLOUD: case ST_AUTO_TRACK:
         case ST_AUTO_START: case ST_AUTO_START_MPH: return SG_RECORDING;
         case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO:
@@ -5626,7 +5786,8 @@ static void drawSettingsPage() {
                 case ST_AM_COL:        cidx = s.alertmax_color_idx; break;
                 case ST_TEMP_WARN_COL: cidx = s.coolant_warn_col;   break;
                 case ST_PSI_WARN_COL:  cidx = s.oil_warn_col;       break;
-                case ST_AFR_WARN_COL:  cidx = s.afr_warn_col;       break;
+                case ST_AFR_WARN_COL:  cidx = s.afr_warn_col;        break;
+                case ST_VOLT_WARN_COL: cidx = s.volt_warn_col;       break;
                 default: break;
             }
             tft.fillRect(CTRL_COLOR_X, y, CTRL_COLOR_W, SETTINGS_ROW_HEIGHT, PALETTE[cidx]);
@@ -5808,6 +5969,7 @@ static void handleSettingsTap(int x, int y) {
                     case ST_TEMP_WARN_COL: s.coolant_warn_col   = (s.coolant_warn_col   + 1) % N_PALETTE; break;
                     case ST_PSI_WARN_COL:  s.oil_warn_col       = (s.oil_warn_col       + 1) % N_PALETTE; break;
                     case ST_AFR_WARN_COL:  s.afr_warn_col       = (s.afr_warn_col       + 1) % N_PALETTE; break;
+                    case ST_VOLT_WARN_COL: s.volt_warn_col      = (s.volt_warn_col      + 1) % N_PALETTE; break;
                     default: break;
                 }
                 settingsDirty = true;

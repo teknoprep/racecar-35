@@ -545,6 +545,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `wssid` / `wpass` | string | WiFi SSID / PSK |
 | `s_temp` / `t_warn` / `t_col` | bool/uint16/uint8 | Coolant show / warn-°F / warn-colour |
 | `s_psi` / `p_warn` / `p_col` | bool/uint16/uint8 | Oil-PSI show / warn-PSI / warn-colour |
+| `s_volt` / `v_warn` / `v_col` | bool/uint16/uint8 | **Voltage show / low-warn (V×10, default 128=12.8 V) / warn-colour (v0.1.110).** Source: BT ATRV (srctyp==2) or MS3 CAN bat (==1). Display AND warning are gated on `eng.rpm >= ENGINE_RUNNING_RPM` (500) — parked ignition-on reads ~12.4 V, which is normal, not a dying alternator. The VOLT line shares the AFR dash row (renders only when the AFR line doesn't). |
 | `srctyp` | uint8 | **Sensor source: 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN), 2=Bluetooth (BLE OBD-II dongle for slow readings)** |
 | `bt_addr` / `bt_atype` / `bt_name` | string/uint8/string | **Paired BLE OBD-II (ELM327) dongle**: address `"aa:bb:.."`, BLE address type, friendly name. Used when `srctyp==2` to auto-reconnect on boot. Set from PAGE_BT_SCAN. |
 | `btpid` | uint8 | **Mode-01 PID mapped to the COOLANT function** (default 0x05 = standard ECT). Set from PAGE_PID_SCAN (Sensor page → COOLANT PID button); decoded as A−40 °C. |
@@ -557,6 +558,17 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **Struct size changed, so pre-0.1.82 blobs are length-mismatched and ignored once (overrides reset — re-capture via SET S/F).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
 
 `clampInvariants()` enforces `rpm_min < rpm_max`, `alert1_rpm < alertmax_rpm`, `alert1_hz < alertmax_hz` after every mutation.
+
+### Full-screen sensor warning flash (v0.1.110)
+When a sensor warning is active on the dash page, the **whole screen flashes
+the warn colour at 2 Hz with the warning NAME** (Font4×6, centered):
+`OIL` (psi ≤ warn) > `TEMP` (coolant ≥ warn) > `VOLT` (low volts while
+running) > `AFR` (out of band) — highest priority wins (`activeSensorWarning()`
+next to `computeBgColor()`; it mirrors the per-line warn_active conditions).
+The ON phase early-returns from `drawDashPage()` (same pattern as the lap
+popup); the OFF phase renders the normal dash, so the **RPM shift flash shows
+interleaved** (shift lights themselves are unchanged — colour-only, no label).
+Transitions force a full repaint via `pageJustEntered`.
 
 ## Dash UI architecture (RaceDash.ino)
 
