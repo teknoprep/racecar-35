@@ -117,18 +117,34 @@ cd <repo root>
 export PYTHONPATH=/home/chris/racecar-tools/pylibs          # <-- required (1e)
 CLI="/home/chris/racecar-tools/bin/arduino-cli --config-file /home/chris/racecar-tools/arduino-cli.yaml"
 base="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none"
+# NimBLE size trim (v0.1.109): we are BLE central+observer only — compiling out the
+# peripheral/broadcaster roles + single connection saves ~15.5 KB of the 1.31 MB OTA slot.
+# Must go to BOTH c and cpp flags (the NimBLE host core is C).
+trim="-DCONFIG_BT_NIMBLE_ROLE_PERIPHERAL_DISABLED -DCONFIG_BT_NIMBLE_ROLE_BROADCASTER_DISABLED -DCONFIG_BT_NIMBLE_MAX_CONNECTIONS=1"
 
 # 7" Basic (crowpanel7), 4M
-$CLI compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7"  --build-path /tmp/rd7_build   --output-dir /tmp/rd7_out   crowpanel-arduino/RaceDash
+$CLI compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7 $trim"  --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd7_build   --output-dir /tmp/rd7_out   crowpanel-arduino/RaceDash
 # 5" Basic (crowpanel5), 4M
-$CLI compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5"  --build-path /tmp/rd5_build   --output-dir /tmp/rd5_out   crowpanel-arduino/RaceDash
+$CLI compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5 $trim"  --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd5_build   --output-dir /tmp/rd5_out   crowpanel-arduino/RaceDash
 # 5" Advance (crowpanel5adv), 16M
-$CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
+$CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51 $trim" --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
 ```
 Rules (from CLAUDE.md): use `compiler.cpp.extra_flags` (NOT `build.extra_flags`, which carries
 the required USB-mode flags), and a **distinct `--build-path` per board** so the `-DDASH_BOARD`
 define can't cross-contaminate the cache. The APP binary is `RaceDash.ino.bin` in each
 `--output-dir`.
+
+**Flash-size ceiling — what actually limits us.** The binding limit is the **A/B OTA app slot
+in the partition table** (PartitionScheme=default ⇒ 1,310,720 B per slot), NOT total flash and
+NOT the OTA transport. The partition table is written ONLY during a USB flash — OTA can never
+change it — so **1.31 MB stays the release ceiling until every deployed 4M panel has been
+bench-flashed**. The shipped `.bin` is partition-agnostic (ESP32 apps are MMU-mapped; the same
+binary runs from either slot on either table), so the release builds above keep
+`PartitionScheme=default` harmlessly. **Policy: any USB (bench) flash of a panel should use
+`PartitionScheme=min_spiffs`** — same A/B OTA layout but SPIFFS (which we never use; settings
+live in NVS) shrinks from 1.4 MB to 128 KB, growing each app slot to 1,966,080 B (+50%
+headroom). Units migrate opportunistically as they visit the bench; an oversized image sent to
+a not-yet-migrated unit fails cleanly (its `Update.begin()` checks its own table — no brick).
 
 ---
 

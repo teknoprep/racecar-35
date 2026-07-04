@@ -81,6 +81,8 @@ static const char* lastResp() { return g_last_resp; }
 static volatile int16_t  d_coolant_f_x10 = -1;
 static volatile int16_t  d_iat_f_x10     = -1;
 static volatile int16_t  d_volt_x10      = -1;
+static volatile int16_t  d_tps_x10       = -1;     // throttle % ×10 (0111)
+static volatile int16_t  d_spark_x10     = -1000;  // timing adv °BTDC ×10 (010E); can be negative — sentinel is -1000
 static volatile uint32_t d_last_ms       = 0;   // millis() of last good PID parse
 
 // scan results (populated by the task after a blocking scan completes)
@@ -389,9 +391,34 @@ static void doPidScan() {
 }
 
 static void pollOnce() {
-  static uint8_t idx = 0;
+  static uint8_t idx  = 0;   // slow-rotation cursor: coolant / IAT / volts
+  static uint8_t pass = 0;
+  static uint8_t tps_fail = 0, spk_fail = 0;   // consecutive-miss backoff
   char resp[64];
   char ccmd[8], ckey[8];
+  pass++;
+
+  // FAST channels — polled every pass (race analysis): throttle trace (0111)
+  // and timing advance (010E, the knock-retard proxy — the stock ECU pulls
+  // timing when it hears knock). K-line budget is ~4-6 queries/s total, so
+  // if the car never answers one (unsupported PID / ignition off) we back
+  // off to ~every 10th pass so its 1.2 s timeout doesn't starve coolant.
+  if (tps_fail < 5 || (pass % 10) == 0) {
+    bool ok = false;
+    if (elmCmd("0111", 1200)) { snapResp(resp, sizeof(resp));
+      int a = pidByte(resp, "4111", 0);
+      if (a >= 0) { d_tps_x10 = (int16_t)((a * 1000 + 127) / 255); d_last_ms = millis(); tps_fail = 0; ok = true; } }
+    if (!ok && tps_fail < 250) tps_fail++;
+  }
+  if (spk_fail < 5 || (pass % 10) == 3) {   // phase-offset from the TPS retry
+    bool ok = false;
+    if (elmCmd("010E", 1200)) { snapResp(resp, sizeof(resp));
+      int a = pidByte(resp, "410E", 0);
+      if (a >= 0) { d_spark_x10 = (int16_t)((a - 128) * 5); d_last_ms = millis(); spk_fail = 0; ok = true; } }
+    if (!ok && spk_fail < 250) spk_fail++;
+  }
+
+  // SLOW rotation — one per pass: coolant / IAT / battery volts.
   switch (idx) {
     case 0:  // coolant  01<g_pid_clt> -> 41<pid> XX : °C = XX-40
       snprintf(ccmd, sizeof(ccmd), "01%02X", g_pid_clt);
@@ -495,7 +522,7 @@ static void obdTask(void*) {
             snprintf(g_last_err, sizeof(g_last_err), "BT link wedged - resetting");
             g_client->disconnect();
             g_state = RECONNECT;
-          } else { pollOnce(); vTaskDelay(pdMS_TO_TICKS(350)); }
+          } else { pollOnce(); vTaskDelay(pdMS_TO_TICKS(150)); }  // 350->150: a pass is now up to 3 queries
         }
         else { g_state = RECONNECT; }
         break;
@@ -556,6 +583,8 @@ static bool     dataFresh()    { return d_last_ms != 0 && (millis() - d_last_ms)
 static int16_t  coolantF_x10() { return d_coolant_f_x10; }
 static int16_t  iatF_x10()     { return d_iat_f_x10; }
 static int16_t  voltX10()      { return d_volt_x10; }
+static int16_t  tpsX10()       { return d_tps_x10; }
+static int16_t  sparkX10()     { return d_spark_x10; }   // -1000 = no data
 static const char* targetAddr(){ return g_target_addr; }
 static const char* connName()  { return g_conn_name; }
 

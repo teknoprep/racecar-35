@@ -285,6 +285,14 @@ reads the bare `crowpanel` key) can still OTA forward; keep it pointing at the 7
 
 Full publish procedure (Linux host; `$HOME` is unset in this shell — prefix git ops with
 `HOME=/root` OR push to an explicit token URL):
+**⚠️ Size ceiling = the OTA app slot, not the hardware.** PartitionScheme=default gives two
+1,310,720 B A/B app slots + 1.4 MB SPIFFS we never use. OTA can never rewrite the partition
+table (USB flash only), so 1.31 MB is the release ceiling until deployed 4M panels get
+bench-flashed. The `.bin` is partition-agnostic — release builds keep PartitionScheme=default.
+**USB/bench flashes should use `PartitionScheme=min_spiffs`** (same A/B OTA, app slots grow to
+1,966,080 B); an oversized OTA to a not-yet-migrated unit fails cleanly, no brick. Full
+explanation in BUILD.md §1f.
+
 **⚠️ Publishing now uses a STAGING dir** — `RACECAR_FW_DIR=/tmp/fwstage
 ./server/publish_firmware.sh <ver>` after copying fresh builds there. The repo
 `firmware/` dir is the frozen GitHub bridge and must not be overwritten.
@@ -310,9 +318,11 @@ sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" crowpa
 #    NOTE the per-board FlashSize: Advance=16M, Basics=4M.
 cli=~/.local/bin/arduino-cli
 base="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none"
-$cli compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7"  --build-path /tmp/rd7_build  --output-dir /tmp/rd7_out  crowpanel-arduino/RaceDash
-$cli compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5"  --build-path /tmp/rd5_build  --output-dir /tmp/rd5_out  crowpanel-arduino/RaceDash
-$cli compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
+# NimBLE trim (v0.1.109): central+observer only; must go to BOTH c and cpp flags (~15.5 KB saved)
+trim="-DCONFIG_BT_NIMBLE_ROLE_PERIPHERAL_DISABLED -DCONFIG_BT_NIMBLE_ROLE_BROADCASTER_DISABLED -DCONFIG_BT_NIMBLE_MAX_CONNECTIONS=1"
+$cli compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7 $trim"  --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd7_build  --output-dir /tmp/rd7_out  crowpanel-arduino/RaceDash
+$cli compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5 $trim"  --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd5_build  --output-dir /tmp/rd5_out  crowpanel-arduino/RaceDash
+$cli compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51 $trim" --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
 cp /tmp/rd7_out/RaceDash.ino.bin   firmware/crowpanel7-dash.bin
 cp /tmp/rd5_out/RaceDash.ino.bin   firmware/crowpanel5-dash.bin
 cp /tmp/rdadv_out/RaceDash.ino.bin firmware/crowpanel5adv-dash.bin
@@ -492,9 +502,16 @@ CFG,dbg_on,<0|1>   # (part of CFG) debug logging master switch. 0 = Teensy write
                    #   wire key stays dbg_on).
 CFG,srctyp,<0|1|2> # sensor source: 0=Direct, 1=MegaSquirt, 2=Bluetooth OBD-II
 DTEMP,<c>          # dash -> Teensy: dash ESP32-S3 die temp (1 Hz, for HLTH/.dbg)
-BTD,<clt_f_x10>,<iat_f_x10>,<volt_x10>   # 1 Hz BLE-OBD relay while the dongle link is up:
-                   #   coolant/IAT (°F×10) + battery (V×10). Teensy uses coolant for the ENG
-                   #   line + session NDJSON when srctyp==2 (fresh ≤10 s), volts for HLTH/.dbg.
+BTD,<clt_f_x10>,<iat_f_x10>,<volt_x10>[,<tps_x10>,<spark_x10>]
+                   # 1 Hz BLE-OBD relay while the dongle link is up: coolant/IAT (°F×10),
+                   #   battery (V×10), + v0.1.109 throttle (%×10, PID 0111) and timing
+                   #   advance (°BTDC×10, PID 010E — knock-retard proxy). Spark can be
+                   #   legitimately negative: its no-data sentinel is -1000, others -1.
+                   #   Teensy parses the 3-field short form from old dashes. Coolant feeds
+                   #   the ENG line + NDJSON when srctyp==2 (fresh ≤10 s); volts back HLTH/
+                   #   .dbg; tps/spark land in the session NDJSON as tps_pct/spark_deg
+                   #   (tps_pct prefers MS3 CAN when live; spark is BT-only; keys omitted
+                   #   when no live source — old parsers unaffected).
 SETTIME,<unix>     # set Teensy RTC
 TZ,<id>            # timezone id (for SD filenames / metadata)
 SDFORMAT           # FAT32-format the SD card
@@ -579,8 +596,13 @@ never appear in a scan. ELM init: `ATZ ATE0 ATL0 ATS0
 ATH0 ATSP0`, then (v0.1.106) a **`0100` protocol-lock probe with a 10 s budget**
 — with ATSP0 the FIRST query triggers the ELM's bus-protocol search (3–8 s,
 way past the normal poll timeout; without the probe the first coolant reads
-all "time out" and BT looks dead) — then round-robin `0105` (coolant), `010F`
-(IAT), `ATRV` (voltage) at ~1 Hz each. Auto-reconnects on link loss. The dash
+all "time out" and BT looks dead) — then (v0.1.109) a **fast/slow poll split**
+per `pollOnce()` pass (150 ms task delay): FAST every pass = `0111` throttle +
+`010E` timing advance (the knock-retard proxy — race analysis channels; if the
+car never answers one, 5 consecutive misses back it off to every 10th pass so
+its 1.2 s timeout doesn't starve coolant on the ~4-6 queries/s K-line budget);
+SLOW one-per-pass rotation = coolant (`01`+mapped `btpid`), `010F` IAT, `ATRV`
+volts. Auto-reconnects on link loss. The dash
 overrides its coolant readout with `obd::coolantF_x10()` when `sensor_type==2`,
 relays the data to the Teensy as `BTD,...` (session logging + HLTH batt), and
 the Sensor page shows coolant/IAT/volts plus the raw ELM reply

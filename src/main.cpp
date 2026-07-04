@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.108"
+#define FIRMWARE_VERSION "0.1.109"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -215,6 +215,8 @@ static float dash_temp_c = -999.0f;
 static int16_t  bt_clt_f_x10 = -1;
 static int16_t  bt_iat_f_x10 = -1;
 static int16_t  bt_volt_x10  = -1;
+static int16_t  bt_tps_x10   = -1;      // throttle % ×10 (PID 0111)
+static int16_t  bt_spark_x10 = -1000;   // timing adv °BTDC ×10 (PID 010E); negative is valid — sentinel is -1000
 static uint32_t bt_last_ms   = 0;
 
 // Teensy reset-cause forensics (SRC_SRSR). Captured once at boot, then the
@@ -479,10 +481,13 @@ static void handleDashCommand(const String& line) {
         // `pio device monitor` on /dev/ttyACM0 to see dash-side state.
         Serial.printf("[dash-dbg] %s\n", line.substring(4).c_str());
     } else if (line.startsWith("BTD,")) {
-        // Dash-relayed BLE OBD data: BTD,<clt_f_x10>,<iat_f_x10>,<volt_x10>
-        int v[3] = { -1, -1, -1 };
+        // Dash-relayed BLE OBD data:
+        //   BTD,<clt_f_x10>,<iat_f_x10>,<volt_x10>[,<tps_x10>,<spark_x10>]
+        // tps/spark added v0.1.109; defaults keep an old dash's 3-field form
+        // parsing as "no data" (spark can be legitimately negative -> -1000).
+        int v[5] = { -1, -1, -1, -1, -1000 };
         int idx = 4;
-        for (int i = 0; i < 3 && idx > 0 && idx <= (int)line.length(); i++) {
+        for (int i = 0; i < 5 && idx > 0 && idx <= (int)line.length(); i++) {
             v[i] = line.substring(idx).toInt();
             int c = line.indexOf(',', idx);
             idx = (c < 0) ? -1 : c + 1;
@@ -490,6 +495,8 @@ static void handleDashCommand(const String& line) {
         bt_clt_f_x10 = (int16_t)v[0];
         bt_iat_f_x10 = (int16_t)v[1];
         bt_volt_x10  = (int16_t)v[2];
+        bt_tps_x10   = (int16_t)v[3];
+        bt_spark_x10 = (int16_t)v[4];
         bt_last_ms   = millis();
     } else if (line.startsWith("DTEMP,")) {
         // Dash reports its ESP32-S3 die temp (°C) so we can log both MCUs' temps
@@ -2169,7 +2176,7 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
     // Hand-rolled NDJSON — avoids ArduinoJson dep, ~250 bytes/sample.
     // -1 sentinels for oil/coolant become JSON null so the server can
     // distinguish "sensor faulted" from a real zero.
-    char buf[320];
+    char buf[384];   // ~305 B worst case with tps/spark — keep slack
     int n = 0;
     if (session_start_unix > 0) {
         n = snprintf(buf, sizeof(buf),
@@ -2194,6 +2201,23 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
     else              n += snprintf(buf+n, sizeof(buf)-n, "\"oil_psi\":%.1f,",  oil_x10 * 0.1f);
     if (cool_x10 < 0) n += snprintf(buf+n, sizeof(buf)-n, "\"coolant_f\":null,");
     else              n += snprintf(buf+n, sizeof(buf)-n, "\"coolant_f\":%.1f,", cool_x10 * 0.1f);
+
+    // Race-analysis channels (v0.1.109): throttle % + timing advance (°BTDC,
+    // the knock-retard proxy). TPS comes from MS3 CAN when live, else from the
+    // BT dongle; spark is BT-only (the MS3 simplified-dash frames don't carry
+    // it). Emitted only when a live source has answered — absent keys keep old
+    // sessions/parsers unchanged.
+    {
+        const bool bt_ok = (bt_last_ms != 0) && (millis() - bt_last_ms <= 10000);
+        const bool can_ok = (can_ecu.last_ms != 0) && (millis() - can_ecu.last_ms <= CAN_STALE_MS);
+        int16_t tps = -1;
+        if (can_ok && can_ecu.tps_x10 >= 0) tps = can_ecu.tps_x10;
+        else if (bt_ok && bt_tps_x10 >= 0)  tps = bt_tps_x10;
+        if (tps >= 0)
+            n += snprintf(buf+n, sizeof(buf)-n, "\"tps_pct\":%.1f,", tps * 0.1f);
+        if (bt_ok && bt_spark_x10 > -1000)
+            n += snprintf(buf+n, sizeof(buf)-n, "\"spark_deg\":%.1f,", bt_spark_x10 * 0.1f);
+    }
 
     n += snprintf(buf+n, sizeof(buf)-n,
         "\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"gx\":%.1f,\"gy\":%.1f,\"gz\":%.1f}\n",

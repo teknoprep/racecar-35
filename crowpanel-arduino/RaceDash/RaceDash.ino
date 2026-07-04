@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.108"
+#define FIRMWARE_VERSION "0.1.109"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4995,6 +4995,12 @@ static void drawSensorPage() {
         if (obd::voltX10() > 0 && cn < (int)sizeof(cbuf))
             cn += snprintf(cbuf + cn, sizeof(cbuf) - cn, "   %d.%dV",
                            obd::voltX10() / 10, obd::voltX10() % 10);
+        if (obd::tpsX10() >= 0 && cn < (int)sizeof(cbuf))
+            cn += snprintf(cbuf + cn, sizeof(cbuf) - cn, "   TPS %d%%",
+                           (int)((obd::tpsX10() + 5) / 10));
+        if (obd::sparkX10() > -1000 && cn < (int)sizeof(cbuf))
+            cn += snprintf(cbuf + cn, sizeof(cbuf) - cn, "   SPK %.1f",
+                           obd::sparkX10() / 10.0f);
         snprintf(buf, sizeof(buf), "Status: %s%s", obd::stateStr(), cbuf);
         tft.setTextColor(conn ? TFT_GREEN : TFT_YELLOW, BG);
         tft.drawString(buf, 30, by + 26);
@@ -9163,8 +9169,9 @@ static void dashHealthTick() {
     // Relay BLE OBD data to the Teensy (coolant source when srctyp==2 + battery
     // volts for HLTH/.dbg) so it lands in the recorded session, not just the UI.
     if (obd::connected() && obd::dataFresh()) {
-        Serial.printf("BTD,%d,%d,%d\n",
-                      (int)obd::coolantF_x10(), (int)obd::iatF_x10(), (int)obd::voltX10());
+        Serial.printf("BTD,%d,%d,%d,%d,%d\n",
+                      (int)obd::coolantF_x10(), (int)obd::iatF_x10(), (int)obd::voltX10(),
+                      (int)obd::tpsX10(), (int)obd::sparkX10());
     }
     // Adopt the dongle's REAL name once connected: pairing from the scan list
     // may have stored "(unnamed)" (name absent from the advertisement); after
