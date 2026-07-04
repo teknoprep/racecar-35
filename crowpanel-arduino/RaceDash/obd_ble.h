@@ -71,6 +71,12 @@ static void blePhase(uint8_t ph) {
 static char g_last_err[48] = {0};
 static const char* lastErr() { return g_last_err; }
 
+// Last raw ELM reply snippet (shown on the Sensor page when coolant is
+// missing — surfaces "NODATA" / "UNABLETOCONNECT" / "SEARCHING" so "connected
+// but no ECU answer" (ignition off, dead OBD bus) is diagnosable on-screen).
+static char g_last_resp[28] = {0};
+static const char* lastResp() { return g_last_resp; }
+
 // live data — sentinel -1 (or 0 for rpm) until a valid reading arrives
 static volatile int16_t  d_coolant_f_x10 = -1;
 static volatile int16_t  d_iat_f_x10     = -1;
@@ -169,17 +175,15 @@ static void doScan() {
   g_scanning = true; g_scan_n = 0;
   blePhase(2);
   NimBLEScan* sc = NimBLEDevice::getScan();
-  // GENTLE scan (brownout mitigation). NimBLE's defaults are a CONTINUOUS
-  // active scan: radio RX ~100% duty (+~90 mA sustained on top of WiFi + LCD)
-  // plus SCAN_REQ TX bursts — the board rebooted ~200 ms after scan start,
-  // i.e. right when the radio went to work. PASSIVE (no TX at all) + 20 ms
-  // window per 100 ms interval = ~20% duty ≈ ~18 mA average instead. Longer
-  // 8 s duration compensates the lower duty for discovery odds. (Passive
-  // means some dongles' names only arrive via scan-response and may list as
-  // "(unnamed)" — still pairable by address.)
-  sc->setActiveScan(false);
+  // ACTIVE scan (v0.1.106): device NAMES mostly live in the SCAN RESPONSE,
+  // which the scanner only receives if it actively requests it — the passive
+  // scan (a leftover crash mitigation) listed most devices as "(unnamed)".
+  // Safe now: the historical crash was the WiFi+BLE coex bug, and the radio
+  // time-share keeps WiFi HARD-OFF during every scan, so BLE owns the radio
+  // outright. SCAN_REQ TX stays at 0 dBm; ~45% duty is plenty gentle.
+  sc->setActiveScan(true);
   sc->setInterval(100);   // ms
-  sc->setWindow(20);      // ms of each interval actually listening
+  sc->setWindow(45);      // ms of each interval actually listening
   sc->setMaxResults(24);
   sc->clearResults();
   NimBLEScanResults res = sc->start(8, false);   // 8 s, blocking on THIS task only
@@ -196,6 +200,14 @@ static void doScan() {
     g_scan[n].atype = d.getAddressType();
     g_scan[n].rssi  = d.getRSSI();
     n++;
+  }
+  // Strongest signal first — the dongle IN the car tops the list (and named
+  // devices win ties). Tiny N: insertion sort.
+  for (uint8_t i = 1; i < n; i++) {
+    ScanItem tmp = g_scan[i];
+    int8_t j = i - 1;
+    while (j >= 0 && g_scan[j].rssi < tmp.rssi) { g_scan[j + 1] = g_scan[j]; j--; }
+    g_scan[j + 1] = tmp;
   }
   g_scan_n = n;
   g_scanning = false;
@@ -244,6 +256,24 @@ static bool connectAndInit() {
   // for notifications (CCCD=1) on an indicate-only char silently gets nothing.
   g_rx->subscribe(g_rx->canNotify(), notifyCB);
 
+  // NAME FALLBACK: if the scan never yielded a name, read the GAP Device Name
+  // characteristic (0x1800/0x2A00) — mandatory on every BLE device, so we get
+  // a real name even from dongles that never advertise one. The dash adopts
+  // it into the saved pairing (see dashHealthTick).
+  if (!g_conn_name[0] || strcmp(g_conn_name, "(unnamed)") == 0) {
+    NimBLERemoteService* gap = g_client->getService(NimBLEUUID((uint16_t)0x1800));
+    if (gap) {
+      NimBLERemoteCharacteristic* nmch = gap->getCharacteristic(NimBLEUUID((uint16_t)0x2A00));
+      if (nmch && nmch->canRead()) {
+        std::string v = nmch->readValue();
+        if (!v.empty()) {
+          strncpy(g_conn_name, v.c_str(), sizeof(g_conn_name) - 1);
+          g_conn_name[sizeof(g_conn_name) - 1] = 0;
+        }
+      }
+    }
+  }
+
   g_state = INIT;
   elmCmd("ATZ", 2000); vTaskDelay(pdMS_TO_TICKS(200));   // reset
   elmCmd("ATE0", 1000);   // echo off
@@ -251,6 +281,16 @@ static bool connectAndInit() {
   elmCmd("ATS0", 1000);   // spaces off
   elmCmd("ATH0", 1000);   // headers off
   elmCmd("ATSP0", 1000);  // auto protocol
+  // PROTOCOL LOCK: with ATSP0 the FIRST query triggers the ELM's bus-protocol
+  // search, which can take 3-8 s — far beyond the normal 1.2 s poll timeout,
+  // so the first coolant reads would all "time out" and the feature looks
+  // dead for a while. Burn the search here ONCE with a 10 s budget (0100 =
+  // supported-PIDs probe); every later poll is then fast.
+  if (elmCmd("0100", 10000)) {
+    char r[28]; snapResp(r, sizeof(r));
+    strncpy(g_last_resp, r, sizeof(g_last_resp) - 1);
+    g_last_resp[sizeof(g_last_resp) - 1] = 0;
+  }
   d_last_ms = millis();
   g_state = POLL;
   blePhase(4);   // connected — stays set while linked (power-off reads POWERON = ignored)
@@ -262,9 +302,14 @@ static void pollOnce() {
   char resp[64];
   switch (idx) {
     case 0:  // coolant  0105 -> 4105 XX : °C = XX-40
-      if (elmCmd("0105", 1200)) { snapResp(resp, sizeof(resp));
+      if (elmCmd("0105", 2500)) { snapResp(resp, sizeof(resp));
         int a = pidByte(resp, "4105", 0);
-        if (a >= 0) { d_coolant_f_x10 = (int16_t)lroundf(((a - 40) * 9.0f / 5.0f + 32.0f) * 10.0f); d_last_ms = millis(); } }
+        if (a >= 0) { d_coolant_f_x10 = (int16_t)lroundf(((a - 40) * 9.0f / 5.0f + 32.0f) * 10.0f); d_last_ms = millis(); }
+        else {
+          // Keep the raw reply for the Sensor page ("NODATA" etc).
+          strncpy(g_last_resp, resp, sizeof(g_last_resp) - 1);
+          g_last_resp[sizeof(g_last_resp) - 1] = 0;
+        } }
       break;
     case 1:  // intake air temp 010F -> 410F XX : °C = XX-40
       if (elmCmd("010F", 1200)) { snapResp(resp, sizeof(resp));

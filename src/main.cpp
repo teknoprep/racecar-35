@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.105"
+#define FIRMWARE_VERSION "0.1.106"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -206,6 +206,16 @@ static struct {
 // ESP32-S3 dash temp, reported by the dash via the DTEMP line (heat diagnostics).
 // Declared here (before handleDashCommand) so the command parser can set it.
 static float dash_temp_c = -999.0f;
+
+// BLE OBD-II data relayed by the dash (BTD,<clt_f_x10>,<iat_f_x10>,<volt_x10>,
+// 1 Hz while the dongle link is up). Used as the coolant source when
+// sensor_type==2 (Bluetooth) so BT coolant lands in the ENG line AND the
+// recorded session NDJSON, and as the battery-volts fallback for HLTH/.dbg
+// when MS3 CAN isn't connected (the ELM's ATRV reads the car battery).
+static int16_t  bt_clt_f_x10 = -1;
+static int16_t  bt_iat_f_x10 = -1;
+static int16_t  bt_volt_x10  = -1;
+static uint32_t bt_last_ms   = 0;
 
 // Teensy reset-cause forensics (SRC_SRSR). Captured once at boot, then the
 // sticky bits are cleared. Distinguishes a power/brownout reset (POR) from a
@@ -468,6 +478,19 @@ static void handleDashCommand(const String& line) {
         // DBG,<text> lines through and we forward to our USB CDC console. Use
         // `pio device monitor` on /dev/ttyACM0 to see dash-side state.
         Serial.printf("[dash-dbg] %s\n", line.substring(4).c_str());
+    } else if (line.startsWith("BTD,")) {
+        // Dash-relayed BLE OBD data: BTD,<clt_f_x10>,<iat_f_x10>,<volt_x10>
+        int v[3] = { -1, -1, -1 };
+        int idx = 4;
+        for (int i = 0; i < 3 && idx > 0 && idx <= (int)line.length(); i++) {
+            v[i] = line.substring(idx).toInt();
+            int c = line.indexOf(',', idx);
+            idx = (c < 0) ? -1 : c + 1;
+        }
+        bt_clt_f_x10 = (int16_t)v[0];
+        bt_iat_f_x10 = (int16_t)v[1];
+        bt_volt_x10  = (int16_t)v[2];
+        bt_last_ms   = millis();
     } else if (line.startsWith("DTEMP,")) {
         // Dash reports its ESP32-S3 die temp (°C) so we can log both MCUs' temps
         // together in the health line / .dbg log (heat diagnostics).
@@ -1933,7 +1956,9 @@ static void dbgHealth() {
     const uint32_t pvt_age = (gnss_last_fresh_ms == 0) ? 999999u : (now - gnss_last_fresh_ms);
     const int avail = GPS_SERIAL.available();   // GPS UART backlog RIGHT NOW
     const float t_die = tempmonGetTemp();       // Teensy i.MX RT1062 die temp (°C)
-    const float batt  = (can_ecu.bat_x10 >= 0) ? can_ecu.bat_x10 / 10.0f : -1.0f;
+    float batt = (can_ecu.bat_x10 >= 0) ? can_ecu.bat_x10 / 10.0f : -1.0f;
+    if (batt < 0 && bt_last_ms != 0 && now - bt_last_ms <= 10000 && bt_volt_x10 > 0)
+        batt = bt_volt_x10 / 10.0f;   // BT dongle ATRV fallback
     char line[360];
     int n = snprintf(line, sizeof(line),
         "{\"t\":%lu,\"ev\":\"h\",\"loop_ms\":%lu,\"sdwr_ms\":%lu,\"fresh\":%lu,\"avail\":%d,"
@@ -1979,7 +2004,10 @@ static void healthTick() {
     const int16_t t_die_x10 = (int16_t)lroundf(t_die * 10.0f);
     const int16_t t_mpu_x10 = (imu_temp_c  > -100.0f) ? (int16_t)lroundf(imu_temp_c  * 10.0f) : -9999;
     const int16_t t_esp_x10 = (dash_temp_c > -100.0f) ? (int16_t)lroundf(dash_temp_c * 10.0f) : -9999;
-    const int16_t batt_x10  = can_ecu.bat_x10;   // -1 if no CAN
+    // Battery volts: MS3 CAN when present, else the BT dongle's ATRV reading.
+    int16_t batt_x10 = can_ecu.bat_x10;   // -1 if no CAN
+    if (batt_x10 < 0 && bt_last_ms != 0 && millis() - bt_last_ms <= 10000 && bt_volt_x10 > 0)
+        batt_x10 = bt_volt_x10;
     DASH_SERIAL.printf("HLTH,%d,%d,%d,%d\n", t_die_x10, t_mpu_x10, t_esp_x10, batt_x10);
     Serial.printf("[health] die=%.1fC mpu=%.1fC esp=%.1fC batt_x10=%d%s\n",
                   t_die, imu_temp_c, dash_temp_c, (int)batt_x10,
@@ -3365,11 +3393,16 @@ static void emitToDash() {
     const bool can_live = (can_ecu.last_ms != 0)
                           && (millis() - can_ecu.last_ms <= CAN_STALE_MS);
     const bool use_can  = (g_cfg.sensor_type == 1) || can_live;
+    // Bluetooth OBD coolant (dash-relayed BTD line): the coolant source when
+    // sensor_type==2 and the dongle data is fresh; RPM stays on the tach/CAN.
+    const bool bt_live  = (g_cfg.sensor_type == 2) && bt_last_ms != 0
+                          && (millis() - bt_last_ms <= 10000) && bt_clt_f_x10 > -400;
     const uint16_t directRpm  = computeRpmAndReset();   // always drain the tach FIFO
     const int16_t  directCool = readCoolantFx10();       // always keep EMA warm
     uint16_t       rpm         = use_can ? can_ecu.rpm       : directRpm;
     int16_t        oil_psi_x10 = readOilPsiX10();
-    int16_t        cool_f_x10  = use_can ? can_ecu.clt_f_x10 : directCool;
+    int16_t        cool_f_x10  = bt_live ? bt_clt_f_x10
+                               : (use_can ? can_ecu.clt_f_x10 : directCool);
 
     // IMU — flush averaged samples and emit even when absent (zeroes keep the
     // dash parser's field count stable and make it easy to detect a missing IMU).

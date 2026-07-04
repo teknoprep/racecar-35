@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.105"
+#define FIRMWARE_VERSION "0.1.106"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4896,15 +4896,31 @@ static void drawSensorPage() {
         tft.drawString(buf, 30, by);
 
         const bool conn = obd::connected();
-        char cbuf[64] = {0};
+        char cbuf[96] = {0};
+        int  cn = 0;
         if (obd::coolantF_x10() >= 0)
-            snprintf(cbuf, sizeof(cbuf), "   coolant %d F", (int)((obd::coolantF_x10() + 5) / 10));
+            cn += snprintf(cbuf + cn, sizeof(cbuf) - cn, "   coolant %d F",
+                           (int)((obd::coolantF_x10() + 5) / 10));
+        if (obd::iatF_x10() >= 0 && cn < (int)sizeof(cbuf))
+            cn += snprintf(cbuf + cn, sizeof(cbuf) - cn, "   IAT %d F",
+                           (int)((obd::iatF_x10() + 5) / 10));
+        if (obd::voltX10() > 0 && cn < (int)sizeof(cbuf))
+            cn += snprintf(cbuf + cn, sizeof(cbuf) - cn, "   %d.%dV",
+                           obd::voltX10() / 10, obd::voltX10() % 10);
         snprintf(buf, sizeof(buf), "Status: %s%s", obd::stateStr(), cbuf);
         tft.setTextColor(conn ? TFT_GREEN : TFT_YELLOW, BG);
         tft.drawString(buf, 30, by + 26);
         if (obd::lastErr()[0]) {   // e.g. "BT skipped: low heap (..KB free)"
             tft.setTextColor(TFT_YELLOW, BG);
             tft.drawString(obd::lastErr(), 30, by + 52);
+        } else if (conn && obd::coolantF_x10() < 0 && obd::lastResp()[0]) {
+            // Dongle linked but the ECU isn't answering the coolant PID — show
+            // the raw ELM reply (NODATA / UNABLETOCONNECT / SEARCHING...).
+            char ebuf[64];
+            snprintf(ebuf, sizeof(ebuf), "ECU reply: %s  (ignition on? OBD wired?)",
+                     obd::lastResp());
+            tft.setTextColor(TFT_YELLOW, BG);
+            tft.drawString(ebuf, 30, by + 52);
         }
 
         // SCAN button
@@ -8847,6 +8863,25 @@ static void dashHealthTick() {
     dash_health_ms = now;
     health_esp_c = temperatureRead();   // ESP32-S3 internal temp sensor (°C)
     Serial.printf("DTEMP,%.1f\n", health_esp_c);
+    // Relay BLE OBD data to the Teensy (coolant source when srctyp==2 + battery
+    // volts for HLTH/.dbg) so it lands in the recorded session, not just the UI.
+    if (obd::connected() && obd::dataFresh()) {
+        Serial.printf("BTD,%d,%d,%d\n",
+                      (int)obd::coolantF_x10(), (int)obd::iatF_x10(), (int)obd::voltX10());
+    }
+    // Adopt the dongle's REAL name once connected: pairing from the scan list
+    // may have stored "(unnamed)" (name absent from the advertisement); after
+    // connect obd reads the GAP Device Name (0x2A00) — persist it so the
+    // Sensor page shows a recognisable device from then on.
+    if (obd::connected() && obd::connName()[0] &&
+        strcmp(obd::connName(), "(unnamed)") != 0 &&
+        strcmp(s.bt_name, obd::connName()) != 0) {
+        strncpy(s.bt_name, obd::connName(), sizeof(s.bt_name) - 1);
+        s.bt_name[sizeof(s.bt_name) - 1] = '\0';
+        saveSettings();
+        sensor_page_dirty = true;
+        Serial.printf("DBG,bt name adopted: %s\n", s.bt_name);
+    }
 }
 
 void loop() {

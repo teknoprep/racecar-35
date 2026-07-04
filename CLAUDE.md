@@ -364,7 +364,7 @@ SD,REC,<0|1>,<file>,<samples>   (+ SD,READY/FMT/NONE/ERR/ACTIVE status forms)
 CLD,<live_ok>,<queue_depth>
 CANSNIFF,<0|1>,<file>,<frames>  (CAN sniffer status / live frame count)
 TIME,<unix_epoch>               (RTC, 1 Hz)
-HLTH,<t_die_x10>,<t_mpu_x10>,<t_esp_x10>,<batt_x10>  (1 Hz device health)
+HLTH,<t_die_x10>,<t_mpu_x10>,<t_esp_x10>,<batt_x10>  (1 Hz device health; batt falls back to the BT dongle's ATRV when no MS3 CAN)
 RST,teensy,<reason>             (once at boot: Teensy reset cause)
 VER,teensy,<semver>
 ```
@@ -477,6 +477,9 @@ CFG,dbg_on,<0|1>   # (part of CFG) debug logging master switch. 0 = Teensy write
                    #   wire key stays dbg_on).
 CFG,srctyp,<0|1|2> # sensor source: 0=Direct, 1=MegaSquirt, 2=Bluetooth OBD-II
 DTEMP,<c>          # dash -> Teensy: dash ESP32-S3 die temp (1 Hz, for HLTH/.dbg)
+BTD,<clt_f_x10>,<iat_f_x10>,<volt_x10>   # 1 Hz BLE-OBD relay while the dongle link is up:
+                   #   coolant/IAT (°F×10) + battery (V×10). Teensy uses coolant for the ENG
+                   #   line + session NDJSON when srctyp==2 (fresh ≤10 s), volts for HLTH/.dbg.
 SETTIME,<unix>     # set Teensy RTC
 TZ,<id>            # timezone id (for SD filenames / metadata)
 SDFORMAT           # FAT32-format the SD card
@@ -556,9 +559,23 @@ caps, subscribe uses notifications vs indications per the char, and
 prior BLE crash.) ⚠️ The dongle MUST be a **BLE** ELM327 (e.g. Vgate iCar Pro
 *BLE*) — the ESP32-S3 has no Classic BT/SPP, so a classic-only ELM327 will
 never appear in a scan. ELM init: `ATZ ATE0 ATL0 ATS0
-ATH0 ATSP0`, then round-robin `0105` (coolant), `010F` (IAT), `ATRV` (voltage)
-at ~1 Hz each. Auto-reconnects on link loss. The dash overrides its coolant
-readout with `obd::coolantF_x10()` when `sensor_type==2`.
+ATH0 ATSP0`, then (v0.1.106) a **`0100` protocol-lock probe with a 10 s budget**
+— with ATSP0 the FIRST query triggers the ELM's bus-protocol search (3–8 s,
+way past the normal poll timeout; without the probe the first coolant reads
+all "time out" and BT looks dead) — then round-robin `0105` (coolant), `010F`
+(IAT), `ATRV` (voltage) at ~1 Hz each. Auto-reconnects on link loss. The dash
+overrides its coolant readout with `obd::coolantF_x10()` when `sensor_type==2`,
+relays the data to the Teensy as `BTD,...` (session logging + HLTH batt), and
+the Sensor page shows coolant/IAT/volts plus the raw ELM reply
+(`obd::lastResp()`: NODATA/UNABLETOCONNECT/SEARCHING) when the ECU isn't
+answering. **Scan is ACTIVE again since v0.1.106** (names live in the scan
+response; safe because the radio time-share keeps WiFi hard-off during scans),
+results are RSSI-sorted (strongest first), and after connect the GAP Device
+Name (0x1800/0x2A00 — mandatory on every BLE device) is read as a name
+fallback and adopted into the saved pairing (`dashHealthTick`). ⚠️ Car-side
+prerequisite: something must ANSWER OBD2 on the port — an MS3Pro needs
+"OBD-II over CAN (ISO 15765)" enabled in TunerStudio; a 90–95 NA Miata has no
+OBD2 at all.
 
 **⚠️ WiFi + BLE may NEVER run at the same time (v0.1.101).** On this core
 (arduino-esp32 2.0.14 / IDF 4.4, ESP32-S3) enabling the BT controller with
