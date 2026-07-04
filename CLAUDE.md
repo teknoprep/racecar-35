@@ -530,6 +530,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `s_psi` / `p_warn` / `p_col` | bool/uint16/uint8 | Oil-PSI show / warn-PSI / warn-colour |
 | `srctyp` | uint8 | **Sensor source: 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN), 2=Bluetooth (BLE OBD-II dongle for slow readings)** |
 | `bt_addr` / `bt_atype` / `bt_name` | string/uint8/string | **Paired BLE OBD-II (ELM327) dongle**: address `"aa:bb:.."`, BLE address type, friendly name. Used when `srctyp==2` to auto-reconnect on boot. Set from PAGE_BT_SCAN. |
+| `btpid` | uint8 | **Mode-01 PID mapped to the COOLANT function** (default 0x05 = standard ECT). Set from PAGE_PID_SCAN (Sensor page → COOLANT PID button); decoded as A−40 °C. |
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `rpmspk` | uint8 | **RPM spike filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2). Sent as `CFG,rpmspk,<v>`; Teensy slew-gates tach pulses (see "RPM spike filter" note above). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
@@ -551,7 +552,8 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `PAGE_TEXT_KB` | tap on cloud host / auth user / auth pass | Full lowercase keyboard (10 × 4 letters/digits + .-_/ + BACK/SPACE/DONE/CANCEL) |
 | `PAGE_TRACK_PICKER` | tap START button (when not auto-confirming) | Modal list of tracks; closest GPS match auto-bumped to top with distance label |
 | `PAGE_SENSOR` | tap the **Sensor data source** settings row | Dedicated picker: Direct / MegaSquirt / **Bluetooth** buttons (like the GPS page). In Bluetooth mode shows the paired OBD-II dongle + live BLE status + a SCAN button. DONE saves, CANCEL reverts. |
-| `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). RESCAN / BACK. |
+| `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). Drag-scrollable. RESCAN / BACK. |
+| `PAGE_PID_SCAN` | tap COOLANT PID on PAGE_SENSOR | Mode-01 PID scan (needs connected dongle + ignition); tap a row to map it as COOLANT (`btpid`). Drag-scrollable. RESCAN / BACK. |
 
 ### Bluetooth OBD-II (ELM327 BLE) — `sensor_type == 2`
 `obd_ble.h` is a self-contained NimBLE client for a **BLE ELM327** dongle in the
@@ -600,8 +602,18 @@ dongle is alive, so a stall is a dead LINK not a sleeping ECU) → disconnect �
 reconnect (ATZ hard-resets the ELM). **STATUS page (page 3) has a BT row** in
 the LINK section: OFF (source≠BT) / "waiting (BT on at REC)" / state while
 connecting / green `<name> <temp>F` when data flows / yellow `<name> no ECU
-data`. **PID mapping is fixed to coolant 0105 for now** — a user-selectable
-"which PID is coolant" / generic data-point mapper is planned but deferred. ⚠️ Car-side
+data`. **PID mapper (v0.1.108, PAGE_PID_SCAN)**: Sensor page → `COOLANT PID:
+xx` button → scans the car's supported Mode-01 PIDs (0100/0120/... bitmask
+walk, then one live sample each; supported-but-silent PIDs listed as "no
+answer") into a drag-scrollable list — tap a row to map that PID to the
+COOLANT function (NVS `btpid`, default 0x05 = standard ECT; applied via
+`obd::setCoolantPid()` in `loadSettings()`). Decode assumes the 1-byte A−40 °C
+temperature formula (true for 05 ECT / 0F IAT / 46 ambient / 5C oil temp).
+The scan runs on the obd task (`g_req_pidscan`/`doPidScan()`), needs a
+connected dongle + ignition ON, and refreshes `d_last_ms` at the end so the
+wedge watchdog doesn't fire after a long scan. IAT polling stays hardcoded
+0x0F. Generic multi-function mapping (RPM/MAP/etc from BT) is still future
+work — only COOLANT is mappable today. ⚠️ Car-side
 prerequisite: something must ANSWER OBD2 on the port — an MS3Pro needs
 "OBD-II over CAN (ISO 15765)" enabled in TunerStudio; a 90–95 NA Miata has no
 OBD2 at all.

@@ -318,13 +318,86 @@ static bool connectAndInit() {
   return true;
 }
 
+// Which Mode-01 PID feeds the COOLANT function. Standard ECT is 0x05 (correct
+// for any 1996+ OBD2 car incl. the 2001 Miata), but it's user-mappable via the
+// PID scan page — e.g. 0x5C (oil temp) or a vendor PID. Decode assumes the
+// 1-byte temperature formula A-40 °C (true for 05/0F/46/5C).
+static uint8_t g_pid_clt = 0x05;
+
+// ---- PID scan: enumerate supported Mode-01 PIDs + one live sample each -----
+struct PidItem {
+  uint8_t pid;      // Mode-01 PID number
+  int16_t a;        // first data byte of the reply (-1 = supported but silent)
+  char    raw[13];  // raw reply payload hex (up to 6 bytes)
+};
+static PidItem       g_pids[48];
+static uint8_t       g_pids_n      = 0;
+static volatile bool g_pidscan     = false;
+static volatile bool g_req_pidscan = false;
+
+static void doPidScan() {
+  g_pidscan = true; g_pids_n = 0;
+  char resp[64], cmd[8], key[8];
+  // 1. Supported-PID bitmasks: 0100 covers 01-20, 0120 covers 21-40, ... Each
+  //    reply is 4 big-endian bytes; bit 31 = first PID of the range, bit 0 =
+  //    the NEXT range-query PID (so it doubles as a "more ranges" flag).
+  uint32_t mask[7] = {0};
+  int ranges = 0;
+  for (int r = 0; r < 7; r++) {
+    const uint8_t base = (uint8_t)(r * 0x20);
+    snprintf(cmd, sizeof(cmd), "01%02X", base);
+    snprintf(key, sizeof(key), "41%02X", base);
+    if (!elmCmd(cmd, r == 0 ? 8000 : 3000)) break;
+    snapResp(resp, sizeof(resp));
+    uint32_t m = 0; bool ok = true;
+    for (int i = 0; i < 4; i++) {
+      int b = pidByte(resp, key, i);
+      if (b < 0) { ok = false; break; }
+      m = (m << 8) | (uint32_t)b;
+    }
+    if (!ok) break;
+    mask[r] = m; ranges = r + 1;
+    if (!(m & 1)) break;   // next range not supported
+  }
+  // 2. Sample every supported PID once (skip the range-query PIDs themselves).
+  const uint8_t cap = (uint8_t)(sizeof(g_pids) / sizeof(g_pids[0]));
+  for (int r = 0; r < ranges && g_pids_n < cap; r++) {
+    for (int bit = 0; bit < 32 && g_pids_n < cap; bit++) {
+      if (!(mask[r] & (0x80000000u >> bit))) continue;
+      const uint8_t pid = (uint8_t)(r * 0x20 + bit + 1);
+      if ((pid & 0x1F) == 0) continue;   // 0x20/0x40/... = range queries
+      PidItem& it = g_pids[g_pids_n];
+      it.pid = pid; it.a = -1; it.raw[0] = 0;
+      snprintf(cmd, sizeof(cmd), "01%02X", pid);
+      snprintf(key, sizeof(key), "41%02X", pid);
+      if (elmCmd(cmd, 1500)) {
+        snapResp(resp, sizeof(resp));
+        const char* p = strstr(resp, key);
+        if (p) {
+          p += 4;
+          size_t k = 0;
+          while (p[k] && k < sizeof(it.raw) - 1 && hexNibble(p[k]) >= 0) { it.raw[k] = p[k]; k++; }
+          it.raw[k] = 0;
+          it.a = (int16_t)pidByte(resp, key, 0);
+        }
+      }
+      g_pids_n++;   // keep supported-but-silent PIDs visible too
+    }
+  }
+  d_last_ms = millis();   // scan took a while — don't trip the wedge watchdog
+  g_pidscan = false;
+}
+
 static void pollOnce() {
   static uint8_t idx = 0;
   char resp[64];
+  char ccmd[8], ckey[8];
   switch (idx) {
-    case 0:  // coolant  0105 -> 4105 XX : °C = XX-40
-      if (elmCmd("0105", 2500)) { snapResp(resp, sizeof(resp));
-        int a = pidByte(resp, "4105", 0);
+    case 0:  // coolant  01<g_pid_clt> -> 41<pid> XX : °C = XX-40
+      snprintf(ccmd, sizeof(ccmd), "01%02X", g_pid_clt);
+      snprintf(ckey, sizeof(ckey), "41%02X", g_pid_clt);
+      if (elmCmd(ccmd, 2500)) { snapResp(resp, sizeof(resp));
+        int a = pidByte(resp, ckey, 0);
         if (a >= 0) { d_coolant_f_x10 = (int16_t)lroundf(((a - 40) * 9.0f / 5.0f + 32.0f) * 10.0f); d_last_ms = millis(); }
         else {
           // Keep the raw reply for the Sensor page ("NODATA" etc).
@@ -401,6 +474,11 @@ static void obdTask(void*) {
       blePhase(0);
     }
     if (g_req_scan) { g_req_scan = false; State prev = g_state; g_state = SCANNING; doScan(); if (prev == POLL) g_state = POLL; else g_state = IDLE; }
+    if (g_req_pidscan) {
+      g_req_pidscan = false;
+      if (g_state == POLL && g_client && g_client->isConnected()) doPidScan();
+      else g_pidscan = false;   // not connected — nothing to scan
+    }
     if (g_req_connect) { g_req_connect = false; connectAndInit(); }
 
     switch (g_state) {
@@ -480,6 +558,14 @@ static int16_t  iatF_x10()     { return d_iat_f_x10; }
 static int16_t  voltX10()      { return d_volt_x10; }
 static const char* targetAddr(){ return g_target_addr; }
 static const char* connName()  { return g_conn_name; }
+
+// PID scan / coolant-PID mapping (see doPidScan)
+static void     startPidScan()          { g_pidscan = true; g_pids_n = 0; g_req_pidscan = true; }
+static bool     pidScanning()           { return g_pidscan; }
+static uint8_t  pidCount()              { return g_pids_n; }
+static const PidItem* pidItem(uint8_t i){ return (i < g_pids_n) ? &g_pids[i] : nullptr; }
+static uint8_t  coolantPid()            { return g_pid_clt; }
+static void     setCoolantPid(uint8_t p){ if (p) { g_pid_clt = p; d_coolant_f_x10 = -1; } }
 
 static const char* stateStr() {
   switch (g_state) {

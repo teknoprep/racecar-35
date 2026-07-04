@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.107"
+#define FIRMWARE_VERSION "0.1.108"
 
 #include <Preferences.h>
 #include <time.h>
@@ -646,6 +646,7 @@ struct Settings {
     char     bt_addr[18]        = {0};     // "aa:bb:cc:dd:ee:ff"
     uint8_t  bt_atype           = 0;       // BLE address type (public/random)
     char     bt_name[24]        = {0};     // friendly name for the UI
+    uint8_t  bt_pid_clt         = 0x05;    // Mode-01 PID mapped to COOLANT (default 05 = std ECT)
 
     // GPS UART baud (Teensy<->u-blox). Default 38400 = the KNOWN-GOOD rate the
     // module ships at (do not auto-raise at boot). Higher rates are an explicit,
@@ -766,6 +767,17 @@ static void clampBtScanScroll() {
     if (maxS < 0) maxS = 0;
     if (bt_scan_scroll < 0)    bt_scan_scroll = 0;
     if (bt_scan_scroll > maxS) bt_scan_scroll = maxS;
+}
+// PAGE_PID_SCAN layout + scroll (same up-top placement rationale as BT_*).
+static constexpr int PS_ROW_Y0 = 92, PS_ROW_H = 40;
+static constexpr int PS_VIEW_H = BT_FOOT_Y - 10 - PS_ROW_Y0;   // shares the BT footer geometry
+static bool     pid_scan_dirty  = true;
+static int      pid_scan_scroll = 0;
+static void clampPidScanScroll() {
+    int maxS = obd::pidCount() * PS_ROW_H - PS_VIEW_H;
+    if (maxS < 0) maxS = 0;
+    if (pid_scan_scroll < 0)    pid_scan_scroll = 0;
+    if (pid_scan_scroll > maxS) pid_scan_scroll = maxS;
 }
 static uint8_t  sensor_orig_type  = 0;   // snapshot for CANCEL on PAGE_SENSOR
 // Device health (heat/brownout diagnostics). Teensy temps + battery arrive via
@@ -1195,6 +1207,9 @@ static void loadSettings() {
     s.debug_enabled      = prefs.getBool  ("dbg2",     s.debug_enabled);
     prefs.getString      ("bt_addr",  s.bt_addr, sizeof(s.bt_addr));
     s.bt_atype           = prefs.getUChar ("bt_atype", s.bt_atype);
+    s.bt_pid_clt         = prefs.getUChar ("btpid",    s.bt_pid_clt);
+    if (!s.bt_pid_clt) s.bt_pid_clt = 0x05;
+    obd::setCoolantPid(s.bt_pid_clt);
     prefs.getString      ("bt_name",  s.bt_name, sizeof(s.bt_name));
     s.rpm_ppr_x10        = prefs.getUShort("rpmppr",   s.rpm_ppr_x10);
     s.gps_baud           = prefs.getULong ("gpsbaud",  s.gps_baud);
@@ -1274,6 +1289,7 @@ static void saveSettings() {
     prefs.putBool  ("dbg2",     s.debug_enabled);
     prefs.putString("bt_addr",  s.bt_addr);
     prefs.putUChar ("bt_atype", s.bt_atype);
+    prefs.putUChar ("btpid",    s.bt_pid_clt);
     prefs.putString("bt_name",  s.bt_name);
     prefs.putUShort("rpmppr",   s.rpm_ppr_x10);
     prefs.putULong ("gpsbaud",  s.gps_baud);
@@ -1369,6 +1385,7 @@ enum Page : uint8_t {
     PAGE_GPS           = 13,  // GPS baud selector + live GPS diagnostics
     PAGE_SENSOR        = 14,  // Sensor source picker (Direct/MegaSquirt/Bluetooth) + BT status
     PAGE_BT_SCAN       = 15,  // BLE OBD-II device scan + select
+    PAGE_PID_SCAN      = 16,  // Mode-01 PID scan + map one to the COOLANT function
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -2808,6 +2825,9 @@ static void openSensorPage();
 static void drawBtScanPage();
 static void handleBtScanTap(int x, int y);
 static void openBtScan();
+static void drawPidScanPage();
+static void handlePidScanTap(int x, int y);
+static void openPidScan();
 static void drawUploadModal();
 static void handleUploadModalTap(int x, int y);
 static bool parseUploadLine(const String& line);
@@ -2916,6 +2936,33 @@ static void handleTouch() {
             tt.lastX = x; tt.lastY = y;
         } else if (!now && tt.active) {
             if (tt.gesture == GESTURE_NONE) handleBtScanTap(tt.startX, tt.startY);
+            tt.active = false;
+        }
+        return;
+    }
+    if (currentPage == PAGE_PID_SCAN) {   // tap to map + vertical drag to scroll
+        if (now && !tt.active) {
+            tt.startX = x; tt.startY = y;
+            tt.lastX  = x; tt.lastY  = y;
+            tt.startMs = millis();
+            tt.active  = true;
+            tt.gesture = GESTURE_NONE;
+            tt.scrollAtStart = pid_scan_scroll;
+        } else if (now && tt.active) {
+            const int dx = x - tt.startX;
+            const int dy = y - tt.startY;
+            if (tt.gesture == GESTURE_NONE
+                && (abs(dx) > GESTURE_THRESH || abs(dy) > GESTURE_THRESH)) {
+                tt.gesture = (abs(dy) > abs(dx)) ? GESTURE_DRAG_V : GESTURE_SWIPE_H;
+            }
+            if (tt.gesture == GESTURE_DRAG_V) {
+                pid_scan_scroll = tt.scrollAtStart - dy;
+                clampPidScanScroll();
+                pid_scan_dirty = true;
+            }
+            tt.lastX = x; tt.lastY = y;
+        } else if (!now && tt.active) {
+            if (tt.gesture == GESTURE_NONE) handlePidScanTap(tt.startX, tt.startY);
             tt.active = false;
         }
         return;
@@ -4693,7 +4740,8 @@ static void netOwnerTick() {
         } else {
             // Session over — give WiFi the radio back (uploads/OTA), unless
             // the user is mid-pairing on the sensor/scan pages.
-            if (currentPage != PAGE_SENSOR && currentPage != PAGE_BT_SCAN)
+            if (currentPage != PAGE_SENSOR && currentPage != PAGE_BT_SCAN &&
+                currentPage != PAGE_PID_SCAN)
                 btReleaseRadio();
         }
     }
@@ -4970,6 +5018,11 @@ static void drawSensorPage() {
         tft.setTextDatum(textdatum_t::middle_center);
         tft.setTextColor(TFT_WHITE, TFT_NAVY);
         tft.drawString("SCAN FOR DEVICES", SS_SCAN_X + SS_SCAN_W / 2, SS_SCAN_Y + SS_SCAN_H / 2);
+        // COOLANT PID mapper button (needs a connected dongle to actually scan)
+        tft.fillRect(SS_SCAN_X + 330, SS_SCAN_Y, SS_SCAN_W, SS_SCAN_H, TFT_NAVY);
+        tft.drawRect(SS_SCAN_X + 330, SS_SCAN_Y, SS_SCAN_W, SS_SCAN_H, TFT_WHITE);
+        char pl[28]; snprintf(pl, sizeof(pl), "COOLANT PID: %02X", s.bt_pid_clt);
+        tft.drawString(pl, SS_SCAN_X + 330 + SS_SCAN_W / 2, SS_SCAN_Y + SS_SCAN_H / 2);
         tft.setTextDatum(textdatum_t::top_left);
     }
     tft.setTextPadding(0);
@@ -5002,6 +5055,9 @@ static void handleSensorPageTap(int x, int y) {
     // SCAN (BT mode only)
     if (s.sensor_type == 2 && y >= SS_SCAN_Y && y <= SS_SCAN_Y + SS_SCAN_H &&
         x >= SS_SCAN_X && x <= SS_SCAN_X + SS_SCAN_W) { openBtScan(); return; }
+    // COOLANT PID mapper (BT mode only)
+    if (s.sensor_type == 2 && y >= SS_SCAN_Y && y <= SS_SCAN_Y + SS_SCAN_H &&
+        x >= SS_SCAN_X + 330 && x <= SS_SCAN_X + 330 + SS_SCAN_W) { openPidScan(); return; }
     // Footer
     if (y >= SS_FOOT_Y && y <= SS_FOOT_Y + SS_FOOT_H) {
         if (x >= SS_CANCEL_X && x <= SS_CANCEL_X + SS_FOOT_W) {
@@ -5115,6 +5171,161 @@ static void drawBtScanPage() {
     tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
     tft.drawString("BACK", BT_BACK_X + BT_FOOT_W / 2, BT_FOOT_Y + BT_FOOT_H / 2);
     tft.setTextDatum(textdatum_t::top_left);
+}
+
+// ---------------------------------------------------------------------------
+// PAGE_PID_SCAN — enumerate the car's supported Mode-01 PIDs with a live
+// sample of each, and tap one to map it to the COOLANT function (NVS btpid).
+// Decode assumes the 1-byte temperature formula A-40 degC (PIDs 05/0F/46/5C).
+// ---------------------------------------------------------------------------
+static const char* pidName(uint8_t p) {
+    switch (p) {
+        case 0x04: return "Engine load";
+        case 0x05: return "Coolant temp (std)";
+        case 0x06: return "ST fuel trim 1";
+        case 0x07: return "LT fuel trim 1";
+        case 0x08: return "ST fuel trim 2";
+        case 0x09: return "LT fuel trim 2";
+        case 0x0A: return "Fuel pressure";
+        case 0x0B: return "MAP";
+        case 0x0C: return "RPM";
+        case 0x0D: return "Vehicle speed";
+        case 0x0E: return "Timing advance";
+        case 0x0F: return "Intake air temp";
+        case 0x10: return "MAF";
+        case 0x11: return "Throttle";
+        case 0x13: return "O2 sensors";
+        case 0x14: return "O2 B1S1";
+        case 0x15: return "O2 B1S2";
+        case 0x1C: return "OBD standard";
+        case 0x1F: return "Run time";
+        case 0x21: return "Dist w/ MIL";
+        case 0x2F: return "Fuel level";
+        case 0x33: return "Baro pressure";
+        case 0x42: return "Module voltage";
+        case 0x46: return "Ambient temp";
+        case 0x5C: return "Oil temp";
+        default:   return "";
+    }
+}
+
+static void openPidScan() {
+    currentPage     = PAGE_PID_SCAN;
+    pageJustEntered = true;
+    pid_scan_dirty  = true;
+    pid_scan_scroll = 0;
+    if (obd::connected() && obd::pidCount() == 0) obd::startPidScan();
+}
+
+static void drawPidScanPage() {
+    const uint16_t BG = TFT_BLACK;
+    if (pageJustEntered) { tft.fillScreen(BG); pageJustEntered = false; }
+    pid_scan_dirty = false;
+
+    tft.setFont(&fonts::Font4); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::top_left);
+    tft.setTextColor(TFT_CYAN, BG); tft.setTextPadding(600);
+    tft.drawString("OBD-II PID SCAN", 20, 12);
+
+    tft.setFont(&fonts::Font2); tft.setTextSize(1);
+    {
+        const int n0 = obd::pidCount();
+        char sub[72];
+        uint16_t scol = TFT_LIGHTGREY;
+        if (!obd::connected()) {
+            strncpy(sub, "Not connected - pair + connect a dongle first.", sizeof(sub));
+            scol = TFT_YELLOW;
+        } else if (obd::pidScanning()) {
+            snprintf(sub, sizeof(sub), "Scanning... %d PIDs so far (takes ~30 s)", n0);
+            scol = TFT_YELLOW;
+        } else if (!n0) {
+            strncpy(sub, "No PIDs answered. RESCAN with ignition ON.", sizeof(sub));
+        } else {
+            snprintf(sub, sizeof(sub), "%d PIDs - tap the one to use as COOLANT:", n0);
+        }
+        sub[sizeof(sub) - 1] = 0;
+        tft.setTextColor(scol, BG); tft.setTextPadding(720);
+        tft.drawString(sub, 20, 60);
+        tft.setTextPadding(0);
+    }
+
+    const int n = obd::pidCount();
+    clampPidScanScroll();
+    tft.setClipRect(20, PS_ROW_Y0, 760, PS_VIEW_H);
+    int lastBottom = PS_ROW_Y0;
+    for (int i = 0; i < n; i++) {
+        const int ry = PS_ROW_Y0 + i * PS_ROW_H - pid_scan_scroll;
+        if (ry + PS_ROW_H <= PS_ROW_Y0 || ry >= PS_ROW_Y0 + PS_VIEW_H) continue;
+        const obd::PidItem* it = obd::pidItem((uint8_t)i);
+        if (!it) continue;
+        const bool mapped = (it->pid == s.bt_pid_clt);
+        const uint16_t rowBg = mapped ? TFT_DARKGREEN : TFT_NAVY;
+        tft.fillRect(20, ry, 760, PS_ROW_H - 4, rowBg);
+        tft.fillRect(20, ry + PS_ROW_H - 4, 760, 4, BG);   // gap strip
+        tft.drawRect(20, ry, 760, PS_ROW_H - 4, mapped ? TFT_GREEN : TFT_DARKGREY);
+        tft.setFont(&fonts::Font2); tft.setTextSize(1);
+        char lbuf[48];
+        const char* nm = pidName(it->pid);
+        snprintf(lbuf, sizeof(lbuf), "01 %02X  %s%s", it->pid, nm[0] ? nm : "(unknown)",
+                 mapped ? "  << COOLANT" : "");
+        tft.setTextColor(TFT_WHITE, rowBg);
+        tft.drawString(lbuf, 32, ry + 10);
+        char vbuf[48];
+        if (it->a >= 0) {
+            const int degF = (int)lroundf((it->a - 40) * 9.0f / 5.0f + 32.0f);
+            snprintf(vbuf, sizeof(vbuf), "A=%-3d (%dF)  [%s]", (int)it->a, degF, it->raw);
+            tft.setTextColor(TFT_LIGHTGREY, rowBg);
+        } else {
+            strncpy(vbuf, "no answer", sizeof(vbuf));
+            tft.setTextColor(TFT_DARKGREY, rowBg);
+        }
+        tft.setTextDatum(textdatum_t::top_right);
+        tft.drawString(vbuf, 768, ry + 10);
+        tft.setTextDatum(textdatum_t::top_left);
+        if (ry + PS_ROW_H > lastBottom) lastBottom = ry + PS_ROW_H;
+    }
+    if (lastBottom < PS_ROW_Y0 + PS_VIEW_H)
+        tft.fillRect(20, lastBottom, 760, PS_ROW_Y0 + PS_VIEW_H - lastBottom, BG);
+    tft.clearClipRect();
+
+    // Footer: RESCAN / BACK (shares the BT footer geometry)
+    tft.fillRect(BT_RESCAN_X, BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_NAVY);
+    tft.drawRect(BT_RESCAN_X, BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_WHITE);
+    tft.fillRect(BT_BACK_X,   BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_DARKGREEN);
+    tft.drawRect(BT_BACK_X,   BT_FOOT_Y, BT_FOOT_W, BT_FOOT_H, TFT_WHITE);
+    tft.setFont(&fonts::Font4); tft.setTextSize(1);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.drawString("RESCAN", BT_RESCAN_X + BT_FOOT_W / 2, BT_FOOT_Y + BT_FOOT_H / 2);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    tft.drawString("BACK", BT_BACK_X + BT_FOOT_W / 2, BT_FOOT_Y + BT_FOOT_H / 2);
+    tft.setTextDatum(textdatum_t::top_left);
+}
+
+static void handlePidScanTap(int x, int y) {
+    if (y >= BT_FOOT_Y && y <= BT_FOOT_Y + BT_FOOT_H) {
+        if (x >= BT_RESCAN_X && x <= BT_RESCAN_X + BT_FOOT_W) {
+            if (obd::connected() && !obd::pidScanning()) obd::startPidScan();
+            pid_scan_dirty = true; return;
+        }
+        if (x >= BT_BACK_X && x <= BT_BACK_X + BT_FOOT_W) {
+            currentPage = PAGE_SENSOR; pageJustEntered = true; sensor_page_dirty = true; return;
+        }
+    }
+    if (obd::pidScanning()) return;   // list still changing — ignore row taps
+    if (y >= PS_ROW_Y0 && y < PS_ROW_Y0 + PS_VIEW_H) {
+        const int rel = y - PS_ROW_Y0 + pid_scan_scroll;
+        const int i   = rel / PS_ROW_H;
+        if (i >= 0 && i < (int)obd::pidCount() && (rel % PS_ROW_H) < PS_ROW_H - 4) {
+            const obd::PidItem* it = obd::pidItem((uint8_t)i);
+            if (it) {
+                s.bt_pid_clt = it->pid;
+                obd::setCoolantPid(it->pid);
+                saveSettings();
+                pid_scan_dirty = true;
+            }
+        }
+    }
 }
 
 static void handleBtScanTap(int x, int y) {
@@ -9064,6 +9275,12 @@ void loop() {
         if (pageJustEntered || ((bt_scan_dirty || now - lastDraw >= 400) && now - lastDraw >= 33)) {
             lastDraw = now;
             drawBtScanPage();
+        }
+    } else if (currentPage == PAGE_PID_SCAN) {
+        // Same refresh policy as the BT scan page (results stream in live).
+        if (pageJustEntered || ((pid_scan_dirty || now - lastDraw >= 400) && now - lastDraw >= 33)) {
+            lastDraw = now;
+            drawPidScanPage();
         }
     } else if (currentPage == PAGE_SESSIONS) {
         // On entry, kick a Q,LIST so the page populates from the SD queue.
