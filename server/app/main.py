@@ -115,6 +115,7 @@ def ai_resolve_model(requested: Optional[str]) -> str:
 # Per-session AI Q&A history lives in a parallel tree so it survives rebuilds
 # alongside the session data and is trivially deleted with its session.
 AI_HISTORY_DIR = DATA_DIR / "ai_history"
+VIDEO_META_DIR = DATA_DIR / "video_meta"   # per-session YouTube link + sync offset
 
 # Google OAuth is optional. If GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are
 # blank, the server stays in open dev mode. Once configured, all browser UI
@@ -2603,10 +2604,22 @@ async def delete_session(
     x_api_key: Optional[str] = Header(None),
 ) -> JSONResponse:
     authorize_api_or_user(request, x_api_key)
-    # Web users may only delete their OWN sessions (admins may delete anyone's).
-    # Being granted visibility of another account does NOT grant delete. Device/
-    # API-key callers (the dash) are exempt from the gate.
-    if not (x_api_key and (x_api_key == API_KEY or email_for_api_key(x_api_key))):
+    # Delete stays OWNER-ONLY (admins excepted) no matter HOW you authenticate.
+    # Security fix: a PER-USER API key used to skip this gate entirely, so a
+    # non-admin who was merely granted VIEW of another account could delete
+    # that account's sessions by sending their own key. Now:
+    #   - firmware/master key (API_KEY): device maintenance — allowed;
+    #   - per-user key: only dirs that key's OWNER could web-delete
+    #     (own dir, or anyone's if the key belongs to an admin);
+    #   - web session: gate_delete_dir (owner or admin), as before.
+    if x_api_key and x_api_key == API_KEY:
+        pass
+    elif x_api_key and email_for_api_key(x_api_key):
+        key_email = str(email_for_api_key(x_api_key) or "").lower()
+        if not can_delete_dir(key_email, safe_name(user)):
+            raise HTTPException(status_code=403,
+                                detail="you can only delete your own sessions")
+    else:
         gate_delete_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
     size = p.stat().st_size
@@ -2632,6 +2645,67 @@ async def delete_session_form(
 ) -> JSONResponse:
     # Convenience alias for clients that can't send DELETE.
     return await delete_session(request, user, filename, x_api_key)
+
+
+@app.post("/sessions/combine")
+async def combine_sessions(request: Request) -> JSONResponse:
+    """Merge 2+ session files (same user) into ONE new session file.
+
+    Body: {"user": "<dir>", "files": ["<f1>.ndjson", "<f2>.ndjson", ...]}
+
+    Files are concatenated in session-id (epoch) order — each file's lines are
+    already time-ordered and carry absolute "t" timestamps, so plain
+    concatenation yields a valid, monotonic combined session. The originals are
+    left untouched; the result is a new "<sid>_<track>-combined.ndjson" (sid +
+    track from the earliest file). Owner-or-admin only (writes into the user's
+    dir — same rule as delete: view grants don't let you modify).
+    """
+    require_web_user(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="json body required")
+    user = safe_name(str(body.get("user", "")))
+    files = body.get("files")
+    if not user or not isinstance(files, list) or len(files) < 2:
+        raise HTTPException(status_code=400, detail="need user + at least 2 files")
+    gate_delete_dir(request, user)
+    paths = [_resolve_session(user, str(f)) for f in files]
+
+    def _sid(p: pathlib.Path) -> int:
+        m = re.match(r"^(\d+)_", p.name)
+        return int(m.group(1)) if m else 0
+
+    paths.sort(key=lambda p: (_sid(p), p.name))
+    first = paths[0].name
+    track = first[:-len(".ndjson")] if first.endswith(".ndjson") else first
+    track = re.sub(r"^\d+_", "", track) or "UNKNOWN"
+    sid = _sid(paths[0]) or int(time.time())
+    base = f"{sid}_{track}-combined"
+    out = DATA_DIR / "sessions" / user / (base + ".ndjson")
+    n = 2
+    while out.exists():
+        out = DATA_DIR / "sessions" / user / f"{base}{n}.ndjson"
+        n += 1
+    total = 0
+    with open(out, "wb") as w:
+        for p in paths:
+            last = b""
+            with open(p, "rb") as f2:
+                while True:
+                    chunk = f2.read(1 << 20)
+                    if not chunk:
+                        break
+                    w.write(chunk)
+                    total += len(chunk)
+                    last = chunk
+            if last and not last.endswith(b"\n"):
+                w.write(b"\n")
+                total += 1
+    log.info("combined %d sessions -> %s (%d bytes) for %s",
+             len(paths), out.name, total, user)
+    return JSONResponse({"ok": True, "filename": out.name,
+                         "bytes": total, "files": len(paths)})
 
 
 @app.get("/admin/sessions/targets")
@@ -3125,6 +3199,83 @@ async def review(request: Request, user: str, filename: str) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Session <-> YouTube video link (overlay viewer).
+# Sidecar json at /data/video_meta/<user>/<file>.json:
+#   {"id": "<yt id>", "url": "<as entered>", "offset_ms": <int>}
+# offset semantics: data_time_rel_s = video_time_s + offset_ms/1000.
+# ---------------------------------------------------------------------------
+def _video_meta_path(user: str, session_name: str) -> pathlib.Path:
+    return VIDEO_META_DIR / safe_name(user) / (safe_name(session_name) + ".json")
+
+
+def _parse_youtube_id(s: str) -> Optional[str]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9_-]{8,16}", s):   # raw video id (11 typical)
+        return s
+    m = re.search(r"(?:[?&]v=|youtu\.be/|/embed/|/shorts/|/live/)([A-Za-z0-9_-]{6,16})", s)
+    return m.group(1) if m else None
+
+
+@app.get("/sessions/{user}/{filename}/video")
+async def get_video_link(request: Request, user: str, filename: str) -> JSONResponse:
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    mp = _video_meta_path(user, p.name)
+    meta = {}
+    if mp.exists():
+        try:
+            meta = json.loads(mp.read_text("utf-8"))
+        except Exception:
+            meta = {}
+    return JSONResponse({"id": meta.get("id"), "url": meta.get("url", ""),
+                         "offset_ms": int(meta.get("offset_ms", 0) or 0)})
+
+
+@app.post("/sessions/{user}/{filename}/video")
+async def set_video_link(request: Request, user: str, filename: str) -> JSONResponse:
+    """Link/unlink a YouTube video + store the data<->video sync offset.
+    Owner-or-admin (same modify rule as delete). Empty url = unlink."""
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="json body required")
+    url = str(body.get("url", "")).strip()
+    offset_ms = int(body.get("offset_ms", 0) or 0)
+    mp = _video_meta_path(user, p.name)
+    if not url:
+        if mp.exists():
+            mp.unlink()
+        return JSONResponse({"ok": True, "id": None})
+    vid = _parse_youtube_id(url)
+    if not vid:
+        raise HTTPException(status_code=400, detail="couldn't parse a YouTube video id from that link")
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    mp.write_text(json.dumps({"id": vid, "url": url, "offset_ms": offset_ms}), "utf-8")
+    log.info("video link %s/%s -> %s offset=%dms", user, p.name, vid, offset_ms)
+    return JSONResponse({"ok": True, "id": vid, "offset_ms": offset_ms})
+
+
+@app.get("/overlay/{user}/{filename}", response_class=HTMLResponse)
+async def overlay(request: Request, user: str, filename: str) -> Response:
+    """Full-screen YouTube player + live telemetry HUD (speed / RPM / track
+    map / laps) rendered as HTML over the video, driven by video time + the
+    saved sync offset. Sync controls on-page (coarse slider + fine nudge +
+    one-click 'launch' auto-sync); SAVE persists the offset."""
+    if oauth_enabled() and not current_user(request):
+        return login_redirect(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    return HTMLResponse(_OVERLAY_HTML.replace("__USER__", safe_name(user))
+                                     .replace("__FILE__", p.name))
+
+
+# ---------------------------------------------------------------------------
 # HTML / CSS / JS for the index + review pages.
 #
 # The CSS variables in :root below are a direct mirror of the design tokens
@@ -3528,6 +3679,37 @@ ul.grants li{display:flex;align-items:center;justify-content:space-between;gap:v
 </body></html>"""
 )
 
+_COMBINE_JS = """
+<script>
+/* ---- combine selected sessions into one file ------------------------- */
+(function(){
+  const btn = document.getElementById('combine-btn');
+  if (!btn) return;
+  btn.addEventListener('click', async function(){
+    const boxes = Array.from(document.querySelectorAll('.cmb:checked'));
+    if (boxes.length < 2){ alert('Select at least 2 sessions (checkboxes on the left).'); return; }
+    const users = new Set(boxes.map(b=>b.dataset.user));
+    if (users.size > 1){ alert('All selected sessions must belong to the SAME user.'); return; }
+    const files = boxes.map(b=>b.dataset.file);
+    if (!confirm('Combine '+files.length+' sessions into one new file?\\n\\n'+files.join('\\n')+
+                 '\\n\\n(The originals are kept.)')) return;
+    btn.disabled = true; btn.textContent = 'combining\u2026';
+    try {
+      const r = await fetch('/sessions/combine', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({user: boxes[0].dataset.user, files})});
+      const j = await r.json().catch(()=>({}));
+      if (!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
+      location.reload();
+    } catch(e){
+      alert('combine failed: '+e.message);
+      btn.disabled = false; btn.textContent = 'combine selected';
+    }
+  });
+})();
+</script>
+"""
+
 _INDEX_HEAD = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -3780,7 +3962,9 @@ async def index(request: Request) -> Response:
                     if dir_can_delete else ""
                 )
                 rows.append(
-                    f"<tr><td>{user_h}</td>"
+                    f'<tr><td><input type="checkbox" class="cmb" '
+                    f'data-user="{user_h}" data-file="{file_h}"></td>'
+                    f"<td>{user_h}</td>"
                     f"<td class=mono>{when_h}</td>"
                     f"<td>{track_h}</td>"
                     f'<td class=mono><a href="/review/{user_h}/{file_h}">{file_h}</a></td>'
@@ -3797,8 +3981,10 @@ async def index(request: Request) -> Response:
         listing = (
             '<div class="toolbar"><div class="grow">'
             '<input type="search" id="q" placeholder="filter by user / track / date / filename\u2026" autofocus>'
-            '</div><span class="pill" id="vis"></span></div>'
-            "<table><thead><tr><th>user</th><th>started (UTC)</th>"
+            '</div><button id="combine-btn" class="btn" '
+            'title="select 2+ sessions of the same user, oldest+newest are joined in time order">'
+            'combine selected</button><span class="pill" id="vis"></span></div>'
+            "<table><thead><tr><th></th><th>user</th><th>started (UTC)</th>"
             "<th>track</th><th>filename</th><th>size</th><th>actions</th></tr></thead><tbody id=\"rows\">"
             + "\n".join(rows)
             + "</tbody></table>"
@@ -3811,7 +3997,7 @@ async def index(request: Request) -> Response:
     current_email = html.escape((user or {}).get("email", ""))
     upload_panel = _UPLOAD_PANEL_HTML.replace("__CURRENT_EMAIL__", current_email)
     user_chip = _user_chip_html(user)
-    return _INDEX_HEAD.replace("__USER_CHIP__", user_chip) + upload_panel + listing + _INDEX_JS + "</main></body></html>"
+    return _INDEX_HEAD.replace("__USER_CHIP__", user_chip) + upload_panel + listing + _INDEX_JS + _COMBINE_JS + "</main></body></html>"
 
 
 # ---------------------------------------------------------------------------
@@ -4238,6 +4424,10 @@ _REVIEW_HTML = (
     <button id="move-btn" class="btn">reassign</button>
   </span>
   <a class="btn" href="/sessions/__USER__/__FILE__">download</a>
+  <input id="yt-url" class="cmp-input" type="text" placeholder="YouTube link…"
+         autocomplete="off" style="width:190px">
+  <button id="yt-save" class="btn">link video</button>
+  <a id="yt-view" class="btn" target="_blank" style="display:none">&#9654; overlay</a>
 </header>
 <main>
   <div id="loading" class="loading">loading session\u2026</div>
@@ -5258,6 +5448,328 @@ _REVIEW_HTML = (
   });
 })();
 </script>
+<script>
+/* ---- YouTube link + overlay viewer ---------------------------------- */
+(async function(){
+  const enc = encodeURIComponent;
+  const url = document.getElementById('yt-url');
+  const save = document.getElementById('yt-save');
+  const view = document.getElementById('yt-view');
+  const base = '/sessions/'+enc('__USER__')+'/'+enc('__FILE__')+'/video';
+  let offset_ms = 0;
+  function reflect(j){
+    offset_ms = (j&&j.offset_ms)||0;
+    if (j && j.id){
+      url.value = j.url || j.id;
+      view.style.display = '';
+      view.href = '/overlay/__USER__/__FILE__';
+      save.textContent = 'update';
+    } else {
+      view.style.display = 'none';
+      save.textContent = 'link video';
+    }
+  }
+  try { reflect(await (await fetch(base)).json()); } catch(e){}
+  save.addEventListener('click', async ()=>{
+    save.disabled = true;
+    try {
+      const r = await fetch(base, {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({url: url.value.trim(), offset_ms})});
+      const j = await r.json().catch(()=>({}));
+      if (!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
+      reflect(await (await fetch(base)).json());
+    } catch(e){ alert('video link failed: '+e.message); }
+    save.disabled = false;
+  });
+})();
+</script>
 </body></html>
 """
+)
+
+
+# ---------------------------------------------------------------------------
+# Overlay viewer: full-screen YouTube + HTML telemetry HUD.
+# Self-contained page (no Leaflet — the track map is a plain canvas drawn from
+# the GPS trace). Sync model: data_rel_seconds = video_seconds + offset.
+# Controls: coarse slider (±5 min), fine nudge buttons (0.05/1/10 s), a
+# one-click "SYNC @ LAUNCH" auto-helper (scrub the video to the moment the car
+# starts moving, click — offset is computed from the data's launch instant),
+# and SAVE (persists to the /video sidecar). HUD ticks at 20 Hz off
+# player.getCurrentTime(), samples looked up by binary search.
+# ---------------------------------------------------------------------------
+_OVERLAY_HTML = (
+    """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>overlay · __FILE__</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html,body { margin:0; padding:0; background:#000; height:100%; overflow:hidden;
+    font-family: system-ui, sans-serif; }
+  #stage { position:fixed; inset:0; background:#000; }
+  #yt, #ytwrap { position:absolute; inset:0; }
+  #ytwrap iframe { width:100%; height:100%; }
+  .hud { position:absolute; pointer-events:none; z-index:5;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9); color:#fff; }
+  #tmap { position:absolute; left:16px; top:16px; z-index:5; pointer-events:none;
+    background: rgba(0,0,0,0.35); border-radius:10px; }
+  #speedbox { left:16px; bottom:76px; text-align:left; }
+  #spd { font: 700 84px/0.95 'JetBrains Mono', monospace; letter-spacing:-2px; }
+  #spd .u { font: 600 20px/1 system-ui; color:#FFB020; margin-left:6px; }
+  #rpmbar { width:260px; height:14px; background:rgba(255,255,255,0.15);
+    border-radius:7px; margin-top:8px; overflow:hidden; }
+  #rpmfill { height:100%; width:0%; background:#FFB020; border-radius:7px; }
+  #rpmtxt { font: 600 15px 'JetBrains Mono', monospace; margin-top:4px; color:#ddd; }
+  #gtxt { font: 600 14px 'JetBrains Mono', monospace; margin-top:2px; color:#9ad; }
+  #lapbox { right:16px; top:16px; text-align:right; }
+  #lapbox .n  { font: 700 26px 'JetBrains Mono', monospace; color:#FFB020; }
+  #lapbox .t  { font: 700 44px 'JetBrains Mono', monospace; }
+  #lapbox .s  { font: 600 15px 'JetBrains Mono', monospace; color:#bbb; margin-top:2px; }
+  #bar { position:absolute; left:0; right:0; bottom:0; z-index:10;
+    display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    padding:10px 14px; background:rgba(10,10,12,0.85);
+    transition:opacity .25s; }
+  #bar.hidden { opacity:0; pointer-events:none; }
+  #bar button, #bar a { background:#222; color:#eee; border:1px solid #444;
+    border-radius:6px; padding:7px 11px; font:600 13px system-ui; cursor:pointer;
+    text-decoration:none; }
+  #bar button.acc { background:#5a4200; border-color:#FFB020; color:#ffd77a; }
+  #bar .off { font: 700 15px 'JetBrains Mono', monospace; color:#FFB020;
+    min-width:86px; text-align:center; }
+  #bar input[type=range] { flex:1; min-width:120px; accent-color:#FFB020; }
+  #msg { position:absolute; left:50%; top:40%; transform:translate(-50%,-50%);
+    color:#eee; font:600 18px system-ui; z-index:20; text-align:center;
+    background:rgba(0,0,0,0.7); padding:18px 26px; border-radius:10px; display:none; }
+  #toast { position:absolute; left:50%; bottom:74px; transform:translateX(-50%);
+    color:#0d0; font:600 14px system-ui; z-index:20; display:none;
+    background:rgba(0,0,0,0.75); padding:8px 14px; border-radius:8px; }
+</style></head>
+<body>
+<div id="stage">
+  <div id="ytwrap"><div id="yt"></div></div>
+  <canvas id="tmap" width="240" height="240"></canvas>
+  <div class="hud" id="speedbox">
+    <div id="spd">--<span class="u">MPH</span></div>
+    <div id="rpmbar"><div id="rpmfill"></div></div>
+    <div id="rpmtxt">-- RPM</div>
+    <div id="gtxt"></div>
+  </div>
+  <div class="hud" id="lapbox">
+    <div class="n" id="lapn">LAP –</div>
+    <div class="t" id="lapt">--:--.-</div>
+    <div class="s" id="lapl">LAST --:--.-</div>
+    <div class="s" id="lapb">BEST --:--.-</div>
+  </div>
+  <div id="bar">
+    <button id="pp">play</button>
+    <button id="fs">fullscreen</button>
+    <span style="color:#888;font:600 12px system-ui">SYNC</span>
+    <button data-n="-10">-10s</button>
+    <button data-n="-1">-1s</button>
+    <button data-n="-0.05">-.05</button>
+    <span class="off" id="off">+0.00s</span>
+    <button data-n="0.05">+.05</button>
+    <button data-n="1">+1s</button>
+    <button data-n="10">+10s</button>
+    <input type="range" id="coarse" min="-300" max="300" step="0.1" value="0">
+    <button id="launch" class="acc" title="Scrub the video to the moment the car starts moving, then click">SYNC @ LAUNCH</button>
+    <button id="save" class="acc">SAVE</button>
+    <a href="/review/__USER__/__FILE__">back</a>
+  </div>
+  <div id="msg"></div>
+  <div id="toast"></div>
+</div>
+<script>
+(function(){
+  const USER='__USER__', FILE='__FILE__';
+  const el = id => document.getElementById(id);
+  const enc = encodeURIComponent;
+  let S=[], T=[], laps=[], bestLapS=null, meta={}, offset=0, player=null, ready=false;
+  let rpmMax=8000, bounds=null;
+
+  function fmtLap(sec){
+    if (!(sec>0)) return '--:--.-';
+    const m=Math.floor(sec/60), r=sec-m*60;
+    return m+':'+(r<10?'0':'')+r.toFixed(1);
+  }
+  function fmtOff(){ return (offset>=0?'+':'')+offset.toFixed(2)+'s'; }
+  function toast(t){ const x=el('toast'); x.textContent=t; x.style.display='block';
+    clearTimeout(x._t); x._t=setTimeout(()=>x.style.display='none', 2500); }
+
+  async function boot(){
+    let d, l, v;
+    try {
+      [d,l,v] = await Promise.all([
+        fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/data?target=20000').then(r=>r.json()),
+        fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/laps').then(r=>r.json()),
+        fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/video').then(r=>r.json()),
+      ]);
+    } catch(e){
+      el('msg').style.display='block';
+      el('msg').textContent='failed to load session data: '+e.message;
+      return;
+    }
+    meta = v||{};
+    if (!meta.id){
+      el('msg').style.display='block';
+      el('msg').innerHTML='No video linked to this session yet.<br>' +
+        'Go back to the review page and paste a YouTube link.';
+      return;
+    }
+    offset = (meta.offset_ms||0)/1000;
+    el('off').textContent = fmtOff();
+    el('coarse').value = Math.max(-300, Math.min(300, offset));
+    S = d.samples||[]; bounds = d.bounds;
+    laps = (l&&l.laps)||[];
+    if (l&&l.best_lap){ const b=laps.find(x=>x.lap===l.best_lap); if(b) bestLapS=b.seconds; }
+    // normalize timestamps -> rel seconds (epoch t, else t_ms, else 25 Hz synthetic)
+    let t0=null;
+    T = new Array(S.length);
+    for (let i=0;i<S.length;i++){
+      const s=S[i]; let v2=null;
+      if (typeof s.t==='number' && s.t>946684800) v2=s.t;
+      else if (typeof s.t_ms==='number') v2=s.t_ms/1000;
+      if (t0===null && v2!==null) t0=v2;
+      if (v2!==null && t0!==null) T[i]=v2-t0;
+      else T[i]=i? T[i-1]+0.04 : 0;   // synthetic 25 Hz fallback
+    }
+    let mr=0; for (const s of S) if (s.rpm>mr) mr=s.rpm;
+    rpmMax = Math.max(1000, Math.ceil(mr/1000)*1000);
+    drawTrack();
+    // YouTube IFrame API
+    const tag=document.createElement('script');
+    tag.src='https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+    window.onYouTubeIframeAPIReady = function(){
+      player = new YT.Player('yt', {
+        videoId: meta.id, width:'100%', height:'100%',
+        playerVars:{rel:0, modestbranding:1, playsinline:1, controls:1},
+        events:{ onReady: ()=>{ ready=true; }, onStateChange: st=>{
+          el('pp').textContent = (st.data===1)?'pause':'play'; } }
+      });
+    };
+  }
+
+  // ---- track map canvas ------------------------------------------------
+  let proj=null;
+  function drawTrack(){
+    const c=el('tmap'), ctx=c.getContext('2d');
+    ctx.clearRect(0,0,c.width,c.height);
+    const pts=[];
+    for (const s of S) if (typeof s.lat==='number'&&typeof s.lon==='number'&&(s.lat||s.lon)) pts.push([s.lat,s.lon]);
+    if (pts.length<10){ c.style.display='none'; return; }
+    let mnLa=1e9,mxLa=-1e9,mnLo=1e9,mxLo=-1e9;
+    for (const p of pts){ if(p[0]<mnLa)mnLa=p[0]; if(p[0]>mxLa)mxLa=p[0];
+      if(p[1]<mnLo)mnLo=p[1]; if(p[1]>mxLo)mxLo=p[1]; }
+    const cosl=Math.cos(mnLa*Math.PI/180);
+    const w=(mxLo-mnLo)*cosl, h=(mxLa-mnLa);
+    const sc=Math.min((c.width-24)/(w||1e-9),(c.height-24)/(h||1e-9));
+    proj = (la,lo)=>[12+((lo-mnLo)*cosl)*sc, c.height-12-((la-mnLa))*sc];
+    ctx.strokeStyle='rgba(255,176,32,0.85)'; ctx.lineWidth=2.5; ctx.beginPath();
+    for (let i=0;i<pts.length;i++){ const q=proj(pts[i][0],pts[i][1]);
+      if(i)ctx.lineTo(q[0],q[1]); else ctx.moveTo(q[0],q[1]); }
+    ctx.stroke();
+  }
+  function drawDot(la,lo){
+    if(!proj) return;
+    drawTrack();
+    const c=el('tmap'), ctx=c.getContext('2d'); const q=proj(la,lo);
+    ctx.fillStyle='#fff'; ctx.strokeStyle='#000'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(q[0],q[1],6,0,7); ctx.fill(); ctx.stroke();
+  }
+
+  function idxAt(t){
+    let lo=0, hi=T.length-1;
+    if (!T.length || t<=T[0]) return 0;
+    if (t>=T[hi]) return hi;
+    while (hi-lo>1){ const m=(lo+hi)>>1; if (T[m]<=t) lo=m; else hi=m; }
+    return lo;
+  }
+
+  // ---- HUD tick ----------------------------------------------------------
+  setInterval(function(){
+    if (!ready || !S.length || !player || !player.getCurrentTime) return;
+    const vt = player.getCurrentTime()||0;
+    const dt = vt + offset;
+    const i = idxAt(dt);
+    const s = S[i];
+    const inRange = dt>=T[0]-2 && dt<=T[T.length-1]+2;
+    el('spd').innerHTML = (inRange && typeof s.speed_mph==='number' ? Math.round(s.speed_mph) : '--')
+                          + '<span class="u">MPH</span>';
+    const rpm = (inRange && typeof s.rpm==='number') ? s.rpm : 0;
+    el('rpmfill').style.width = Math.min(100, rpm*100/rpmMax)+'%';
+    el('rpmtxt').textContent = (inRange&&rpm? rpm : '--')+' RPM';
+    if (inRange && typeof s.ax==='number' && typeof s.ay==='number')
+      el('gtxt').textContent = 'LAT '+Math.abs(s.ay).toFixed(2)+'g   LON '+Math.abs(s.ax).toFixed(2)+'g';
+    if (inRange && typeof s.lat==='number' && (s.lat||s.lon)) drawDot(s.lat, s.lon);
+    // laps
+    let cur=null, last=null;
+    for (const lp of laps){
+      if (dt>=lp.t_start && dt<lp.t_end){ cur=lp; break; }
+      if (dt>=lp.t_end) last=lp;
+    }
+    if (cur){
+      el('lapn').textContent='LAP '+cur.lap;
+      el('lapt').textContent=fmtLap(dt-cur.t_start);
+    } else {
+      el('lapn').textContent='LAP –';
+      el('lapt').textContent='--:--.-';
+    }
+    el('lapl').textContent='LAST '+fmtLap(last?last.seconds:0);
+    el('lapb').textContent='BEST '+fmtLap(bestLapS||0);
+  }, 50);
+
+  // ---- controls -----------------------------------------------------------
+  function setOffset(v){
+    offset=v;
+    el('off').textContent=fmtOff();
+    el('coarse').value=Math.max(-300,Math.min(300,offset));
+  }
+  document.querySelectorAll('#bar button[data-n]').forEach(b=>{
+    b.addEventListener('click',()=>setOffset(offset+parseFloat(b.dataset.n)));
+  });
+  el('coarse').addEventListener('input',()=>setOffset(parseFloat(el('coarse').value)));
+  el('pp').addEventListener('click',()=>{
+    if (!player) return;
+    (player.getPlayerState()===1)?player.pauseVideo():player.playVideo();
+  });
+  el('fs').addEventListener('click',()=>{
+    const st=el('stage');
+    if (document.fullscreenElement) document.exitFullscreen();
+    else st.requestFullscreen && st.requestFullscreen();
+  });
+  el('launch').addEventListener('click',()=>{
+    // Auto-sync helper: find the data's LAUNCH (first sustained >15 mph) and
+    // pin it to the video's current position.
+    if (!S.length || !player) return;
+    let li=-1;
+    for (let i=0;i<S.length-5;i++){
+      if (S[i].speed_mph>15 && S[i+3]&&S[i+3].speed_mph>12 && S[i+5]&&S[i+5].speed_mph>12){ li=i; break; }
+    }
+    if (li<0){ toast('no launch found in data (never above 15 mph?)'); return; }
+    setOffset(T[li] - (player.getCurrentTime()||0));
+    toast('synced: data launch = this video moment. Fine-tune then SAVE.');
+  });
+  el('save').addEventListener('click',async ()=>{
+    try{
+      const r=await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/video',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url:meta.url||meta.id, offset_ms:Math.round(offset*1000)})});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      toast('sync saved');
+    }catch(e){ toast('save failed: '+e.message); }
+  });
+  // auto-hide the control bar
+  let hideT=null;
+  function poke(){ el('bar').classList.remove('hidden');
+    clearTimeout(hideT); hideT=setTimeout(()=>el('bar').classList.add('hidden'), 3000); }
+  document.addEventListener('mousemove',poke);
+  document.addEventListener('touchstart',poke);
+  poke();
+
+  boot();
+})();
+</script>
+</body></html>"""
 )
