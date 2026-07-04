@@ -215,6 +215,27 @@ Admin rows have a **history** button → `/admin/user/<email>/history` (page) / 
 total sign-ins, active 7d/30d, sign-ins 7d/30d, new users 30d) + a per-user table (total / 30d /
 7d logins, distinct active days, first & last seen) built from `login_stats_all()`.
 
+### Combine sessions + YouTube overlay viewer (server)
+
+- **Combine**: index page has a checkbox column + `combine selected` toolbar button →
+  `POST /sessions/combine {user, files[≥2]}` concatenates the files in session-id (time)
+  order into a new `<sid>_<track>-combined.ndjson` (originals kept; absolute `t`
+  timestamps make plain concatenation valid). Owner-or-admin (`gate_delete_dir`).
+- **Video link**: review-page header takes a YouTube URL → `POST /sessions/<u>/<f>/video`
+  (owner-or-admin) stores a sidecar `/data/video_meta/<user>/<file>.json`
+  `{id,url,offset_ms}`; server parses the id from any URL shape (`_parse_youtube_id`).
+  `GET …/video` is view-gated. Linking reveals a **▶ overlay** button.
+- **Overlay viewer** `GET /overlay/<u>/<f>` (`_OVERLAY_HTML`): full-screen YouTube IFrame +
+  HTML HUD on top — big MPH, RPM bar, lat/long g, canvas track map with live dot, lap # +
+  running lap time + last/best (reuses `/laps`). Sync model: `data_rel_s = video_s +
+  offset_ms/1000`. Controls (auto-hide bar): coarse slider ±5 min, fine nudges
+  ±0.05/1/10 s, **SYNC @ LAUNCH** (scrub video to the car launching, click — offset pinned
+  to the data's first sustained >15 mph), SAVE persists. HUD ticks 20 Hz off
+  `player.getCurrentTime()` + binary-search sample lookup.
+- **Delete is owner-only however you authenticate** (security fix): per-user API keys now
+  pass `can_delete_dir(key_owner, dir)` — a viewer's own key can no longer delete other
+  users' sessions. Firmware/master key stays exempt (dash deletes its own uploads).
+
 ### AI corner analysis on the review page (v-server, Open WebUI @ ai.blueuc.com)
 
 The review page (`/review/<user>/<file>`) has an **AI Corner Analysis** card: the user clicks
