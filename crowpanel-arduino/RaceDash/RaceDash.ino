@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.116"
+#define FIRMWARE_VERSION "0.1.117"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2356,10 +2356,18 @@ static void ufNetTask(void*) {
             if (n > 16384) n = 16384;
             const uint32_t off = uf.ring_tail % uf.bufcap;
             if (n > uf.bufcap - off) n = uf.bufcap - off;   // stay contiguous
+            // BOUNCE through internal RAM (v0.1.117): the ring lives in PSRAM,
+            // but on this board the RGB panel scans the framebuffer out of the
+            // SAME OPI PSRAM bus the WiFi/TLS stack contends for — sending
+            // straight from PSRAM measured ~70 KB/s at RSSI -55 (nettest
+            // 07-17). One memcpy into .bss internal RAM decouples the radio
+            // path from the display's PSRAM traffic.
+            static uint8_t bounce[16384];   // net task only — single user
+            memcpy(bounce, uf.buf + off, n);
             char hdr[12];
             const int hn = snprintf(hdr, sizeof(hdr), "%x\r\n", (unsigned)n);
             if (!ufTaskWrite((const uint8_t*)hdr, (size_t)hn) ||
-                !ufTaskWrite(uf.buf + off, n) ||
+                !ufTaskWrite(bounce, n) ||
                 !ufTaskWrite((const uint8_t*)"\r\n", 2)) { werr = true; break; }
             uf.ring_tail    += n;
             uf.bytes_written = uf.ring_tail;        // modal progress = bytes on the wire
@@ -8435,14 +8443,26 @@ static volatile uint8_t nettest_state = 0;   // 0=idle 1=running 2=done
 static char nettest_result[80] = "";
 
 static void netTestTask(void*) {
-    constexpr uint32_t TOTAL = 2UL * 1024 * 1024;
-    constexpr size_t   BLK   = 32768;
-    uint8_t*   blk = (uint8_t*)ps_malloc(BLK);
-    WiFiClient* c  = nullptr;
+    // TWO passes of 1 MB each (v0.1.117): pass A sends from INTERNAL RAM,
+    // pass B from PSRAM. On this board the RGB panel scans the framebuffer
+    // out of the same OPI PSRAM bus the WiFi/TLS stack fights for -- if A is
+    // much faster than B, PSRAM contention is the dash's throughput ceiling
+    // and the uploader's bounce-buffer fix is the cure. Both passes are
+    // logged server-side (X-Note: ram=int / ram=psram, X-Tls: connect ms).
+    constexpr uint32_t PASS_TOTAL = 1UL * 1024 * 1024;
+    constexpr size_t   BLK        = 16384;
+    static uint8_t     iblk[BLK];                       // internal RAM (.bss)
+    uint8_t* pblk = (uint8_t*)ps_malloc(BLK);           // PSRAM
     const int rssi0 = (int)WiFi.RSSI();
-    do {
-        if (!blk) { snprintf(nettest_result, sizeof(nettest_result), "no PSRAM"); break; }
+    uint32_t kbps_a = 0, kbps_b = 0;
+    bool fail = false;
+    char failwhy[40] = "";
+
+    for (int pass = 0; pass < 2 && !fail; ++pass) {
+        uint8_t* blk = (pass == 0) ? iblk : pblk;
+        if (!blk) { snprintf(failwhy, sizeof(failwhy), "no PSRAM"); fail = true; break; }
         memset(blk, 'x', BLK);
+        WiFiClient* c = nullptr;
         if (s.cloud_protocol == 1) {
             WiFiClientSecure* sec = new WiFiClientSecure();
             sec->setInsecure();
@@ -8454,11 +8474,12 @@ static void netTestTask(void*) {
         }
         const uint32_t tc0 = millis();
         if (!c->connect(s.cloud_host, s.cloud_port)) {
-            snprintf(nettest_result, sizeof(nettest_result),
-                     "connect FAILED (%lus)  RSSI %d",
-                     (unsigned long)((millis() - tc0) / 1000), rssi0);
+            snprintf(failwhy, sizeof(failwhy), "connect failed");
+            fail = true;
+            c->stop(); delete c;
             break;
         }
+        const uint32_t tls_ms = millis() - tc0;
         c->setNoDelay(true);
         c->printf("POST /nettest HTTP/1.1\r\n"
                   "Host: %s\r\n"
@@ -8466,49 +8487,45 @@ static void netTestTask(void*) {
                   "Content-Length: %lu\r\n"
                   "X-Rssi: %d\r\n"
                   "X-Fw: %s\r\n"
+                  "X-Note: ram=%s\r\n"
+                  "X-Tls: %lu\r\n"
                   "Connection: close\r\n\r\n",
-                  s.cloud_host, (unsigned long)TOTAL, rssi0, FIRMWARE_VERSION);
+                  s.cloud_host, (unsigned long)PASS_TOTAL, rssi0, FIRMWARE_VERSION,
+                  (pass == 0) ? "int" : "psram", (unsigned long)tls_ms);
         const uint32_t t0 = millis();
         uint32_t sent = 0, last = millis();
-        bool stalled = false;
-        while (sent < TOTAL) {
-            size_t want = TOTAL - sent;
+        while (sent < PASS_TOTAL) {
+            size_t want = PASS_TOTAL - sent;
             if (want > BLK) want = BLK;
             const int w = c->write(blk, want);
             if (w > 0) { sent += (uint32_t)w; last = millis(); }
-            else if (!c->connected() || millis() - last > 20000) { stalled = true; break; }
-            else vTaskDelay(1);
+            else if (!c->connected() || millis() - last > 20000) {
+                snprintf(failwhy, sizeof(failwhy), "stalled at %luKB (%s)",
+                         (unsigned long)(sent / 1024), (pass == 0) ? "int" : "psram");
+                fail = true;
+                break;
+            } else vTaskDelay(1);
         }
         const uint32_t dt = millis() - t0;
         const uint32_t kbps = (uint32_t)(((uint64_t)sent * 1000) / 1024 / (dt ? dt : 1));
-        if (stalled) {
-            snprintf(nettest_result, sizeof(nettest_result),
-                     "STALLED at %luKB (%lus, %luKB/s)  RSSI %d",
-                     (unsigned long)(sent / 1024), (unsigned long)(dt / 1000),
-                     (unsigned long)kbps, rssi0);
-        } else {
-            // Drain the response briefly (also confirms the server logged it).
-            char resp[64] = {0}; size_t rn = 0;
-            const uint32_t rt0 = millis();
-            while (millis() - rt0 < 5000) {
-                while (c->available() && rn < sizeof(resp) - 1) resp[rn++] = (char)c->read();
-                if (rn >= 12 || (!c->connected() && !c->available())) break;
-                vTaskDelay(10);
-            }
-            const int code = (rn > 9) ? atoi(resp + 9) : 0;
-            if (code == 404)
-                snprintf(nettest_result, sizeof(nettest_result),
-                         "%lu KB/s  (server needs redeploy for logging)",
-                         (unsigned long)kbps);
-            else
-                snprintf(nettest_result, sizeof(nettest_result),
-                         "2MB in %lu.%lus = %lu KB/s  RSSI %d",
-                         (unsigned long)(dt / 1000), (unsigned long)((dt % 1000) / 100),
-                         (unsigned long)kbps, rssi0);
+        if (pass == 0) kbps_a = kbps; else kbps_b = kbps;
+        // Drain the response briefly so the server finishes logging the run.
+        const uint32_t rt0 = millis();
+        while (millis() - rt0 < 4000) {
+            while (c->available()) (void)c->read();
+            if (!c->connected() && !c->available()) break;
+            vTaskDelay(10);
         }
-    } while (false);
-    if (c) { c->stop(); delete c; }
-    if (blk) free(blk);
+        c->stop(); delete c;
+    }
+    if (pblk) free(pblk);
+    if (fail)
+        snprintf(nettest_result, sizeof(nettest_result),
+                 "FAIL: %s  RSSI %d", failwhy, rssi0);
+    else
+        snprintf(nettest_result, sizeof(nettest_result),
+                 "intRAM %lu / PSRAM %lu KB/s  RSSI %d",
+                 (unsigned long)kbps_a, (unsigned long)kbps_b, rssi0);
     nettest_state = 2;
     vTaskDelete(NULL);
 }
