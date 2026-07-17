@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.115"
+#define FIRMWARE_VERSION "0.1.116"
 
 #include <Preferences.h>
 #include <time.h>
@@ -8403,11 +8403,12 @@ static void handleOtaModalTap(int x, int y) {
 // ---------------------------------------------------------------------------
 namespace {
     constexpr int TOOLS_BTN_X = 40,  TOOLS_BTN_W = 720;
-    constexpr int TOOLS_BTN_H = 80,  TOOLS_GAP   = 16;
+    constexpr int TOOLS_BTN_H = 64,  TOOLS_GAP   = 12;   // 5 buttons since v0.1.116
     constexpr int TOOLS_BTN1_Y = 50;
     constexpr int TOOLS_BTN2_Y = TOOLS_BTN1_Y + TOOLS_BTN_H + TOOLS_GAP;
     constexpr int TOOLS_BTN3_Y = TOOLS_BTN2_Y + TOOLS_BTN_H + TOOLS_GAP;
     constexpr int TOOLS_BTN4_Y = TOOLS_BTN3_Y + TOOLS_BTN_H + TOOLS_GAP;
+    constexpr int TOOLS_BTN5_Y = TOOLS_BTN4_Y + TOOLS_BTN_H + TOOLS_GAP;   // WiFi speed test
 }
 
 static const char* sdStatusText() {
@@ -8419,6 +8420,97 @@ static const char* sdStatusText() {
         case 4: return "formatting…";
     }
     return "";
+}
+
+// ---------------------------------------------------------------------------
+// WiFi speed test (v0.1.116). POSTs 2 MB of junk from PSRAM straight to the
+// server's /nettest — NO Teensy, NO UART, NO session files: it measures the
+// dash's radio + TCP/TLS path and NOTHING else. This is the discriminator
+// between "upload code broken" and "dash RF starved" (RGB-panel EMI / weak
+// AP). Every run is also RECORDED server-side (upload event log, ev=nettest,
+// with RSSI + fw) so results can be reviewed later at /admin/upload/log.
+// Runs on a core-0 task; the UI just shows nettest_result.
+// ---------------------------------------------------------------------------
+static volatile uint8_t nettest_state = 0;   // 0=idle 1=running 2=done
+static char nettest_result[80] = "";
+
+static void netTestTask(void*) {
+    constexpr uint32_t TOTAL = 2UL * 1024 * 1024;
+    constexpr size_t   BLK   = 32768;
+    uint8_t*   blk = (uint8_t*)ps_malloc(BLK);
+    WiFiClient* c  = nullptr;
+    const int rssi0 = (int)WiFi.RSSI();
+    do {
+        if (!blk) { snprintf(nettest_result, sizeof(nettest_result), "no PSRAM"); break; }
+        memset(blk, 'x', BLK);
+        if (s.cloud_protocol == 1) {
+            WiFiClientSecure* sec = new WiFiClientSecure();
+            sec->setInsecure();
+            sec->setTimeout(15);
+            c = sec;
+        } else {
+            c = new WiFiClient();
+            c->setTimeout(15);
+        }
+        const uint32_t tc0 = millis();
+        if (!c->connect(s.cloud_host, s.cloud_port)) {
+            snprintf(nettest_result, sizeof(nettest_result),
+                     "connect FAILED (%lus)  RSSI %d",
+                     (unsigned long)((millis() - tc0) / 1000), rssi0);
+            break;
+        }
+        c->setNoDelay(true);
+        c->printf("POST /nettest HTTP/1.1\r\n"
+                  "Host: %s\r\n"
+                  "Content-Type: application/octet-stream\r\n"
+                  "Content-Length: %lu\r\n"
+                  "X-Rssi: %d\r\n"
+                  "X-Fw: %s\r\n"
+                  "Connection: close\r\n\r\n",
+                  s.cloud_host, (unsigned long)TOTAL, rssi0, FIRMWARE_VERSION);
+        const uint32_t t0 = millis();
+        uint32_t sent = 0, last = millis();
+        bool stalled = false;
+        while (sent < TOTAL) {
+            size_t want = TOTAL - sent;
+            if (want > BLK) want = BLK;
+            const int w = c->write(blk, want);
+            if (w > 0) { sent += (uint32_t)w; last = millis(); }
+            else if (!c->connected() || millis() - last > 20000) { stalled = true; break; }
+            else vTaskDelay(1);
+        }
+        const uint32_t dt = millis() - t0;
+        const uint32_t kbps = (uint32_t)(((uint64_t)sent * 1000) / 1024 / (dt ? dt : 1));
+        if (stalled) {
+            snprintf(nettest_result, sizeof(nettest_result),
+                     "STALLED at %luKB (%lus, %luKB/s)  RSSI %d",
+                     (unsigned long)(sent / 1024), (unsigned long)(dt / 1000),
+                     (unsigned long)kbps, rssi0);
+        } else {
+            // Drain the response briefly (also confirms the server logged it).
+            char resp[64] = {0}; size_t rn = 0;
+            const uint32_t rt0 = millis();
+            while (millis() - rt0 < 5000) {
+                while (c->available() && rn < sizeof(resp) - 1) resp[rn++] = (char)c->read();
+                if (rn >= 12 || (!c->connected() && !c->available())) break;
+                vTaskDelay(10);
+            }
+            const int code = (rn > 9) ? atoi(resp + 9) : 0;
+            if (code == 404)
+                snprintf(nettest_result, sizeof(nettest_result),
+                         "%lu KB/s  (server needs redeploy for logging)",
+                         (unsigned long)kbps);
+            else
+                snprintf(nettest_result, sizeof(nettest_result),
+                         "2MB in %lu.%lus = %lu KB/s  RSSI %d",
+                         (unsigned long)(dt / 1000), (unsigned long)((dt % 1000) / 100),
+                         (unsigned long)kbps, rssi0);
+        }
+    } while (false);
+    if (c) { c->stop(); delete c; }
+    if (blk) free(blk);
+    nettest_state = 2;
+    vTaskDelete(NULL);
 }
 
 static void drawToolsPage() {
@@ -8454,7 +8546,7 @@ static void drawToolsPage() {
     tft.setTextColor(TFT_WHITE, b1_fill);
     tft.setTextDatum(textdatum_t::middle_center);
     tft.drawString("Check for updates",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + 30);
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + 22);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b1_fill);
     char b1sub[80];
@@ -8466,7 +8558,7 @@ static void drawToolsPage() {
     } else {
         snprintf(b1sub, sizeof(b1sub), "current v%s", FIRMWARE_VERSION);
     }
-    tft.drawString(b1sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + 65);
+    tft.drawString(b1sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + 47);
 
     // ---- Button 2: Format SD card (two-tap arming) ----
     const bool armed = sd_format_armed && (millis() - sd_format_arm_ms < 5000);
@@ -8480,7 +8572,7 @@ static void drawToolsPage() {
     tft.setFont(&fonts::Font4);
     tft.setTextColor(TFT_WHITE, b2_fill);
     tft.drawString(armed ? "TAP AGAIN TO CONFIRM" : "Format SD card",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 30);
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 22);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b2_fill);
     char b2sub[64];
@@ -8492,7 +8584,7 @@ static void drawToolsPage() {
                                (unsigned long)sd_free_mb, (unsigned long)sd_total_mb);
         strncat(b2sub, ssz, sizeof(b2sub) - strlen(b2sub) - 1);
     }
-    tft.drawString(b2sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 65);
+    tft.drawString(b2sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 47);
 
     // ---- Button 3: Test mode ----
     // Generates synthetic GPS/RPM/IMU on the Teensy and writes a real SD
@@ -8506,13 +8598,13 @@ static void drawToolsPage() {
     tft.setFont(&fonts::Font4);
     tft.setTextColor(TFT_WHITE, b3_fill);
     tft.drawString(test_mode_active ? "Stop test mode" : "Start test mode",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 30);
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 22);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b3_fill);
     const char* b3sub = test_mode_active
         ? "recording synthetic data — tap to stop + upload"
         : "record synthetic session for cloud upload test";
-    tft.drawString(b3sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 65);
+    tft.drawString(b3sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 47);
 
     // ---- Button 4: CAN sniffer ----
     // Records every raw CAN frame to /cansniff/ on the SD card so the MS3Pro
@@ -8527,7 +8619,7 @@ static void drawToolsPage() {
     tft.setFont(&fonts::Font4);
     tft.setTextColor(TFT_WHITE, b4_fill);
     tft.drawString(cansniff_active ? "Stop CAN capture" : "Start CAN capture",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 30);
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 22);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b4_fill);
     char b4sub[80];
@@ -8539,7 +8631,31 @@ static void drawToolsPage() {
     } else {
         snprintf(b4sub, sizeof(b4sub), "record raw CAN frames to SD for analysis");
     }
-    tft.drawString(b4sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 65);
+    tft.drawString(b4sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 47);
+
+    // ---- Button 5: WiFi speed test (v0.1.116) ----
+    {
+        const bool wifi_ok = (s.internet_mode == 1 && wifi_state == WS_CONNECTED);
+        const bool running = (nettest_state == 1);
+        const uint16_t b5_fill = running ? TFT_DARKGREY : (wifi_ok ? TFT_NAVY : TFT_DARKGREY);
+        tft.fillRect(TOOLS_BTN_X, TOOLS_BTN5_Y, TOOLS_BTN_W, TOOLS_BTN_H, b5_fill);
+        tft.drawRect(TOOLS_BTN_X, TOOLS_BTN5_Y, TOOLS_BTN_W, TOOLS_BTN_H, TFT_WHITE);
+        tft.drawRect(TOOLS_BTN_X+1, TOOLS_BTN5_Y+1, TOOLS_BTN_W-2, TOOLS_BTN_H-2, TFT_WHITE);
+        tft.setFont(&fonts::Font4);
+        tft.setTextColor(TFT_WHITE, b5_fill);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("WiFi speed test", TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN5_Y + 22);
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_LIGHTGREY, b5_fill);
+        char b5sub[96];
+        if (running)                    snprintf(b5sub, sizeof(b5sub), "testing... (up to 30 s)");
+        else if (nettest_result[0])     snprintf(b5sub, sizeof(b5sub), "%s", nettest_result);
+        else if (!wifi_ok)              snprintf(b5sub, sizeof(b5sub), "requires WiFi connected");
+        else                            snprintf(b5sub, sizeof(b5sub),
+                                                 "2MB dash->server, no Teensy - result is logged server-side");
+        tft.drawString(b5sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN5_Y + 47);
+        tft.setTextDatum(textdatum_t::top_left);
+    }
 
     // ---- CAN health readout (live, from CANDIAG lines) ----
     // One line that tells you at a glance which CAN failure mode you're in:
@@ -8547,7 +8663,7 @@ static void drawToolsPage() {
     //   fresh + high dup% / ACK err             -> STORM   (red) — termination/ACK
     //   0 fps / stale                           -> NO BUS  (grey) — wiring/broadcast
     {
-        const int CAN_Y = TOOLS_BTN4_Y + TOOLS_BTN_H + 6;   // ~424
+        const int CAN_Y = TOOLS_BTN5_Y + TOOLS_BTN_H + 4;   // below button 5 (v0.1.116)
         tft.fillRect(0, CAN_Y - 2, 800, 28, TFT_BLACK);
         const bool fresh = (candiag_ms != 0) && (millis() - candiag_ms < 3000);
         char line[96]; uint16_t col;
@@ -8636,6 +8752,21 @@ static void handleToolsTap(int x, int y) {
         // Optimistically flip the local state so the button re-paints
         // immediately; the Teensy TEST,<0|1> reply will reconcile.
         test_mode_active = !test_mode_active;
+        return;
+    }
+    // Button 5: WiFi speed test (v0.1.116)
+    if (x >= TOOLS_BTN_X && x <= TOOLS_BTN_X + TOOLS_BTN_W &&
+        y >= TOOLS_BTN5_Y && y <= TOOLS_BTN5_Y + TOOLS_BTN_H) {
+        if (nettest_state == 1) return;                       // already running
+        if (s.internet_mode != 1 || wifi_state != WS_CONNECTED) return;
+        if (uf.state != UF_IDLE) return;                      // don't fight an upload
+        nettest_state = 1;
+        nettest_result[0] = '\0';
+        if (xTaskCreatePinnedToCore(netTestTask, "nettest", 12288, nullptr, 1,
+                                    nullptr, 0) != pdPASS) {
+            nettest_state = 2;
+            snprintf(nettest_result, sizeof(nettest_result), "task spawn failed");
+        }
         return;
     }
     // Button 4: CAN sniffer toggle

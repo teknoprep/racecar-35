@@ -952,6 +952,19 @@ TunerStudio units — re-verify if it's ever switched to °C).
 > frames (IAT/AFR/batt) still want a **running-engine capture** to fully confirm, but they
 > follow the same authoritative spec table above.
 
+## WiFi speed test (Tools page button 5, v0.1.116)
+
+The upload-debugging discriminator: POSTs **2 MB of junk from PSRAM straight to the server's
+`POST /nettest`** — no Teensy, no UART, no session files — so it measures the dash's radio +
+TCP/TLS path and NOTHING else. Result shows on the button ("2MB in 3.2s = 640 KB/s  RSSI -67")
+and **every run is recorded server-side** in the upload event log (`ev=nettest` with bytes/
+seconds/kbps/RSSI/fw) — review later via `GET /admin/upload/log` (firmware-key gated).
+Interpretation: hundreds of KB/s here but session uploads fail → transfer code's fault;
+tens of KB/s (or STALLED) while a phone on the same AP is fast → the dash's RF path is
+starved (RGB-panel EMI / weak AP — check the RSSI number, move the hotspot). Runs on a
+core-0 task (`netTestTask`); blocked while an upload is active. Tools page is now FIVE
+64 px buttons; the CAN health readout moved below button 5.
+
 ## CAN sniffer (Tools page → "Start CAN capture")
 
 De-risks the byte-offset guessing: captures **every raw CAN frame** to SD for offline analysis.

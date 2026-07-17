@@ -1785,6 +1785,40 @@ async def admin_upload_log(request: Request, n: int = 200,
     return JSONResponse({"events": out})
 
 
+@app.post("/nettest")
+async def nettest(
+    request: Request,
+    x_rssi: Optional[str] = Header(None),
+    x_fw: Optional[str] = Header(None),
+) -> JSONResponse:
+    """Raw throughput probe for the dash's 'WIFI SPEED TEST' (Tools page).
+    Reads and DISCARDS the body, returns bytes + elapsed so the dash can
+    display real end-to-end throughput with zero UART/session involvement —
+    the discriminator between 'transfer code broken' and 'dash RF starved'.
+    Unauthenticated (stores nothing but a log line). Every run is RECORDED in
+    the upload event log (ev=nettest, with the dash's RSSI + fw version) so
+    results can be reviewed later via GET /admin/upload/log."""
+    client_host = request.client.host if request.client else "?"
+    t0 = time.time()
+    n = 0
+    try:
+        async for chunk in request.stream():
+            n += len(chunk)
+        err = ""
+    except Exception as e:   # client vanished mid-test — log what we got
+        err = f"{type(e).__name__}"
+    dt = max(0.001, time.time() - t0)
+    kbps = round(n / dt / 1024.0, 1)
+    _upload_event({"ev": "nettest", "ip": client_host, "bytes": n,
+                   "seconds": round(dt, 3), "kbps": kbps,
+                   "rssi": (x_rssi or ""), "fw": (x_fw or ""),
+                   "err": err})
+    log.info("nettest %s: %d B in %.2fs = %.1f KB/s rssi=%s fw=%s %s",
+             client_host, n, dt, kbps, x_rssi, x_fw, err)
+    return JSONResponse({"ok": not err, "bytes": n, "seconds": round(dt, 3),
+                         "kbps": kbps})
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": SERVICE_NAME, "data_dir": str(DATA_DIR)}
