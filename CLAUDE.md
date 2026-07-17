@@ -547,6 +547,15 @@ SDFORMAT           # FAT32-format the SD card
 CANSNIFF,<0|1>     # start/stop raw CAN capture to SD (see "CAN sniffer")
 TESTSTART/TESTSTOP # synthetic-data session for pipeline testing
 Q,LIST / Q,GET / Q,DEL / QUEUE,DRAIN / UPLOAD,CANCEL   # cloud queue control
+                   # ⚠️ v0.1.115 RESILIENCE on top: paddock WiFi measurably drops to ZERO
+                   #   throughput for 30 s+ windows (server log 07-17: 66 KB/s → 0 → fine).
+                   #   Net task rides outages up to 90 s (write-stall cap, was 20 s);
+                   #   UART watchdog is RING-AWARE (ring-full = we stopped acking on
+                   #   purpose — not a Teensy failure — so it stays fed while the task
+                   #   lives); Teensy ARQ patience 60×2 s = 120 s (must exceed the dash's
+                   #   90 s); 2 automatic whole-file retries. STATUS page IP row + the
+                   #   uf_stream_start DBG line now show WiFi RSSI (> -70 dBm good,
+                   #   < -80 dBm = uploads will crawl — move the hotspot).
                    # ⚠️ UPLOAD ARCHITECTURE (v0.1.114): TRUE STREAMING via PSRAM ring +
                    #   dedicated net task. The loop (core 1) pushes Q,L lines into a
                    #   512 KB PSRAM ring and ONLY touches UART; ufNetTask (core 0) owns
@@ -744,18 +753,28 @@ The `Auto select by GPS` toggle determines whether the picker actually opens or 
 - The synthetic `(no track / unknown)` row is always last in the list and emits `TRACK,UNKNOWN`
 - Closest track is **highlighted green at the top** of the picker with a `closest · X.X km` distance label
 
-### Track selection: SELECTED track wins; variants are picker-only (v0.1.114)
-`TrackInfo` gained an appended `aux` flag: **aux=1 entries are picker-only VARIANTS, never
-auto-picked** (`closestTrackIdx()` skips them). Summit Point is the motivating case — ONE
-facility, three overlapping circuits (`Summit Point` primary + `Summit Point Jefferson` /
-`Summit Point Shenandoah` as aux variants; renamed from "Summit Pt*", indices unchanged so
-`sf_ovr` stays aligned): the old three-way auto-pick grabbed whichever centre was nearest and
-**flapped between entries mid-lap, resetting the lap timer** — that was the "PRED/LAP/DELTA
-dead at Summit Point" bug. New `lapTrackIdx()` = the user's SELECTED track (`last_track_idx`,
-if within its radius) else `closestTrackIdx()`; it drives `updateLapTimer()` AND the STATUS
-page SET/CLR START-FINISH (fixing "S/F set was stuck on Jefferson even though I picked main").
-Auto flow at Summit Point → always the main circuit; picking a variant once makes it sticky
-(last_track_idx) until another track is picked.
+### Track selection: sub-tracks (configs) with their own S/F; SELECTED track wins (v0.1.115)
+**Summit Point is ONE picker entry with three sub-tracks** (configs Main / Jefferson /
+Shenandoah). `TrackConfig` gained `sf_from`: a config may BORROW its S/F — baked coords AND
+the SET START/FINISH override slot — from a **hidden aux TRACKS[] entry** (aux=1 = never
+auto-picked, never listed; `Summit Point Jefferson`/`Summit Point Shenandoah` remain in the
+array purely as S/F-storage tombstones so the append-only `sf_ovr` blob stays index-stable —
+DO NOT remove/reorder). `sfStorageIdx(tIdx)` resolves (track, active config) → storage index
+by NAME; `effectiveSf`/`effectiveSfLine`/SET/DELETE S/F/`sendSfToTeensy` all route through it.
+Active config = `active_cfg_idx` (NVS `lcfg`), set by the config picker, reset to 0 on plain
+track select. **AUTO flow never prompts**: a config track defaults to config 0 (Summit Point
+Main); variants are chosen deliberately from the track picker (manual START still shows the
+config picker). `lapTrackIdx()` = SELECTED track (within radius) else GPS-closest — drives
+lap timing AND S/F set/delete (the old three-entry auto-pick flapped mid-lap and reset the
+lap timer = the "PRED/LAP/DELTA dead at Summit Point" bug).
+
+### S/F capture: dash-page button while recording + DELETE CUSTOM S/F (v0.1.115)
+`captureSfHere()` (shared): parked <5 mph → POINT, rolling → perpendicular LINE, stored into
+`sfStorageIdx()`'s slot + re-sent to the Teensy. **While RECORDING the dash TRACK button
+becomes SET S/F** (two-tap: arm → "TAP AGAIN" → capture; green "S/F SET!" flash; the button
+reverts to TRACK+picker when idle) — so the driver can set the line any time, e.g. rolling
+across S/F on an out-lap. STATUS page: the old "CLR S/F" is now a wide maroon **DELETE CUSTOM
+S/F** button (x180-404, only visible when an override exists).
 
 ### Lap timer / predictive / delta / LAP COUNTER (S/F LINE-crossing, v0.1.82)
 Lap timing runs in `RaceDash.ino` (`updateLapTimer()`) — **only WHILE RECORDING since v0.1.105**:

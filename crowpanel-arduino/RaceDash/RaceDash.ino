@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.114"
+#define FIRMWARE_VERSION "0.1.115"
 
 #include <Preferences.h>
 #include <time.h>
@@ -559,6 +559,7 @@ constexpr int32_t  DELTA_SAME_MS = 50;       // |delta| <= this -> "same pace" (
 static bool recording         = false;
 static int  last_track_idx    = -1;        // TRACKS[] index of the last confirmed track (-1 = none saved)
 static char active_track_name[52] = "";    // full display name (may include config, e.g. "Mid-Ohio Full Course")
+static uint8_t active_cfg_idx     = 0;     // selected config of last_track_idx (NVS "lcfg"); 0 = primary
 
 // Button geometry on the dash page — both buttons sit left of the speed.
 // START/STOP is smaller and higher than before; TRACK button lives below it.
@@ -979,7 +980,12 @@ static uint32_t makeEpochUtc(int y, int mo, int d, int h, int mi, int s) {
 // alphabetically (the picker re-orders on the fly when GPS is available).
 // Add tracks by extending this array OR (TODO) editing via the settings page.
 // ---------------------------------------------------------------------------
-struct TrackConfig { const char* name; };
+// sf_from (v0.1.115): a config variant may BORROW its S/F (baked coords AND
+// the SET START/FINISH override slot in the sf_ovr blob) from a hidden aux
+// TRACKS[] entry named here — this is how one "Summit Point" picker entry
+// carries three sub-tracks with genuinely different start/finish lines while
+// the append-only override storage stays index-stable. nullptr = parent's S/F.
+struct TrackConfig { const char* name; const char* sf_from; };
 
 struct TrackInfo {
     const char* name;
@@ -1004,6 +1010,11 @@ struct TrackInfo {
 // Layouts with genuinely different S/F locations get separate TRACKS[] entries.
 static const TrackConfig MID_OHIO_CFGS[] = { {"Full + Chicane"}, {"Full Course"}, {"Short Course"} };
 static const TrackConfig SONOMA_CFGS[]   = { {"Full Course"}, {"Short Course"} };
+static const TrackConfig SUMMIT_CFGS[]   = {
+    {"Main",       nullptr},
+    {"Jefferson",  "Summit Point Jefferson"},    // hidden aux entries below
+    {"Shenandoah", "Summit Point Shenandoah"},
+};
 static const TrackConfig WGL_CFGS[]      = { {"Grand Prix"}, {"Short Course"} };
 static const TrackConfig VIR_CFGS[]      = { {"Full Course"}, {"Grand Course"}, {"North Course"} };
 
@@ -1027,11 +1038,12 @@ static const TrackInfo TRACKS[] = {
     { "Road Atlanta",  34.1469f,  -83.8189f, 2.5f,  34.1518f,  -83.8197f, nullptr,         0 },
     { "Sebring",       27.4570f,  -81.3568f, 3.5f,  27.4502f,  -81.3537f, nullptr,         0 },
     { "Sonoma",        38.1614f, -122.4544f, 2.5f,  38.1615f, -122.4547f, SONOMA_CFGS,     2 },
-    // Summit Point: ONE facility, three overlapping circuits. Only the main
-    // circuit auto-selects (aux=0); Jefferson/Shenandoah are aux=1 = picker-
-    // only variants (the old three-way auto-pick grabbed whichever centre was
-    // nearest and FLAPPED between them mid-lap, resetting the lap timer).
-    { "Summit Point",            39.2415f, -77.9779f, 2.0f, 39.2415f, -77.9779f, nullptr,  0 },
+    // Summit Point: ONE picker entry, three sub-tracks (configs). The
+    // Jefferson/Shenandoah rows below are aux=1 = HIDDEN storage tombstones:
+    // never auto-picked, never listed — they exist so each sub-track keeps
+    // its own baked S/F + its own SET START/FINISH override slot (indices
+    // must stay stable for the sf_ovr blob — do NOT remove or reorder).
+    { "Summit Point",            39.2415f, -77.9779f, 2.0f, 39.2415f, -77.9779f, SUMMIT_CFGS, 3 },
     { "Summit Point Jefferson",  39.2370f, -77.9700f, 1.2f, 39.2370f, -77.9700f, nullptr,  0, 0.0f, 0.0f, 1 },
     { "Summit Point Shenandoah", 39.2450f, -77.9650f, 1.5f, 39.2450f, -77.9650f, nullptr,  0, 0.0f, 0.0f, 1 },
     { "VIR",           36.5611f,  -79.2103f, 2.5f,  36.5689f,  -79.2067f, VIR_CFGS,        3 },
@@ -1112,6 +1124,13 @@ static int lapTrackIdx() {
 // Stored in NVS as one blob keyed by TRACKS[] index (append-only: never insert
 // a track in the middle or existing overrides shift onto the wrong track).
 // ---------------------------------------------------------------------------
+// Where a track's S/F (baked coords + SET START/FINISH override slot) LIVES.
+// A config variant with sf_from (e.g. Summit Point / Jefferson) borrows a
+// hidden aux TRACKS[] entry — resolved by name so array growth can't skew it.
+// Everything S/F-related (lap timing, capture, clear, Teensy CFG,sf) routes
+// through this.
+static int sfStorageIdx(int tIdx);   // fwd (needs sfOverride below)
+
 // used==0 => baked S/F. lat/lon = endpoint A; lat2/lon2 = endpoint B
 // (0,0 => point-only, radius fallback). Blob size changed with the line fields,
 // so any pre-line stored blob is length-mismatched and ignored (overrides reset
@@ -1127,6 +1146,7 @@ static uint32_t sf_set_msg_ms = 0;
 
 // Resolve the start/finish line actually used for lap detection at track idx.
 static void effectiveSf(int idx, float* lat, float* lon) {
+    idx = sfStorageIdx(idx);   // config variants borrow their own S/F entry
     if (idx < 0 || idx >= N_TRACKS) { *lat = 0; *lon = 0; return; }
     if (sfOverride[idx].used) { *lat = sfOverride[idx].lat; *lon = sfOverride[idx].lon; }
     else                      { *lat = TRACKS[idx].sf_lat;  *lon = TRACKS[idx].sf_lon;  }
@@ -1134,8 +1154,22 @@ static void effectiveSf(int idx, float* lat, float* lon) {
 
 // Resolve the S/F as a LINE (endpoints A,B). hasLine=false => only a point is
 // known (endpoint B is 0,0) and the caller should use the radius method.
+static int sfStorageIdx(int tIdx) {
+    if (tIdx < 0 || tIdx >= N_TRACKS) return tIdx;
+    if (tIdx == last_track_idx && TRACKS[tIdx].configs
+        && active_cfg_idx < TRACKS[tIdx].n_configs) {
+        const char* from = TRACKS[tIdx].configs[active_cfg_idx].sf_from;
+        if (from) {
+            for (int i = 0; i < N_TRACKS; ++i)
+                if (strcmp(TRACKS[i].name, from) == 0) return i;
+        }
+    }
+    return tIdx;
+}
+
 static void effectiveSfLine(int idx, float* aLat, float* aLon,
                             float* bLat, float* bLon, bool* hasLine) {
+    idx = sfStorageIdx(idx);   // config variants borrow their own S/F entry
     if (idx < 0 || idx >= N_TRACKS) { *aLat=*aLon=*bLat=*bLon=0; *hasLine=false; return; }
     if (sfOverride[idx].used) {
         *aLat=sfOverride[idx].lat;  *aLon=sfOverride[idx].lon;
@@ -1160,6 +1194,47 @@ static void saveSfOverrides() {
     prefs.begin("dash", false);
     prefs.putBytes("sf_ovr", sfOverride, sizeof(sfOverride));
     prefs.end();
+}
+
+// Capture the CURRENT GPS position as the active track's custom S/F — a
+// POINT when parked (<5 mph; heading is garbage at rest), a perpendicular
+// LINE when rolling. Shared by the STATUS-page two-tap and the dash-page
+// SET S/F button that replaces TRACK while recording (v0.1.115). Stores into
+// the active config's S/F slot (sfStorageIdx) and pushes the new line to the
+// Teensy so NDJSON lap stamping follows immediately.
+static bool captureSfHere() {
+    const int tIdx = lapTrackIdx();
+    if (tIdx < 0) {
+        snprintf(sf_set_msg, sizeof(sf_set_msg), "not at a known track");
+        sf_set_msg_ms = millis();
+        return false;
+    }
+    const int sIdx = sfStorageIdx(tIdx);
+    if (g.mph < 5.0f) {
+        sfOverride[sIdx].used = 1;
+        sfOverride[sIdx].lat  = g.lat_deg;
+        sfOverride[sIdx].lon  = g.lon_deg;
+        sfOverride[sIdx].lat2 = 0.0f;
+        sfOverride[sIdx].lon2 = 0.0f;
+        snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F POINT SET: %s (parked)", TRACKS[sIdx].name);
+    } else {
+        const float D2R = (float)M_PI / 180.0f;
+        const float H  = g.hdg_deg * D2R;
+        const float lE = -cosf(H), lN = sinf(H);      // left-of-travel (E,N)
+        const float half_m = 30.0f;
+        const float dLat = half_m / 111320.0f;
+        const float dLon = half_m / (111320.0f * cosf(g.lat_deg * D2R));
+        sfOverride[sIdx].used = 1;
+        sfOverride[sIdx].lat  = g.lat_deg + lN * dLat;
+        sfOverride[sIdx].lon  = g.lon_deg + lE * dLon;
+        sfOverride[sIdx].lat2 = g.lat_deg - lN * dLat;
+        sfOverride[sIdx].lon2 = g.lon_deg - lE * dLon;
+        snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F LINE SET: %s", TRACKS[sIdx].name);
+    }
+    saveSfOverrides();
+    sendSfToTeensy(tIdx);        // Teensy stamps lap #s into the NDJSON
+    sf_set_msg_ms = millis();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,6 +1351,9 @@ static void loadSettings() {
         for (int i = 0; i < N_TRACKS; ++i) {
             if (strcmp(TRACKS[i].name, ltrk) == 0) { last_track_idx = i; break; }
         }
+        active_cfg_idx = prefs.getUChar("lcfg", 0);
+        if (last_track_idx < 0 || active_cfg_idx >= TRACKS[last_track_idx].n_configs)
+            active_cfg_idx = 0;
         // If no display name was saved yet, fall back to the base track name.
         if (active_track_name[0] == '\0' && last_track_idx >= 0)
             strncpy(active_track_name, TRACKS[last_track_idx].name, sizeof(active_track_name) - 1);
@@ -1399,12 +1477,16 @@ static void sendCfgToTeensy() {
 static void saveLastTrack(int idx, const char* display_name = nullptr) {
     if (idx < 0 || idx >= N_TRACKS) return;
     last_track_idx = idx;
+    // Plain track select (no config display name) resets to the primary
+    // config; confirmConfigAndStart sets active_cfg_idx BEFORE calling us.
+    if (!display_name) active_cfg_idx = 0;
     const char* dn = display_name ? display_name : TRACKS[idx].name;
     strncpy(active_track_name, dn, sizeof(active_track_name) - 1);
     active_track_name[sizeof(active_track_name) - 1] = '\0';
     prefs.begin("dash", false);
     prefs.putString("last_trk",   TRACKS[idx].name);
     prefs.putString("last_trk_d", active_track_name);
+    prefs.putUChar ("lcfg",       active_cfg_idx);
     prefs.end();
     sendSfToTeensy(idx);   // Teensy needs the S/F line to stamp lap #s in NDJSON
 }
@@ -1628,8 +1710,10 @@ static void updateLapTimer() {
         if (now - last_lap_dbg >= 20000) {
             last_lap_dbg = now;
             const int dm = (int)(trackDistanceKm(g.lat_deg, g.lon_deg, aLat, aLon) * 1000.0f);
-            Serial.printf("DBG,lap trk=%s ovr=%d line=%d d_sf=%dm armed=%d laps=%d\n",
-                          TRACKS[tIdx].name, (int)sfOverride[tIdx].used, (int)hasLine,
+            const int sdi = sfStorageIdx(tIdx);
+            Serial.printf("DBG,lap trk=%s sf=%s ovr=%d line=%d d_sf=%dm armed=%d laps=%d\n",
+                          TRACKS[tIdx].name, TRACKS[sdi].name,
+                          (int)sfOverride[sdi].used, (int)hasLine,
                           dm, (int)lapTimer.timing_started, (int)lapTimer.lap_number);
         }
     }
@@ -2090,7 +2174,7 @@ static void ufFailOrRetry(bool sendAbort) {
     ufStopNetTask();
     ufCloseTcp();
     if (sendAbort) { Serial.printf("Q,ABORT\n"); Serial.flush(); }
-    if (uf.file_retries < 1 && uf.files_idx < uf.files_n) {
+    if (uf.file_retries < 2 && uf.files_idx < uf.files_n) {
         uf.file_retries++;
         Serial.printf("DBG,uf_retry file=%s err=%s\n",
                       uf.files[uf.files_idx].name, uf.last_err);
@@ -2237,7 +2321,12 @@ static bool ufTaskWrite(const uint8_t* d, size_t len) {
         }
         const int w = uf.tcp->write(d + off, len - off);
         if (w > 0) { off += (size_t)w; last = millis(); }
-        else if (millis() - last > 20000) {
+        else if (millis() - last > 90000) {
+            // 90 s (v0.1.115, was 20 s): paddock WiFi (hotspots, congestion)
+            // measurably drops to ZERO throughput for 30 s+ windows — ride
+            // them out on the ring + the Teensy's 120 s ARQ patience instead
+            // of aborting the file (server log 07-17: uploads on the same
+            // AP went 66 KB/s -> 0 -> fine again minutes later).
             snprintf(uf.net_err, sizeof(uf.net_err),
                      "TCP write stalled at %lu B", (unsigned long)uf.ring_tail);
             return false;
@@ -2499,9 +2588,9 @@ static bool parseQLine(const String& line) {
         uf.response_len  = 0;
         uf.response[0]   = '\0';
         uf.net_state     = 1;
-        Serial.printf("DBG,uf_stream_start size=%lu ring=%lu heap=%u\n",
+        Serial.printf("DBG,uf_stream_start size=%lu ring=%lu heap=%u rssi=%d\n",
                       (unsigned long)sz, (unsigned long)cap,
-                      (unsigned)ESP.getFreeHeap());
+                      (unsigned)ESP.getFreeHeap(), (int)WiFi.RSSI());
         if (xTaskCreatePinnedToCore(ufNetTask, "ufnet", 16384, nullptr, 1,
                                     nullptr, 0) != pdPASS) {
             uf.net_state = 0;
@@ -2717,7 +2806,7 @@ static void uploadTick() {
         if (uf.ring_tail != uf.fin_tail) {
             uf.fin_tail = uf.ring_tail;
             uf.fin_ms   = now;
-        } else if (now - uf.fin_ms > 45000) {
+        } else if (now - uf.fin_ms > 100000) {   // > task's 90 s write-stall cap
             snprintf(uf.last_err, sizeof(uf.last_err),
                      "finish stalled at %lu/%lu B",
                      (unsigned long)uf.ring_tail, (unsigned long)uf.ring_head);
@@ -2744,6 +2833,15 @@ static void uploadTick() {
             upload_last_draw_ms = now;
         }
         return;
+    }
+
+    // Ring-full means WE stopped acking (network slower than the wire) — UART
+    // silence is then EXPECTED, not a Teensy failure. Keep the watchdog fed
+    // while the net task is alive so a long outage rides on the ring + the
+    // Teensy's ARQ patience instead of aborting the file (v0.1.115).
+    if (uf.state == UF_STREAMING && uf.net_state == 1 && uf.buf) {
+        const uint32_t free_b = uf.bufcap - (uf.ring_head - uf.ring_tail);
+        if (free_b < 512) uf.last_rx_ms = now;
     }
 
     // Timeout watchdogs. For wait-for-first-response states the clock starts
@@ -3352,10 +3450,24 @@ static void handleTouch() {
 }
 
 static void handleDashTap(int x, int y) {
-    // TRACK button — opens picker in select-only mode (no recording start).
+    // TRACK button — opens picker in select-only mode when idle. While
+    // RECORDING it becomes the SET S/F button (v0.1.115): two-tap (arm, then
+    // confirm within 5 s) captures the current position/heading as the active
+    // track's custom start/finish — settable whenever you want, mid-session.
     if (x >= TRKBTN_X && x < TRKBTN_X + TRKBTN_W &&
         y >= TRKBTN_Y && y < TRKBTN_Y + TRKBTN_H) {
-        openTrackPicker(false);
+        if (!recording) {
+            openTrackPicker(false);
+            return;
+        }
+        const bool wasArmed = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
+        if (wasArmed) {
+            sf_set_armed = false;
+            captureSfHere();
+        } else {
+            sf_set_armed  = true;
+            sf_set_arm_ms = millis();
+        }
         return;
     }
 
@@ -3400,14 +3512,13 @@ static void handleDashTap(int x, int y) {
             }
             if (idx < 0) idx = closestTrackIdx();
             if (idx >= 0) {
-                if (TRACKS[idx].n_configs > 0) {
-                    openConfigPicker(idx, true, true);   // from_auto, for_recording
-                } else {
-                    saveLastTrack(idx);
-                    Serial.printf("TRACK,%s\n", active_track_name);
-                    Serial.printf("REC,1\n");
-                    recording = true; rec_start_ms = millis();
-                }
+                // AUTO flow never prompts (v0.1.115): a config track defaults
+                // to its PRIMARY sub-track (config 0 — e.g. Summit Point Main).
+                // Variants are chosen deliberately from the track picker.
+                saveLastTrack(idx);   // also resets active_cfg_idx to 0
+                Serial.printf("TRACK,%s\n", active_track_name);
+                Serial.printf("REC,1\n");
+                recording = true; rec_start_ms = millis();
                 return;
             }
         }
@@ -3551,6 +3662,7 @@ struct LastDrawn {
     uint32_t afr_col_tag  = UINT32_MAX;
     int32_t  volt_x10     = INT32_MIN;   // VOLT line (shares the AFR row)
     uint32_t volt_col_tag = UINT32_MAX;
+    uint8_t  trkbtn_state = 0xFF;        // TRACK / SET S/F button (v0.1.115)
     // REC badge state: composite tag of (dash recording bit, teensy ack bit,
     // mismatch-warning bit), plus the last-drawn sample count and queue depth.
     uint8_t  rec_badge_tag = 0xFF;
@@ -3576,6 +3688,7 @@ static void invalidateAll() {
     ld.psi_x10  = INT32_MIN; ld.psi_col_tag  = UINT32_MAX;
     ld.afr_x10  = INT32_MIN; ld.afr_col_tag  = UINT32_MAX;
     ld.volt_x10 = INT32_MIN; ld.volt_col_tag = UINT32_MAX;
+    ld.trkbtn_state = 0xFF;
 }
 
 static void drawRecordButton() {
@@ -3703,14 +3816,8 @@ static void drawDashPage() {
         tft.drawString("SATS", 620, 405);
         tft.drawString("GPS",  620, 430);
 
-        // TRACK button — static, drawn once on enter / bg-flip.
-        tft.fillRect(TRKBTN_X, TRKBTN_Y, TRKBTN_W, TRKBTN_H, TFT_DARKCYAN);
-        tft.drawRect(TRKBTN_X,     TRKBTN_Y,     TRKBTN_W,     TRKBTN_H,     TFT_WHITE);
-        tft.drawRect(TRKBTN_X + 1, TRKBTN_Y + 1, TRKBTN_W - 2, TRKBTN_H - 2, TFT_WHITE);
-        tft.setFont(&fonts::Font4);
-        tft.setTextDatum(textdatum_t::middle_center);
-        tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
-        tft.drawString("TRACK", TRKBTN_X + TRKBTN_W / 2, TRKBTN_Y + TRKBTN_H / 2);
+        // (TRACK / SET S/F button is drawn by the dynamic block below — it
+        //  changes with recording/armed state since v0.1.115.)
 
         ld.bg = bg;
         pageJustEntered = false;
@@ -3875,6 +3982,38 @@ static void drawDashPage() {
     }
 
     // ---- Start/Stop button (sits to the left of the speed) ----
+    // TRACK / SET S/F button (dynamic, v0.1.115): TRACK + picker when idle;
+    // while RECORDING it becomes the on-the-fly S/F capture (two-tap). The
+    // confirmation flashes green for 3 s after a capture.
+    {
+        uint8_t st = 0;   // 0=TRACK 1=SET S/F 2=TAP AGAIN(armed) 3=result msg
+        if (recording) {
+            const bool armed   = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
+            const bool haveMsg = sf_set_msg[0] && (millis() - sf_set_msg_ms < 3000);
+            st = haveMsg ? 3 : armed ? 2 : 1;
+        }
+        if (st != ld.trkbtn_state) {
+            const uint16_t fill = (st == 0) ? TFT_DARKCYAN
+                                : (st == 1) ? TFT_NAVY
+                                : (st == 2) ? TFT_ORANGE : TFT_DARKGREEN;
+            const uint16_t fg   = (st == 2) ? TFT_BLACK : TFT_WHITE;
+            const char* lbl = (st == 0) ? "TRACK"
+                            : (st == 1) ? "SET S/F"
+                            : (st == 2) ? "TAP AGAIN"
+                            : (strncmp(sf_set_msg, "S/F", 3) == 0 ? "S/F SET!" : "NO TRACK");
+            tft.fillRect(TRKBTN_X, TRKBTN_Y, TRKBTN_W, TRKBTN_H, fill);
+            tft.drawRect(TRKBTN_X,     TRKBTN_Y,     TRKBTN_W,     TRKBTN_H,     TFT_WHITE);
+            tft.drawRect(TRKBTN_X + 1, TRKBTN_Y + 1, TRKBTN_W - 2, TRKBTN_H - 2, TFT_WHITE);
+            tft.setFont(&fonts::Font4);
+            tft.setTextSize(1);
+            tft.setTextDatum(textdatum_t::middle_center);
+            tft.setTextColor(fg, fill);
+            tft.drawString(lbl, TRKBTN_X + TRKBTN_W / 2, TRKBTN_Y + TRKBTN_H / 2);
+            tft.setTextDatum(textdatum_t::top_left);
+            ld.trkbtn_state = st;
+        }
+    }
+
     if ((int)recording != ld.recording) {
         drawRecordButton();
         ld.recording = recording;
@@ -6566,6 +6705,7 @@ static void buildTrackOrder() {
     if (closest >= 0) tp.order[pos++] = (uint8_t)closest;
     for (uint8_t i = 0; i < N_TRACKS; ++i) {
         if ((int)i == closest) continue;
+        if (TRACKS[i].aux) continue;   // hidden S/F-storage tombstones (v0.1.115)
         tp.order[pos++] = i;
     }
     tp.order[pos++] = TP_UNKNOWN_IDX;
@@ -6777,6 +6917,10 @@ static void openConfigPicker(int track_idx, bool from_auto, bool for_recording) 
 static void confirmConfigAndStart() {
     const TrackInfo& t = TRACKS[cp.track_idx];
     char trackName[48];
+    // Config index FIRST — saveLastTrack persists it + sends the (possibly
+    // config-specific) S/F line to the Teensy via sendSfToTeensy.
+    active_cfg_idx = (cp.selected >= 0 && cp.selected < (int)t.n_configs)
+                     ? (uint8_t)cp.selected : 0;
     if (cp.selected >= 0 && cp.selected < (int)t.n_configs) {
         snprintf(trackName, sizeof(trackName), "%s %s",
                  t.name, t.configs[cp.selected].name);
@@ -8999,7 +9143,15 @@ static void drawStatusPage() {
     // IP
     {
         tft.setTextColor(VAL, BG);
-        tft.drawString(active_ip, LV, 81);
+        {   // IP + live WiFi RSSI (dBm) — the "is the paddock WiFi any good"
+            // number (v0.1.115; > -70 fine, < -80 = uploads will crawl).
+            char ipbuf[40];
+            if (wifiConnectedNow())
+                snprintf(ipbuf, sizeof(ipbuf), "%s  %ddBm", active_ip, (int)WiFi.RSSI());
+            else
+                snprintf(ipbuf, sizeof(ipbuf), "%s", active_ip);
+            tft.drawString(ipbuf, LV, 81);
+        }
     }
     // BT — OBD dongle link (only meaningful with sensor source = Bluetooth)
     {
@@ -9175,7 +9327,8 @@ static void drawStatusPage() {
     // S/F override; the baked sf_lat/sf_lon are only approximate.
     {
         const int bx = 410, by = 344, bw = 370, bh = 32;
-        const int tIdx = lapTrackIdx();   // SELECTED track, not GPS-closest
+        const int tIdx = lapTrackIdx();          // SELECTED track, not GPS-closest
+        const int sIdx = sfStorageIdx(tIdx);     // active config's S/F slot (v0.1.115)
         const bool armed   = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
         const bool haveMsg = (sf_set_msg[0] != '\0') && (millis() - sf_set_msg_ms < 4000);
         uint16_t fill = haveMsg     ? TFT_DARKGREEN
@@ -9190,7 +9343,7 @@ static void drawStatusPage() {
         char lbl[56];
         if      (haveMsg)  snprintf(lbl, sizeof(lbl), "%s", sf_set_msg);
         else if (tIdx < 0) snprintf(lbl, sizeof(lbl), "SET S/F - not at a known track");
-        else if (armed)    snprintf(lbl, sizeof(lbl), "TAP AGAIN: set S/F @ %s", TRACKS[tIdx].name);
+        else if (armed)    snprintf(lbl, sizeof(lbl), "TAP AGAIN: set S/F @ %s", TRACKS[sIdx].name);
         else {
             // Live distance to the EFFECTIVE S/F (override if set, else baked)
             // — the trackside "why aren't laps ticking" diagnostic. If this
@@ -9200,17 +9353,18 @@ static void drawStatusPage() {
             effectiveSfLine(tIdx, &aLat, &aLon, &bLat, &bLon, &hasLine);
             const int dm = (int)(trackDistanceKm(g.lat_deg, g.lon_deg, aLat, aLon) * 1000.0f);
             snprintf(lbl, sizeof(lbl), "SET S/F @ %s (%s, %dm)",
-                     TRACKS[tIdx].name, sfOverride[tIdx].used ? "custom" : "default", dm);
+                     TRACKS[sIdx].name, sfOverride[sIdx].used ? "custom" : "default", dm);
         }
         tft.drawString(lbl, bx + bw / 2, by + bh / 2);
-        // CLR S/F sub-button — only when a custom override exists to clear.
-        if (tIdx >= 0 && sfOverride[tIdx].used && !armed && !haveMsg) {
-            tft.fillRect(330, by, 74, bh, TFT_MAROON);
-            tft.drawRect(330, by, 74, bh, TFT_WHITE);
+        // DELETE CUSTOM S/F — only when a custom override exists to delete
+        // (widened + renamed from "CLR S/F" in v0.1.115 per request).
+        if (sIdx >= 0 && sfOverride[sIdx].used && !armed && !haveMsg) {
+            tft.fillRect(180, by, 224, bh, TFT_MAROON);
+            tft.drawRect(180, by, 224, bh, TFT_WHITE);
             tft.setTextColor(TFT_WHITE, TFT_MAROON);
-            tft.drawString("CLR S/F", 330 + 37, by + bh / 2);
+            tft.drawString("DELETE CUSTOM S/F", 180 + 112, by + bh / 2);
         } else {
-            tft.fillRect(330, by, 74, bh, TFT_BLACK);
+            tft.fillRect(180, by, 224, bh, TFT_BLACK);
         }
         tft.setTextDatum(textdatum_t::top_left);
     }
@@ -9290,13 +9444,14 @@ static void handleStatusTap(int x, int y) {
     // CLR S/F button (left of SET): wipe this track's custom S/F override and
     // fall back to the baked line — the trackside escape hatch for a bad
     // capture (which used to silently kill lap timing with no way out).
-    if (x >= 330 && x <= 404 && y >= 344 && y <= 376) {
+    if (x >= 180 && x <= 404 && y >= 344 && y <= 376) {
         const int tIdx = lapTrackIdx();   // SELECTED track, not GPS-closest
-        if (tIdx >= 0 && sfOverride[tIdx].used) {
-            sfOverride[tIdx] = SfOverride{};
+        const int sIdx = sfStorageIdx(tIdx);   // active config's S/F slot
+        if (sIdx >= 0 && sfOverride[sIdx].used) {
+            sfOverride[sIdx] = SfOverride{};
             saveSfOverrides();
             sendSfToTeensy(tIdx);
-            snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F reset to default: %s", TRACKS[tIdx].name);
+            snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F reset to default: %s", TRACKS[sIdx].name);
             sf_set_msg_ms = millis();
         }
         return;
@@ -9314,39 +9469,7 @@ static void handleStatusTap(int x, int y) {
         const bool wasArmed = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
         if (wasArmed) {
             sf_set_armed = false;
-            if (g.mph < 5.0f) {
-                // PARKED capture (v0.1.112 fix): GPS heading is GARBAGE at
-                // rest, so the old code built a "line" pointing anywhere — a
-                // parked capture silently killed lap detection for the whole
-                // track until cleared. Parked = store a POINT: the 75 m
-                // radius-crossing method (the documented "park on the line"
-                // flow). Roll through S/F above 5 mph to capture a true line.
-                sfOverride[tIdx].used = 1;
-                sfOverride[tIdx].lat  = g.lat_deg;
-                sfOverride[tIdx].lon  = g.lon_deg;
-                sfOverride[tIdx].lat2 = 0.0f;
-                sfOverride[tIdx].lon2 = 0.0f;
-                snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F POINT SET: %s (parked)", TRACKS[tIdx].name);
-            } else {
-                // Rolling capture: build a start/finish LINE perpendicular to
-                // the (now trustworthy) heading, centred on the car (± ~30 m),
-                // so lap detection is a precise line crossing.
-                const float D2R = (float)M_PI / 180.0f;
-                const float H  = g.hdg_deg * D2R;
-                const float lE = -cosf(H), lN = sinf(H);      // left-of-travel (E,N)
-                const float half_m = 30.0f;
-                const float dLat = half_m / 111320.0f;
-                const float dLon = half_m / (111320.0f * cosf(g.lat_deg * D2R));
-                sfOverride[tIdx].used = 1;
-                sfOverride[tIdx].lat  = g.lat_deg + lN * dLat;
-                sfOverride[tIdx].lon  = g.lon_deg + lE * dLon;
-                sfOverride[tIdx].lat2 = g.lat_deg - lN * dLat;
-                sfOverride[tIdx].lon2 = g.lon_deg - lE * dLon;
-                snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F LINE SET: %s", TRACKS[tIdx].name);
-            }
-            saveSfOverrides();
-            sendSfToTeensy(tIdx);        // Teensy stamps lap #s into the NDJSON
-            sf_set_msg_ms = millis();
+            captureSfHere();   // shared with the dash-page SET S/F button
         } else {
             sf_set_armed  = true;
             sf_set_arm_ms = millis();

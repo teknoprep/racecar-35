@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.114"
+#define FIRMWARE_VERSION "0.1.115"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2929,14 +2929,13 @@ static void handleQGet(const char* args) {
         DASH_SERIAL.write('\n');
     };
     // Block until the cumulative ack advances. On a 2 s stall, go-back-N
-    // retransmit of everything in flight; 30 stalls in a row (60 s) = link
-    // dead. ⚠️ Patience MUST exceed the dash's worst TCP stall: while the dash
-    // blocks flushing an HTTP chunk over weak WiFi it CANNOT ack, and the old
-    // 8×2 s = 16 s ceiling made us declare the link dead mid-upload — the
-    // server saw ClientDisconnect, the dash then timed out waiting for data
-    // ("no data for 30s"), and the file never uploaded (v0.1.112 fix).
+    // retransmit of everything in flight; 60 stalls in a row (120 s) = link
+    // dead. ⚠️ Patience MUST exceed the dash's worst network-outage tolerance
+    // (v0.1.115: its net task rides out up to 90 s of zero WiFi throughput on
+    // the PSRAM ring — during which its ring is full and it CANNOT ack). The
+    // original 8×2 s = 16 s ceiling killed uploads mid-stream (v0.1.112 saga).
     auto waitAckProgress = [&]() -> bool {
-        for (int attempt = 0; attempt < 30; ++attempt) {
+        for (int attempt = 0; attempt < 60; ++attempt) {
             const long   before = last_acked;
             const uint32_t t0   = millis();
             while (millis() - t0 < 2000) {
