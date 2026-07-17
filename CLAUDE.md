@@ -547,19 +547,22 @@ SDFORMAT           # FAT32-format the SD card
 CANSNIFF,<0|1>     # start/stop raw CAN capture to SD (see "CAN sniffer")
 TESTSTART/TESTSTOP # synthetic-data session for pipeline testing
 Q,LIST / Q,GET / Q,DEL / QUEUE,DRAIN / UPLOAD,CANCEL   # cloud queue control
-                   # ⚠️ UPLOAD ARCHITECTURE (v0.1.113): STORE-AND-FORWARD. The old design
-                   #   streamed Q,L lines straight into a chunked HTTP body — coupling the
-                   #   UART and WiFi links so either one's stall killed the other (server
-                   #   log: chunked uploads died ClientDisconnect while a plain sized POST
-                   #   of the same file did ~850 KB/s). Now: (1) STAGE a segment of the
-                   #   file into PSRAM over UART, network idle (segment = whole file if it
-                   #   fits, else up to 4 MB — ps_malloc with halving fallback);
-                   #   (2) POST the staged bytes with Content-Length — UART idle — to
-                   #   /upload (first segment, mode=w) or /stream (later segments,
-                   #   mode=a); (3) repeat via Q,GET,<name>,<skip_lines> until EOF.
-                   #   POST failures re-send the STAGED segment (post_tries≤2, no UART);
-                   #   then one whole-file retry (ufFailOrRetry/UF_RETRY_WAIT). Chunked
-                   #   encoding is GONE. openUploadModal() forces BLE off (btReleaseRadio).
+                   # ⚠️ UPLOAD ARCHITECTURE (v0.1.114): TRUE STREAMING via PSRAM ring +
+                   #   dedicated net task. The loop (core 1) pushes Q,L lines into a
+                   #   512 KB PSRAM ring and ONLY touches UART; ufNetTask (core 0) owns
+                   #   the socket end-to-end — TCP/TLS connect, headers (chunked), body
+                   #   chunks (≤16 KB), terminator, response — and drains the ring at
+                   #   network speed. File streams car→cloud in ONE continuous pass at
+                   #   min(UART, WiFi) rate; ring-full = don't-ack (Teensy ARQ paces the
+                   #   wire), so neither link ever blocks the other and the TLS handshake
+                   #   no longer stalls the UI. ⚠️ The net task must NEVER Serial.print
+                   #   (UART0 = Teensy link; an interleaved print corrupts the Q,A ack
+                   #   stream) — it reports via uf.net_err/net_state only, and
+                   #   ufStopNetTask() MUST run before ufCloseTcp/ufFreeBuf (task owns
+                   #   uf.tcp/uf.buf). Failure = whole-file retry once (ufFailOrRetry /
+                   #   UF_RETRY_WAIT + Q,ABORT). openUploadModal() forces BLE off.
+                   #   (v0.1.113's store-and-forward /stream append segments are gone;
+                   #   the Teensy's Q,GET skip_lines support remains, unused.)
 Q,GET,<name>[,<skip_lines>]   # skip_lines (v0.1.113) = segmented pull: Teensy does a
                    #   buffered line-skip, then streams with seq starting at skip+1 (acks
                    #   are absolute line numbers; Teensy inits last_acked=skip).
@@ -740,6 +743,19 @@ The `Auto select by GPS` toggle determines whether the picker actually opens or 
 - **OFF** or no match → open picker; user taps a row, taps CONFIRM
 - The synthetic `(no track / unknown)` row is always last in the list and emits `TRACK,UNKNOWN`
 - Closest track is **highlighted green at the top** of the picker with a `closest · X.X km` distance label
+
+### Track selection: SELECTED track wins; variants are picker-only (v0.1.114)
+`TrackInfo` gained an appended `aux` flag: **aux=1 entries are picker-only VARIANTS, never
+auto-picked** (`closestTrackIdx()` skips them). Summit Point is the motivating case — ONE
+facility, three overlapping circuits (`Summit Point` primary + `Summit Point Jefferson` /
+`Summit Point Shenandoah` as aux variants; renamed from "Summit Pt*", indices unchanged so
+`sf_ovr` stays aligned): the old three-way auto-pick grabbed whichever centre was nearest and
+**flapped between entries mid-lap, resetting the lap timer** — that was the "PRED/LAP/DELTA
+dead at Summit Point" bug. New `lapTrackIdx()` = the user's SELECTED track (`last_track_idx`,
+if within its radius) else `closestTrackIdx()`; it drives `updateLapTimer()` AND the STATUS
+page SET/CLR START-FINISH (fixing "S/F set was stuck on Jefferson even though I picked main").
+Auto flow at Summit Point → always the main circuit; picking a variant once makes it sticky
+(last_track_idx) until another track is picked.
 
 ### Lap timer / predictive / delta / LAP COUNTER (S/F LINE-crossing, v0.1.82)
 Lap timing runs in `RaceDash.ino` (`updateLapTimer()`) — **only WHILE RECORDING since v0.1.105**:

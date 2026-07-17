@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.113"
+#define FIRMWARE_VERSION "0.1.114"
 
 #include <Preferences.h>
 #include <time.h>
@@ -994,6 +994,11 @@ struct TrackInfo {
     // positional initializers that omit these get 0 via aggregate zero-fill):
     float       sf_lat2;                // S/F endpoint B. (0,0) => point-only -> radius fallback.
     float       sf_lon2;                // Two endpoints => precise LINE-CROSSING lap detection.
+    uint8_t     aux;                    // 1 = manual-select-only VARIANT (never auto-picked).
+                                        //     For facilities with overlapping circuits (Summit
+                                        //     Point): auto-select always lands on the primary;
+                                        //     variants are chosen from the picker, and the
+                                        //     SELECTED track then drives lap timing + SET S/F.
 };
 // Config arrays — tracks with multiple layouts that share the same S/F line.
 // Layouts with genuinely different S/F locations get separate TRACKS[] entries.
@@ -1022,9 +1027,13 @@ static const TrackInfo TRACKS[] = {
     { "Road Atlanta",  34.1469f,  -83.8189f, 2.5f,  34.1518f,  -83.8197f, nullptr,         0 },
     { "Sebring",       27.4570f,  -81.3568f, 3.5f,  27.4502f,  -81.3537f, nullptr,         0 },
     { "Sonoma",        38.1614f, -122.4544f, 2.5f,  38.1615f, -122.4547f, SONOMA_CFGS,     2 },
-    { "Summit Pt",           39.2415f, -77.9779f, 1.5f, 39.2415f, -77.9779f, nullptr,      0 },
-    { "Summit Pt Jefferson", 39.2370f, -77.9700f, 1.2f, 39.2370f, -77.9700f, nullptr,      0 },
-    { "Summit Pt Shenandoah",39.2450f, -77.9650f, 1.5f, 39.2450f, -77.9650f, nullptr,      0 },
+    // Summit Point: ONE facility, three overlapping circuits. Only the main
+    // circuit auto-selects (aux=0); Jefferson/Shenandoah are aux=1 = picker-
+    // only variants (the old three-way auto-pick grabbed whichever centre was
+    // nearest and FLAPPED between them mid-lap, resetting the lap timer).
+    { "Summit Point",            39.2415f, -77.9779f, 2.0f, 39.2415f, -77.9779f, nullptr,  0 },
+    { "Summit Point Jefferson",  39.2370f, -77.9700f, 1.2f, 39.2370f, -77.9700f, nullptr,  0, 0.0f, 0.0f, 1 },
+    { "Summit Point Shenandoah", 39.2450f, -77.9650f, 1.5f, 39.2450f, -77.9650f, nullptr,  0, 0.0f, 0.0f, 1 },
     { "VIR",           36.5611f,  -79.2103f, 2.5f,  36.5689f,  -79.2067f, VIR_CFGS,        3 },
     { "VIR South",     36.5620f,  -79.2100f, 1.2f,  36.5620f,  -79.2100f, nullptr,         0 },
     { "VIR Patriot",   36.5660f,  -79.2120f, 1.0f,  36.5660f,  -79.2120f, nullptr,         0 },
@@ -1070,6 +1079,7 @@ static int closestTrackIdx() {
     int   best   = -1;
     float bestKm = 1e9f;
     for (int i = 0; i < N_TRACKS; ++i) {
+        if (TRACKS[i].aux) continue;     // variants are manual-select only
         const float km = trackDistanceKm(g.lat_deg, g.lon_deg,
                                          TRACKS[i].lat, TRACKS[i].lon);
         if (km <= TRACKS[i].radius_km && km < bestKm) {
@@ -1077,6 +1087,23 @@ static int closestTrackIdx() {
         }
     }
     return best;
+}
+
+// The track that LAP TIMING and SET START/FINISH should operate on: the
+// user's SELECTED track wins whenever the car is actually within its radius
+// (so picking "Summit Point Jefferson" beats GPS guessing the main circuit
+// from overlapping centres); only when nothing usable is selected do we fall
+// back to the GPS-closest primary. This is the fix for "S/F set was stuck on
+// Jefferson even though I picked Summit Point main".
+static int lapTrackIdx() {
+    if (g.fix < 2) return -1;
+    if (last_track_idx >= 0 && last_track_idx < N_TRACKS) {
+        const float km = trackDistanceKm(g.lat_deg, g.lon_deg,
+                                         TRACKS[last_track_idx].lat,
+                                         TRACKS[last_track_idx].lon);
+        if (km <= TRACKS[last_track_idx].radius_km) return last_track_idx;
+    }
+    return closestTrackIdx();
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,7 +1576,10 @@ static void updateLapTimer() {
     if (!was_recording) { lapTimer = LapTimer{}; was_recording = true; }
     if (g.fix < 2) return;    // no usable fix — pause, don't reset
 
-    const int tIdx = closestTrackIdx();
+    // SELECTED track wins (see lapTrackIdx): a picked variant (e.g. Summit
+    // Point Jefferson) times against ITS S/F, and a stable index means the
+    // overlapping-circuit flap can no longer reset the timer mid-lap.
+    const int tIdx = lapTrackIdx();
     const uint32_t now = millis();
 
     if (tIdx < 0) {
@@ -1929,10 +1959,25 @@ struct UploadFlow {
     // plain Content-Length body (UART completely idle), then the next segment
     // is pulled (Q,GET,<name>,<skip_lines>). The two links never wait on each
     // other — which is what killed the old chunked-at-UART-pace design.
-    uint32_t   seg_start_line;  // lines already POSTed in prior segments
-    uint32_t   bytes_done;      // bytes POSTed in completed segments
-    bool       seg_eof;         // Teensy sent Q,EOF during this segment (final)
-    uint8_t    post_tries;      // POST retries for the CURRENT staged segment
+    uint32_t   seg_start_line;  // (legacy, unused since v0.1.114)
+    uint32_t   bytes_done;      // (legacy, unused since v0.1.114)
+    bool       seg_eof;         // (legacy, unused since v0.1.114)
+    uint8_t    post_tries;      // (legacy, unused since v0.1.114)
+    // TRUE STREAMING uploader (v0.1.114). The loop (core 1) pushes UART lines
+    // into a PSRAM ring; a dedicated writer task (core 0) owns the socket
+    // end-to-end (TLS handshake, headers, chunked body, response) and drains
+    // the ring at network speed. Neither side ever waits on the other — the
+    // file streams car -> cloud in ONE continuous pass, and a slow network
+    // shows up only as the ring filling (UART ARQ backpressure), never as a
+    // blocked UI loop or a starved ACK stream.
+    volatile uint32_t ring_head;   // total bytes queued by the UART producer
+    volatile uint32_t ring_tail;   // total bytes sent by the net task
+    volatile bool     net_eof;     // producer: file fully queued
+    volatile bool     net_abort;   // loop asks the task to bail + close
+    volatile uint8_t  net_state;   // 0 idle / 1 running / 2 done / 3 failed
+    char              net_err[96]; // task-written failure reason
+    uint32_t          fin_tail;    // FINISH stall watchdog: last seen tail
+    uint32_t          fin_ms;      //   ...and when it last moved
     // Whole-file staging buffer (PSRAM). The complete session file is pulled
     // off the Teensy/SD into here FIRST, then POSTed to the cloud in one clean
     // request (see UF_POSTING). Staging fully decouples the UART transfer from
@@ -1977,7 +2022,21 @@ static void ufFreeBuf() {
 // socket writes were the coupling that killed uploads; the POST now happens
 // from staged PSRAM inside uploadTick()'s UF_POSTING driver.)
 
+// Ask the net task to bail and wait for it to exit (bounded). MUST be called
+// before ufCloseTcp()/ufFreeBuf() whenever a stream might be live — the task
+// owns uf.tcp and reads uf.buf, so tearing those down under it is a crash.
+static void ufStopNetTask() {
+    if (uf.net_state == 1) {
+        uf.net_abort = true;
+        const uint32_t t0 = millis();
+        while (uf.net_state == 1 && millis() - t0 < 3000) delay(5);
+    }
+    uf.net_state = 0;
+    uf.net_abort = false;
+}
+
 static void ufReset() {
+    ufStopNetTask();
     ufCloseTcp();
     ufFreeBuf();
     memset(&uf, 0, sizeof(uf));
@@ -2013,6 +2072,7 @@ static void ufStartCurrentFile() {
 }
 
 static void ufNextFile() {
+    ufStopNetTask();
     ufCloseTcp();
     ufFreeBuf();
     uf.files_idx++;
@@ -2027,6 +2087,7 @@ static void ufNextFile() {
 // 60 s patient) go-back-N retransmit loop FIRST — otherwise our retry's Q,GET
 // line would be eaten as a stray inside its ack-pump and the retry would hang.
 static void ufFailOrRetry(bool sendAbort) {
+    ufStopNetTask();
     ufCloseTcp();
     if (sendAbort) { Serial.printf("Q,ABORT\n"); Serial.flush(); }
     if (uf.file_retries < 1 && uf.files_idx < uf.files_n) {
@@ -2041,21 +2102,8 @@ static void ufFailOrRetry(bool sendAbort) {
     }
 }
 
-// POST-side failure: the segment is STILL staged in PSRAM, so retrying costs
-// nothing on the UART side — fresh socket, same bytes. After 2 tries fall
-// back to the whole-file retry. (last_err must already be set.)
-static void ufPostFailRetry() {
-    if (uf.post_tries < 2) {
-        uf.post_tries++;
-        Serial.printf("DBG,uf_post_retry try=%u err=%s\n",
-                      (unsigned)uf.post_tries, uf.last_err);
-        ufCloseTcp();                       // also clears post_started/post_off
-        uf.retry_at_ms = millis() + 1500;
-        ufEnter(UF_POSTING);
-    } else {
-        ufFailOrRetry(false);
-    }
-}
+// (ufPostFailRetry removed in v0.1.114 — there is no staged-segment POST any
+// more; a network failure is a whole-file retry via ufFailOrRetry.)
 
 // Parse the unix-epoch session id out of a 'session_<epoch>_<track>.ndjson'
 // filename; falls back to millis() when the filename doesn't match.
@@ -2134,14 +2182,10 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
     // call heap_caps_get_largest_free_block() — it walks the whole heap inside
     // a critical section (interrupts off) and on the Advance's large heap that
     // walk trips the Interrupt WDT -> panic/reboot mid-upload (v0.1.70/0.1.71).
-    Serial.printf("DBG,uf_connect host=%s port=%u sec=%d size=%lu heap=%u\n",
-                  s.cloud_host, (unsigned)s.cloud_port, (int)uf.tcp_secure,
-                  (unsigned long)content_length,
-                  (unsigned)ESP.getFreeHeap());
-    const uint32_t t_conn0 = millis();
+    // ⚠️ NO Serial prints in here since v0.1.114: this runs on the NET TASK,
+    // and UART0 is the Teensy link — an interleaved print would corrupt the
+    // Q,A ack stream the loop is emitting concurrently.
     const bool connected = uf.tcp->connect(s.cloud_host, s.cloud_port);
-    Serial.printf("DBG,uf_connect_done ok=%d ms=%lu\n",
-                  (int)connected, (unsigned long)(millis() - t_conn0));
     if (!connected) {
         snprintf(uf.last_err, sizeof(uf.last_err), "TCP connect failed");
         ufCloseTcp();
@@ -2171,6 +2215,91 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
     uf.tcp->printf("\r\n");
     uf.response_len  = 0;   // expected_size/bytes_written managed by the caller:
     return true;             // total file size for the modal, not this segment's
+}
+
+// ---------------------------------------------------------------------------
+// Streaming net task (v0.1.114). Core 0. Owns uf.tcp for the whole stream:
+// connect + TLS handshake + headers happen HERE (the ~15 s handshake no longer
+// stalls the UI or the UART pump), then it drains the PSRAM ring as HTTP
+// chunks at network speed, writes the chunked terminator once the producer
+// flags EOF, and reads the HTTP response. It NEVER touches Serial (UART0 is
+// the Teensy link) — all diagnostics go through uf.net_err / uf.net_state.
+// ---------------------------------------------------------------------------
+static bool ufTaskWrite(const uint8_t* d, size_t len) {
+    size_t off = 0;
+    uint32_t last = millis();
+    while (off < len) {
+        if (uf.net_abort) { snprintf(uf.net_err, sizeof(uf.net_err), "aborted"); return false; }
+        if (!uf.tcp || !uf.tcp->connected()) {
+            snprintf(uf.net_err, sizeof(uf.net_err),
+                     "TCP closed at %lu B", (unsigned long)uf.ring_tail);
+            return false;
+        }
+        const int w = uf.tcp->write(d + off, len - off);
+        if (w > 0) { off += (size_t)w; last = millis(); }
+        else if (millis() - last > 20000) {
+            snprintf(uf.net_err, sizeof(uf.net_err),
+                     "TCP write stalled at %lu B", (unsigned long)uf.ring_tail);
+            return false;
+        } else vTaskDelay(1);
+    }
+    return true;
+}
+
+static void ufNetTask(void*) {
+    bool ok = false;
+    do {
+        if (!ufOpenStream(uf.expected_size, "/upload")) {
+            snprintf(uf.net_err, sizeof(uf.net_err), "%s",
+                     uf.last_err[0] ? uf.last_err : "connect failed");
+            break;
+        }
+        bool werr = false;
+        while (!werr) {
+            if (uf.net_abort) { snprintf(uf.net_err, sizeof(uf.net_err), "aborted"); werr = true; break; }
+            const uint32_t avail = uf.ring_head - uf.ring_tail;
+            if (avail == 0) {
+                if (uf.net_eof) break;             // drained + nothing more coming
+                vTaskDelay(pdMS_TO_TICKS(5));       // producer will catch up
+                continue;
+            }
+            uint32_t n = avail;
+            if (n > 16384) n = 16384;
+            const uint32_t off = uf.ring_tail % uf.bufcap;
+            if (n > uf.bufcap - off) n = uf.bufcap - off;   // stay contiguous
+            char hdr[12];
+            const int hn = snprintf(hdr, sizeof(hdr), "%x\r\n", (unsigned)n);
+            if (!ufTaskWrite((const uint8_t*)hdr, (size_t)hn) ||
+                !ufTaskWrite(uf.buf + off, n) ||
+                !ufTaskWrite((const uint8_t*)"\r\n", 2)) { werr = true; break; }
+            uf.ring_tail    += n;
+            uf.bytes_written = uf.ring_tail;        // modal progress = bytes on the wire
+        }
+        if (werr) break;
+        if (!ufTaskWrite((const uint8_t*)"0\r\n\r\n", 5)) break;
+        uf.tcp->flush();
+        // Response: complete headers (or disconnect), bounded. Parse as soon
+        // as headers are in — some stacks ignore Connection: close.
+        uint32_t last = millis();
+        while (millis() - last < 20000) {
+            if (uf.net_abort) break;
+            while (uf.tcp->available()) {
+                const int c = uf.tcp->read();
+                if (c < 0) break;
+                if (uf.response_len + 1 < sizeof(uf.response)) {
+                    uf.response[uf.response_len++] = (char)c;
+                    uf.response[uf.response_len]   = '\0';
+                }
+                last = millis();
+            }
+            if (strstr(uf.response, "\r\n\r\n")) break;
+            if (!uf.tcp->connected() && !uf.tcp->available()) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        ok = true;
+    } while (false);
+    uf.net_state = ok ? 2 : 3;
+    vTaskDelete(NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -2336,11 +2465,11 @@ static bool parseQLine(const String& line) {
         const char* comma = strchr(rest, ',');
         if (!comma) return true;
         const uint32_t sz = (uint32_t)strtoul(comma + 1, nullptr, 10);
-        // STORE-AND-FORWARD (v0.1.113): stage this segment of the file into
-        // PSRAM over UART — the network is COMPLETELY idle during staging, so
-        // nothing can stall the Teensy stream; the socket only opens once the
-        // segment is fully in RAM (UF_POSTING). Big files go in multiple
-        // segments via Q,GET,<name>,<skip_lines> + the server's append mode.
+        // TRUE STREAMING (v0.1.114): allocate the PSRAM ring and spawn the
+        // net task — it owns connect/TLS/headers/body/response on core 0 while
+        // the loop only ever touches the UART + ring. The file flows car ->
+        // cloud in one continuous pass at min(UART, network) speed.
+        ufStopNetTask();
         ufFreeBuf();
         if (sz == 0) {
             snprintf(uf.last_err, sizeof(uf.last_err), "zero file size");
@@ -2348,15 +2477,10 @@ static bool parseQLine(const String& line) {
             ufNextFile();
             return true;
         }
-        // Segment capacity: whole file if it fits, else the biggest PSRAM
-        // block we can grab (bounded so a single POST stays short). Halve on
-        // alloc failure down to a 256 KB floor.
-        constexpr uint32_t UF_SEG_CAP = 4UL * 1024 * 1024;
-        uint32_t cap = sz + 4096;                 // +slack: lines + '\n' framing
-        if (cap > UF_SEG_CAP) cap = UF_SEG_CAP;
-        while (!(uf.buf = (uint8_t*)ps_malloc(cap)) && cap > 256UL * 1024) cap /= 2;
+        uint32_t cap = 512UL * 1024;   // ~6 s of UART at full rate; halve on alloc fail
+        while (!(uf.buf = (uint8_t*)ps_malloc(cap)) && cap > 64UL * 1024) cap /= 2;
         if (!uf.buf) {
-            snprintf(uf.last_err, sizeof(uf.last_err), "PSRAM segment alloc failed");
+            snprintf(uf.last_err, sizeof(uf.last_err), "PSRAM ring alloc failed");
             uf.failed++;
             ufNextFile();
             return true;
@@ -2364,14 +2488,29 @@ static bool parseQLine(const String& line) {
         uf.bufcap        = cap;
         uf.buflen        = 0;
         uf.lines_recv    = 0;
-        uf.next_seq      = uf.seg_start_line + 1;  // Teensy numbers lines from skip+1
-        uf.seg_eof       = false;
+        uf.next_seq      = 1;
         uf.expected_size = sz;      // modal progress (total file bytes)
-        uf.bytes_written = uf.bytes_done;
-        ufEnter(UF_STREAMING);
-        Serial.printf("DBG,uf_stage_start size=%lu seg_cap=%lu start_line=%lu\n",
+        uf.bytes_written = 0;
+        uf.ring_head     = 0;
+        uf.ring_tail     = 0;
+        uf.net_eof       = false;
+        uf.net_abort     = false;
+        uf.net_err[0]    = '\0';
+        uf.response_len  = 0;
+        uf.response[0]   = '\0';
+        uf.net_state     = 1;
+        Serial.printf("DBG,uf_stream_start size=%lu ring=%lu heap=%u\n",
                       (unsigned long)sz, (unsigned long)cap,
-                      (unsigned long)uf.seg_start_line);
+                      (unsigned)ESP.getFreeHeap());
+        if (xTaskCreatePinnedToCore(ufNetTask, "ufnet", 16384, nullptr, 1,
+                                    nullptr, 0) != pdPASS) {
+            uf.net_state = 0;
+            snprintf(uf.last_err, sizeof(uf.last_err), "net task spawn failed");
+            uf.failed++;
+            ufNextFile();
+            return true;
+        }
+        ufEnter(UF_STREAMING);
         return true;
     }
     if (strncmp(p, "L,", 2) == 0 && uf.state == UF_STREAMING) {
@@ -2400,24 +2539,22 @@ static bool parseQLine(const String& line) {
                 uf.failed++; ufNextFile();
                 return true;
             }
-            // Segment buffer full: do NOT apply this line. Abort the Teensy's
-            // sender and POST what we have; the next segment re-GETs from
-            // exactly this line (Q,GET,<name>,<skip>). No socket I/O here —
-            // staging never waits on the network.
-            if (uf.buflen + need > uf.bufcap) {
-                Serial.printf("Q,ABORT\n");
-                Serial.flush();
-                Serial.printf("DBG,uf_seg_full lines=%lu bytes=%lu\n",
-                              (unsigned long)uf.lines_recv, (unsigned long)uf.buflen);
-                uf.post_tries = 0;
-                uf.retry_at_ms = 0;
-                ufEnter(UF_POSTING);
-                return true;
+            // Ring full = the network is momentarily slower than the UART.
+            // Do NOT apply/ack — the Teensy's ARQ retries in 2 s while the net
+            // task keeps draining; the stream self-paces to the slower link.
+            // (If the net is DEAD the task flags net_state=3 and uploadTick
+            // aborts+retries — we never sit here forever.)
+            const uint32_t free_b = uf.bufcap - (uf.ring_head - uf.ring_tail);
+            if (free_b < need) return true;
+            {   // copy line + '\n' into the ring (with wrap)
+                const uint32_t off = uf.ring_head % uf.bufcap;
+                size_t c1 = uf.bufcap - off;
+                if (c1 > n) c1 = n;
+                memcpy(uf.buf + off, data, c1);
+                if (n > c1) memcpy(uf.buf, data + c1, n - c1);
+                uf.buf[(off + n) % uf.bufcap] = '\n';
             }
-            memcpy(uf.buf + uf.buflen, data, n);
-            uf.buf[uf.buflen + n] = '\n';
-            uf.buflen        += need;
-            uf.bytes_written  = uf.bytes_done + uf.buflen;   // modal progress
+            uf.ring_head += need;
             uf.next_seq++;
             uf.lines_recv++;
             if ((uf.lines_recv % 1000) == 0) {
@@ -2434,13 +2571,15 @@ static bool parseQLine(const String& line) {
         return true;
     }
     if (strncmp(p, "EOF", 3) == 0 && uf.state == UF_STREAMING) {
-        // Whole remainder of the file is staged — this is the final segment.
-        uf.seg_eof     = true;
-        uf.post_tries  = 0;
-        uf.retry_at_ms = 0;
-        Serial.printf("DBG,uf_stage_done lines=%lu bytes=%lu\n",
-                      (unsigned long)uf.lines_recv, (unsigned long)uf.buflen);
-        ufEnter(UF_POSTING);
+        // File fully queued — the net task drains the ring tail, writes the
+        // chunked terminator, and reads the response. We just watch it.
+        uf.net_eof  = true;
+        uf.fin_tail = uf.ring_tail;
+        uf.fin_ms   = millis();
+        Serial.printf("DBG,uf_eof lines=%lu queued=%lu sent=%lu\n",
+                      (unsigned long)uf.lines_recv,
+                      (unsigned long)uf.ring_head, (unsigned long)uf.ring_tail);
+        ufEnter(UF_STREAM_FINISH);
         return true;
     }
     if (strncmp(p, "ERR,", 4) == 0) {
@@ -2527,109 +2666,27 @@ static void uploadTick() {
         }
     }
 
-    // UF_POSTING driver: push the staged segment out as a plain sized POST.
-    // Bounded work per tick (≤32 KB) keeps the UI/touch alive; the watchdog
-    // below catches a genuinely dead socket via last_rx_ms.
-    if (uf.state == UF_POSTING) {
-        if (!uf.post_started) {
-            if (now < uf.retry_at_ms) return;   // settle delay between tries
-            if (uf.buflen == 0) {
-                // Segment boundary coincided exactly with EOF — nothing left.
-                if (uf.seg_eof && uf.seg_start_line > 0) {
-                    Serial.printf("Q,DEL,%s\n", uf.files[uf.files_idx].name);
-                    Serial.flush();
-                    ufEnter(UF_DELETING);
-                } else {
-                    snprintf(uf.last_err, sizeof(uf.last_err), "empty segment");
-                    ufFailOrRetry(false);
-                }
-                return;
-            }
-            const char* path = (uf.seg_start_line == 0) ? "/upload" : "/stream";
-            Serial.printf("DBG,uf_post start_line=%lu bytes=%lu path=%s eof=%d try=%u\n",
-                          (unsigned long)uf.seg_start_line, (unsigned long)uf.buflen,
-                          path, (int)uf.seg_eof, (unsigned)uf.post_tries);
-            if (!ufOpenStream(uf.buflen, path)) {   // last_err set inside
-                ufPostFailRetry();
-                return;
-            }
-            uf.post_started = true;
-            uf.post_off     = 0;
-            uf.last_rx_ms   = now;
-        }
-        size_t budget = 32 * 1024;
-        while (budget > 0 && uf.post_off < uf.buflen) {
-            if (!uf.tcp || !uf.tcp->connected()) {
-                snprintf(uf.last_err, sizeof(uf.last_err),
-                         "TCP closed at %lu/%lu B",
-                         (unsigned long)uf.post_off, (unsigned long)uf.buflen);
-                ufPostFailRetry();
-                return;
-            }
-            size_t want = uf.buflen - uf.post_off;
-            if (want > budget) want = budget;
-            const int w = uf.tcp->write(uf.buf + uf.post_off, want);
-            if (w > 0) {
-                uf.post_off      += (size_t)w;
-                budget           -= (size_t)w;
-                uf.last_rx_ms     = now;
-                uf.bytes_written  = uf.bytes_done + uf.post_off;
-            } else break;   // would block — resume next tick (watchdog covers death)
-        }
-        if (uf.post_off >= uf.buflen) {
-            uf.tcp->flush();
-            Serial.printf("DBG,uf_post_done bytes=%lu\n", (unsigned long)uf.buflen);
-            ufEnter(UF_STREAM_FINISH);
-        }
+    // Net-task failure surfaces here regardless of sub-state (the task never
+    // touches Serial or the state machine — it just flags net_state=3).
+    if ((uf.state == UF_STREAMING || uf.state == UF_STREAM_FINISH) &&
+        uf.net_state == 3) {
+        snprintf(uf.last_err, sizeof(uf.last_err), "%s",
+                 uf.net_err[0] ? uf.net_err : "network task failed");
+        Serial.printf("DBG,uf_net_fail %s\n", uf.last_err);
+        ufFailOrRetry(true);   // stops the (already dead) task, aborts Teensy, retries once
         return;
     }
 
     // Per-state housekeeping.
     if (uf.state == UF_STREAM_FINISH) {
-        if (!uf.tcp) {
-            snprintf(uf.last_err, sizeof(uf.last_err), "no tcp in finish");
-            uf.failed++;
-            ufNextFile();
-            return;
-        }
-        // Drain any available HTTP response bytes into our buffer.
-        while (uf.tcp->available()) {
-            const int c = uf.tcp->read();
-            if (c < 0) break;
-            if (uf.response_len + 1 < sizeof(uf.response)) {
-                uf.response[uf.response_len++] = (char)c;
-                uf.response[uf.response_len]   = '\0';
-            }
-            uf.last_rx_ms = millis();
-        }
-        // We only need the HTTP status. Do not require the server to close the
-        // socket: some HTTP/1.1 stacks keep it open even when we ask for
-        // Connection: close, which made otherwise-complete uploads look like
-        // response timeouts. Parse as soon as response headers are complete;
-        // otherwise fall back to parsing after disconnect.
-        const bool headers_complete = (strstr(uf.response, "\r\n\r\n") != nullptr);
-        const bool socket_done = (!uf.tcp->connected() && !uf.tcp->available());
-        if (headers_complete || socket_done) {
+        if (uf.net_state == 2) {
+            // Task finished cleanly: body sent + response captured.
             char body[140];
             const int code = ufParseResponse(body, sizeof(body));
             Serial.printf("DBG,uf_response code=%d body=%s\n", code, body);
-            // Capture BEFORE ufCloseTcp() — it zeroes lines_recv.
-            const uint32_t seg_lines = uf.lines_recv;
-            const uint32_t seg_bytes = uf.buflen;
+            ufStopNetTask();
             ufCloseTcp();
             if (code >= 200 && code < 300) {
-                if (!uf.seg_eof) {
-                    // Segment landed; pull the next one from where we stopped.
-                    uf.seg_start_line += seg_lines;
-                    uf.bytes_done     += seg_bytes;
-                    ufFreeBuf();
-                    uf.post_tries = 0;
-                    Serial.printf("Q,GET,%s,%lu\n", uf.files[uf.files_idx].name,
-                                  (unsigned long)uf.seg_start_line);
-                    Serial.flush();
-                    ufEnter(UF_FETCH_HEAD);
-                    return;
-                }
                 Serial.printf("Q,DEL,%s\n", uf.files[uf.files_idx].name);
                 Serial.flush();
                 ufEnter(UF_DELETING);
@@ -2643,8 +2700,7 @@ static void uploadTick() {
                     snprintf(uf.last_err, sizeof(uf.last_err), "no http response");
                 }
                 uf.failed++;
-                // Debug logs are BEST-EFFORT: if the server rejects one (e.g.
-                // it hasn't been redeployed to accept X-File-Kind: debug), drop
+                // Debug logs are BEST-EFFORT: if the server rejects one, drop
                 // it (fire-and-forget delete) so a rejected .dbg file can NEVER
                 // clog the queue and block session uploads. Sessions are kept
                 // for retry. The Q,DEL,OK reply is ignored (state != DELETING).
@@ -2654,6 +2710,18 @@ static void uploadTick() {
                 }
                 ufNextFile();
             }
+            return;
+        }
+        // Task still draining the ring tail / waiting for the response:
+        // watchdog on ITS progress (ring_tail), not UART activity.
+        if (uf.ring_tail != uf.fin_tail) {
+            uf.fin_tail = uf.ring_tail;
+            uf.fin_ms   = now;
+        } else if (now - uf.fin_ms > 45000) {
+            snprintf(uf.last_err, sizeof(uf.last_err),
+                     "finish stalled at %lu/%lu B",
+                     (unsigned long)uf.ring_tail, (unsigned long)uf.ring_head);
+            ufFailOrRetry(true);
         }
         return;
     }
@@ -2688,8 +2756,8 @@ static void uploadTick() {
         case UF_LISTING:        timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
         case UF_FETCH_HEAD:     timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
         case UF_STREAMING:      timeout_ms = 30000;  since = now - uf.last_rx_ms;       break;
-        case UF_POSTING:        timeout_ms = 30000;  since = now - uf.last_rx_ms;       break;
-        case UF_STREAM_FINISH:  timeout_ms = 30000;  since = now - uf.last_rx_ms;       break;
+        // (UF_POSTING gone; UF_STREAM_FINISH watches net-task progress in its
+        // own block above, not UART activity — no entry here.)
         case UF_DELETING:       timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
         default: return;
     }
@@ -2712,12 +2780,10 @@ static void uploadTick() {
                       (unsigned)uf.state, uf.last_err);
         if (uf.state == UF_LISTING) { ufCloseTcp(); ufEnter(UF_DONE); }
         else if (uf.state == UF_STREAMING) {
-            // UART staging stalled: abort the Teensy's sender + retry once.
+            // UART went quiet for 30 s. Either the Teensy died, or the ring
+            // has been full that long (network-dead — the net task usually
+            // flags itself first). Abort the sender + retry the file once.
             ufFailOrRetry(true);
-        }
-        else if (uf.state == UF_POSTING || uf.state == UF_STREAM_FINISH) {
-            // Network-side stall: segment is still in PSRAM — re-POST it.
-            ufPostFailRetry();
         }
         else { ufCloseTcp(); uf.failed++; ufNextFile(); }
     }
@@ -6974,8 +7040,8 @@ static void drawUploadModal() {
     switch (uf.state) {
         case UF_LISTING:
         case UF_FETCH_HEAD:    phase = "Preparing...";           break;
-        case UF_STREAMING:     phase = "Copying from car...";    break;
-        case UF_POSTING:       phase = "Uploading to cloud...";  break;
+        case UF_STREAMING:     phase = "Streaming to cloud...";  break;
+        case UF_POSTING:       phase = "Streaming to cloud...";  break;
         case UF_RETRY_WAIT:    phase = "Retrying...";            break;
         case UF_STREAM_FINISH: phase = "Finalizing...";          break;
         case UF_DELETING:      phase = "Cleaning up...";      break;
@@ -9109,7 +9175,7 @@ static void drawStatusPage() {
     // S/F override; the baked sf_lat/sf_lon are only approximate.
     {
         const int bx = 410, by = 344, bw = 370, bh = 32;
-        const int tIdx = closestTrackIdx();
+        const int tIdx = lapTrackIdx();   // SELECTED track, not GPS-closest
         const bool armed   = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
         const bool haveMsg = (sf_set_msg[0] != '\0') && (millis() - sf_set_msg_ms < 4000);
         uint16_t fill = haveMsg     ? TFT_DARKGREEN
@@ -9225,7 +9291,7 @@ static void handleStatusTap(int x, int y) {
     // fall back to the baked line — the trackside escape hatch for a bad
     // capture (which used to silently kill lap timing with no way out).
     if (x >= 330 && x <= 404 && y >= 344 && y <= 376) {
-        const int tIdx = closestTrackIdx();
+        const int tIdx = lapTrackIdx();   // SELECTED track, not GPS-closest
         if (tIdx >= 0 && sfOverride[tIdx].used) {
             sfOverride[tIdx] = SfOverride{};
             saveSfOverrides();
@@ -9239,7 +9305,7 @@ static void handleStatusTap(int x, int y) {
     // version-match early-return below). Two-tap: first tap arms, second tap
     // within 5 s stores the current GPS position as this track's S/F override.
     if (x >= 410 && x <= 780 && y >= 344 && y <= 376) {
-        const int tIdx = closestTrackIdx();
+        const int tIdx = lapTrackIdx();   // SELECTED track, not GPS-closest
         if (tIdx < 0) {
             snprintf(sf_set_msg, sizeof(sf_set_msg), "not at a known track");
             sf_set_msg_ms = millis();
