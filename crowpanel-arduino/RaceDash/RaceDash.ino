@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.127"
+#define FIRMWARE_VERSION "0.1.128"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2123,6 +2123,8 @@ static void ufFreeBuf() {
     uf.buflen       = 0;
     uf.post_off     = 0;
     uf.post_started = false;
+    zbFree();   // compressor buffers live only while a stream is running
+                // (callers already guarantee the net task is stopped here)
 }
 
 // (ufWriteAll / ufFlushChunk deleted in v0.1.113 — the chunked mid-stream
@@ -2277,6 +2279,10 @@ static void ufExtractTrack(const char* filename, char* out, size_t outsize) {
 // ---------------------------------------------------------------------------
 static bool ufTaskWrite(const uint8_t* d, size_t len);   // fwd (net task writer)
 
+// (declared here, used by the Tools page far below: zbFree() must not free
+// the compressor buffers while the WIFI SPEED TEST task is using them)
+static volatile uint8_t nettest_state = 0;   // 0=idle 1=running 2=done
+
 static int8_t   srv_zblocks = -1;      // /caps probe: -1 unknown, 0 no, 1 yes
 static ZDeflWS* zb_ws  = nullptr;      // 72 KB PSRAM workspace (lazy, kept)
 static uint8_t* zb_raw = nullptr;      // 32 KB staging block
@@ -2285,11 +2291,34 @@ static uint32_t zb_fill = 0;           // bytes staged in zb_raw
 static bool     zb_stream_on = false;  // this stream is compressed
 static volatile uint32_t zb_wire = 0;  // compressed bytes sent (diagnostics)
 
+// ⚠️ INTERNAL RAM first (v0.1.128): the workspace access pattern is random
+// (hash probes + chain walks per byte); in PSRAM every probe is an OPI-bus
+// cache miss fought over with the RGB scanout, and v0.1.127 measured the
+// compressor at ~25 KB/s that way (slower than the raw path!). Internal RAM
+// runs it at hundreds of KB/s. ~73 KB total, allocated only while a stream/
+// speed test needs it and freed by zbFree() so BLE's ~64 KB heap guard still
+// clears when recording starts. PSRAM fallback keeps it functional (slow) if
+// internal heap is tight.
 static bool zbEnsure() {
+    if (!zb_ws)  zb_ws  = (ZDeflWS*)heap_caps_malloc(sizeof(ZDeflWS),
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!zb_ws)  zb_ws  = (ZDeflWS*)ps_malloc(sizeof(ZDeflWS));
+    if (!zb_raw) zb_raw = (uint8_t*)heap_caps_malloc(ZDEF_BLOCK_MAX,
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!zb_raw) zb_raw = (uint8_t*)ps_malloc(ZDEF_BLOCK_MAX);
+    if (!zb_out) zb_out = (uint8_t*)heap_caps_malloc(ZDEF_BOUND(ZDEF_BLOCK_MAX),
+                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!zb_out) zb_out = (uint8_t*)ps_malloc(ZDEF_BOUND(ZDEF_BLOCK_MAX));
     return zb_ws && zb_raw && zb_out;
+}
+
+static void zbFree() {
+    if (nettest_state == 1) return;   // speed test owns the buffers right now
+    if (zb_ws)  { free(zb_ws);  zb_ws  = nullptr; }
+    if (zb_raw) { free(zb_raw); zb_raw = nullptr; }
+    if (zb_out) { free(zb_out); zb_out = nullptr; }
+    zb_fill = 0;
+    zb_stream_on = false;
 }
 
 // One-time (per boot) server capability probe. Runs on the net/nettest task
@@ -8753,7 +8782,7 @@ static const char* sdStatusText() {
 // with RSSI + fw) so results can be reviewed later at /admin/upload/log.
 // Runs on a core-0 task; the UI just shows nettest_result.
 // ---------------------------------------------------------------------------
-static volatile uint8_t nettest_state = 0;   // 0=idle 1=running 2=done
+// (nettest_state now declared up in the zblocks section — zbFree guards on it)
 static char nettest_result[80] = "";
 
 static void netTestTask(void*) {
@@ -8839,10 +8868,36 @@ static void netTestTask(void*) {
     // through the SAME zdeflate + zblocks framing the uploader uses, and
     // reports RAW bytes/second — i.e. what a session upload will actually
     // achieve on the net hop. Server decodes the frames and logs raw+ratio.
-    uint32_t kbps_c = 0, ratio_x10 = 0;
+    uint32_t kbps_c = 0, ratio_x10 = 0, czps = 0;
     if (!fail) {
         zbProbeCaps();
         if (srv_zblocks == 1 && zbEnsure()) {
+            // Pre-measure PURE compressor speed (no network): 16 blocks of
+            // synthetic telemetry, wall-clocked. Reported as czps=<KB/s> in
+            // the X-Note so a slow compressor (e.g. buffers stuck in PSRAM)
+            // is remotely distinguishable from a slow socket.
+            {
+                uint32_t lcg0 = 0xC0FFEE42u; float t2 = 0;
+                uint32_t raw_b = 0; const uint32_t tz0 = millis();
+                for (int blk = 0; blk < 16; ++blk) {
+                    uint32_t fill = 0;
+                    while (fill + 300 < ZDEF_BLOCK_MAX) {
+                        lcg0 = lcg0 * 1664525u + 1013904223u;
+                        t2 += 0.04f;
+                        fill += (uint32_t)snprintf((char*)zb_raw + fill,
+                            ZDEF_BLOCK_MAX - fill,
+                            "{\"t\":%.3f,\"lat\":%.6f,\"lon\":%.6f,\"rpm\":%d,"
+                            "\"speed_mph\":%.1f,\"ax\":%.3f}\n",
+                            (double)(1784000000.0 + t2), (double)(39.2 + t2 * 1e-6),
+                            (double)(-77.9 + t2 * 1e-6), (int)(900 + (lcg0 % 6300)),
+                            (double)(lcg0 % 140), (double)((int)(lcg0 % 200) - 100) * 0.01);
+                    }
+                    (void)zdeflate(zb_ws, zb_raw, fill, zb_out, ZDEF_BOUND(ZDEF_BLOCK_MAX));
+                    raw_b += fill;
+                }
+                const uint32_t dtz = millis() - tz0;
+                czps = (uint32_t)(((uint64_t)raw_b * 1000) / 1024 / (dtz ? dtz : 1));
+            }
             WiFiClient* c = nullptr;
             if (s.cloud_protocol == 1) {
                 WiFiClientSecure* sec = new WiFiClientSecure();
@@ -8859,9 +8914,10 @@ static void netTestTask(void*) {
                           "Content-Type: application/octet-stream\r\n"
                           "Transfer-Encoding: chunked\r\n"
                           "X-Body-Format: zblocks\r\n"
-                          "X-Rssi: %d\r\nX-Fw: %s\r\nX-Note: ram=zb\r\n"
+                          "X-Rssi: %d\r\nX-Fw: %s\r\nX-Note: ram=zb czps=%lu\r\n"
                           "Connection: close\r\n\r\n",
-                          s.cloud_host, rssi0, FIRMWARE_VERSION);
+                          s.cloud_host, rssi0, FIRMWARE_VERSION,
+                          (unsigned long)czps);
                 constexpr uint32_t RAW_TOTAL = 3UL * 1024 * 1024;
                 uint32_t raw_sent = 0, wire_sent = 0, lcg = 0x2545F491u;
                 float tt = 0, mph = 60, rpm = 3500;
@@ -8944,6 +9000,7 @@ static void netTestTask(void*) {
                  "intRAM %lu / PSRAM %lu KB/s  RSSI %d",
                  (unsigned long)kbps_a, (unsigned long)kbps_b, rssi0);
     nettest_state = 2;
+    zbFree();   // per-use buffers (state already 2, so the guard lets this run)
     vTaskDelete(NULL);
 }
 

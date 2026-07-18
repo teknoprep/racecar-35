@@ -26,16 +26,24 @@
 #include <string.h>
 #include <stddef.h>
 
-#define ZDEF_BLOCK_MAX 32768u
-#define ZDEF_HASH_BITS 12
+#define ZDEF_BLOCK_MAX 16384u
+#define ZDEF_HASH_BITS 12   // 4096 heads
 #define ZDEF_HASH_SIZE (1u << ZDEF_HASH_BITS)
 #define ZDEF_NIL       0xFFFFu
-#define ZDEF_MAXCHAIN  64
+#define ZDEF_MAXCHAIN  16
 // Caller must give an output buffer of at least ZDEF_BOUND(n) bytes: the
 // stored-block fallback needs n + 5 (header) and we keep a safety margin.
 #define ZDEF_BOUND(n)  ((n) + 16u)
 
-// Workspace: 8 KB heads + 64 KB chains = 72 KB. Allocate ONCE from PSRAM.
+// Workspace: 8 KB heads + 32 KB chains = 40 KB. ⚠️ Allocate from INTERNAL
+// RAM (heap_caps_malloc MALLOC_CAP_INTERNAL): the access pattern is random
+// (hash probes + chain walks per input byte) and in PSRAM every probe is an
+// OPI-bus cache miss fought over with the RGB scanout — v0.1.127 shipped the
+// workspace in PSRAM and compressed at ~25 KB/s (nettest pass C, ratio 6.8x
+// but ClientDisconnect at the proxy's 60 s limit); internal RAM makes it
+// hundreds of KB/s. Block size 16 KB: ratio on telemetry drops only ~6% vs
+// 32 KB (line-to-line redundancy is ~220 B away, not 20 KB) and halves the
+// table RAM.
 typedef struct {
     uint16_t head[ZDEF_HASH_SIZE];
     uint16_t prev[ZDEF_BLOCK_MAX];
@@ -146,7 +154,7 @@ static size_t zdeflate(ZDeflWS* ws, const uint8_t* in, size_t n,
                     if (l > best_len) {
                         best_len  = l;
                         best_dist = (uint32_t)(i - j);
-                        if (l >= 96) break;          // good enough — stop walking
+                        if (l >= 32) break;          // good enough — stop walking
                     }
                 }
                 j = ws->prev[j];
