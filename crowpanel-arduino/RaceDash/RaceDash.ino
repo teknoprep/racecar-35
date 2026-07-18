@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.119"
+#define FIRMWARE_VERSION "0.1.120"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2393,7 +2393,7 @@ static void ufDiagReport(const char* why) {
              why, (unsigned)uf.state, (unsigned)uf.net_state,
              (unsigned long)uf.ring_head, (unsigned long)uf.ring_tail,
              (unsigned long)uf.lines_recv,
-             uf.net_err[0] ? uf.net_err : uf.last_err,
+             uf.last_err[0] ? uf.last_err : uf.net_err,   // cause before symptom
              (uf.files_idx >= 0 && uf.files_idx < uf.files_n)
                  ? uf.files[uf.files_idx].name : "-");
     ufdiag_busy = true;
@@ -2660,6 +2660,7 @@ static bool parseQLine(const String& line) {
         uf.net_eof       = false;
         uf.net_abort     = false;
         uf.net_err[0]    = '\0';
+        uf.last_err[0]   = '\0';   // stale errors from a previous file confused the modal
         uf.response_len  = 0;
         uf.response[0]   = '\0';
         uf.net_state     = 1;
@@ -2933,7 +2934,13 @@ static void uploadTick() {
     switch (uf.state) {
         case UF_LISTING:        timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
         case UF_FETCH_HEAD:     timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
-        case UF_STREAMING:      timeout_ms = 30000;  since = now - uf.last_rx_ms;       break;
+        // 90 s (was 30 s, v0.1.120): an SD card's internal garbage collection
+        // (triggered by the previous file's delete) can silence the Teensy for
+        // 30+ s MID-STREAM — ufdiag proved the stream was healthy on both
+        // sides and the retry ran clean. Wait out the pause instead of
+        // shooting a stream that's merely stalled; genuinely dead links still
+        // die (Teensy patience 120 s > our 90 s).
+        case UF_STREAMING:      timeout_ms = 90000;  since = now - uf.last_rx_ms;       break;
         // (UF_POSTING gone; UF_STREAM_FINISH watches net-task progress in its
         // own block above, not UART activity — no entry here.)
         case UF_DELETING:       timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
@@ -7332,12 +7339,14 @@ static void drawUploadModal() {
     // 1 running / 2 done / 3 failed), rt/rh = ring sent/queued KB, then the
     // most recent error text. Photograph this line when something wedges.
     {
+        // Error preference: last_err first — net_err is often just "aborted",
+        // which is the SYMPTOM of the loop's abort, not the cause (v0.1.120).
+        const char* derr = uf.last_err[0] ? uf.last_err : uf.net_err;
         char diag[110];
         snprintf(diag, sizeof(diag), "S%u N%u rt=%luK rh=%luK %.48s",
                  (unsigned)uf.state, (unsigned)uf.net_state,
                  (unsigned long)(uf.ring_tail / 1024),
-                 (unsigned long)(uf.ring_head / 1024),
-                 uf.net_err[0] ? uf.net_err : uf.last_err);
+                 (unsigned long)(uf.ring_head / 1024), derr);
         tft.setFont(&fonts::Font2);
         tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
         tft.setTextDatum(textdatum_t::middle_center);

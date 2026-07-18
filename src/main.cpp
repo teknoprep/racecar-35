@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.119"
+#define FIRMWARE_VERSION "0.1.120"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2959,8 +2959,20 @@ static void handleQGet(const char* args) {
         return false;
     };
 
+    // BUFFERED reads (v0.1.120): per-byte f.read() made millions of SdFat
+    // calls per file and left us maximally exposed to SD-card internal GC
+    // stalls (the "first attempt after a delete dies at ~28 lines" flake —
+    // ufdiag proved the Teensy went silent 30+ s mid-stream, then the retry
+    // ran clean). 4 KB block reads = ~4000x fewer card transactions.
+    static uint8_t rdbuf[4096];
+    int rdn = 0, rdi = 0;
     while (!ack_fail) {
-        const int c = f.read();
+        int c;
+        if (rdi >= rdn) {
+            rdn = f.read(rdbuf, sizeof(rdbuf));
+            rdi = 0;
+        }
+        c = (rdn <= 0) ? -1 : (int)rdbuf[rdi++];
         if (c < 0 && line_n == 0) break;          // EOF, no partial
         if (c == '\r') continue;
         if (c == '\n' || c < 0) {
