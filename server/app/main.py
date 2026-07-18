@@ -3759,6 +3759,7 @@ _ADMIN_HTML = (
 <header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
   <span class="crumbs"><a href="/">sessions</a> &rsaquo; admin</span>
   <span style="flex:1"></span>
+  <a class="btn" href="/tools/sfpicker">S/F picker</a>
   <a class="btn" href="/admin/report" style="margin-right:var(--sp-md)">report</a>
   <a class="btn" href="/admin/canbus" style="margin-right:var(--sp-md)">CAN captures</a>__USER_CHIP__</header>
 <main>

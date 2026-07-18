@@ -48,6 +48,14 @@
     </div>
 
     <div class="row">
+      <select id="trackSel" style="flex:1;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:8px 10px">
+        <option value="">— jump to a known track —</option>
+      </select>
+    </div>
+    <div class="label">Current baked S/F (shown red on the map)</div>
+    <div class="val" id="cursf" style="font-size:12px">select a track above</div>
+
+    <div class="row">
       <button id="mode-sf" class="on">① draw S/F line</button>
       <button id="mode-c">② set center</button>
     </div>
@@ -120,11 +128,41 @@
     if (sfA && sfB && c){
       const r=(parseFloat(el('radius').value)||1.5).toFixed(1);
       el('out').textContent =
-        `{ "TRACKNAME", ${f6(c[0])}f, ${f6(c[1])}f, ${r}f, ${f6(sfA[0])}f, ${f6(sfA[1])}f, nullptr, 0, ${f6(sfB[0])}f, ${f6(sfB[1])}f },`;
+        `{ "${selName||'TRACKNAME'}", ${f6(c[0])}f, ${f6(c[1])}f, ${r}f, ${f6(sfA[0])}f, ${f6(sfA[1])}f, nullptr, 0, ${f6(sfB[0])}f, ${f6(sfB[1])}f },`;
     } else {
       el('out').textContent = 'click two points across the track for the S/F line…';
     }
   }
+  // ---- current firmware TRACKS[] (regenerated from RaceDash.ino at deploy;
+  // aux entries are the hidden S/F-storage variants, e.g. Summit sub-tracks) --
+  const TRACKS = [{"name":"Barber","lat":33.5328,"lon":-86.6181,"r":2.5,"sfa":[33.5327,-86.6155],"sfb":null,"aux":false},{"name":"CMP Full","lat":34.4884,"lon":-80.5941,"r":2.0,"sfa":[34.487,-80.5955],"sfb":null,"aux":false},{"name":"CMP East","lat":34.487,"lon":-80.588,"r":1.2,"sfa":[34.484,-80.588],"sfb":null,"aux":false},{"name":"CMP West","lat":34.4884,"lon":-80.6,"r":1.0,"sfa":[34.49,-80.6],"sfb":null,"aux":false},{"name":"COTA","lat":30.1328,"lon":-97.6411,"r":3.0,"sfa":[30.1341,-97.6413],"sfb":null,"aux":false},{"name":"Daytona","lat":29.1853,"lon":-81.0697,"r":3.0,"sfa":[29.1868,-81.07],"sfb":null,"aux":false},{"name":"Laguna Seca","lat":36.5847,"lon":-121.7494,"r":2.5,"sfa":[36.5843,-121.753],"sfb":null,"aux":false},{"name":"Lime Rock","lat":41.9263,"lon":-73.3856,"r":2.0,"sfa":[41.9271,-73.3821],"sfb":null,"aux":false},{"name":"Mid-Ohio","lat":40.6889,"lon":-82.6356,"r":2.5,"sfa":[40.6895,-82.6375],"sfb":null,"aux":false},{"name":"Nelson Ledges","lat":41.3892,"lon":-81.0852,"r":1.5,"sfa":[41.3899,-81.0858],"sfb":null,"aux":false},{"name":"NHMS","lat":43.3628,"lon":-71.463,"r":2.0,"sfa":[43.36,-71.464],"sfb":null,"aux":false},{"name":"NJMP Thunderbolt","lat":39.4053,"lon":-75.0789,"r":2.0,"sfa":[39.4079,-75.0793],"sfb":null,"aux":false},{"name":"NJMP Lightning","lat":39.3998,"lon":-75.0735,"r":1.5,"sfa":[39.4008,-75.0728],"sfb":null,"aux":false},{"name":"Pocono","lat":41.0561,"lon":-75.5128,"r":3.5,"sfa":[41.055,-75.5115],"sfb":null,"aux":false},{"name":"Road America","lat":43.7986,"lon":-87.9956,"r":3.0,"sfa":[43.7963,-87.9944],"sfb":null,"aux":false},{"name":"Road Atlanta","lat":34.1469,"lon":-83.8189,"r":2.5,"sfa":[34.1518,-83.8197],"sfb":null,"aux":false},{"name":"Sebring","lat":27.457,"lon":-81.3568,"r":3.5,"sfa":[27.4502,-81.3537],"sfb":null,"aux":false},{"name":"Sonoma","lat":38.1614,"lon":-122.4544,"r":2.5,"sfa":[38.1615,-122.4547],"sfb":null,"aux":false},{"name":"Summit Point","lat":39.2415,"lon":-77.9779,"r":2.0,"sfa":[39.235214,-77.969128],"sfb":[39.235189,-77.969019],"aux":false},{"name":"Summit Point Jefferson","lat":39.237,"lon":-77.97,"r":1.2,"sfa":[39.237,-77.97],"sfb":null,"aux":true},{"name":"Summit Point Shenandoah","lat":39.245,"lon":-77.965,"r":1.5,"sfa":[39.245,-77.965],"sfb":null,"aux":true},{"name":"VIR","lat":36.5611,"lon":-79.2103,"r":2.5,"sfa":[36.5689,-79.2067],"sfb":null,"aux":false},{"name":"VIR South","lat":36.562,"lon":-79.21,"r":1.2,"sfa":[36.562,-79.21],"sfb":null,"aux":false},{"name":"VIR Patriot","lat":36.566,"lon":-79.212,"r":1.0,"sfa":[36.566,-79.212],"sfb":null,"aux":false},{"name":"Watkins Glen","lat":42.3417,"lon":-76.9272,"r":2.5,"sfa":[42.3369,-76.9272],"sfb":null,"aux":false},{"name":"Thompson","lat":41.979695,"lon":-71.827086,"r":1.5,"sfa":[41.979695,-71.827086],"sfb":null,"aux":false}];
+  let selName = null;
+  const curLayer = L.layerGroup().addTo(map);
+  const sel = el('trackSel');
+  for (let i = 0; i < TRACKS.length; i++){
+    const o=document.createElement('option'); o.value=i;
+    o.textContent = TRACKS[i].name + (TRACKS[i].aux ? '  (variant)' : '') +
+                    (TRACKS[i].sfb ? '  [line set]' : '  [point only]');
+    sel.appendChild(o);
+  }
+  sel.onchange = ()=>{
+    curLayer.clearLayers();
+    if (sel.value === ''){ selName=null; el('cursf').textContent='select a track above'; refresh(); return; }
+    const t = TRACKS[parseInt(sel.value,10)];
+    selName = t.name;
+    map.setView(t.sfa && (t.sfa[0]||t.sfa[1]) ? t.sfa : [t.lat,t.lon], 17);
+    if (t.sfb){
+      curLayer.addLayer(L.polyline([t.sfa,t.sfb],{color:'#FF4D4D',weight:4,opacity:0.9}));
+      el('cursf').textContent = 'LINE '+f6(t.sfa[0])+','+f6(t.sfa[1])+' \u2194 '+f6(t.sfb[0])+','+f6(t.sfb[1]);
+    } else {
+      curLayer.addLayer(L.circleMarker(t.sfa,{radius:6,color:'#FF4D4D',fillColor:'#FF4D4D',fillOpacity:1}));
+      curLayer.addLayer(L.circle(t.sfa,{radius:75,color:'#FF4D4D',weight:1,dashArray:'6 6',fill:false}));
+      el('cursf').textContent = 'POINT (75 m radius method) '+f6(t.sfa[0])+','+f6(t.sfa[1])+' \u2014 needs a line!';
+    }
+    curLayer.addLayer(L.circle([t.lat,t.lon],{radius:t.r*1000,color:'#4EA1FF',weight:1,opacity:0.5,fill:false}));
+    el('radius').value = t.r;
+    refresh();
+  };
   map.on('click', e=>{
     const p=[e.latlng.lat, e.latlng.lng];
     if (mode==='sf'){
