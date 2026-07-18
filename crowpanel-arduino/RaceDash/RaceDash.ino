@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.122"
+#define FIRMWARE_VERSION "0.1.123"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1044,7 +1044,11 @@ static const TrackInfo TRACKS[] = {
     // never auto-picked, never listed — they exist so each sub-track keeps
     // its own baked S/F + its own SET START/FINISH override slot (indices
     // must stay stable for the sf_ovr blob — do NOT remove or reorder).
-    { "Summit Point",            39.2415f, -77.9779f, 2.0f, 39.2415f, -77.9779f, SUMMIT_CFGS, 3 },
+    // Main circuit S/F LINE picked by the user on satellite imagery
+    // (2026-07-18, /tools/sfpicker; midpoint verified 1.7 m off the OSM
+    // centerline). Facility centre/radius unchanged — they define "am I at
+    // Summit Point", the line defines the lap crossing.
+    { "Summit Point",            39.2415f, -77.9779f, 2.0f, 39.235214f, -77.969128f, SUMMIT_CFGS, 3, 39.235189f, -77.969019f },
     { "Summit Point Jefferson",  39.2370f, -77.9700f, 1.2f, 39.2370f, -77.9700f, nullptr,  0, 0.0f, 0.0f, 1 },
     { "Summit Point Shenandoah", 39.2450f, -77.9650f, 1.5f, 39.2450f, -77.9650f, nullptr,  0, 0.0f, 0.0f, 1 },
     { "VIR",           36.5611f,  -79.2103f, 2.5f,  36.5689f,  -79.2067f, VIR_CFGS,        3 },
