@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.121"
+#define FIRMWARE_VERSION "0.1.122"
 
 #include <Preferences.h>
 #include <time.h>
@@ -3179,14 +3179,49 @@ static bool parseLine(const String& line) {
     }
     return false;
 }
+static uint32_t uart_last_ok_ms = 0;   // last successfully PARSED line from the Teensy
+static uint32_t uart_reinit_ms  = 0;
+static uint16_t uart_reinits    = 0;
+
 static void pumpUart() {
     while (Serial.available()) {
         char c = (char)Serial.read();
         if (c == '\r') continue;
-        if (c == '\n') { parseLine(rxBuf); rxBuf = ""; }
+        if (c == '\n') {
+            if (parseLine(rxBuf)) uart_last_ok_ms = millis();
+            rxBuf = "";
+        }
         else if (rxBuf.length() < UART_LINE_MAX) { rxBuf += c; }
         else { rxBuf = ""; }
     }
+}
+
+// UART link watchdog (v0.1.122). Field case: the dash showed no speed for a
+// whole session while the Teensy recorded perfectly — the wire glitched
+// (loose connector) and the dash's UART/parser never came back. If NO valid
+// line has parsed for 15 s, hard-reinit UART0 (flush ring, reset the line
+// accumulator, end+begin) and poke the Teensy; repeat every 15 s until lines
+// flow again. Skipped while an upload is active (streams have their own
+// recovery and a reinit would drop in-flight ARQ bytes).
+static void uartLinkTick() {
+    const uint32_t now = millis();
+    if (uart_last_ok_ms == 0) {
+        if (now < 20000) return;             // boot grace — Teensy may still be starting
+    }
+    if (now - uart_last_ok_ms < 15000) return;
+    if (now - uart_reinit_ms  < 15000) return;
+    if (uf.state != UF_IDLE || sl.state != SL_IDLE) return;   // mid-transfer: leave it alone
+    uart_reinit_ms = now;
+    uart_reinits++;
+    rxBuf = "";
+    while (Serial.available()) (void)Serial.read();
+    Serial.flush();
+    Serial.end();
+    delay(5);
+    Serial.setRxBufferSize(32768);           // must precede begin() (ESP32 core)
+    Serial.begin(921600);
+    Serial.printf("VER?\n");                 // poke — any reply revives uart_last_ok_ms
+    Serial.printf("DBG,uart_reinit n=%u\n", (unsigned)uart_reinits);
 }
 
 // ---------------------------------------------------------------------------
@@ -4049,10 +4084,16 @@ static void drawDashPage() {
     // sees a half-rendered digit during the LCD scan — this is the biggest
     // tearing offender on the dash page given its size and 25 Hz update.
     {
-        const int spd_int = (int)(g.mph + 0.5f);
+        // Link-stale honesty (v0.1.122): if no GPS line has arrived for 3 s,
+        // show "--" instead of silently freezing the last number — the driver
+        // must KNOW the display is blind (the recording on the Teensy side is
+        // typically still fine; this is a dash-link problem, not a GPS one).
+        const bool link_stale = (g.last_ms == 0) || (millis() - g.last_ms > 3000);
+        const int spd_int = link_stale ? -2 : (int)(g.mph + 0.5f);   // -1 = never-drawn sentinel
         if (spd_int != ld.spd_int) {
             char buf[8];
-            snprintf(buf, sizeof(buf), "%d", spd_int);
+            if (spd_int < 0) snprintf(buf, sizeof(buf), "--");
+            else             snprintf(buf, sizeof(buf), "%d", spd_int);
             if (dash_sprites_ready) {
                 spr_speed.fillSprite(bg);
                 spr_speed.setFont(&fonts::Font7);
@@ -10002,6 +10043,7 @@ static void dashHealthTick() {
 
 void loop() {
     pumpUart();
+    uartLinkTick();   // hard-reinit UART0 if the Teensy link goes silent (v0.1.122)
     handleTouch();
     dashHealthTick();  // 1 Hz ESP32 temp -> Teensy (heat diagnostics)
     netOwnerTick();   // WiFi<->BLE radio time-share arbiter (must run before wifiTick)

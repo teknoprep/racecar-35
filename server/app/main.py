@@ -117,6 +117,7 @@ def ai_resolve_model(requested: Optional[str]) -> str:
 AI_HISTORY_DIR = DATA_DIR / "ai_history"
 VIDEO_META_DIR = DATA_DIR / "video_meta"   # per-session YouTube link + sync offset
 SHARE_DIR = DATA_DIR / "shares"            # public view-only overlay tokens
+LAP_META_DIR = DATA_DIR / "lap_meta"       # per-session excluded-lap lists
 
 # Google OAuth is optional. If GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are
 # blank, the server stays in open dev mode. Once configured, all browser UI
@@ -2933,6 +2934,64 @@ def _session_data_payload(p: pathlib.Path, stride: int, target: int) -> dict:
             "bounds": bounds, "samples": samples}
 
 
+# ---------------------------------------------------------------------------
+# Lap exclusion. A spurious S/F crossing (GPS jitter on the line) can log a
+# garbage 0.06 s "lap" that poisons best-lap, deltas, PRED references and the
+# AI metrics. Laps can be EXCLUDED: automatically (< 10 s = physically
+# impossible) or manually from the review page. Exclusions live in a sidecar
+# (/data/lap_meta/<user>/<file>.json: {"excluded":[n..], "included":[n..]});
+# "included" whitelists a lap the auto rule would have dropped. Excluded laps
+# keep their ORIGINAL numbers and are returned separately so the UI can show
+# a restore control; /laps consumers (review, overlay, shared) all get the
+# filtered view.
+# ---------------------------------------------------------------------------
+LAP_AUTO_EXCLUDE_UNDER_S = 10.0
+
+
+def _lap_meta_path(user: str, session_name: str) -> pathlib.Path:
+    return LAP_META_DIR / safe_name(user) / (safe_name(session_name) + ".json")
+
+
+def _lap_meta(user: str, session_name: str) -> dict:
+    p = _lap_meta_path(user, session_name)
+    if p.exists():
+        try:
+            d = json.loads(p.read_text("utf-8"))
+            return {"excluded": [int(x) for x in d.get("excluded", [])],
+                    "included": [int(x) for x in d.get("included", [])]}
+        except Exception:
+            pass
+    return {"excluded": [], "included": []}
+
+
+def _apply_lap_meta(payload: dict, user: str, session_name: str) -> dict:
+    laps = payload.get("laps") or []
+    meta = _lap_meta(user, session_name)
+    excl = set(meta["excluded"])
+    incl = set(meta["included"])
+    kept: list = []
+    dropped: list = []
+    for lp in laps:
+        n = int(lp.get("lap", 0))
+        auto = (float(lp.get("seconds", 0)) < LAP_AUTO_EXCLUDE_UNDER_S) and (n not in incl)
+        if n in excl or auto:
+            lp = dict(lp)
+            lp["excluded_reason"] = "manual" if n in excl else "auto (<10s)"
+            dropped.append(lp)
+        else:
+            kept.append(lp)
+    best = None
+    best_s = float("inf")
+    for lp in kept:
+        if lp["seconds"] < best_s:
+            best_s = lp["seconds"]
+            best = lp["lap"]
+    payload["laps"] = kept
+    payload["excluded_laps"] = dropped
+    payload["best_lap"] = best
+    return payload
+
+
 def _laps_payload(p: pathlib.Path) -> dict:
     """Core of /laps — shared by the authenticated route and /shared/<token>/laps."""
     samples: list = []
@@ -2961,7 +3020,37 @@ async def session_laps(request: Request, user: str, filename: str) -> JSONRespon
     require_web_user(request)
     gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
-    return JSONResponse(_laps_payload(p))
+    return JSONResponse(_apply_lap_meta(_laps_payload(p), safe_name(user), p.name))
+
+
+@app.post("/sessions/{user}/{filename}/laps/exclude")
+async def set_lap_exclusion(request: Request, user: str, filename: str) -> JSONResponse:
+    """Exclude / restore a lap. Body: {"lap": N, "exclude": true|false}.
+    Restoring an auto-excluded (<10 s) lap whitelists it. Owner-or-admin."""
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    try:
+        body = await request.json()
+        lap = int(body["lap"])
+        exclude = bool(body.get("exclude", True))
+    except Exception:
+        raise HTTPException(status_code=400, detail="need {lap:int, exclude:bool}")
+    u = safe_name(user)
+    meta = _lap_meta(u, p.name)
+    excl = set(meta["excluded"])
+    incl = set(meta["included"])
+    if exclude:
+        excl.add(lap)
+        incl.discard(lap)
+    else:
+        excl.discard(lap)
+        incl.add(lap)   # whitelist so the auto rule can't re-drop it
+    mp = _lap_meta_path(u, p.name)
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    mp.write_text(json.dumps({"excluded": sorted(excl), "included": sorted(incl)}), "utf-8")
+    log.info("lap exclusion %s/%s lap=%d exclude=%s", u, p.name, lap, exclude)
+    return JSONResponse(_apply_lap_meta(_laps_payload(p), u, p.name))
 
 
 @app.get("/sessions/{user}/{filename}/gpsdiag")
@@ -3442,7 +3531,7 @@ async def shared_data(
 async def shared_laps(token: str) -> JSONResponse:
     user, filename = _share_lookup(token)
     p = _resolve_session(user, filename)
-    return JSONResponse(_laps_payload(p))
+    return JSONResponse(_apply_lap_meta(_laps_payload(p), safe_name(user), p.name))
 
 
 @app.get("/shared/{token}/video")
@@ -4696,7 +4785,7 @@ _REVIEW_HTML = (
       <div class="card-body lap-body">
         <div class="lap-table-wrap">
           <table class="laptable">
-            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th>Max</th></tr></thead>
+            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th>Max</th><th></th></tr></thead>
             <tbody id="lap-rows"></tbody>
           </table>
         </div>
@@ -5393,10 +5482,41 @@ _REVIEW_HTML = (
       const gapTxt=(lap.lap===bestLap.lap) ? 'best' : '+'+gap.toFixed(2);
       tr.innerHTML='<td>'+lap.lap+'</td><td>'+lapFmt(lap.seconds)+
         '</td><td class="gap">'+gapTxt+'</td><td>'+
-        (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>';
+        (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>'+
+        '<td><button class="btn" data-xlap="'+lap.lap+'" '+
+        'title="exclude this lap from best/deltas" '+
+        'style="padding:1px 7px;line-height:1.1">\u2715</button></td>';
       tr.addEventListener('click', ()=>selectPrimary(lap, rows));
       rows.appendChild(tr);
     }
+    // Excluded laps (garbage crossings, or manually dropped): greyed, with a
+    // restore control. They keep their original numbers.
+    for (const lap of (lr.excluded_laps||[])){
+      const tr=document.createElement('tr');
+      tr.style.opacity='0.45';
+      tr.innerHTML='<td>'+lap.lap+'</td><td>'+lapFmt(lap.seconds)+
+        '</td><td class="gap">excluded ('+(lap.excluded_reason||'')+')</td><td>'+
+        (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>'+
+        '<td><button class="btn" data-rlap="'+lap.lap+'" title="restore this lap" '+
+        'style="padding:1px 7px;line-height:1.1">\u21a9</button></td>';
+      rows.appendChild(tr);
+    }
+    rows.addEventListener('click', async (ev)=>{
+      const xb=ev.target.closest('[data-xlap]'), rb=ev.target.closest('[data-rlap]');
+      if (!xb && !rb) return;
+      ev.stopPropagation();
+      const lap=parseInt((xb||rb).dataset.xlap||(xb||rb).dataset.rlap,10);
+      try {
+        const r=await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/laps/exclude',{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({lap, exclude:!!xb})});
+        if (!r.ok){ const j=await r.json().catch(()=>({}));
+          alert('lap update failed: '+((j&&j.detail)||('HTTP '+r.status))); return; }
+        location.reload();
+      } catch(e){ alert('lap update failed: '+e.message); }
+    });
+    if ((lr.excluded_laps||[]).length)
+      el('lap-sub').textContent += ' \u00b7 '+lr.excluded_laps.length+' excluded';
     selectPrimary(bestLap, rows);
     loadCompList();
   })();
