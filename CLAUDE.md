@@ -215,6 +215,17 @@ Admin rows have a **history** button → `/admin/user/<email>/history` (page) / 
 total sign-ins, active 7d/30d, sign-ins 7d/30d, new users 30d) + a per-user table (total / 30d /
 7d logins, distinct active days, first & last seen) built from `login_stats_all()`.
 
+### S/F line picker on the server (`/tools/sfpicker`, admin-page link)
+Served copy of `tools/track_sf_picker.html` living at `server/app/sf_picker.html` (the Docker
+image only ships `app/`). Login-gated. Satellite imagery + 2-click S/F line + centre; **track
+dropdown embeds the CURRENT firmware `TRACKS[]`** (all rows incl. hidden aux variants) and
+draws the baked S/F in RED (line, or point + dashed 75 m radius circle = "needs a line!") so a
+misplaced pin is obvious; blue circle = auto-select radius; output line pre-fills the selected
+track's name. **⚠️ When `TRACKS[]` changes in RaceDash.ino, regenerate the picker's embedded
+JS copy in the same commit** (parse rows → JSON → `const TRACKS = [...]` in sf_picker.html).
+Workflow: user picks the line → pastes the generated row into chat → coords get baked into
+firmware (keep the existing facility centre/radius; only the sf endpoints change).
+
 ### Combine sessions + YouTube overlay viewer (server)
 
 - **Combine**: index page has a checkbox column + `combine selected` toolbar button →
