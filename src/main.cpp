@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.126"
+#define FIRMWARE_VERSION "0.1.127"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2902,11 +2902,17 @@ static void handleQGet(const char* args) {
     // in flight; the dash already ACKs the highest CONTIGUOUS seq it applied
     // (a gap simply re-acks the last good seq), so on an ack stall we
     // retransmit everything unacked (go-back-N) and the dash dedups by seq.
-    // Window sized so max in-flight (~5 KB) stays well under the dash's 32 KB
-    // UART RX ring even while it blocks flushing a TCP chunk (backpressure:
+    // Window sized so max in-flight stays well under the dash's 32 KB UART
+    // RX ring even while it blocks flushing a TCP chunk (backpressure:
     // no acks -> window fills -> we wait).
-    constexpr uint32_t QGET_WIN = 16;
-    static char     wtext[QGET_WIN][320];   // retransmit ring (static: ~5 KB, off the stack)
+    // 16 -> 48 (v0.1.127): at 921600 baud a ~220 B line takes ~2.4 ms on the
+    // wire; a 16-line window (~3.5 KB ≈ 38 ms of pipe) drained faster than
+    // the dash's ack cadence could refill it, capping the UART hop at
+    // ~70 KB/s. 48 lines (~11 KB ≈ 120 ms of pipe, still ×3 under the 32 KB
+    // ring) rides through the dash's UI-loop ack latency and pushes the hop
+    // toward the wire's ~90 KB/s. RAM cost: 15 KB static (T4.1 has 1 MB).
+    constexpr uint32_t QGET_WIN = 48;
+    static char     wtext[QGET_WIN][320];   // retransmit ring (static: ~15 KB, off the stack)
     static uint16_t wlen[QGET_WIN];
     char     line[320];
     size_t   line_n = 0;

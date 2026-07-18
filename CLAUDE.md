@@ -459,8 +459,25 @@ VER,teensy,<semver>
   on every re-begin path. Context: the racing-only stales show `avail=0` (module silent, 51% of
   the 1783087863 session, 8-min outages, fine when parked) — mrst>0 = reboots (power/wiring),
   mrst==0 with msss advancing = module alive but mute (UART wire/antenna path).
+- **Compressed uploads — "zblocks" (v0.1.127).** The dash→cloud socket is hard-capped ~70 KB/s
+  by lwIP's `TCP_SND_BUF=5744` ÷ path RTT (compile-time, not fixable without a core rebuild), so
+  the uploader now **deflate-compresses the HTTP body**: `zdeflate.h` (tiny raw-DEFLATE,
+  fixed-Huffman + stored fallback, ~3 KB flash, 72 KB PSRAM workspace; host-verified against
+  Python zlib, ~4-6× on session NDJSON) compresses 32 KB blocks on the NET TASK; body = frames
+  `['Z','B', u32le raw_len, u32le comp_len, raw-deflate]`, header `X-Body-Format: zblocks`.
+  **Negotiated per boot via `GET /caps`** (`{"zblocks":true}`) — old server → raw body, so
+  update order never matters. Server `_zb_decode()` inflates in `_save_body` (zlib -15;
+  malformed frame → 400 reject `zblocks: …`), logs `wire` vs `bytes` (ratio) in the upload
+  event. Net effect: the socket carries ~4× more RAW telemetry → the UART wire is the upload
+  bottleneck again (~2× end-to-end). **The Tools speed test gained a third pass** (`ram=zb`
+  note): synthesizes telemetry-shaped NDJSON, pushes it through the SAME zdeflate+framing, and
+  reports EFFECTIVE raw KB/s + ratio (`ZB <n> KB/s (<r>x)` on the Tools page; server logs
+  `raw_bytes`/`raw_kbps`/`ratio` in the nettest event — `/nettest` stream-parses frame headers
+  without inflating).
 - **Upload speed: sliding-window ARQ (v0.1.102).** `handleQGet()` streams with a **go-back-N
-  window (QGET_WIN=16 lines in flight, cumulative ACKs)** instead of stop-and-wait — the old
+  window (QGET_WIN=16→48 lines in flight since v0.1.127 — 16 was ~38 ms of pipe and drained
+  faster than the dash's ack cadence, capping the UART hop ≈ 70 KB/s; 48 ≈ 120 ms rides through
+  the dash's UI-loop ack latency, ~11 KB still ×3 under the 32 KB RX ring, cumulative ACKs)** instead of stop-and-wait — the old
   one-line-per-round-trip paid the dash's 5–30 ms UI-loop latency per ~220-byte line (20k-line
   session = many minutes); now it's wire-limited (~90 KB/s at 921600, 4 MB ≈ 1 min). The dash
   side needed NO protocol change (it already ACKs the highest CONTIGUOUS seq — a gap re-acks the

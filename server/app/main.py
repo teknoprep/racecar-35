@@ -45,7 +45,9 @@ import pathlib
 import re
 import secrets
 import shutil
+import struct
 import time
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1834,6 +1836,38 @@ async def sf_picker(request: Request) -> Response:
     return HTMLResponse(p.read_text("utf-8"))
 
 
+@app.get("/caps")
+async def caps() -> dict:
+    """Server capability probe for the dash (public, static). The dash asks
+    once per boot before its first upload; 'zblocks' advertises that /upload,
+    /stream and /nettest decode the compressed body framing (v0.1.127).
+    An old dash never asks; an old server 404s and the dash sends raw."""
+    return {"ok": True, "zblocks": True}
+
+
+def _zb_decode(data: bytes) -> bytes:
+    """Decode a zblocks body: frames of ['Z','B', u32le raw_len, u32le comp_len,
+    raw-deflate bytes] — each frame an independent ≤32 KB deflate stream
+    (fixed-Huffman or stored, from the dash's zdeflate.h). Raises ValueError
+    on any malformed frame so the caller can 400 with a useful reason."""
+    out = bytearray()
+    off = 0
+    n = len(data)
+    while off < n:
+        if data[off:off + 2] != b"ZB" or off + 10 > n:
+            raise ValueError(f"bad frame header at {off}")
+        rl, cl = struct.unpack_from("<II", data, off + 2)
+        if rl == 0 or rl > (1 << 20) or cl == 0 or cl > (1 << 20) or off + 10 + cl > n:
+            raise ValueError(f"bad frame lengths at {off} (raw={rl} comp={cl})")
+        d = zlib.decompressobj(-15)
+        raw = d.decompress(data[off + 10:off + 10 + cl]) + d.flush()
+        if len(raw) != rl:
+            raise ValueError(f"frame at {off} inflated to {len(raw)}, expected {rl}")
+        out += raw
+        off += 10 + cl
+    return bytes(out)
+
+
 @app.post("/nettest")
 async def nettest(
     request: Request,
@@ -1852,23 +1886,54 @@ async def nettest(
     client_host = request.client.host if request.client else "?"
     t0 = time.time()
     n = 0
+    # zblocks pass (v0.1.127): stream-parse the frame headers to count RAW
+    # bytes without buffering or inflating — the point is the ratio + the
+    # effective raw throughput of the compressed upload path.
+    zb = (request.headers.get("x-body-format") or "").strip().lower() == "zblocks"
+    raw_n = 0
+    _hdr = b""
+    _skip = 0
     try:
         async for chunk in request.stream():
             n += len(chunk)
+            if zb:
+                mv = memoryview(chunk)
+                while len(mv):
+                    if _skip:
+                        t = min(_skip, len(mv))
+                        _skip -= t
+                        mv = mv[t:]
+                        continue
+                    t = min(10 - len(_hdr), len(mv))
+                    _hdr += bytes(mv[:t])
+                    mv = mv[t:]
+                    if len(_hdr) == 10:
+                        if _hdr[:2] != b"ZB":       # not actually zblocks — stop parsing
+                            zb = False
+                            raw_n = 0
+                            break
+                        rl, cl = struct.unpack("<II", _hdr[2:])
+                        raw_n += rl
+                        _skip = cl
+                        _hdr = b""
         err = ""
     except Exception as e:   # client vanished mid-test — log what we got
         err = f"{type(e).__name__}"
     dt = max(0.001, time.time() - t0)
     kbps = round(n / dt / 1024.0, 1)
+    raw_kbps = round(raw_n / dt / 1024.0, 1) if raw_n else 0.0
+    ratio = round(raw_n / n, 2) if (raw_n and n) else 0.0
     _upload_event({"ev": "nettest", "ip": client_host, "bytes": n,
                    "seconds": round(dt, 3), "kbps": kbps,
+                   "raw_bytes": raw_n, "raw_kbps": raw_kbps, "ratio": ratio,
                    "rssi": (x_rssi or ""), "fw": (x_fw or ""),
                    "note": (x_note or ""), "tls_ms": (x_tls or ""),
                    "err": err})
-    log.info("nettest %s: %d B in %.2fs = %.1f KB/s rssi=%s fw=%s %s",
-             client_host, n, dt, kbps, x_rssi, x_fw, err)
+    log.info("nettest %s: %d B in %.2fs = %.1f KB/s raw=%d (%.1f KB/s eff, %.2fx) rssi=%s fw=%s %s",
+             client_host, n, dt, kbps, raw_n, raw_kbps, ratio, x_rssi, x_fw, err)
     return JSONResponse({"ok": not err, "bytes": n, "seconds": round(dt, 3),
-                         "kbps": kbps})
+                         "kbps": kbps, "raw_bytes": raw_n,
+                         "raw_kbps": raw_kbps, "ratio": ratio})
 
 
 @app.get("/health")
@@ -2047,6 +2112,18 @@ async def _save_body(
         _upload_event({"ev": "reject", "ip": _client_host, "kind": kind or "session",
                        "session": x_session_id, "reason": "empty body"})
         raise HTTPException(status_code=400, detail="empty body")
+    # Compressed upload (v0.1.127): the dash only sends this header after the
+    # /caps probe confirmed we decode it. Inflate to the raw NDJSON here so
+    # everything downstream (validation, lap detection, storage) is unchanged.
+    wire_len = len(body)
+    if (request.headers.get("x-body-format") or "").strip().lower() == "zblocks":
+        try:
+            body = _zb_decode(body)
+        except ValueError as e:
+            _upload_event({"ev": "reject", "ip": _client_host, "kind": kind or "session",
+                           "session": x_session_id, "reason": f"zblocks: {e}",
+                           "bytes": wire_len})
+            raise HTTPException(status_code=400, detail=f"zblocks decode failed: {e}")
     if len(body) > MAX_BODY_BYTES:
         _upload_event({"ev": "reject", "ip": _client_host, "kind": kind or "session",
                        "session": x_session_id, "reason": "too large", "bytes": len(body)})
@@ -2115,6 +2192,7 @@ async def _save_body(
 
     _upload_event({"ev": "ok", "ip": _client_host, "kind": kind or "session",
                    "session": sid, "track": track, "bytes": len(body), "lines": nl,
+                   "wire": wire_len,   # < bytes when the body came in compressed
                    "path": str(out_path.relative_to(DATA_DIR))})
     log.info(
         "received %s mode=%s email=%s session=%s%s track=%s bytes=%d lines=%d -> %s",

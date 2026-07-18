@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.126"
+#define FIRMWARE_VERSION "0.1.127"
 
 #include <Preferences.h>
 #include <time.h>
@@ -37,6 +37,7 @@
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
 #include "board_config.h"   // per-panel RGB pin map + timing (DASH_BOARD 7|5)
 #include "obd_ble.h"       // Bluetooth-LE OBD-II (ELM327) client for sensor_type==2
+#include "zdeflate.h"      // tiny raw-DEFLATE for compressed uploads (v0.1.127 zblocks)
 
 // ---------------------------------------------------------------------------
 // Forward type decls — Arduino IDE auto-injects function prototypes at the
@@ -2262,6 +2263,101 @@ static void ufExtractTrack(const char* filename, char* out, size_t outsize) {
 // are the shape that measured ~850 KB/s where chunked died). path selects the
 // server endpoint: "/upload" (mode=w, first segment) or "/stream" (mode=a,
 // append — subsequent segments of the same file).
+// ---------------------------------------------------------------------------
+// zblocks upload compression (v0.1.127). Session NDJSON is ~75-90% redundant;
+// the dash→cloud socket is hard-capped ~70 KB/s by lwIP's 5744 B send buffer
+// ÷ path RTT (verified by the two-pass speed test + sdkconfig). Compressing
+// the body makes that socket carry ~4x more RAW telemetry, moving the upload
+// bottleneck back to the UART wire. Framing: the chunked HTTP body becomes a
+// sequence of frames ['Z','B', u32le raw_len, u32le comp_len, <raw-deflate>]
+// — each frame an INDEPENDENT ≤32 KB deflate stream (server: zlib -15).
+// Negotiated per boot via GET /caps ("zblocks":true); an old server without
+// it gets the legacy raw body, so dash/server update order doesn't matter.
+// All of this runs on the NET TASK only — no Serial prints, no loop stalls.
+// ---------------------------------------------------------------------------
+static bool ufTaskWrite(const uint8_t* d, size_t len);   // fwd (net task writer)
+
+static int8_t   srv_zblocks = -1;      // /caps probe: -1 unknown, 0 no, 1 yes
+static ZDeflWS* zb_ws  = nullptr;      // 72 KB PSRAM workspace (lazy, kept)
+static uint8_t* zb_raw = nullptr;      // 32 KB staging block
+static uint8_t* zb_out = nullptr;      // compressed output (bound: raw+16)
+static uint32_t zb_fill = 0;           // bytes staged in zb_raw
+static bool     zb_stream_on = false;  // this stream is compressed
+static volatile uint32_t zb_wire = 0;  // compressed bytes sent (diagnostics)
+
+static bool zbEnsure() {
+    if (!zb_ws)  zb_ws  = (ZDeflWS*)ps_malloc(sizeof(ZDeflWS));
+    if (!zb_raw) zb_raw = (uint8_t*)ps_malloc(ZDEF_BLOCK_MAX);
+    if (!zb_out) zb_out = (uint8_t*)ps_malloc(ZDEF_BOUND(ZDEF_BLOCK_MAX));
+    return zb_ws && zb_raw && zb_out;
+}
+
+// One-time (per boot) server capability probe. Runs on the net/nettest task
+// (blocking TLS is fine there). Only DEFINITIVE answers are cached: a dead
+// connection leaves -1 so the next attempt re-probes.
+static void zbProbeCaps() {
+    if (srv_zblocks != -1) return;
+    if (s.internet_mode != 1 || !wifiConnectedNow()) return;
+    WiFiClient* c = nullptr;
+    if (s.cloud_protocol == 1) {
+        WiFiClientSecure* sec = new WiFiClientSecure();
+        sec->setInsecure();
+        sec->setTimeout(8);
+        c = sec;
+    } else {
+        c = new WiFiClient();
+        c->setTimeout(8);
+    }
+    if (c->connect(s.cloud_host, s.cloud_port)) {
+        c->printf("GET /caps HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+                  s.cloud_host);
+        char resp[512]; size_t rn = 0;
+        const uint32_t t0 = millis();
+        while (millis() - t0 < 5000) {
+            while (c->available() && rn + 1 < sizeof(resp)) {
+                const int ch = c->read();
+                if (ch < 0) break;
+                resp[rn++] = (char)ch;
+            }
+            resp[rn] = '\0';
+            if (rn + 1 >= sizeof(resp)) break;
+            if (!c->connected() && !c->available()) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        resp[rn] = '\0';
+        if (strstr(resp, "HTTP/1.")) {   // got a real answer -> cache it
+            srv_zblocks = (strstr(resp, "\"zblocks\":true") ||
+                           strstr(resp, "\"zblocks\": true")) ? 1 : 0;
+        }
+    }
+    c->stop();
+    delete c;
+}
+
+// Compress + send the staged block as one HTTP chunk. NET TASK ONLY.
+static bool zbFlushBlock() {
+    if (zb_fill == 0) return true;
+    const size_t cl = zdeflate(zb_ws, zb_raw, zb_fill, zb_out,
+                               ZDEF_BOUND(ZDEF_BLOCK_MAX));
+    if (cl == 0) {
+        snprintf(uf.net_err, sizeof(uf.net_err), "zb compress fail");
+        return false;
+    }
+    uint8_t fh[10] = {'Z', 'B'};
+    const uint32_t rl = zb_fill, cl32 = (uint32_t)cl;
+    memcpy(fh + 2, &rl,   4);
+    memcpy(fh + 6, &cl32, 4);
+    char hdr[12];
+    const int hn = snprintf(hdr, sizeof(hdr), "%x\r\n", (unsigned)(10 + cl));
+    if (!ufTaskWrite((const uint8_t*)hdr, (size_t)hn) ||
+        !ufTaskWrite(fh, 10) ||
+        !ufTaskWrite(zb_out, cl) ||
+        !ufTaskWrite((const uint8_t*)"\r\n", 2)) return false;
+    zb_wire += 10 + (uint32_t)cl;
+    zb_fill = 0;
+    return true;
+}
+
 static bool ufOpenStream(uint32_t content_length, const char* path) {
     if (s.cloud_host[0] == '\0' || s.cloud_port == 0) {
         snprintf(uf.last_err, sizeof(uf.last_err), "cloud host/port unset");
@@ -2325,6 +2421,9 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
     // size isn't knowable up front (UART lines are re-framed with '\n').
     (void)content_length;   // used for the progress bar by the caller only
     uf.tcp->printf("Transfer-Encoding: chunked\r\n");
+    // Compressed body (v0.1.127): only after the /caps probe said the server
+    // decodes zblocks. Old server -> header absent -> legacy raw body.
+    if (zb_stream_on) uf.tcp->printf("X-Body-Format: zblocks\r\n");
     uf.tcp->printf("X-API-Key: %s\r\n",       s.cloud_auth_pass);
     uf.tcp->printf("X-User-Email: %s\r\n",    s.cloud_auth_user);
     uf.tcp->printf("X-Session-Id: %ld\r\n",   sid);
@@ -2427,6 +2526,10 @@ static void ufDiagReport(const char* why) {
 
 static void ufNetTask(void*) {
     bool ok = false;
+    zbProbeCaps();                              // no-op once answered (per boot)
+    zb_stream_on = (srv_zblocks == 1) && zbEnsure();
+    zb_fill = 0;
+    zb_wire = 0;
     do {
         if (!ufOpenStream(uf.expected_size, "/upload")) {
             snprintf(uf.net_err, sizeof(uf.net_err), "%s",
@@ -2454,15 +2557,33 @@ static void ufNetTask(void*) {
             // path from the display's PSRAM traffic.
             static uint8_t bounce[16384];   // net task only — single user
             memcpy(bounce, uf.buf + off, n);
-            char hdr[12];
-            const int hn = snprintf(hdr, sizeof(hdr), "%x\r\n", (unsigned)n);
-            if (!ufTaskWrite((const uint8_t*)hdr, (size_t)hn) ||
-                !ufTaskWrite(bounce, n) ||
-                !ufTaskWrite((const uint8_t*)"\r\n", 2)) { werr = true; break; }
+            if (zb_stream_on) {
+                // Stage into the 32 KB compression block; flush each full
+                // block as one zblocks frame. Compression (~10-30 ms/block)
+                // runs HERE on core 0 between socket writes — the socket
+                // sits idle far longer than that waiting on its send window.
+                uint32_t done = 0;
+                while (done < n) {
+                    uint32_t take = ZDEF_BLOCK_MAX - zb_fill;
+                    if (take > n - done) take = n - done;
+                    memcpy(zb_raw + zb_fill, bounce + done, take);
+                    zb_fill += take;
+                    done    += take;
+                    if (zb_fill == ZDEF_BLOCK_MAX && !zbFlushBlock()) { werr = true; break; }
+                }
+                if (werr) break;
+            } else {
+                char hdr[12];
+                const int hn = snprintf(hdr, sizeof(hdr), "%x\r\n", (unsigned)n);
+                if (!ufTaskWrite((const uint8_t*)hdr, (size_t)hn) ||
+                    !ufTaskWrite(bounce, n) ||
+                    !ufTaskWrite((const uint8_t*)"\r\n", 2)) { werr = true; break; }
+            }
             uf.ring_tail    += n;
-            uf.bytes_written = uf.ring_tail;        // modal progress = bytes on the wire
+            uf.bytes_written = uf.ring_tail;        // modal progress = RAW bytes staged
         }
         if (werr) break;
+        if (zb_stream_on && !zbFlushBlock()) break;   // tail partial block
         if (!ufTaskWrite((const uint8_t*)"0\r\n\r\n", 5)) break;
         uf.tcp->flush();
         // Response: complete headers (or disconnect), bounded. Parse as soon
@@ -8711,10 +8832,113 @@ static void netTestTask(void*) {
         }
         c->stop(); delete c;
     }
+
+    // ---- pass C (v0.1.127): EFFECTIVE throughput of the compressed upload
+    // path. Synthesizes telemetry-shaped NDJSON (realistic entropy — random
+    // data won't compress, constant data compresses absurdly), pushes it
+    // through the SAME zdeflate + zblocks framing the uploader uses, and
+    // reports RAW bytes/second — i.e. what a session upload will actually
+    // achieve on the net hop. Server decodes the frames and logs raw+ratio.
+    uint32_t kbps_c = 0, ratio_x10 = 0;
+    if (!fail) {
+        zbProbeCaps();
+        if (srv_zblocks == 1 && zbEnsure()) {
+            WiFiClient* c = nullptr;
+            if (s.cloud_protocol == 1) {
+                WiFiClientSecure* sec = new WiFiClientSecure();
+                sec->setInsecure();
+                sec->setTimeout(15);
+                c = sec;
+            } else {
+                c = new WiFiClient();
+                c->setTimeout(15);
+            }
+            if (c->connect(s.cloud_host, s.cloud_port)) {
+                c->setNoDelay(true);
+                c->printf("POST /nettest HTTP/1.1\r\nHost: %s\r\n"
+                          "Content-Type: application/octet-stream\r\n"
+                          "Transfer-Encoding: chunked\r\n"
+                          "X-Body-Format: zblocks\r\n"
+                          "X-Rssi: %d\r\nX-Fw: %s\r\nX-Note: ram=zb\r\n"
+                          "Connection: close\r\n\r\n",
+                          s.cloud_host, rssi0, FIRMWARE_VERSION);
+                constexpr uint32_t RAW_TOTAL = 3UL * 1024 * 1024;
+                uint32_t raw_sent = 0, wire_sent = 0, lcg = 0x2545F491u;
+                float tt = 0, mph = 60, rpm = 3500;
+                const uint32_t t0 = millis();
+                bool cfail = false;
+                while (raw_sent < RAW_TOTAL && !cfail) {
+                    // fill one 32 KB block with telemetry-shaped lines
+                    uint32_t fill = 0;
+                    while (fill + 300 < ZDEF_BLOCK_MAX) {
+                        lcg = lcg * 1664525u + 1013904223u;
+                        tt += 0.04f;
+                        mph += (float)((int)(lcg % 17) - 8) * 0.1f;
+                        rpm += (float)((int)((lcg >> 8) % 251) - 125);
+                        if (rpm < 900) rpm = 900; if (rpm > 7200) rpm = 7200;
+                        fill += (uint32_t)snprintf((char*)zb_raw + fill,
+                            ZDEF_BLOCK_MAX - fill,
+                            "{\"t\":%.3f,\"fix\":3,\"sats\":12,\"lat\":%.6f,"
+                            "\"lon\":%.6f,\"speed_mph\":%.1f,\"heading_deg\":%.1f,"
+                            "\"rpm\":%d,\"ax\":%.3f,\"ay\":%.3f,\"az\":1.002}\n",
+                            (double)(1784000000.0 + tt), (double)(39.2352 + tt * 1e-6),
+                            (double)(-77.9691 + tt * 1.3e-6), (double)mph,
+                            (double)((int)(tt * 7) % 360), (int)rpm,
+                            (double)((int)(lcg % 200) - 100) * 0.01,
+                            (double)((int)((lcg >> 16) % 260) - 130) * 0.01);
+                    }
+                    const size_t cl = zdeflate(zb_ws, zb_raw, fill, zb_out,
+                                               ZDEF_BOUND(ZDEF_BLOCK_MAX));
+                    if (!cl) { cfail = true; break; }
+                    uint8_t fh[10] = {'Z', 'B'};
+                    const uint32_t rl = fill, cl32 = (uint32_t)cl;
+                    memcpy(fh + 2, &rl, 4); memcpy(fh + 6, &cl32, 4);
+                    char hdr[12];
+                    const int hn = snprintf(hdr, sizeof(hdr), "%x\r\n",
+                                            (unsigned)(10 + cl));
+                    // chunk = frame; write with a stall guard like passes A/B
+                    const uint8_t* parts[3] = {(const uint8_t*)hdr, fh, zb_out};
+                    const size_t   plen[3]  = {(size_t)hn, 10, cl};
+                    for (int p = 0; p < 3 && !cfail; ++p) {
+                        size_t offp = 0; uint32_t lastw = millis();
+                        while (offp < plen[p]) {
+                            const int w = c->write(parts[p] + offp, plen[p] - offp);
+                            if (w > 0) { offp += (size_t)w; lastw = millis(); }
+                            else if (!c->connected() || millis() - lastw > 20000) { cfail = true; break; }
+                            else vTaskDelay(1);
+                        }
+                    }
+                    if (!cfail && c->write((const uint8_t*)"\r\n", 2) != 2) cfail = true;
+                    raw_sent  += fill;
+                    wire_sent += 10 + (uint32_t)cl + (uint32_t)hn + 2;
+                }
+                if (!cfail) (void)c->write((const uint8_t*)"0\r\n\r\n", 5);
+                const uint32_t dt = millis() - t0;
+                if (!cfail && dt) {
+                    kbps_c = (uint32_t)(((uint64_t)raw_sent * 1000) / 1024 / dt);
+                    if (wire_sent) ratio_x10 = (uint32_t)(((uint64_t)raw_sent * 10) / wire_sent);
+                }
+                const uint32_t rt0 = millis();
+                while (millis() - rt0 < 4000) {
+                    while (c->available()) (void)c->read();
+                    if (!c->connected() && !c->available()) break;
+                    vTaskDelay(10);
+                }
+            }
+            c->stop(); delete c;
+        }
+    }
+
     if (pblk) free(pblk);
     if (fail)
         snprintf(nettest_result, sizeof(nettest_result),
                  "FAIL: %s  RSSI %d", failwhy, rssi0);
+    else if (kbps_c)
+        snprintf(nettest_result, sizeof(nettest_result),
+                 "raw %lu/%lu  ZB %lu KB/s (%lu.%lux)  RSSI %d",
+                 (unsigned long)kbps_a, (unsigned long)kbps_b,
+                 (unsigned long)kbps_c, (unsigned long)(ratio_x10 / 10),
+                 (unsigned long)(ratio_x10 % 10), rssi0);
     else
         snprintf(nettest_result, sizeof(nettest_result),
                  "intRAM %lu / PSRAM %lu KB/s  RSSI %d",
