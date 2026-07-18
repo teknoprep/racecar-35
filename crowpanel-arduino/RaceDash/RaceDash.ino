@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.123"
+#define FIRMWARE_VERSION "0.1.124"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1049,7 +1049,10 @@ static const TrackInfo TRACKS[] = {
     // centerline). Facility centre/radius unchanged — they define "am I at
     // Summit Point", the line defines the lap crossing.
     { "Summit Point",            39.2415f, -77.9779f, 2.0f, 39.235214f, -77.969128f, SUMMIT_CFGS, 3, 39.235189f, -77.969019f },
-    { "Summit Point Jefferson",  39.2370f, -77.9700f, 1.2f, 39.2370f, -77.9700f, nullptr,  0, 0.0f, 0.0f, 1 },
+    // Jefferson S/F LINE user-picked 2026-07-18 (/tools/sfpicker; midpoint
+    // verified 1.7 m off the OSM Jefferson Circuit centerline). Old pin was
+    // 118 m from any tarmac — lap detection could never fire there.
+    { "Summit Point Jefferson",  39.231705f, -77.975314f, 1.2f, 39.234146f, -77.972436f, nullptr,  0, 39.234125f, -77.972320f, 1 },
     { "Summit Point Shenandoah", 39.2450f, -77.9650f, 1.5f, 39.2450f, -77.9650f, nullptr,  0, 0.0f, 0.0f, 1 },
     { "VIR",           36.5611f,  -79.2103f, 2.5f,  36.5689f,  -79.2067f, VIR_CFGS,        3 },
     { "VIR South",     36.5620f,  -79.2100f, 1.2f,  36.5620f,  -79.2100f, nullptr,         0 },
@@ -1057,7 +1060,10 @@ static const TrackInfo TRACKS[] = {
     { "Watkins Glen",  42.3417f,  -76.9272f, 2.5f,  42.3369f,  -76.9272f, WGL_CFGS,        2 },
     // Appended (TRACKS[] is append-only — keeps NVS sf_ovr indices stable).
     // S/F pinned from satellite (tools/track_sf_picker.html); refine on-site via STATUS → SET START/FINISH.
-    { "Thompson",      41.979695f, -71.827086f, 1.5f, 41.979695f, -71.827086f, nullptr,    0 },
+    // Thompson S/F LINE user-picked 2026-07-18 (midpoint verified 0.3 m off
+    // the OSM Road Course centerline). Facility centre kept (proven in the
+    // field for auto-select); only the crossing line changed.
+    { "Thompson",      41.979695f, -71.827086f, 1.5f, 41.979644f, -71.827130f, nullptr,    0, 41.979743f, -71.827036f },
 };
 constexpr int N_TRACKS = sizeof(TRACKS) / sizeof(TRACKS[0]);
 
