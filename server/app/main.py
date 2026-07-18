@@ -1786,6 +1786,20 @@ async def admin_upload_log(request: Request, n: int = 200,
     return JSONResponse({"events": out})
 
 
+@app.get("/tools/sfpicker", response_class=HTMLResponse)
+async def sf_picker(request: Request) -> Response:
+    """Satellite start/finish line picker (served copy of
+    tools/track_sf_picker.html). Click two points across the S/F stripe +
+    optionally the circuit centre; paste the generated TRACKS[] coords back
+    into chat to get them baked into firmware. Login-gated like other pages."""
+    if oauth_enabled() and not current_user(request):
+        return login_redirect(request)
+    p = pathlib.Path(__file__).parent / "sf_picker.html"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="picker not deployed")
+    return HTMLResponse(p.read_text("utf-8"))
+
+
 @app.post("/nettest")
 async def nettest(
     request: Request,
