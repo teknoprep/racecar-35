@@ -1790,6 +1790,8 @@ async def nettest(
     request: Request,
     x_rssi: Optional[str] = Header(None),
     x_fw: Optional[str] = Header(None),
+    x_note: Optional[str] = Header(None),
+    x_tls: Optional[str] = Header(None),
 ) -> JSONResponse:
     """Raw throughput probe for the dash's 'WIFI SPEED TEST' (Tools page).
     Reads and DISCARDS the body, returns bytes + elapsed so the dash can
@@ -1812,6 +1814,7 @@ async def nettest(
     _upload_event({"ev": "nettest", "ip": client_host, "bytes": n,
                    "seconds": round(dt, 3), "kbps": kbps,
                    "rssi": (x_rssi or ""), "fw": (x_fw or ""),
+                   "note": (x_note or ""), "tls_ms": (x_tls or ""),
                    "err": err})
     log.info("nettest %s: %d B in %.2fs = %.1f KB/s rssi=%s fw=%s %s",
              client_host, n, dt, kbps, x_rssi, x_fw, err)
