@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.118"
+#define FIRMWARE_VERSION "0.1.119"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -196,6 +196,7 @@ static struct {
                                   // opto-tach frequency into RPM in Direct mode.
     int8_t   rpm_smooth  = 0;     // RPM display smoothing trim from the dash slider
     uint8_t  rpm_spike   = 2;     // spike filter: 0=Off 1=Mild 2=Normal 3=Strong (CFG,rpmspk)
+    uint8_t  gps_filter  = 2;     // GPS drift filter: 0=Off 1=Mild 2=Normal 3=Strong (CFG,gpsflt)
                                   // (-10..+10): <0 raw/jumpy, 0 baseline, >0 smoother.
     bool     debug_enabled = false;// dash CFG,dbg_on. Default OFF (v0.1.103) —
                                   // diagnostic tool, enabled from Settings when
@@ -2355,6 +2356,14 @@ static void handleCfgLine(const String& line) {
             Serial.printf("[cfg] rpm spike filter = %u\n", (unsigned)v);
         }
     }
+    else if (key == "gpsflt") {
+        uint8_t v = (uint8_t)val.toInt();
+        if (v > 3) v = 3;
+        if (v != g_cfg.gps_filter) {
+            g_cfg.gps_filter = v;
+            Serial.printf("[cfg] gps drift filter = %u\n", (unsigned)v);
+        }
+    }
     else {
         Serial.printf("[cfg] unknown key %s\n", key.c_str());
         return;
@@ -3448,6 +3457,55 @@ static void generateTestSample(uint8_t& fix, uint8_t& sats,
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPS drift filter (dash "GPS drift filter", CFG,gpsflt — same idea as the
+// RPM spike filter). A parked GPS wanders: position scribbles around, speed
+// flickers 0.3-1.5 mph, heading spins. Below the freeze threshold (held for
+// ~0.5 s) we LATCH the position/heading and clamp speed to 0; we thaw the
+// instant real movement shows up — speed above the (hysteresis) thaw level OR
+// the raw fix escaping a radius from the latch point (covers a slow creep
+// that never crosses the speed gate). Applied at the emit choke point so the
+// dash display, lap timing AND the logged NDJSON all see the same clean data.
+// ---------------------------------------------------------------------------
+static bool    gpsf_frozen  = false;
+static float   gpsf_lat, gpsf_lon, gpsf_hdg;
+static uint8_t gpsf_below_n = 0;
+
+static void applyGpsDriftFilter(bool have_pvt, uint8_t fix,
+                                float* lat, float* lon, float* mph, float* hdg) {
+    if (g_cfg.gps_filter == 0 || !have_pvt || fix < 2) {
+        gpsf_frozen = false; gpsf_below_n = 0;
+        return;
+    }
+    const uint8_t lv = (g_cfg.gps_filter > 3) ? 3 : g_cfg.gps_filter;
+    static const float FREEZE_MPH[4] = {0, 0.8f, 1.2f, 2.0f};
+    static const float THAW_MPH[4]   = {0, 1.8f, 2.5f, 3.5f};
+    static const float ESCAPE_M[4]   = {0, 8.0f, 12.0f, 20.0f};
+    if (!gpsf_frozen) {
+        if (*mph < FREEZE_MPH[lv]) {
+            if (++gpsf_below_n >= 12) {   // ~0.5 s of below-threshold at 25 Hz
+                gpsf_frozen = true;
+                gpsf_lat = *lat; gpsf_lon = *lon; gpsf_hdg = *hdg;
+            }
+        } else {
+            gpsf_below_n = 0;
+        }
+        if (!gpsf_frozen) return;
+    }
+    // Frozen: hold everything — unless the car is genuinely moving again.
+    const float dlat = (*lat - gpsf_lat) * 111320.0f;
+    const float dlon = (*lon - gpsf_lon) * 111320.0f * cosf(gpsf_lat * 0.01745329f);
+    const float dist = sqrtf(dlat * dlat + dlon * dlon);
+    if (*mph > THAW_MPH[lv] || dist > ESCAPE_M[lv]) {
+        gpsf_frozen = false; gpsf_below_n = 0;
+        return;                            // real values pass through immediately
+    }
+    *lat = gpsf_lat;
+    *lon = gpsf_lon;
+    *hdg = gpsf_hdg;
+    *mph = 0.0f;
+}
+
 static void emitToDash() {
     // Only read the SparkFun lib's PVT cache after we've confirmed at least
     // ONE fresh PVT arrived (gnss_last_fresh_ms != 0). Calling getFixType()
@@ -3461,6 +3519,7 @@ static void emitToDash() {
     float   mph     = have_pvt ? myGNSS.getGroundSpeed() * 0.00223694f : 0.0f;
     float   hdg_deg = have_pvt ? myGNSS.getHeading()     * 1e-5f      : 0.0f;
     uint8_t status  = gpsStatus();
+    applyGpsDriftFilter(have_pvt, fix, &lat_deg, &lon_deg, &mph, &hdg_deg);
 
     // Engine data — source selected by g_cfg.sensor_type, with an AUTO override:
     //   0 = Direct:      RPM from opto tach (FreqMeasureMulti pin 9),

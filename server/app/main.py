@@ -1976,13 +1976,22 @@ async def _save_body(
     elif oauth_enabled():
         web_user = current_user(request)
 
+    _rx = 0
     try:
-        body = await request.body()
+        _chunks: list[bytes] = []
+        async for _chunk in request.stream():
+            _chunks.append(_chunk)
+            _rx += len(_chunk)
+        body = b"".join(_chunks)
     except Exception as e:
         # Client aborted mid-stream (dropped WiFi, TLS reset, chunked framing
-        # error). This is the smoking gun for "upload died partway".
+        # error). This is the smoking gun for "upload died partway" — and
+        # bytes_received says HOW FAR it got before dying (0 = the body never
+        # started; N = it flowed then stopped), which discriminates a
+        # never-wrote client bug from a mid-stream stall.
         _upload_event({"ev": "recv_error", "ip": _client_host, "kind": kind or "session",
                        "session": x_session_id, "track": x_track_name,
+                       "bytes_received": _rx,
                        "err": f"{type(e).__name__}: {e}"})
         raise HTTPException(status_code=400, detail=f"body read failed: {type(e).__name__}")
     if not body:

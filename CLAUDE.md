@@ -613,6 +613,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `btpid` | uint8 | **Mode-01 PID mapped to the COOLANT function** (default 0x05 = standard ECT). Set from PAGE_PID_SCAN (Sensor page → COOLANT PID button); decoded as A−40 °C. |
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `rpmspk` | uint8 | **RPM spike filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2). Sent as `CFG,rpmspk,<v>`; Teensy slew-gates tach pulses (see "RPM spike filter" note above). |
+| `gpsflt` | uint8 | **GPS drift filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2, v0.1.119). Sent as `CFG,gpsflt,<v>`. Teensy `applyGpsDriftFilter()` at the emit choke point (dash display + lap timing + NDJSON all filtered): parked GPS wander is LATCHED — below the freeze speed (0.8/1.2/2.0 mph, ~0.5 s) position/heading hold and speed clamps to 0; thaws instantly above the hysteresis speed (1.8/2.5/3.5 mph) OR when the raw fix escapes 8/12/20 m from the latch point (catches speed-less creep). |
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
 | `lapov` | uint8 | **Finish-line lap-time popup duration** in seconds, 0–9 (default 3, 0 = off). Dash-only (no CFG). Settings → "Lap time popup (sec)". |
@@ -951,6 +952,17 @@ TunerStudio units — re-verify if it's ever switched to °C).
 > Note: only `0x5E8` was seen in the engine-off capture. The 1513-1516 (`0x5E9`-`0x5EC`)
 > frames (IAT/AFR/batt) still want a **running-engine capture** to fully confirm, but they
 > follow the same authoritative spec table above.
+
+### Upload diagnostics (v0.1.119) — how to debug a wedged upload REMOTELY
+- **Modal diag line** (under the progress bar): `S<state> N<net_state> rt=<sentKB> rh=<queuedKB> <err>`
+  — S = UploadFlowState, N = net task (0 idle/1 running/2 done/3 failed). Photograph this.
+- **`ufDiagReport()`**: on every retry/failure AND on success the dash fires a 0-byte POST
+  /nettest with `X-Note: ufdiag <why> st=.. net=.. rh=.. rt=.. lr=.. er=.. f=..` — lands in the
+  server upload event log (`ev=nettest`, note field) readable via `GET /admin/upload/log`.
+- **Server `recv_error` now logs `bytes_received`** (body bytes before the client died):
+  0 = body never started (client-side pre-write bug), large = mid-stream stall.
+- Modal progress reads the VOLATILE `uf.ring_tail` directly during streaming (bytes on the
+  wire), not the non-volatile relay.
 
 ## WiFi speed test (Tools page button 5, v0.1.116)
 

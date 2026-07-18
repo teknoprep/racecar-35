@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.118"
+#define FIRMWARE_VERSION "0.1.119"
 
 #include <Preferences.h>
 #include <time.h>
@@ -50,7 +50,7 @@ enum SettingId : uint8_t {
     ST_BRIGHTNESS = 0,            // LCD backlight slider — top of the settings list
     ST_INET_MODE,
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
-    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_RPM_SPIKE, ST_LAP_OVERLAY, ST_ALERTS,
+    ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_RPM_SPIKE, ST_GPS_FILTER, ST_LAP_OVERLAY, ST_ALERTS,
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
     ST_AM_RPM, ST_AM_COL, ST_AM_HZ,
     // Coolant temp warn-color + oil PSI warn-color. Each has a master
@@ -680,6 +680,7 @@ struct Settings {
     // -ve = rawer/snappier (numbers jump), +ve = heavier smoothing.
     int8_t   rpm_smooth         = 0;
     uint8_t  rpm_spike          = 2;    // 0=Off 1=Mild 2=Normal 3=Strong (CFG,rpmspk)
+    uint8_t  gps_filter         = 2;    // GPS drift filter, same levels (CFG,gpsflt, NVS gpsflt)
     uint8_t  lap_overlay_s      = 3;    // finish-line lap-time popup duration, 0-9 s (0 = off)
 
     // AFR (Air/Fuel Ratio) — only meaningful in MegaSquirt sensor mode.
@@ -1334,6 +1335,7 @@ static void loadSettings() {
     if (s.rpm_smooth < -10) s.rpm_smooth = -10;
     if (s.rpm_smooth >  10) s.rpm_smooth =  10;
     s.rpm_spike          = prefs.getUChar ("rpmspk",   s.rpm_spike) % N_SPIKE_FILTER;
+    s.gps_filter         = prefs.getUChar ("gpsflt",   s.gps_filter) % N_SPIKE_FILTER;
     s.lap_overlay_s      = prefs.getUChar ("lapov",    s.lap_overlay_s);
     if (s.lap_overlay_s > 9) s.lap_overlay_s = 9;
     s.show_afr           = prefs.getBool  ("s_afr",    s.show_afr);
@@ -1418,6 +1420,7 @@ static void saveSettings() {
     prefs.putUChar ("gpshz",    s.gps_nav_hz);
     prefs.putChar  ("rpmsm",    s.rpm_smooth);
     prefs.putUChar ("rpmspk",   s.rpm_spike);
+    prefs.putUChar ("gpsflt",   s.gps_filter);
     prefs.putUChar ("lapov",    s.lap_overlay_s);
     prefs.putBool  ("s_afr",    s.show_afr);
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
@@ -1470,6 +1473,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,gpshz,%u\n",     (unsigned)s.gps_nav_hz);
     Serial.printf("CFG,rpmsm,%d\n",     (int)s.rpm_smooth);
     Serial.printf("CFG,rpmspk,%u\n",    (unsigned)s.rpm_spike);
+    Serial.printf("CFG,gpsflt,%u\n",    (unsigned)s.gps_filter);
     Serial.printf("CFG,dbg_on,%d\n",    (int)s.debug_enabled);
     sendSfToTeensy(last_track_idx);     // active track's S/F line for lap stamping
 }
@@ -2170,7 +2174,10 @@ static void ufNextFile() {
 // felt spotty. sendAbort=true also tells the Teensy to bail out of its (now
 // 60 s patient) go-back-N retransmit loop FIRST — otherwise our retry's Q,GET
 // line would be eaten as a stray inside its ack-pump and the retry would hang.
+static void ufDiagReport(const char* why);   // defined near the net task
+
 static void ufFailOrRetry(bool sendAbort) {
+    ufDiagReport("fail");   // snapshot BEFORE teardown mutates the state
     ufStopNetTask();
     ufCloseTcp();
     if (sendAbort) { Serial.printf("Q,ABORT\n"); Serial.flush(); }
@@ -2341,6 +2348,58 @@ static bool ufTaskWrite(const uint8_t* d, size_t len) {
         } else vTaskDelay(1);
     }
     return true;
+}
+
+// Fire-and-forget diagnostics: POST a 0-byte /nettest whose X-Note carries a
+// compact snapshot of the uploader (state, net task state, ring head/tail,
+// lines, last error, file). Lands in the server's upload event log
+// (ev=nettest, note=ufdiag…) so failures in the field are inspectable
+// remotely without USB access (v0.1.119).
+static char          ufdiag_note[176];
+static volatile bool ufdiag_busy = false;
+
+static void ufDiagTask(void*) {
+    WiFiClient* c = nullptr;
+    if (s.cloud_protocol == 1) {
+        WiFiClientSecure* sec = new WiFiClientSecure();
+        sec->setInsecure();
+        sec->setTimeout(8);
+        c = sec;
+    } else {
+        c = new WiFiClient();
+        c->setTimeout(8);
+    }
+    if (c->connect(s.cloud_host, s.cloud_port)) {
+        c->printf("POST /nettest HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\n"
+                  "X-Rssi: %d\r\nX-Fw: %s\r\nX-Note: %s\r\nConnection: close\r\n\r\n",
+                  s.cloud_host, (int)WiFi.RSSI(), FIRMWARE_VERSION, ufdiag_note);
+        const uint32_t t0 = millis();
+        while (millis() - t0 < 4000 && c->connected()) {
+            while (c->available()) (void)c->read();
+            vTaskDelay(10);
+        }
+    }
+    c->stop();
+    delete c;
+    ufdiag_busy = false;
+    vTaskDelete(NULL);
+}
+
+static void ufDiagReport(const char* why) {
+    if (ufdiag_busy) return;                                    // one in flight
+    if (s.internet_mode != 1 || !wifiConnectedNow()) return;
+    snprintf(ufdiag_note, sizeof(ufdiag_note),
+             "ufdiag %s st=%u net=%u rh=%lu rt=%lu lr=%lu er=%.40s f=%.28s",
+             why, (unsigned)uf.state, (unsigned)uf.net_state,
+             (unsigned long)uf.ring_head, (unsigned long)uf.ring_tail,
+             (unsigned long)uf.lines_recv,
+             uf.net_err[0] ? uf.net_err : uf.last_err,
+             (uf.files_idx >= 0 && uf.files_idx < uf.files_n)
+                 ? uf.files[uf.files_idx].name : "-");
+    ufdiag_busy = true;
+    if (xTaskCreatePinnedToCore(ufDiagTask, "ufdiag", 12288, nullptr, 1,
+                                nullptr, 0) != pdPASS)
+        ufdiag_busy = false;
 }
 
 static void ufNetTask(void*) {
@@ -2759,7 +2818,11 @@ static void uploadTick() {
                                           : uf.files[uf.files_idx].size > 0
                                               ? uf.files[uf.files_idx].size
                                               : 1;
-            done  = uf.bytes_written;
+            // Progress = bytes ON THE WIRE. Read the VOLATILE ring_tail
+            // directly during a stream (v0.1.119) — it's the net task's
+            // ground truth; bytes_written is a non-volatile relay of it.
+            done = (uf.state == UF_STREAMING || uf.state == UF_STREAM_FINISH)
+                   ? uf.ring_tail : uf.bytes_written;
         }
         if (strcmp(upload_file, fname) != 0 ||
             total != upload_total || done != upload_done) {
@@ -2789,6 +2852,7 @@ static void uploadTick() {
             char body[140];
             const int code = ufParseResponse(body, sizeof(body));
             Serial.printf("DBG,uf_response code=%d body=%s\n", code, body);
+            ufDiagReport((code >= 200 && code < 300) ? "ok" : "httpfail");
             ufStopNetTask();
             ufCloseTcp();
             if (code >= 200 && code < 300) {
@@ -4600,6 +4664,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_RPM_DIV,    "Tach pulses/rev",      SettingRow::NUMERIC },
     { ST_RPM_SMOOTH, "RPM smoothing",        SettingRow::SLIDER  },
     { ST_RPM_SPIKE,  "RPM spike filter",     SettingRow::ENUM    },
+    { ST_GPS_FILTER, "GPS drift filter",     SettingRow::ENUM    },
     { ST_ALERTS,     "Enable RPM alerts",    SettingRow::TOGGLE  },
     { ST_A1_RPM,     "Alert 1 RPM",          SettingRow::NUMERIC },
     { ST_A1_COL,     "Alert 1 color",        SettingRow::COLOR   },
@@ -5861,6 +5926,7 @@ static const char* enumValue(SettingId id) {
         case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
         case ST_RPM_SPIKE:   return SPIKE_FILTER_NAMES[s.rpm_spike % N_SPIKE_FILTER];
+        case ST_GPS_FILTER:  return SPIKE_FILTER_NAMES[s.gps_filter % N_SPIKE_FILTER];
         case ST_RPM_DIV:     return RPM_PPR_NAMES[rpmPprIndex()];
         case ST_GPS_BAUD: {
             static char b[24];
@@ -5941,7 +6007,8 @@ static int rowGroup(SettingId id) {
         case ST_BRIGHTNESS: case ST_LAP_OVERLAY: return SG_DISPLAY;
         case ST_INET_MODE:
         case ST_WIFI_SSID: case ST_WIFI_PASS: case ST_WIFI_STATUS: return SG_NET;
-        case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_RPM_SPIKE: case ST_ALERTS:
+        case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_RPM_SPIKE:
+        case ST_GPS_FILTER: case ST_ALERTS:
         case ST_A1_RPM: case ST_A1_COL: case ST_A1_HZ:
         case ST_AM_RPM: case ST_AM_COL: case ST_AM_HZ: return SG_RPM;
         case ST_SENSOR_TYPE:
@@ -6354,6 +6421,9 @@ static void handleSettingsTap(int x, int y) {
                 } else if (r.id == ST_RPM_SPIKE) {
                     s.rpm_spike = (s.rpm_spike + 1) % N_SPIKE_FILTER;
                     Serial.printf("CFG,rpmspk,%u\n", (unsigned)s.rpm_spike);
+                } else if (r.id == ST_GPS_FILTER) {
+                    s.gps_filter = (s.gps_filter + 1) % N_SPIKE_FILTER;
+                    Serial.printf("CFG,gpsflt,%u\n", (unsigned)s.gps_filter);
                 } else if (r.id == ST_SENSOR_TYPE) {
                     // Open the dedicated Sensor Source page (Direct/MegaSquirt/
                     // Bluetooth) instead of cycling — Bluetooth needs a device
@@ -7256,6 +7326,25 @@ static void drawUploadModal() {
     tft.setTextPadding(UM_CARD_W - 40);
     tft.drawString(line, UM_CARD_X + UM_CARD_W / 2, UM_BAR_Y + UM_BAR_H + 24);
     tft.setTextPadding(0);
+
+    // Diagnostic internals line (v0.1.119): raw uploader state so a stuck
+    // modal is self-describing — S=flow state, N=net task state (0 idle /
+    // 1 running / 2 done / 3 failed), rt/rh = ring sent/queued KB, then the
+    // most recent error text. Photograph this line when something wedges.
+    {
+        char diag[110];
+        snprintf(diag, sizeof(diag), "S%u N%u rt=%luK rh=%luK %.48s",
+                 (unsigned)uf.state, (unsigned)uf.net_state,
+                 (unsigned long)(uf.ring_tail / 1024),
+                 (unsigned long)(uf.ring_head / 1024),
+                 uf.net_err[0] ? uf.net_err : uf.last_err);
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextPadding(UM_CARD_W - 40);
+        tft.drawString(diag, UM_CARD_X + UM_CARD_W / 2, UM_BAR_Y + UM_BAR_H + 46);
+        tft.setTextPadding(0);
+    }
 
     // Result banner replaces filename area when DONE arrives.
     if (upload_result_msg[0] != '\0') {
