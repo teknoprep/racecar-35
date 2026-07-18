@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.120"
+#define FIRMWARE_VERSION "0.1.121"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2040,7 +2040,8 @@ struct UploadFlow {
     char       response[1024];  // accumulated HTTP response (headers + body)
     size_t     response_len;
     char       last_err[180];
-    uint8_t    file_retries;    // per-file retry count (1 automatic retry max)
+    uint8_t    file_retries;    // per-file retry count (2 automatic retries max)
+    uint8_t    list_tries;      // Q,LIST re-asks after a 6 s silence (v0.1.121)
     uint32_t   retry_at_ms;     // when UF_RETRY_WAIT re-sends Q,GET / UF_POSTING re-opens
     // Segmented store-and-forward (v0.1.113). The file is pulled over UART
     // into a PSRAM segment FIRST (network completely idle), then POSTed as a
@@ -2124,6 +2125,11 @@ static void ufStopNetTask() {
 }
 
 static void ufReset() {
+    // Free a possibly-wedged Teensy sender FIRST (v0.1.121): if a previous
+    // stream died without a clean abort, the Teensy sits in its patient
+    // retransmit loop and eats our next request as a stray line.
+    Serial.printf("Q,ABORT\n");
+    Serial.flush();
     ufStopNetTask();
     ufCloseTcp();
     ufFreeBuf();
@@ -2933,7 +2939,12 @@ static void uploadTick() {
     uint32_t since      = 0;
     switch (uf.state) {
         case UF_LISTING:        timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
-        case UF_FETCH_HEAD:     timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
+        // 30 s (was 6 s, v0.1.121): the Q,DATA reply needs the Teensy to OPEN
+        // the file — which can block behind the same SD-card garbage
+        // collection that stalls mid-stream reads. Failure routes through the
+        // whole-file retry (Q,ABORT + fresh Q,GET), which also un-wedges a
+        // Teensy stuck in a zombie stream.
+        case UF_FETCH_HEAD:     timeout_ms = 30000;  since = now - uf.state_entered_ms; break;
         // 90 s (was 30 s, v0.1.120): an SD card's internal garbage collection
         // (triggered by the previous file's delete) can silence the Teensy for
         // 30+ s MID-STREAM — ufdiag proved the stream was healthy on both
@@ -2963,7 +2974,25 @@ static void uploadTick() {
         }
         Serial.printf("DBG,uf_timeout state=%u %s\n",
                       (unsigned)uf.state, uf.last_err);
-        if (uf.state == UF_LISTING) { ufCloseTcp(); ufEnter(UF_DONE); }
+        if (uf.state == UF_LISTING) {
+            // Re-ask before giving up (v0.1.121): our Q,LIST may have been
+            // eaten by a Teensy wedged in a zombie stream — the first re-ask
+            // un-wedges it (implicit abort), the next one gets answered.
+            if (uf.list_tries < 2) {
+                uf.list_tries++;
+                Serial.println("Q,LIST");
+                Serial.flush();
+                ufEnter(UF_LISTING);
+            } else {
+                ufCloseTcp();
+                ufEnter(UF_DONE);
+            }
+        }
+        else if (uf.state == UF_FETCH_HEAD) {
+            // No Q,DATA: eaten request or SD-stalled open — whole-file retry
+            // (sends Q,ABORT first, then a fresh Q,GET after the settle).
+            ufFailOrRetry(true);
+        }
         else if (uf.state == UF_STREAMING) {
             // UART went quiet for 30 s. Either the Teensy died, or the ring
             // has been full that long (network-dead — the net task usually

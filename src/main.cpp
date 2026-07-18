@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.120"
+#define FIRMWARE_VERSION "0.1.121"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -2833,6 +2833,17 @@ static long qPumpAcksOnce(long best) {
                 // would otherwise read Q,ABORT as "everything acked". The dash
                 // sends this when it gives up on a stream so we exit fast and
                 // its retry's fresh Q,GET isn't eaten as a stray line here.
+                q_abort = true;
+            } else if (strncmp(line, "UPLOAD,CANCEL", 13) == 0 ||
+                       strncmp(line, "Q,LIST", 6) == 0 ||
+                       strncmp(line, "Q,GET,", 6) == 0) {
+                // v0.1.121: a NEW queue request (or an explicit cancel) arriving
+                // MID-STREAM means the dash abandoned this stream — without
+                // this, we'd sit DEAF in the (120 s patient) retransmit loop
+                // eating the dash's fresh requests as strays, and the dash
+                // showed "Preparing..." forever. The consumed request line is
+                // lost; the dash re-asks on its own timeout and the next one
+                // lands on a free main loop.
                 q_abort = true;
             } else if (strncmp(line, "Q,A,", 4) == 0) {
                 const long v = strtol(line + 4, nullptr, 10);
