@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.117"
+#define FIRMWARE_VERSION "0.1.118"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2286,7 +2286,15 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
     uf.tcp->printf("POST %s HTTP/1.1\r\n", path);
     uf.tcp->printf("Host: %s\r\n",            s.cloud_host);
     uf.tcp->printf("Content-Type: application/x-ndjson\r\n");
-    uf.tcp->printf("Content-Length: %lu\r\n", (unsigned long)content_length);
+    // ⚠️ CHUNKED, not Content-Length (v0.1.118 fix). The net task writes the
+    // body with chunked FRAMING ("<hex>\r\n...\r\n" + "0\r\n\r\n") — v0.1.114
+    // accidentally dropped this header while keeping the framing, so the
+    // server read Content-Length bytes of chunk-framed data, the counts never
+    // lined up, and EVERY streamed upload died ~30 s in (ClientDisconnect).
+    // Chunked is also the only honest choice for a stream: the exact body
+    // size isn't knowable up front (UART lines are re-framed with '\n').
+    (void)content_length;   // used for the progress bar by the caller only
+    uf.tcp->printf("Transfer-Encoding: chunked\r\n");
     uf.tcp->printf("X-API-Key: %s\r\n",       s.cloud_auth_pass);
     uf.tcp->printf("X-User-Email: %s\r\n",    s.cloud_auth_user);
     uf.tcp->printf("X-Session-Id: %ld\r\n",   sid);
