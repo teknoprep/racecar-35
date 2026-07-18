@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.125"
+#define FIRMWARE_VERSION "0.1.126"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1036,7 +1036,7 @@ static const TrackInfo TRACKS[] = {
     { "Daytona", 29.1853f, -81.0697f, 3.0f, 29.184313f, -81.072454f, nullptr, 0, 29.184213f, -81.072335f },  // osm-sf VERIFY
     { "Laguna Seca", 36.5847f, -121.7494f, 2.5f, 36.584093f, -121.757188f, nullptr, 0, 36.584080f, -121.757010f },  // osm-sf
     { "Lime Rock", 41.9263f, -73.3856f, 2.0f, 41.928886f, -73.381634f, nullptr, 0, 41.928755f, -73.381713f },  // osm-sf
-    { "Mid-Ohio", 40.6896f, -82.6364f, 2.5f, 40.689477f, -82.637036f, nullptr, 0, 40.689620f, -82.637027f },  // osm-sf
+    { "Mid-Ohio", 40.6896f, -82.6364f, 2.5f, 40.689477f, -82.637036f, MID_OHIO_CFGS, 3, 40.689620f, -82.637027f },  // osm-sf
     { "Nelson Ledges", 41.3055f, -81.0180f, 1.5f, 41.303945f, -81.021750f, nullptr, 0, 41.303906f, -81.021566f },  // osm-sf VERIFY
     { "NHMS", 43.3628f, -71.4630f, 2.0f, 43.362739f, -71.462085f, nullptr, 0, 43.362786f, -71.462272f },  // osm-sf
     { "NJMP Thunderbolt", 39.3603f, -75.0687f, 2.0f, 39.360880f, -75.074045f, nullptr, 0, 39.361003f, -75.073949f },  // osm-sf
@@ -1045,7 +1045,7 @@ static const TrackInfo TRACKS[] = {
     { "Road America", 43.7986f, -87.9956f, 3.0f, 43.798079f, -87.989534f, nullptr, 0, 43.798076f, -87.989733f },  // osm-sf
     { "Road Atlanta", 34.1469f, -83.8189f, 2.5f, 34.149649f, -83.813004f, nullptr, 0, 34.149770f, -83.812910f },  // osm-sf
     { "Sebring", 27.4570f, -81.3568f, 3.5f, 27.450302f, -81.352701f, nullptr, 0, 27.450158f, -81.352700f },  // osm-sf
-    { "Sonoma", 38.1614f, -122.4544f, 2.5f, 38.160290f, -122.453223f, nullptr, 0, 38.160341f, -122.453052f },  // osm-sf
+    { "Sonoma", 38.1614f, -122.4544f, 2.5f, 38.160290f, -122.453223f, SONOMA_CFGS, 2, 38.160341f, -122.453052f },  // osm-sf
     // Summit Point: ONE picker entry, three sub-tracks (configs). The
     // Jefferson/Shenandoah rows below are aux=1 = HIDDEN storage tombstones:
     // never auto-picked, never listed — they exist so each sub-track keeps
@@ -1061,10 +1061,10 @@ static const TrackInfo TRACKS[] = {
     // 118 m from any tarmac — lap detection could never fire there.
     { "Summit Point Jefferson",  39.231705f, -77.975314f, 1.2f, 39.234146f, -77.972436f, nullptr,  0, 39.234125f, -77.972320f, 1 },
     { "Summit Point Shenandoah", 39.2450f, -77.9650f, 1.5f, 39.241349f, -77.979632f, nullptr, 0, 39.241207f, -77.979657f, 1 },  // osm-sf VERIFY
-    { "VIR", 36.5611f, -79.2103f, 2.5f, 36.568224f, -79.209125f, nullptr, 0, 36.568095f, -79.209045f },  // osm-sf
+    { "VIR", 36.5611f, -79.2103f, 2.5f, 36.568224f, -79.209125f, VIR_CFGS, 3, 36.568095f, -79.209045f },  // osm-sf
     { "VIR South", 36.5620f, -79.2100f, 1.2f, 36.558404f, -79.209554f, nullptr, 0, 36.558461f, -79.209390f },  // osm-sf VERIFY
     { "VIR Patriot", 36.5660f, -79.2120f, 1.0f, 36.557121f, -79.207920f, nullptr, 0, 36.557051f, -79.208077f },  // osm-sf VERIFY
-    { "Watkins Glen", 42.3417f, -76.9272f, 2.5f, 42.340868f, -76.928941f, nullptr, 0, 42.340859f, -76.928746f },  // osm-sf
+    { "Watkins Glen", 42.3417f, -76.9272f, 2.5f, 42.340868f, -76.928941f, WGL_CFGS, 2, 42.340859f, -76.928746f },  // osm-sf
     // Appended (TRACKS[] is append-only — keeps NVS sf_ovr indices stable).
     // S/F pinned from satellite (tools/track_sf_picker.html); refine on-site via STATUS → SET START/FINISH.
     // Thompson S/F LINE user-picked 2026-07-18 (midpoint verified 0.3 m off

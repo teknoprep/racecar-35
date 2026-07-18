@@ -1765,6 +1765,40 @@ async def admin_debug_get(request: Request, user: str, file: str,
     return Response(content=p.read_text("utf-8", "replace"), media_type="text/plain")
 
 
+@app.get("/admin/sessions/list")
+async def admin_sessions_list(request: Request,
+                             x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    """List ALL session files (firmware-key gated) so tooling/agents can run
+    remote forensics (e.g. test a baked S/F line against a real GPS trace)
+    without a browser session. Mirrors /admin/debug/list."""
+    if not FIRMWARE_KEY or x_api_key != FIRMWARE_KEY:
+        raise HTTPException(status_code=401, detail="firmware key required")
+    out = []
+    root = DATA_DIR / "sessions"
+    if root.exists():
+        for ud in sorted(root.iterdir()):
+            if ud.is_dir():
+                for f in sorted(ud.iterdir()):
+                    if f.is_file():
+                        st = f.stat()
+                        out.append({"user": ud.name, "file": f.name,
+                                    "size": st.st_size, "mtime": int(st.st_mtime)})
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return JSONResponse({"sessions": out})
+
+
+@app.get("/admin/sessions/get")
+async def admin_sessions_get(request: Request, user: str, file: str,
+                            x_api_key: Optional[str] = Header(None)) -> Response:
+    """Raw NDJSON of one session (firmware-key gated; forensics tooling)."""
+    if not FIRMWARE_KEY or x_api_key != FIRMWARE_KEY:
+        raise HTTPException(status_code=401, detail="firmware key required")
+    p = DATA_DIR / "sessions" / safe_name(user) / safe_name(file, maxlen=256)
+    if not p.exists() or not p.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(p, media_type="application/x-ndjson", filename=p.name)
+
+
 @app.get("/admin/upload/log")
 async def admin_upload_log(request: Request, n: int = 200,
                           x_api_key: Optional[str] = Header(None)) -> JSONResponse:
