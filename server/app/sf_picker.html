@@ -33,11 +33,24 @@
   .sf-dot { color:var(--primary); } .c-dot { color:#4EA1FF; }
   ol { padding-left:18px; color:var(--muted); font-size:12px; }
   ol b { color:var(--text); }
+  #mapbox { position:relative; }
+  #modebar { position:absolute; top:12px; right:12px; z-index:1100; display:flex; gap:6px; }
+  #modebar button { box-shadow:0 1px 8px rgba(0,0,0,.55); font-size:13px; }
+  /* precision cursor while placing points — the grab-hand made straight
+     lines hard to draw */
+  #map.placing, #map.placing * { cursor: crosshair !important; }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <div id="map"></div>
+  <div id="mapbox">
+    <div id="map"></div>
+    <div id="modebar">
+      <button id="mb-move">✋ move</button>
+      <button id="mb-sf">┃ S/F line</button>
+      <button id="mb-c">◎ center</button>
+    </div>
+  </div>
   <aside>
     <h1>Track Start/Finish Picker</h1>
     <p class="sub">racecar-35 · pick S/F + center on satellite imagery</p>
@@ -95,7 +108,7 @@
     maxZoom: 20, attribution: 'Imagery © Esri'
   }).addTo(map);
 
-  let mode = 'sf';
+  let mode = 'move';
   let sfA = null, sfB = null, center = null;
   let sfMarkerA = null, sfMarkerB = null, sfLine = null, cMarker = null;
   const el = id => document.getElementById(id);
@@ -105,9 +118,16 @@
     mode = m;
     el('mode-sf').classList.toggle('on', m==='sf');
     el('mode-c').classList.toggle('on', m==='c');
+    el('mb-move').classList.toggle('on', m==='move');
+    el('mb-sf').classList.toggle('on', m==='sf');
+    el('mb-c').classList.toggle('on', m==='c');
+    document.getElementById('map').classList.toggle('placing', m!=='move');
   }
   el('mode-sf').onclick = ()=>setMode('sf');
   el('mode-c').onclick  = ()=>setMode('c');
+  el('mb-move').onclick = ()=>setMode('move');
+  el('mb-sf').onclick   = ()=>setMode('sf');
+  el('mb-c').onclick    = ()=>setMode('c');
 
   function icon(color){
     return L.divIcon({className:'', iconSize:[16,16], iconAnchor:[8,8],
@@ -164,6 +184,7 @@
     refresh();
   };
   map.on('click', e=>{
+    if (mode==='move') return;   // pan/zoom only — no accidental points
     const p=[e.latlng.lat, e.latlng.lng];
     if (mode==='sf'){
       if (!sfA || (sfA && sfB)){          // start a fresh line
@@ -201,7 +222,7 @@
       el('copy').textContent='copied!'; setTimeout(()=>el('copy').textContent='copy line',1200);
     });
   };
-  refresh();
+  refresh(); setMode('move');
 </script>
 </body>
 </html>
