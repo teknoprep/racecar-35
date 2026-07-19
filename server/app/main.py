@@ -2926,12 +2926,63 @@ def _ai_chat(messages: list, model: Optional[str] = None) -> tuple:
     try:
         content = payload["choices"][0]["message"]["content"]
     except Exception:
-        return json.dumps(payload)[:2000], use_model
+        return json.dumps(payload)[:2000], use_model, {}
+    # Cost/usage capture (v: admin cost display): the OpenAI-compatible payload
+    # may carry a usage block, and Open WebUI appends a <details> cost/token
+    # footer to the text — harvest BOTH before stripping the footer.
+    usage = _ai_parse_usage(payload, content)
     # Open WebUI appends a collapsible <details> usage/cost/token footer (admin-
     # only info) to the reply. Strip EVERY such block anywhere in the text so the
     # review card shows only the coaching content.
     content = re.sub(r"<details>.*?</details>", "", content, flags=re.S | re.I).strip()
-    return content, use_model
+    return content, use_model, usage
+
+
+def _ai_parse_usage(payload: dict, content: str) -> dict:
+    """Harvest token counts + $ cost from the API usage block and/or the Open
+    WebUI <details> footer. Best-effort — absent fields are simply omitted."""
+    out: dict = {}
+    u = payload.get("usage")
+    if isinstance(u, dict):
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            if isinstance(u.get(k), (int, float)):
+                out[k] = int(u[k])
+        for k in ("cost", "total_cost", "cost_usd"):
+            if isinstance(u.get(k), (int, float)):
+                out["cost_usd"] = round(float(u[k]), 6)
+                break
+    for m in re.finditer(r"<details>(.*?)</details>", content, re.S | re.I):
+        txt = m.group(1)
+        if "cost_usd" not in out:
+            dm = re.search(r"\$\s*([0-9]+(?:\.[0-9]+)?)", txt)
+            if dm:
+                try:
+                    out["cost_usd"] = round(float(dm.group(1)), 6)
+                except ValueError:
+                    pass
+        if "total_tokens" not in out:
+            tm = re.findall(r"([\d,]+)\s*(?:total\s*)?tokens", txt, re.I)
+            if tm:
+                try:
+                    out["total_tokens"] = int(tm[-1].replace(",", ""))
+                except ValueError:
+                    pass
+    return out
+
+
+def _req_is_admin(request: Request) -> bool:
+    """Is the signed-in viewer an admin? (dev mode / OAuth off = yes)."""
+    if not oauth_enabled():
+        return True
+    u = current_user(request)
+    return bool(u and is_admin_email(str(u.get("email", ""))))
+
+
+def _hist_public(hist: list, admin: bool) -> list:
+    """History as sent to the browser: usage/cost is ADMIN-ONLY."""
+    if admin:
+        return hist
+    return [{k: v for k, v in e.items() if k != "usage"} for e in hist]
 
 
 def _ai_history_path(user: str, session_name: str) -> pathlib.Path:
@@ -3662,7 +3713,7 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
             log.warning("lap library failed for %s/%s: %s", user, filename, e)
     question = str(body.get("prompt", "")).strip()
     messages = _region_prompt(metrics, question, lib=lib)
-    answer, used_model = _ai_chat(messages, model=body.get("model"))
+    answer, used_model, usage = _ai_chat(messages, model=body.get("model"))
 
     entry = {
         "id": secrets.token_hex(8),
@@ -3677,14 +3728,17 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
         "refs_similar": len((lib or {}).get("similar", [])),
         "refs_sessions": (lib or {}).get("sessions_scanned", 0),
     }
+    if usage:
+        entry["usage"] = usage   # persisted; exposed to ADMIN viewers only
     history = _ai_history_append(user, p.name, entry)
+    adm = _req_is_admin(request)
     return JSONResponse({
         "ok": True,
         "model": used_model,
         "metrics": metrics,
         "answer": answer,
-        "entry": entry,
-        "history": history,
+        "entry": (entry if adm else {k: v for k, v in entry.items() if k != "usage"}),
+        "history": _hist_public(history, adm),
         "refs": {"faster": len((lib or {}).get("faster", [])),
                  "similar": len((lib or {}).get("similar", [])),
                  "sessions": (lib or {}).get("sessions_scanned", 0)},
@@ -3711,6 +3765,22 @@ async def session_lines(request: Request, user: str, filename: str) -> JSONRespo
                             detail="region.points must be a polygon of >=3 [lat,lon] pairs")
     poly = [[float(pt[0]), float(pt[1])] for pt in poly]
     lib = _lap_library(safe_name(user), p, poly)
+    ideal, your_best, refs = _rank_lines(lib)
+    return JSONResponse({
+        "ok": True,
+        "track": lib.get("track"),
+        "sessions_scanned": lib.get("sessions_scanned", 0),
+        "ideal": ideal,
+        "your_best": your_best,
+        "refs": refs,
+        "delta_s": round(your_best["seconds"] - ideal["seconds"], 2),
+        "region": {"points": poly},
+    })
+
+
+def _rank_lines(lib: dict):
+    """Shared by /lines and /lines/ai: (ideal, your_best, refs[≤4]) from the
+    cross-session library. 422s when the region caught no laps."""
     cur = lib.get("current") or []
     if not cur:
         raise HTTPException(status_code=422,
@@ -3729,16 +3799,82 @@ async def session_lines(request: Request, user: str, filename: str) -> JSONRespo
     refs = [t for t in uniq
             if (t["session"], t["lap"]) not in
                {(ideal["session"], ideal["lap"]), (your_best["session"], your_best["lap"])}][:4]
-    return JSONResponse({
-        "ok": True,
-        "track": lib.get("track"),
-        "sessions_scanned": lib.get("sessions_scanned", 0),
-        "ideal": ideal,
-        "your_best": your_best,
-        "refs": refs,
-        "delta_s": round(your_best["seconds"] - ideal["seconds"], 2),
+    return ideal, your_best, refs
+
+
+def _line_row(t: dict) -> str:
+    b = t.get("brake") or {}
+    return " | ".join(str(v if v is not None else "-") for v in (
+        t["label"], t["seconds"], t["entry_mph"], t["min_mph"], t["exit_mph"],
+        b.get("mph", "-"), b.get("dist_to_apex_m", "-")))
+
+
+@app.post("/sessions/{user}/{filename}/lines/ai")
+async def session_lines_ai(request: Request, user: str, filename: str) -> JSONResponse:
+    """AI commentary on the /lineview racing line: the geometry (fastest real
+    traverse vs the driver's best) is computed HERE from data — the AI is then
+    asked to interpret it (what the ideal does differently, concrete actions).
+    Body {region:{points}, model?}. Appended to the session's AI history."""
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    if not ai_enabled():
+        raise HTTPException(status_code=503,
+                            detail="AI is not configured (set RACECAR_AI_API_KEY)")
+    p = _resolve_session(user, filename)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    poly = (body.get("region") or {}).get("points") or []
+    if not isinstance(poly, list) or len(poly) < 3:
+        raise HTTPException(status_code=400,
+                            detail="region.points must be a polygon of >=3 [lat,lon] pairs")
+    poly = [[float(pt[0]), float(pt[1])] for pt in poly]
+    lib = _lap_library(safe_name(user), p, poly)
+    ideal, your_best, refs = _rank_lines(lib)
+    hdr = "who | time_s | entry_mph | min_mph | exit_mph | brake_mph | brake_m_before_apex"
+    rows = [hdr, "IDEAL " + _line_row(ideal), "YOU " + _line_row(your_best)]
+    rows += [_line_row(t) for t in refs]
+    same = (ideal["session"] == your_best["session"] and ideal["lap"] == your_best["lap"])
+    userq = (
+        "The driver circled ONE section of the track. Below: the IDEAL line "
+        "(the fastest REAL traverse of this section across all their sessions "
+        "— achievable, somebody drove it), the driver's best this session, and "
+        "further fast references. brake_m_before_apex = metres before the "
+        "min-speed point where sustained braking began.\n\n"
+        + "\n".join(rows) + "\n\n"
+        + ("NOTE: the driver's best IS the ideal here — confirm what they're "
+           "doing right and where the remaining margin might be.\n" if same else "")
+        + "In <=180 words of clean Markdown: (1) one short paragraph on what "
+          "the ideal does differently (braking point, apex speed, exit); "
+          "(2) a compact Markdown table IDEAL vs YOU (time, min, exit, brake "
+          "distance); (3) 2-4 bullet ACTIONS with concrete numbers."
+    )
+    system = (
+        "You are a professional race engineer. Be concrete and numeric. "
+        "Format in clean Markdown with a proper table (header + '---' row)."
+    )
+    answer, used_model, usage = _ai_chat(
+        [{"role": "system", "content": system}, {"role": "user", "content": userq}],
+        model=body.get("model"))
+    entry = {
+        "id": secrets.token_hex(8),
+        "ts": int(time.time()),
+        "question": "Ideal line — circled section (lineview)",
+        "model": used_model,
+        "answer": answer,
         "region": {"points": poly},
-    })
+        "laps": len(lib.get("current", [])),
+    }
+    if usage:
+        entry["usage"] = usage
+    _ai_history_append(user, p.name, entry)
+    adm = _req_is_admin(request)
+    out = {"ok": True, "model": used_model, "answer": answer,
+           "delta_s": round(your_best["seconds"] - ideal["seconds"], 2)}
+    if adm and usage:
+        out["usage"] = usage
+    return JSONResponse(out)
 
 
 @app.get("/lineview/{user}/{filename}", response_class=HTMLResponse)
@@ -3781,6 +3917,22 @@ _LINEVIEW_HTML = """<!doctype html>
     padding:1px 3px;border-radius:3px;white-space:nowrap;border:1px solid rgba(255,255,255,.25)}
   .mk-lbl{background:rgba(0,0,0,.75);font:700 10px Inter,sans-serif;padding:2px 5px;
     border-radius:3px;white-space:nowrap}
+  .btn{background:#20242E;color:var(--text);border:1px solid var(--line);border-radius:4px;
+    padding:8px 12px;cursor:pointer;font:13px Inter,sans-serif;width:100%}
+  .btn:disabled{opacity:.5;cursor:default}
+  #aiOut{display:none;margin-top:8px;font-size:13px;line-height:1.5}
+  #aiOut p{margin:6px 0}
+  #aiOut h2{font-size:14px;margin:10px 0 4px;color:var(--warn);border-bottom:1px solid var(--line);padding-bottom:3px}
+  #aiOut h3{font-size:13px;margin:8px 0 3px;color:var(--warn)}
+  #aiOut ul,#aiOut ol{margin:6px 0;padding-left:20px}
+  #aiOut li{margin:2px 0}
+  #aiOut table{border-collapse:collapse;margin:8px 0;font:12px ui-monospace,Menlo,monospace}
+  #aiOut th{background:var(--bg);color:var(--warn);font-weight:700;text-align:left;
+    padding:4px 9px;border:1px solid var(--line);border-bottom:2px solid var(--warn);white-space:nowrap}
+  #aiOut td{padding:4px 9px;border:1px solid var(--line)}
+  #aiOut td.num{text-align:right;font-variant-numeric:tabular-nums}
+  #aiOut tbody tr:nth-child(even) td{background:rgba(255,255,255,.03)}
+  #aiCost{color:var(--muted);font-size:11px;margin-top:4px}
 </style></head><body>
 <div id="wrap">
   <div id="map"></div>
@@ -3804,6 +3956,11 @@ _LINEVIEW_HTML = """<!doctype html>
     <div class="muted">Speed labels are mph along each line. “brake m” = metres before the
     apex where sustained braking began. The ideal line is a REAL lap — someone (you) drove
     it, so it's achievable.</div>
+    <div class="card">
+      <button id="aiBtn" class="btn">AI: analyze this line</button>
+      <div id="aiOut"></div>
+      <div id="aiCost"></div>
+    </div>
   </aside>
 </div>
 <script>
@@ -3879,6 +4036,89 @@ _LINEVIEW_HTML = """<!doctype html>
     }
     document.getElementById('scanned').textContent=j.sessions_scanned+' sessions scanned on this track';
   }).catch(e=>{ status.textContent='request failed: '+e.message; });
+
+    function mdInline(s){
+    return s.replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>')
+            .replace(/(^|[^*])\\*([^*\\s][^*]*)\\*/g,'$1<em>$2</em>')
+            .replace(/`([^`]+)`/g,'<code>$1</code>');
+  }
+  function md(t){
+    const esc = (t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const L = esc.split(/\\r?\\n/);
+    const out = [];
+    const isNum = c => /^[-+]?\\$?\\d[\\d,]*\\.?\\d*\\s*(s|ms|mph|m|km|rpm|g|%)?$/i.test(c.trim());
+    let i = 0;
+    while (i < L.length){
+      const ln = L[i];
+      if (!ln.trim()){ i++; continue; }
+      // table: | a | b | followed by |---|---|
+      if (/^\\s*\\|.*\\|\\s*$/.test(ln) && i+1 < L.length && /^\\s*\\|[\\s:|-]+\\|\\s*$/.test(L[i+1])){
+        const cells = r => r.trim().replace(/^\\|/,'').replace(/\\|$/,'').split('|').map(c=>c.trim());
+        const head = cells(ln);
+        const align = cells(L[i+1]).map(c => /^:-+:$/.test(c) ? 'center' : /-+:$/.test(c) ? 'right' : '');
+        let h = '<table><thead><tr>';
+        head.forEach((c,k)=>{ h += '<th'+(align[k]?' style="text-align:'+align[k]+'"':'')+'>'+mdInline(c)+'</th>'; });
+        h += '</tr></thead><tbody>';
+        i += 2;
+        while (i < L.length && /^\\s*\\|.*\\|\\s*$/.test(L[i])){
+          h += '<tr>';
+          cells(L[i]).forEach((c,k)=>{
+            const cls = (align[k]==='right' || (!align[k] && isNum(c))) ? ' class="num"' : '';
+            const st  = align[k]==='center' ? ' style="text-align:center"' : '';
+            h += '<td'+cls+st+'>'+mdInline(c)+'</td>';
+          });
+          h += '</tr>'; i++;
+        }
+        out.push(h+'</tbody></table>');
+        continue;
+      }
+      // heading
+      const hm = ln.match(/^(#{1,6})\\s+(.+)$/);
+      if (hm){ out.push((hm[1].length<=2?'<h2>':'<h3>')+mdInline(hm[2])+(hm[1].length<=2?'</h2>':'</h3>')); i++; continue; }
+      // horizontal rule
+      if (/^\\s*(-{3,}|\\*{3,}|_{3,})\\s*$/.test(ln)){ out.push('<hr>'); i++; continue; }
+      // list (unordered or ordered)
+      if (/^\\s*([-*+]|\\d+[.)])\\s+/.test(ln)){
+        const ord = /^\\s*\\d+[.)]/.test(ln);
+        let h = ord ? '<ol>' : '<ul>';
+        while (i < L.length && /^\\s*([-*+]|\\d+[.)])\\s+/.test(L[i])){
+          h += '<li>'+mdInline(L[i].replace(/^\\s*([-*+]|\\d+[.)])\\s+/,''))+'</li>'; i++;
+        }
+        out.push(h + (ord ? '</ol>' : '</ul>'));
+        continue;
+      }
+      // paragraph: gather until blank/structural line
+      let para = [ln];
+      i++;
+      while (i < L.length && L[i].trim()
+             && !/^\\s*\\|.*\\|\\s*$/.test(L[i]) && !/^#{1,6}\\s+/.test(L[i])
+             && !/^\\s*([-*+]|\\d+[.)])\\s+/.test(L[i]) && !/^\\s*-{3,}\\s*$/.test(L[i])){
+        para.push(L[i]); i++;
+      }
+      out.push('<p>'+mdInline(para.join(' '))+'</p>');
+    }
+    return out.join('');
+  }
+  const aiBtn=document.getElementById('aiBtn'), aiOut=document.getElementById('aiOut'),
+        aiCost=document.getElementById('aiCost');
+  aiBtn.addEventListener('click', async ()=>{
+    aiBtn.disabled=true; aiBtn.textContent='analyzing\u2026';
+    try{
+      const r=await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/lines/ai',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({region:{points:pts}})});
+      const j=await r.json();
+      if(!r.ok){ aiOut.style.display='block'; aiOut.textContent='error: '+((j&&j.detail)||('HTTP '+r.status)); }
+      else{
+        aiOut.style.display='block'; aiOut.innerHTML=md(j.answer||'');
+        let c='';
+        if(j.usage){ if(j.usage.cost_usd!=null)c+='$'+(+j.usage.cost_usd).toFixed(4);
+                     if(j.usage.total_tokens)c+=(c?' \u00b7 ':'')+j.usage.total_tokens+' tok'; }
+        aiCost.textContent = c ? ('model '+j.model+' \u00b7 '+c) : (j.model?('model '+j.model):'');
+      }
+    }catch(e){ aiOut.style.display='block'; aiOut.textContent='request failed: '+e.message; }
+    aiBtn.disabled=false; aiBtn.textContent='AI: analyze this line';
+  });
 })();
 </script></body></html>"""
 
@@ -3889,7 +4129,8 @@ async def session_ai_history(request: Request, user: str, filename: str) -> JSON
     require_web_user(request)
     gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
-    return JSONResponse({"history": _ai_history_load(user, p.name)})
+    return JSONResponse({"history": _hist_public(_ai_history_load(user, p.name),
+                                                 _req_is_admin(request))})
 
 
 @app.post("/sessions/{user}/{filename}/ai/delete")
@@ -6276,7 +6517,13 @@ _REVIEW_HTML = (
         const div = document.createElement('div');
         div.className = 'ai-hist-item' + (k===0 ? ' open' : '');
         const q = esc(e.question || '(no question)');
-        const meta = esc((e.model||'') + ' · ' + (e.laps||0) + ' laps · ' + fmtWhen(e.ts));
+        // usage/cost is only present for ADMIN viewers (server-gated)
+        let cost = '';
+        if (e.usage){
+          if (e.usage.cost_usd != null) cost += '$' + (+e.usage.cost_usd).toFixed(4);
+          if (e.usage.total_tokens) cost += (cost?' · ':'') + e.usage.total_tokens + ' tok';
+        }
+        const meta = esc((e.model||'') + ' · ' + (e.laps||0) + ' laps' + (cost?(' · '+cost):'') + ' · ' + fmtWhen(e.ts));
         div.innerHTML =
           '<div class="ai-hist-head"><span class="ai-hist-q">'+q+'</span>'+
           '<span class="ai-hist-meta">'+meta+'</span></div>'+
