@@ -272,6 +272,14 @@ exit speed, brake zones, best line, consistency). Server side (`server/app/main.
   **`RACECAR_AI_MODEL` = the DEFAULT model id** (Open WebUI hosts many models, so this is
   required to name the fallback; users can override per-question from the dropdown),
   `RACECAR_AI_TIMEOUT_SECONDS` (120). Keys documented in `server/.env.example` + `server/README.md`.
+- **AI cost is captured + ADMIN-ONLY visible**: `_ai_chat` returns `(answer, model, usage)` —
+  usage harvested from the payload `usage` block AND the Open WebUI `<details>` footer (parsed
+  BEFORE stripping). Stored in every history entry; `_hist_public()` strips it for non-admins
+  (`_req_is_admin`; dev mode = admin). Review meta line + lineview cost line show `$x · N tok`.
+- **Lineview AI commentary**: the ideal line is pure DATA (fastest real traverse); `POST
+  /sessions/{u}/{f}/lines/ai` layers the model on top (shared `_rank_lines()` with /lines —
+  compact metric table in, ≤180-word markdown out), appended to the session AI history. Popout
+  button "AI: analyze this line".
 - **Answers render as real Markdown** (review page `md()`): tables (thead + numeric cells
   right-aligned, striped/hover rows), `##`→h2 / `###`+→h3, ul/ol lists, hr, paragraphs,
   bold/italic/code — escape-first so the model can't inject markup. The system prompt asks the
