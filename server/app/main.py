@@ -2872,8 +2872,11 @@ def _region_prompt(metrics: dict, question: str, lib: Optional[dict] = None) -> 
         "specific, actionable coaching (braking points, apex speed, throttle "
         "application, gear, line) grounded in the numbers provided. Compare the "
         "laps to each other, call out the best and worst, and quantify the time "
-        "or speed on offer. Prefer short paragraphs and bullet points. If the "
-        "data is insufficient to answer, say so plainly."
+        "or speed on offer. Format the answer in clean Markdown: '##' section "
+        "headings, bullet lists for coaching points, and proper Markdown tables "
+        "(header row + '---' separator row) for any lap comparison — never "
+        "ASCII-art or inline pipe lists. Bold the key numbers. If the data is "
+        "insufficient to answer, say so plainly."
     )
     user = f"{question.strip() or 'Analyze this section and tell me how to be faster through it.'}\n\n{table}"
     return [
@@ -5238,10 +5241,27 @@ _REVIEW_HTML = (
   .ai-hist-head:hover { background: var(--surface-2); }
   .ai-hist-q { flex:1; color: var(--text); font-weight:600; }
   .ai-hist-meta { color: var(--muted); font: 400 11px var(--ff-mono); white-space:nowrap; }
-  .ai-hist-body { display:none; padding: 4px 12px 12px; white-space:pre-wrap; line-height:1.5; }
+  .ai-hist-body { display:none; padding: 4px 12px 12px; white-space:normal; line-height:1.55; }
   .ai-hist-item.open .ai-hist-body { display:block; }
   .ai-hist-body code { font-family: var(--ff-mono); color: var(--primary); }
   .ai-hist-body strong { color: var(--text); }
+  /* Rendered-markdown building blocks (AI answers) */
+  .ai-hist-body p { margin: 6px 0; }
+  .ai-hist-body h2 { font-size: 16px; margin: 14px 0 6px; color: var(--primary);
+    border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+  .ai-hist-body h3 { font-size: 14px; margin: 12px 0 4px; color: var(--primary); }
+  .ai-hist-body ul, .ai-hist-body ol { margin: 6px 0; padding-left: 22px; }
+  .ai-hist-body li { margin: 3px 0; }
+  .ai-hist-body hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
+  .ai-hist-body table { border-collapse: collapse; margin: 8px 0; width: auto;
+    font: 12.5px var(--ff-mono); }
+  .ai-hist-body th { background: var(--bg); color: var(--primary); font-weight: 700;
+    text-align: left; padding: 6px 12px; border: 1px solid var(--line);
+    border-bottom: 2px solid var(--primary); white-space: nowrap; }
+  .ai-hist-body td { padding: 5px 12px; border: 1px solid var(--line); color: var(--text); }
+  .ai-hist-body td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ai-hist-body tbody tr:nth-child(even) td { background: rgba(255,255,255,0.03); }
+  .ai-hist-body tbody tr:hover td { background: rgba(255,176,32,0.07); }
   .ai-hist-actions { display:flex; gap:6px; padding: 0 12px 10px; }
   .ai-hist-actions .btn { padding: 4px 8px; }
   .ai-hist-x { color: var(--bad); }
@@ -6159,13 +6179,70 @@ _REVIEW_HTML = (
       regionInfo();
     });
 
-    // Light markdown -> HTML (escape first, then inline bold/code + headings).
+    // Markdown -> HTML (block-level: tables, headings, lists, hr, paragraphs;
+    // inline: bold, italic, code). Escapes FIRST, so the AI can never inject
+    // markup. Tables get thead/tbody + numeric cells right-aligned.
+    function mdInline(s){
+      return s.replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>')
+              .replace(/(^|[^*])\\*([^*\\s][^*]*)\\*/g,'$1<em>$2</em>')
+              .replace(/`([^`]+)`/g,'<code>$1</code>');
+    }
     function md(t){
-      let h = t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      h = h.replace(/^#{1,6}\\s*(.+)$/gm,'<h3>$1</h3>');
-      h = h.replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>');
-      h = h.replace(/`([^`]+)`/g,'<code>$1</code>');
-      return h;
+      const esc = (t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const L = esc.split(/\\r?\\n/);
+      const out = [];
+      const isNum = c => /^[-+]?\\$?\\d[\\d,]*\\.?\\d*\\s*(s|ms|mph|m|km|rpm|g|%)?$/i.test(c.trim());
+      let i = 0;
+      while (i < L.length){
+        const ln = L[i];
+        if (!ln.trim()){ i++; continue; }
+        // table: | a | b | followed by |---|---|
+        if (/^\\s*\\|.*\\|\\s*$/.test(ln) && i+1 < L.length && /^\\s*\\|[\\s:|-]+\\|\\s*$/.test(L[i+1])){
+          const cells = r => r.trim().replace(/^\\|/,'').replace(/\\|$/,'').split('|').map(c=>c.trim());
+          const head = cells(ln);
+          const align = cells(L[i+1]).map(c => /^:-+:$/.test(c) ? 'center' : /-+:$/.test(c) ? 'right' : '');
+          let h = '<table><thead><tr>';
+          head.forEach((c,k)=>{ h += '<th'+(align[k]?' style="text-align:'+align[k]+'"':'')+'>'+mdInline(c)+'</th>'; });
+          h += '</tr></thead><tbody>';
+          i += 2;
+          while (i < L.length && /^\\s*\\|.*\\|\\s*$/.test(L[i])){
+            h += '<tr>';
+            cells(L[i]).forEach((c,k)=>{
+              const cls = (align[k]==='right' || (!align[k] && isNum(c))) ? ' class="num"' : '';
+              const st  = align[k]==='center' ? ' style="text-align:center"' : '';
+              h += '<td'+cls+st+'>'+mdInline(c)+'</td>';
+            });
+            h += '</tr>'; i++;
+          }
+          out.push(h+'</tbody></table>');
+          continue;
+        }
+        // heading
+        const hm = ln.match(/^(#{1,6})\\s+(.+)$/);
+        if (hm){ out.push((hm[1].length<=2?'<h2>':'<h3>')+mdInline(hm[2])+(hm[1].length<=2?'</h2>':'</h3>')); i++; continue; }
+        // horizontal rule
+        if (/^\\s*(-{3,}|\\*{3,}|_{3,})\\s*$/.test(ln)){ out.push('<hr>'); i++; continue; }
+        // list (unordered or ordered)
+        if (/^\\s*([-*+]|\\d+[.)])\\s+/.test(ln)){
+          const ord = /^\\s*\\d+[.)]/.test(ln);
+          let h = ord ? '<ol>' : '<ul>';
+          while (i < L.length && /^\\s*([-*+]|\\d+[.)])\\s+/.test(L[i])){
+            h += '<li>'+mdInline(L[i].replace(/^\\s*([-*+]|\\d+[.)])\\s+/,''))+'</li>'; i++;
+          }
+          out.push(h + (ord ? '</ol>' : '</ul>'));
+          continue;
+        }
+        // paragraph: gather until blank/structural line
+        let para = [ln];
+        i++;
+        while (i < L.length && L[i].trim()
+               && !/^\\s*\\|.*\\|\\s*$/.test(L[i]) && !/^#{1,6}\\s+/.test(L[i])
+               && !/^\\s*([-*+]|\\d+[.)])\\s+/.test(L[i]) && !/^\\s*-{3,}\\s*$/.test(L[i])){
+          para.push(L[i]); i++;
+        }
+        out.push('<p>'+mdInline(para.join(' '))+'</p>');
+      }
+      return out.join('');
     }
 
     async function loadModels(){

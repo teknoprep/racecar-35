@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.128"
+#define FIRMWARE_VERSION "0.1.129"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1155,7 +1155,14 @@ static int sfStorageIdx(int tIdx);   // fwd (needs sfOverride below)
 // so any pre-line stored blob is length-mismatched and ignored (overrides reset
 // once — acceptable; re-capture via SET START/FINISH).
 struct SfOverride { uint8_t used; float lat; float lon; float lat2; float lon2; };
-static SfOverride sfOverride[N_TRACKS];   // zero-init: used==0 => fall back to baked
+// ⚠️ v0.1.129 POLICY CHANGE: for KNOWN tracks the baked S/F (managed on the
+// web via /tools/sfpicker) is the ONLY source — sfOverride[] is kept in NVS
+// for back-compat but is NO LONGER CONSULTED. A stale on-device capture used
+// to silently beat a freshly baked line and kill lap timing with no clue why
+// (the Summit Point incident). The on-car SET S/F capture now exists ONLY for
+// UNKNOWN tracks (nothing baked to beat), stored in its own slot below.
+static SfOverride sfOverride[N_TRACKS];   // legacy known-track overrides (ignored since v0.1.129)
+static SfOverride sf_unknown;             // UNKNOWN-track S/F (NVS "sf_unk")
 
 // UI state for the STATUS-page "SET START/FINISH" capture button.
 static bool     sf_set_armed  = false;
@@ -1166,9 +1173,14 @@ static uint32_t sf_set_msg_ms = 0;
 // Resolve the start/finish line actually used for lap detection at track idx.
 static void effectiveSf(int idx, float* lat, float* lon) {
     idx = sfStorageIdx(idx);   // config variants borrow their own S/F entry
-    if (idx < 0 || idx >= N_TRACKS) { *lat = 0; *lon = 0; return; }
-    if (sfOverride[idx].used) { *lat = sfOverride[idx].lat; *lon = sfOverride[idx].lon; }
-    else                      { *lat = TRACKS[idx].sf_lat;  *lon = TRACKS[idx].sf_lon;  }
+    if (idx < 0 || idx >= N_TRACKS) {
+        // UNKNOWN track: the user-captured slot is the only S/F there is.
+        if (idx < 0 && sf_unknown.used) { *lat = sf_unknown.lat; *lon = sf_unknown.lon; return; }
+        *lat = 0; *lon = 0; return;
+    }
+    // KNOWN track: baked ONLY (web-managed; overrides ignored since v0.1.129).
+    *lat = TRACKS[idx].sf_lat;
+    *lon = TRACKS[idx].sf_lon;
 }
 
 // Resolve the S/F as a LINE (endpoints A,B). hasLine=false => only a point is
@@ -1189,14 +1201,18 @@ static int sfStorageIdx(int tIdx) {
 static void effectiveSfLine(int idx, float* aLat, float* aLon,
                             float* bLat, float* bLon, bool* hasLine) {
     idx = sfStorageIdx(idx);   // config variants borrow their own S/F entry
-    if (idx < 0 || idx >= N_TRACKS) { *aLat=*aLon=*bLat=*bLon=0; *hasLine=false; return; }
-    if (sfOverride[idx].used) {
-        *aLat=sfOverride[idx].lat;  *aLon=sfOverride[idx].lon;
-        *bLat=sfOverride[idx].lat2; *bLon=sfOverride[idx].lon2;
-    } else {
-        *aLat=TRACKS[idx].sf_lat;  *aLon=TRACKS[idx].sf_lon;
-        *bLat=TRACKS[idx].sf_lat2; *bLon=TRACKS[idx].sf_lon2;
+    if (idx < 0 || idx >= N_TRACKS) {
+        if (idx < 0 && sf_unknown.used) {   // UNKNOWN track: captured slot
+            *aLat=sf_unknown.lat;  *aLon=sf_unknown.lon;
+            *bLat=sf_unknown.lat2; *bLon=sf_unknown.lon2;
+            *hasLine = (*bLat != 0.0f || *bLon != 0.0f);
+            return;
+        }
+        *aLat=*aLon=*bLat=*bLon=0; *hasLine=false; return;
     }
+    // KNOWN track: baked ONLY (web-managed; overrides ignored since v0.1.129).
+    *aLat=TRACKS[idx].sf_lat;  *aLon=TRACKS[idx].sf_lon;
+    *bLat=TRACKS[idx].sf_lat2; *bLon=TRACKS[idx].sf_lon2;
     *hasLine = (*bLat != 0.0f || *bLon != 0.0f);
 }
 
@@ -1204,14 +1220,15 @@ static void effectiveSfLine(int idx, float* aLat, float* aLon,
 // into the recorded NDJSON (CFG,sf,aLat,aLon,bLat,bLon; all zero => none).
 static void sendSfToTeensy(int idx) {
     float aLat=0,aLon=0,bLat=0,bLon=0; bool hasLine=false;
-    if (idx >= 0) effectiveSfLine(idx, &aLat,&aLon,&bLat,&bLon,&hasLine);
+    effectiveSfLine(idx, &aLat,&aLon,&bLat,&bLon,&hasLine);   // idx<0 = UNKNOWN slot
     if (!hasLine) { Serial.printf("CFG,sf,0,0,0,0\n"); return; }
     Serial.printf("CFG,sf,%.6f,%.6f,%.6f,%.6f\n", aLat,aLon,bLat,bLon);
 }
 
 static void saveSfOverrides() {
     prefs.begin("dash", false);
-    prefs.putBytes("sf_ovr", sfOverride, sizeof(sfOverride));
+    prefs.putBytes("sf_ovr", sfOverride, sizeof(sfOverride));   // legacy (unused)
+    prefs.putBytes("sf_unk", &sf_unknown, sizeof(sf_unknown));
     prefs.end();
 }
 
@@ -1223,19 +1240,25 @@ static void saveSfOverrides() {
 // Teensy so NDJSON lap stamping follows immediately.
 static bool captureSfHere() {
     const int tIdx = lapTrackIdx();
-    if (tIdx < 0) {
-        snprintf(sf_set_msg, sizeof(sf_set_msg), "not at a known track");
+    if (tIdx >= 0) {
+        // v0.1.129: KNOWN tracks are web-managed (/tools/sfpicker) — no
+        // on-car capture, so a stale override can never beat the baked line.
+        snprintf(sf_set_msg, sizeof(sf_set_msg), "known track: set S/F on the web");
         sf_set_msg_ms = millis();
         return false;
     }
-    const int sIdx = sfStorageIdx(tIdx);
+    if (g.fix < 2) {
+        snprintf(sf_set_msg, sizeof(sf_set_msg), "no GPS fix");
+        sf_set_msg_ms = millis();
+        return false;
+    }
     if (g.mph < 5.0f) {
-        sfOverride[sIdx].used = 1;
-        sfOverride[sIdx].lat  = g.lat_deg;
-        sfOverride[sIdx].lon  = g.lon_deg;
-        sfOverride[sIdx].lat2 = 0.0f;
-        sfOverride[sIdx].lon2 = 0.0f;
-        snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F POINT SET: %s (parked)", TRACKS[sIdx].name);
+        sf_unknown.used = 1;
+        sf_unknown.lat  = g.lat_deg;
+        sf_unknown.lon  = g.lon_deg;
+        sf_unknown.lat2 = 0.0f;
+        sf_unknown.lon2 = 0.0f;
+        snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F POINT SET (parked)");
     } else {
         const float D2R = (float)M_PI / 180.0f;
         const float H  = g.hdg_deg * D2R;
@@ -1243,15 +1266,15 @@ static bool captureSfHere() {
         const float half_m = 30.0f;
         const float dLat = half_m / 111320.0f;
         const float dLon = half_m / (111320.0f * cosf(g.lat_deg * D2R));
-        sfOverride[sIdx].used = 1;
-        sfOverride[sIdx].lat  = g.lat_deg + lN * dLat;
-        sfOverride[sIdx].lon  = g.lon_deg + lE * dLon;
-        sfOverride[sIdx].lat2 = g.lat_deg - lN * dLat;
-        sfOverride[sIdx].lon2 = g.lon_deg - lE * dLon;
-        snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F LINE SET: %s", TRACKS[sIdx].name);
+        sf_unknown.used = 1;
+        sf_unknown.lat  = g.lat_deg + lN * dLat;
+        sf_unknown.lon  = g.lon_deg + lE * dLon;
+        sf_unknown.lat2 = g.lat_deg - lN * dLat;
+        sf_unknown.lon2 = g.lon_deg - lE * dLon;
+        snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F LINE SET (unknown track)");
     }
     saveSfOverrides();
-    sendSfToTeensy(tIdx);        // Teensy stamps lap #s into the NDJSON
+    sendSfToTeensy(-1);          // Teensy stamps lap #s into the NDJSON
     sf_set_msg_ms = millis();
     return true;
 }
@@ -1383,6 +1406,8 @@ static void loadSettings() {
     // added/removed, so the old index map can't be trusted; ignore it then.
     if (prefs.getBytesLength("sf_ovr") == sizeof(sfOverride))
         prefs.getBytes("sf_ovr", sfOverride, sizeof(sfOverride));
+    if (prefs.getBytesLength("sf_unk") == sizeof(sf_unknown))
+        prefs.getBytes("sf_unk", &sf_unknown, sizeof(sf_unknown));
     prefs.end();
 }
 
@@ -1686,8 +1711,11 @@ static void updateLapTimer() {
     const int tIdx = lapTrackIdx();
     const uint32_t now = millis();
 
-    if (tIdx < 0) {
-        // Not at any known track — clear state so display shows "--:--.--".
+    if (tIdx < 0 && !sf_unknown.used) {
+        // Not at any known track and no user-captured S/F — nothing to time
+        // against; clear state so display shows "--:--.--". (At an UNKNOWN
+        // track WITH a captured S/F, tIdx stays -1 and effectiveSfLine(-1)
+        // resolves to the captured slot — lap timing works there too.)
         if (lapTimer.active) lapTimer = LapTimer{};
         return;
     }
@@ -3778,6 +3806,7 @@ static void handleDashTap(int x, int y) {
             openTrackPicker(false);
             return;
         }
+        if (lapTrackIdx() >= 0) return;   // known track: S/F is web-managed (v0.1.129)
         const bool wasArmed = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
         if (wasArmed) {
             sf_set_armed = false;
@@ -4311,7 +4340,9 @@ static void drawDashPage() {
     // confirmation flashes green for 3 s after a capture.
     {
         uint8_t st = 0;   // 0=TRACK 1=SET S/F 2=TAP AGAIN(armed) 3=result msg
-        if (recording) {
+        if (recording && lapTrackIdx() < 0) {
+            // v0.1.129: SET S/F mode only at UNKNOWN tracks — known tracks'
+            // S/F is web-managed, so the button stays a plain TRACK label.
             const bool armed   = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
             const bool haveMsg = sf_set_msg[0] && (millis() - sf_set_msg_ms < 3000);
             st = haveMsg ? 3 : armed ? 2 : 1;
@@ -4780,24 +4811,51 @@ static void drawDashPage() {
         }
     }
     {
-        const uint32_t cs = lapTimer.last_lap_ms / 10;
+        // Pre-arm S/F countdown (v0.1.129): until the first crossing arms the
+        // timer, the LAP row shows the LIVE DISTANCE to the start/finish —
+        // watch it sweep to zero on the out-lap. If it never gets small, the
+        // S/F is misplaced and you know it on lap 1, not after the session.
+        const bool prearm = recording && lapTimer.active && !lapTimer.timing_started
+                            && lapTimer.last_lap_ms == 0 && g.fix >= 2;
+        uint32_t cs;
+        char buf[12];
+        uint16_t col = TFT_WHITE;
+        if (prearm) {
+            float aLat, aLon, bLat, bLon; bool hasLine;
+            effectiveSfLine(lapTimer.track_idx, &aLat, &aLon, &bLat, &bLon, &hasLine);
+            if (aLat != 0.0f || aLon != 0.0f) {
+                const float mLat = hasLine ? (aLat + bLat) * 0.5f : aLat;
+                const float mLon = hasLine ? (aLon + bLon) * 0.5f : aLon;
+                const int dm = (int)(trackDistanceKm(g.lat_deg, g.lon_deg, mLat, mLon) * 1000.0f);
+                if (dm < 9950) snprintf(buf, sizeof(buf), "SF %dm", dm);
+                else           snprintf(buf, sizeof(buf), "SF %.1fkm", dm / 1000.0f);
+                col = TFT_CYAN;
+                cs  = 0x40000000u | (uint32_t)(dm / 3);   // ~3 m redraw hysteresis
+            } else {
+                snprintf(buf, sizeof(buf), "--:--.--");
+                cs = 0x7FFFFFFFu;
+            }
+        } else if (lapTimer.last_lap_ms == 0) {
+            snprintf(buf, sizeof(buf), "--:--.--");
+            cs = 0x7FFFFFFEu;
+        } else {
+            formatLapTime(lapTimer.last_lap_ms, buf, sizeof(buf));
+            cs = lapTimer.last_lap_ms / 10;
+        }
         if (cs != ld.last_lap_cs) {
-            char buf[12];
-            if (lapTimer.last_lap_ms == 0) snprintf(buf, sizeof(buf), "--:--.--");
-            else                           formatLapTime(lapTimer.last_lap_ms, buf, sizeof(buf));
             if (dash_sprites_ready) {
                 spr_lap.fillSprite(bg);
                 spr_lap.setFont(&fonts::Font4);
                 spr_lap.setTextSize(1);
                 spr_lap.setTextDatum(textdatum_t::top_left);
-                spr_lap.setTextColor(TFT_WHITE);
+                spr_lap.setTextColor(col);
                 spr_lap.drawString(buf, 0, 0);
                 spr_lap.pushSprite(325, 400);
             } else {
                 tft.setFont(&fonts::Font4);
                 tft.setTextDatum(textdatum_t::top_left);
                 tft.setTextPadding(150);
-                tft.setTextColor(TFT_WHITE, bg);
+                tft.setTextColor(col, bg);
                 tft.drawString(buf, 325, 400);
                 tft.setTextPadding(0);
             }
@@ -7092,6 +7150,7 @@ static void confirmTrackAndStart() {
             prefs.putString("last_trk",   "UNKNOWN");   // matches no TRACKS[] -> idx=-1 on reload
             prefs.putString("last_trk_d", "UNKNOWN");
             prefs.end();
+            sendSfToTeensy(-1);   // unknown-track captured S/F (if any) for lap stamping
         }
     }
     Serial.printf("TRACK,%s\n", trackName);
@@ -9944,47 +10003,54 @@ static void drawStatusPage() {
         tft.drawString(buf, RV, 326);
     }
 
-    // SET START/FINISH capture button (right column, above the firmware row).
-    // Park on (or cross) the real line and two-tap to store it as this track's
-    // S/F override; the baked sf_lat/sf_lon are only approximate.
+    // START/FINISH row (right column, above the firmware row). v0.1.129:
+    // KNOWN track -> passive info only (baked S/F, web-managed via
+    // /tools/sfpicker) with the live distance diagnostic. UNKNOWN track ->
+    // the SET S/F capture button (the only place on-car capture still
+    // exists) + DELETE for the captured slot.
     {
         const int bx = 410, by = 344, bw = 370, bh = 32;
         const int tIdx = lapTrackIdx();          // SELECTED track, not GPS-closest
-        const int sIdx = sfStorageIdx(tIdx);     // active config's S/F slot (v0.1.115)
-        const bool armed   = sf_set_armed && (millis() - sf_set_arm_ms < 5000);
+        const int sIdx = sfStorageIdx(tIdx);     // config's S/F slot (baked coords)
+        const bool unknown = (tIdx < 0);
+        const bool armed   = unknown && sf_set_armed && (millis() - sf_set_arm_ms < 5000);
         const bool haveMsg = (sf_set_msg[0] != '\0') && (millis() - sf_set_msg_ms < 4000);
-        uint16_t fill = haveMsg     ? TFT_DARKGREEN
-                      : (tIdx < 0)  ? TFT_DARKGREY
-                      : armed       ? TFT_ORANGE
-                                     : TFT_NAVY;
+        uint16_t fill = haveMsg  ? TFT_DARKGREEN
+                      : !unknown ? TFT_BLACK        // passive info, not a button
+                      : armed    ? TFT_ORANGE
+                                 : TFT_NAVY;
         tft.fillRect(bx, by, bw, bh, fill);
-        tft.drawRect(bx, by, bw, bh, TFT_WHITE);
+        if (unknown || haveMsg) tft.drawRect(bx, by, bw, bh, TFT_WHITE);
         tft.setFont(&fonts::Font2);
         tft.setTextDatum(textdatum_t::middle_center);
-        tft.setTextColor(TFT_WHITE, fill);
+        tft.setTextColor(!unknown && !haveMsg ? TFT_LIGHTGREY : TFT_WHITE, fill);
         char lbl[56];
-        if      (haveMsg)  snprintf(lbl, sizeof(lbl), "%s", sf_set_msg);
-        else if (tIdx < 0) snprintf(lbl, sizeof(lbl), "SET S/F - not at a known track");
-        else if (armed)    snprintf(lbl, sizeof(lbl), "TAP AGAIN: set S/F @ %s", TRACKS[sIdx].name);
-        else {
-            // Live distance to the EFFECTIVE S/F (override if set, else baked)
-            // — the trackside "why aren't laps ticking" diagnostic. If this
-            // number never gets small while you lap, the S/F is in the wrong
-            // place (bad capture / wrong pin): hit CLR S/F.
+        if (haveMsg) snprintf(lbl, sizeof(lbl), "%s", sf_set_msg);
+        else if (!unknown) {
+            // Live distance to the BAKED S/F — the trackside "why aren't laps
+            // ticking" diagnostic. If this never gets small while you lap,
+            // the baked line is misplaced: fix it in /tools/sfpicker.
             float aLat, aLon, bLat, bLon; bool hasLine;
             effectiveSfLine(tIdx, &aLat, &aLon, &bLat, &bLon, &hasLine);
             const int dm = (int)(trackDistanceKm(g.lat_deg, g.lon_deg, aLat, aLon) * 1000.0f);
-            snprintf(lbl, sizeof(lbl), "SET S/F @ %s (%s, %dm)",
-                     TRACKS[sIdx].name, sfOverride[sIdx].used ? "custom" : "default", dm);
+            snprintf(lbl, sizeof(lbl), "S/F %s: baked %s, %dm (web-managed)",
+                     TRACKS[sIdx].name, hasLine ? "line" : "point", dm);
         }
+        else if (armed) snprintf(lbl, sizeof(lbl), "TAP AGAIN: set S/F here");
+        else if (sf_unknown.used) {
+            const int dm = (int)(trackDistanceKm(g.lat_deg, g.lon_deg,
+                                                 sf_unknown.lat, sf_unknown.lon) * 1000.0f);
+            snprintf(lbl, sizeof(lbl), "SET S/F - unknown track (set, %dm)", dm);
+        }
+        else snprintf(lbl, sizeof(lbl), "SET S/F - unknown track (none set)");
         tft.drawString(lbl, bx + bw / 2, by + bh / 2);
-        // DELETE CUSTOM S/F — only when a custom override exists to delete
-        // (widened + renamed from "CLR S/F" in v0.1.115 per request).
-        if (sIdx >= 0 && sfOverride[sIdx].used && !armed && !haveMsg) {
+        // DELETE S/F — only for the UNKNOWN-track captured slot now (known
+        // tracks have nothing on-car to delete; overrides are ignored).
+        if (unknown && sf_unknown.used && !armed && !haveMsg) {
             tft.fillRect(180, by, 224, bh, TFT_MAROON);
             tft.drawRect(180, by, 224, bh, TFT_WHITE);
             tft.setTextColor(TFT_WHITE, TFT_MAROON);
-            tft.drawString("DELETE CUSTOM S/F", 180 + 112, by + bh / 2);
+            tft.drawString("DELETE S/F", 180 + 112, by + bh / 2);
         } else {
             tft.fillRect(180, by, 224, bh, TFT_BLACK);
         }
@@ -10063,17 +10129,15 @@ static void drawStatusPage() {
 }
 
 static void handleStatusTap(int x, int y) {
-    // CLR S/F button (left of SET): wipe this track's custom S/F override and
-    // fall back to the baked line — the trackside escape hatch for a bad
-    // capture (which used to silently kill lap timing with no way out).
+    // DELETE S/F button (left of SET): wipe the UNKNOWN-track captured S/F.
+    // (Known tracks have no on-car override anymore — web-managed, v0.1.129.)
     if (x >= 180 && x <= 404 && y >= 344 && y <= 376) {
         const int tIdx = lapTrackIdx();   // SELECTED track, not GPS-closest
-        const int sIdx = sfStorageIdx(tIdx);   // active config's S/F slot
-        if (sIdx >= 0 && sfOverride[sIdx].used) {
-            sfOverride[sIdx] = SfOverride{};
+        if (tIdx < 0 && sf_unknown.used) {
+            sf_unknown = SfOverride{};
             saveSfOverrides();
-            sendSfToTeensy(tIdx);
-            snprintf(sf_set_msg, sizeof(sf_set_msg), "S/F reset to default: %s", TRACKS[sIdx].name);
+            sendSfToTeensy(-1);
+            snprintf(sf_set_msg, sizeof(sf_set_msg), "unknown-track S/F deleted");
             sf_set_msg_ms = millis();
         }
         return;
@@ -10083,8 +10147,9 @@ static void handleStatusTap(int x, int y) {
     // within 5 s stores the current GPS position as this track's S/F override.
     if (x >= 410 && x <= 780 && y >= 344 && y <= 376) {
         const int tIdx = lapTrackIdx();   // SELECTED track, not GPS-closest
-        if (tIdx < 0) {
-            snprintf(sf_set_msg, sizeof(sf_set_msg), "not at a known track");
+        if (tIdx >= 0) {
+            // v0.1.129: known tracks are web-managed — no on-car capture.
+            snprintf(sf_set_msg, sizeof(sf_set_msg), "known track: set S/F on the web");
             sf_set_msg_ms = millis();
             return;
         }
