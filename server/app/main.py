@@ -2592,9 +2592,239 @@ def _region_metrics(samples: list, poly: list) -> dict:
     }
 
 
-def _region_prompt(metrics: dict, question: str) -> list:
+# ---------------------------------------------------------------------------
+# Cross-session lap library (v: lineview). When the driver circles a corner,
+# mine ALL of their sessions on the SAME TRACK (any day) for laps through that
+# region: up to 10 FASTER references + up to 10 SIMILAR-pace references feed
+# the AI comparison, and /lines + /lineview render the fastest real line with
+# brake/apex/throttle markers so the difference is visible, not just described.
+# ---------------------------------------------------------------------------
+def _track_key(filename: str) -> str:
+    """'<sid>_<track>.ndjson' -> normalized track key ('-combined' stripped)."""
+    stem = filename[:-7] if filename.endswith(".ndjson") else filename
+    if "_" in stem:
+        stem = stem.split("_", 1)[1]
+    if stem.endswith("-combined"):
+        stem = stem[: -len("-combined")]
+    return stem.lower()
+
+
+def _read_ndjson_samples(p: pathlib.Path) -> list:
+    samples: list = []
+    try:
+        with open(p, "rb") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    samples.append(json.loads(raw))
+                except Exception:
+                    continue
+    except OSError:
+        return []
+    return samples
+
+
+def _session_date_label(filename: str) -> str:
+    try:
+        sid = int(filename.split("_", 1)[0])
+        if reasonable_epoch(sid):
+            return time.strftime("%m/%d", time.localtime(sid))
+    except Exception:
+        pass
+    return filename.split("_", 1)[0][:8]
+
+
+def _region_traverses(samples: list, poly: list, user_dir: str, fname: str) -> list:
+    """Per-lap passes through `poly` with brake/apex/throttle analysis and a
+    decimated GPS trace (window EXTENDED before/after the region so braking
+    that starts before the circled area is captured). Laps excluded on the
+    review page (manual or auto <10s) are skipped — same rules as /laps."""
+    rel, _basis = _relative_seconds(samples)
+    laps_info = _detect_laps(samples)
+    laps = laps_info.get("laps", [])
+    if not laps:
+        return []
+    meta = _lap_meta(user_dir, fname)
+    excl = set(meta["excluded"])
+    incl = set(meta["included"])
+    allowed = {}
+    for lp in laps:
+        n = int(lp.get("lap", 0))
+        if n in excl:
+            continue
+        if float(lp.get("seconds", 0)) < LAP_AUTO_EXCLUDE_UNDER_S and n not in incl:
+            continue
+        allowed[n] = lp
+
+    def lap_of(t: float):
+        for lp in laps:
+            if lp["t_start"] <= t <= lp["t_end"]:
+                return lp["lap"]
+        return None
+
+    def num(s, k):
+        v = s.get(k)
+        return v if isinstance(v, (int, float)) else None
+
+    # bbox prefilter: full point-in-poly only for the tiny fraction of a 90k-
+    # sample session that's anywhere near the circled corner (12-session scans
+    # would otherwise spend many seconds in the polygon test).
+    blat0 = min(p[0] for p in poly); blat1 = max(p[0] for p in poly)
+    blon0 = min(p[1] for p in poly); blon1 = max(p[1] for p in poly)
+    per: dict = {}
+    for i, s in enumerate(samples):
+        lat, lon = s.get("lat"), s.get("lon")
+        if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and (lat or lon)):
+            continue
+        if lat < blat0 or lat > blat1 or lon < blon0 or lon > blon1:
+            continue
+        if not _point_in_poly(lat, lon, poly):
+            continue
+        lp = lap_of(rel[i])
+        if lp in allowed:
+            per.setdefault(lp, []).append(i)
+
+    date_lbl = _session_date_label(fname)
+    out = []
+    for n in sorted(per.keys()):
+        idxs = per[n]
+        # longest CONTIGUOUS run (a lasso over esses can clip a lap twice)
+        runs, cur = [], [idxs[0]]
+        for a, b in zip(idxs, idxs[1:]):
+            if b - a <= 8:
+                cur.append(b)
+            else:
+                runs.append(cur)
+                cur = [b]
+        runs.append(cur)
+        run = max(runs, key=len)
+        if len(run) < 4:
+            continue
+        first, last = run[0], run[-1]
+        lp = allowed[n]
+        # extend the window so pre-region braking / post-region acceleration is
+        # visible (~4s before, ~2.5s after at 25 Hz), clamped to the lap.
+        ext0 = first
+        while ext0 > 0 and first - ext0 < 100 and rel[ext0 - 1] >= lp["t_start"]:
+            ext0 -= 1
+        ext1 = last
+        while ext1 + 1 < len(samples) and ext1 - last < 60 and rel[ext1 + 1] <= lp["t_end"]:
+            ext1 += 1
+        win = list(range(ext0, ext1 + 1))
+        spd = [num(samples[i], "speed_mph") or 0.0 for i in win]
+        # 3-tap smoothing for the brake/throttle edge detectors
+        sm = [spd[0]] + [(spd[k - 1] + spd[k] + spd[k + 1]) / 3.0
+                         for k in range(1, len(spd) - 1)] + [spd[-1]]
+        in0, in1 = first - ext0, last - ext0          # region span within win
+        apex_k = min(range(in0, in1 + 1), key=lambda k: sm[k])
+        bk = apex_k
+        while bk > 0 and sm[bk - 1] > sm[bk] + 0.02:   # climb the decel slope
+            bk -= 1
+        tk = apex_k
+        while tk + 1 < len(sm) and not (sm[tk + 1] > sm[tk] + 0.02):
+            tk += 1
+        if tk + 1 >= len(sm):
+            tk = apex_k
+
+        def pathm(k0, k1):
+            d = 0.0
+            for a, b in zip(win[k0:k1], win[k0 + 1:k1 + 1]):
+                d += _haversine_km(samples[a]["lat"], samples[a]["lon"],
+                                   samples[b]["lat"], samples[b]["lon"]) * 1000.0
+            return d
+
+        def ptinfo(k):
+            s = samples[win[k]]
+            return {"lat": round(s["lat"], 6), "lon": round(s["lon"], 6),
+                    "mph": round(spd[k], 1)}
+
+        step = max(1, (len(win) + 239) // 240)
+        trace = []
+        for k in range(0, len(win), step):
+            s = samples[win[k]]
+            trace.append([round(s["lat"], 6), round(s["lon"], 6), round(spd[k], 1)])
+        brake = ptinfo(bk)
+        brake["dist_to_apex_m"] = round(pathm(bk, apex_k), 0)
+        out.append({
+            "session": fname,
+            "date": date_lbl,
+            "lap": n,
+            "label": f"{date_lbl} L{n}",
+            "seconds": round(rel[last] - rel[first], 2),
+            "entry_mph": round(spd[in0], 1),
+            "min_mph": round(sm[apex_k], 1),
+            "exit_mph": round(spd[in1], 1),
+            "brake": brake if bk < apex_k else None,
+            "apex": ptinfo(apex_k),
+            "throttle": ptinfo(tk) if tk > apex_k else None,
+            "trace": trace,
+        })
+    return out
+
+
+def _lap_library(user_dir: str, current_path: pathlib.Path, poly: list,
+                 max_sessions: int = 12) -> dict:
+    """Gather region traverses from up to `max_sessions` of the user's most
+    recent sessions on the SAME track and rank them against the current
+    session: up to 10 FASTER + up to 10 SIMILAR-pace references."""
+    sroot = DATA_DIR / "sessions" / user_dir
+    tkey = _track_key(current_path.name)
+    cands = []
+    if sroot.exists():
+        for f in sroot.iterdir():
+            if (f.is_file() and f.name.endswith(".ndjson")
+                    and not f.name.endswith(".dbg.ndjson")
+                    and _track_key(f.name) == tkey
+                    and f.name != current_path.name
+                    and f.stat().st_size <= 60 * 1024 * 1024):
+                cands.append(f)
+    cands.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    files = [current_path] + cands[: max(0, max_sessions - 1)]
+
+    current: list = []
+    pool: list = []
+    scanned = 0
+    for f in files:
+        samples = _read_ndjson_samples(f)
+        if not samples:
+            continue
+        trav = _region_traverses(samples, poly, user_dir, f.name)
+        scanned += 1
+        if f.name == current_path.name:
+            current = trav
+        else:
+            pool.extend(trav)
+
+    faster: list = []
+    similar: list = []
+    if current:
+        cur_ts = sorted(t["seconds"] for t in current)
+        cur_best = cur_ts[0]
+        cur_med = cur_ts[len(cur_ts) // 2]
+        faster = sorted([t for t in pool if t["seconds"] < cur_best - 0.005],
+                        key=lambda t: t["seconds"])[:10]
+        in_f = {(t["session"], t["lap"]) for t in faster}
+        similar = sorted([t for t in pool if (t["session"], t["lap"]) not in in_f],
+                         key=lambda t: abs(t["seconds"] - cur_med))[:10]
+    return {"track": tkey, "sessions_scanned": scanned,
+            "current": current, "faster": faster, "similar": similar}
+
+
+def _refs_table(trs: list) -> list:
+    rows = ["session | lap | time_s | entry_mph | min_mph | exit_mph | brake_mph | brake_m_before_apex"]
+    for t in trs:
+        b = t.get("brake") or {}
+        rows.append(" | ".join(str(v if v is not None else "-") for v in (
+            t["date"], t["lap"], t["seconds"], t["entry_mph"], t["min_mph"],
+            t["exit_mph"], b.get("mph", "-"), b.get("dist_to_apex_m", "-"))))
+    return rows
+
+
+def _region_prompt(metrics: dict, question: str, lib: Optional[dict] = None) -> list:
     """Build the chat messages: a race-engineer system prompt + a compact
-    per-lap metrics table + the driver's question."""
+    per-lap metrics table (+ cross-session reference laps) + the question."""
     laps = metrics.get("laps", [])
     lines = [
         "Per-lap telemetry through the track section the driver circled on the map.",
@@ -2615,6 +2845,26 @@ def _region_prompt(metrics: dict, question: str) -> list:
         lines.append(f"Session's fastest overall lap (whole track): lap {metrics['best_lap']}.")
     lines.append(f"({metrics.get('points_in_region', 0)} GPS points fell inside the region "
                  f"across {len(laps)} laps.)")
+    if lib and (lib.get("faster") or lib.get("similar")):
+        lines.append("")
+        lines.append(f"REFERENCE LAPS from the driver's OTHER sessions on this track "
+                     f"({lib.get('sessions_scanned', 0)} sessions scanned), same circled "
+                     f"region. brake_m_before_apex = metres before the min-speed point "
+                     f"where sustained braking began.")
+        if lib.get("faster"):
+            lines.append("")
+            lines.append(f"FASTER than this session's best through the region "
+                         f"({len(lib['faster'])}):")
+            lines.extend(_refs_table(lib["faster"]))
+        if lib.get("similar"):
+            lines.append("")
+            lines.append(f"SIMILAR pace ({len(lib['similar'])}):")
+            lines.extend(_refs_table(lib["similar"]))
+        lines.append("")
+        lines.append("When faster references exist, coach by DIRECT comparison: where do "
+                     "they brake relative to this session (brake_m_before_apex and "
+                     "brake_mph), how much more min/exit speed do they carry, and "
+                     "quantify the time on offer through this section.")
     table = "\n".join(lines)
     system = (
         "You are a professional race engineer and driving coach analyzing "
@@ -3399,8 +3649,16 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
     if not metrics.get("laps"):
         raise HTTPException(status_code=422,
                             detail="no lap data fell inside the selected region")
+    # Cross-session references (other days, same track, same region) — on by
+    # default; body {"refs": false} skips the extra session scans.
+    lib = None
+    if body.get("refs", True):
+        try:
+            lib = _lap_library(safe_name(user), p, poly)
+        except Exception as e:
+            log.warning("lap library failed for %s/%s: %s", user, filename, e)
     question = str(body.get("prompt", "")).strip()
-    messages = _region_prompt(metrics, question)
+    messages = _region_prompt(metrics, question, lib=lib)
     answer, used_model = _ai_chat(messages, model=body.get("model"))
 
     entry = {
@@ -3412,6 +3670,9 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
         "region": {"points": poly},
         "laps": len(metrics.get("laps", [])),
         "points_in_region": metrics.get("points_in_region", 0),
+        "refs_faster": len((lib or {}).get("faster", [])),
+        "refs_similar": len((lib or {}).get("similar", [])),
+        "refs_sessions": (lib or {}).get("sessions_scanned", 0),
     }
     history = _ai_history_append(user, p.name, entry)
     return JSONResponse({
@@ -3421,7 +3682,202 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
         "answer": answer,
         "entry": entry,
         "history": history,
+        "refs": {"faster": len((lib or {}).get("faster", [])),
+                 "similar": len((lib or {}).get("similar", [])),
+                 "sessions": (lib or {}).get("sessions_scanned", 0)},
     })
+
+
+@app.post("/sessions/{user}/{filename}/lines")
+async def session_lines(request: Request, user: str, filename: str) -> JSONResponse:
+    """Racing-line data for the /lineview popout. Body {region:{points}}.
+    Returns the fastest REAL traverse of the region across all of the user's
+    sessions on this track ('ideal' — achievable by construction: somebody
+    drove it), the current session's best, and up to 4 further fast references
+    — each with a GPS trace + brake/apex/throttle markers + speeds."""
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    poly = (body.get("region") or {}).get("points") or []
+    if not isinstance(poly, list) or len(poly) < 3:
+        raise HTTPException(status_code=400,
+                            detail="region.points must be a polygon of >=3 [lat,lon] pairs")
+    poly = [[float(pt[0]), float(pt[1])] for pt in poly]
+    lib = _lap_library(safe_name(user), p, poly)
+    cur = lib.get("current") or []
+    if not cur:
+        raise HTTPException(status_code=422,
+                            detail="no lap data fell inside the selected region")
+    your_best = min(cur, key=lambda t: t["seconds"])
+    pool = cur + lib.get("faster", []) + lib.get("similar", [])
+    seen = set()
+    uniq = []
+    for t in sorted(pool, key=lambda t: t["seconds"]):
+        k = (t["session"], t["lap"])
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(t)
+    ideal = uniq[0]
+    refs = [t for t in uniq
+            if (t["session"], t["lap"]) not in
+               {(ideal["session"], ideal["lap"]), (your_best["session"], your_best["lap"])}][:4]
+    return JSONResponse({
+        "ok": True,
+        "track": lib.get("track"),
+        "sessions_scanned": lib.get("sessions_scanned", 0),
+        "ideal": ideal,
+        "your_best": your_best,
+        "refs": refs,
+        "delta_s": round(your_best["seconds"] - ideal["seconds"], 2),
+        "region": {"points": poly},
+    })
+
+
+@app.get("/lineview/{user}/{filename}", response_class=HTMLResponse)
+async def lineview_page(request: Request, user: str, filename: str) -> Response:
+    """Popout racing-line visualizer (satellite + fastest real line + brake/
+    apex/throttle markers + speed labels vs your line). ?pts=lat,lon|lat,lon…"""
+    if oauth_enabled() and not current_user(request):
+        return login_redirect(request)
+    gate_view_dir(request, safe_name(user))
+    _resolve_session(user, filename)
+    html_out = (_LINEVIEW_HTML
+                .replace("__USER__", json.dumps(user))
+                .replace("__FILE__", json.dumps(filename)))
+    return HTMLResponse(html_out)
+
+
+_LINEVIEW_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Racing line — racecar-35</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root{--bg:#0E1014;--surface:#181B22;--line:#2A2F3A;--text:#E6E8EE;--muted:#8A92A3;
+        --good:#6CD07A;--warn:#FFB020;--bad:#FF4D4D;--you:#4EA1FF;}
+  *{box-sizing:border-box} html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+    font:14px/1.45 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+  #wrap{display:grid;grid-template-columns:1fr 340px;height:100vh}
+  #map{height:100vh}
+  aside{padding:14px;overflow-y:auto;border-left:1px solid var(--line);background:var(--surface)}
+  h1{font-size:15px;margin:0 0 8px} .muted{color:var(--muted);font-size:12px}
+  .leg{display:flex;align-items:center;gap:8px;margin:6px 0;font-size:13px}
+  .sw{width:26px;height:5px;border-radius:2px;flex:0 0 auto}
+  .card{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;margin:10px 0}
+  .big{font-size:20px;font-weight:700}
+  table{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+  td,th{padding:3px 6px;border-bottom:1px solid var(--line);text-align:right}
+  th:first-child,td:first-child{text-align:left}
+  .spd-lbl{background:rgba(0,0,0,.65);color:#fff;font:600 10px Inter,sans-serif;
+    padding:1px 3px;border-radius:3px;white-space:nowrap;border:1px solid rgba(255,255,255,.25)}
+  .mk-lbl{background:rgba(0,0,0,.75);font:700 10px Inter,sans-serif;padding:2px 5px;
+    border-radius:3px;white-space:nowrap}
+</style></head><body>
+<div id="wrap">
+  <div id="map"></div>
+  <aside>
+    <h1>Racing line — circled section</h1>
+    <div class="muted" id="status">loading…</div>
+    <div class="card" id="summary" style="display:none">
+      <div class="big" id="delta"></div>
+      <div class="muted" id="deltaSub"></div>
+    </div>
+    <div class="leg"><div class="sw" style="background:var(--good)"></div>ideal (fastest real lap through here)</div>
+    <div class="leg"><div class="sw" style="background:var(--you)"></div>your best this session</div>
+    <div class="leg"><div class="sw" style="background:#777"></div>other fast references</div>
+    <div class="leg"><div style="width:12px;height:12px;border-radius:50%;background:var(--bad)"></div>brake point</div>
+    <div class="leg"><div style="width:12px;height:12px;border-radius:50%;background:var(--warn)"></div>apex (min speed)</div>
+    <div class="leg"><div style="width:12px;height:12px;border-radius:50%;background:var(--good)"></div>back to throttle</div>
+    <div class="card"><table id="tbl"><thead><tr>
+      <th>lap</th><th>time</th><th>entry</th><th>min</th><th>exit</th><th>brake m</th>
+    </tr></thead><tbody></tbody></table>
+    <div class="muted" id="scanned" style="margin-top:6px"></div></div>
+    <div class="muted">Speed labels are mph along each line. “brake m” = metres before the
+    apex where sustained braking began. The ideal line is a REAL lap — someone (you) drove
+    it, so it's achievable.</div>
+  </aside>
+</div>
+<script>
+(function(){
+  const USER=__USER__, FILE=__FILE__;
+  const q=new URLSearchParams(location.search);
+  const pts=(q.get('pts')||'').split('|').map(s=>s.split(',').map(Number)).filter(a=>a.length===2&&isFinite(a[0])&&isFinite(a[1]));
+  const map=L.map('map');
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    {maxZoom:20, attribution:'Imagery © Esri'}).addTo(map);
+  const status=document.getElementById('status');
+  if(pts.length<3){ status.textContent='no region — open this from the review page (circle a section → ideal line)'; map.setView([39,-77],5); return; }
+  L.polygon(pts,{color:'#6CD07A',weight:1,fillOpacity:0.06,dashArray:'4 4'}).addTo(map);
+
+  function speedColor(mph){ // blue slow -> red fast (relative-ish absolute scale)
+    const t=Math.max(0,Math.min(1,(mph-30)/90));
+    const r=Math.round(60+t*195), g=Math.round(120-40*Math.abs(t-0.5)*2+60*(1-t)), b=Math.round(220-200*t);
+    return 'rgb('+r+','+Math.max(40,g)+','+b+')';
+  }
+  function drawTrace(t, color, weight, opacity, withLabels, labelEvery){
+    const ll=t.trace.map(p=>[p[0],p[1]]);
+    L.polyline(ll,{color:color,weight:weight,opacity:opacity}).addTo(map);
+    if(withLabels){
+      const step=labelEvery||Math.max(8,Math.floor(t.trace.length/12));
+      for(let i=0;i<t.trace.length;i+=step){
+        L.marker([t.trace[i][0],t.trace[i][1]],{interactive:false,icon:L.divIcon({className:'',
+          html:'<div class="spd-lbl" style="border-color:'+color+'">'+Math.round(t.trace[i][2])+'</div>',
+          iconAnchor:[10,-4]})}).addTo(map);
+      }
+    }
+    return ll;
+  }
+  function marker(pt, color, text){
+    if(!pt) return;
+    L.circleMarker([pt.lat,pt.lon],{radius:7,color:'#000',weight:1.5,fillColor:color,fillOpacity:1}).addTo(map);
+    L.marker([pt.lat,pt.lon],{interactive:false,icon:L.divIcon({className:'',
+      html:'<div class="mk-lbl" style="color:'+color+'">'+text+'</div>', iconAnchor:[-10,8]})}).addTo(map);
+  }
+  fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/lines',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({region:{points:pts}})
+  }).then(async r=>{
+    const j=await r.json();
+    if(!r.ok){ status.textContent='error: '+((j&&j.detail)||('HTTP '+r.status)); map.fitBounds(pts); return; }
+    status.textContent='';
+    for(const t of j.refs) drawTrace(t,'#777',2,0.55,false);
+    const sameLap = j.ideal.session===j.your_best.session && j.ideal.lap===j.your_best.lap;
+    let yb=null;
+    if(!sameLap) yb=drawTrace(j.your_best,'#4EA1FF',3,0.85,true);
+    const il=drawTrace(j.ideal,'#6CD07A',5,0.95,true);
+    const b=j.ideal.brake;
+    marker(b,'#FF4D4D','BRAKE '+(b?Math.round(b.mph):'')+' mph · '+(b?Math.round(b.dist_to_apex_m):'?')+' m → apex');
+    marker(j.ideal.apex,'#FFB020','APEX '+Math.round(j.ideal.apex.mph)+' mph');
+    marker(j.ideal.throttle,'#6CD07A','THROTTLE '+(j.ideal.throttle?Math.round(j.ideal.throttle.mph):'')+' mph');
+    if(!sameLap && j.your_best.brake)
+      marker(j.your_best.brake,'#4EA1FF','you brake · '+Math.round(j.your_best.brake.dist_to_apex_m)+' m');
+    map.fitBounds(il.concat(yb||[]), {padding:[40,40]});
+    const d=document.getElementById('delta'), ds=document.getElementById('deltaSub'),
+          sm=document.getElementById('summary');
+    sm.style.display='block';
+    if(sameLap){ d.textContent='your lap IS the ideal here'; ds.textContent='fastest traverse on record: '+j.ideal.label+' · '+j.ideal.seconds+'s'; }
+    else { d.textContent='-'+j.delta_s+'s on offer';
+           ds.textContent='ideal: '+j.ideal.label+' ('+j.ideal.seconds+'s) vs your best this session: '+j.your_best.label+' ('+j.your_best.seconds+'s)'; }
+    const tb=document.querySelector('#tbl tbody');
+    const rows=[['IDEAL '+j.ideal.label,j.ideal],['YOU '+j.your_best.label,j.your_best]]
+      .concat(j.refs.map(t=>[t.label,t]));
+    for(const [nm,t] of rows){
+      const tr=document.createElement('tr');
+      tr.innerHTML='<td>'+nm+'</td><td>'+t.seconds+'</td><td>'+Math.round(t.entry_mph)+'</td>'+
+        '<td>'+Math.round(t.min_mph)+'</td><td>'+Math.round(t.exit_mph)+'</td>'+
+        '<td>'+(t.brake?Math.round(t.brake.dist_to_apex_m):'-')+'</td>';
+      tb.appendChild(tr);
+    }
+    document.getElementById('scanned').textContent=j.sessions_scanned+' sessions scanned on this track';
+  }).catch(e=>{ status.textContent='request failed: '+e.message; });
+})();
+</script></body></html>"""
 
 
 @app.get("/sessions/{user}/{filename}/ai/history")
@@ -4951,6 +5407,7 @@ _REVIEW_HTML = (
         <div class="ai-row">
           <button id="ai-draw" class="btn">circle a section</button>
           <button id="ai-clear" class="btn">clear</button>
+          <button id="ai-line" class="btn" title="popout: fastest real line through this section vs yours, with brake/apex/throttle markers and speed labels">ideal line ↗</button>
           <span style="flex:1"></span>
           <label class="t-label" style="display:flex;align-items:center;gap:6px">model
             <select id="ai-model" class="cmp-input" style="width:auto;min-width:160px"></select>
@@ -5801,6 +6258,13 @@ _REVIEW_HTML = (
       el('ai-ask').disabled=false;
     }
     el('ai-ask').addEventListener('click', ask);
+    el('ai-line').addEventListener('click', ()=>{
+      if (pts.length<3){ status.textContent='circle a section of track first'; return; }
+      const enc = pts.map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join('|');
+      window.open('/lineview/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+
+                  '?pts='+encodeURIComponent(enc), 'lineview',
+                  'width=1200,height=850,menubar=no,toolbar=no');
+    });
     document.querySelectorAll('.ai-preset').forEach(b=>{
       b.addEventListener('click', ()=>{ el('ai-prompt').value=b.dataset.q; ask(); });
     });
