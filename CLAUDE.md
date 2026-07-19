@@ -274,6 +274,17 @@ exit speed, brake zones, best line, consistency). Server side (`server/app/main.
   `RACECAR_AI_TIMEOUT_SECONDS` (120). Keys documented in `server/.env.example` + `server/README.md`.
 - The lasso disables `map.dragging` while drawing; client-side point-in-poly shows a live
   “N points in region” count before asking. No new Python deps (uses stdlib `urllib`).
+- **Cross-session references + racing-line popout (lineview).** Circling a region now also
+  mines up to 12 most-recent sessions on the SAME track (`_track_key()` from the filename,
+  '-combined' aware) via `_lap_library()` → `_region_traverses()` (per-lap region pass, window
+  extended ~4 s before/2.5 s after so pre-region braking is captured; brake point = walk back up
+  the smoothed decel slope from the apex; respects lap exclusions): up to **10 FASTER + 10
+  SIMILAR** reference laps are embedded in the AI prompt as comparison tables (body
+  `{refs:false}` opts out). **`POST /sessions/{u}/{f}/lines` + `GET /lineview/{u}/{f}`**
+  (view-gated, `?pts=lat,lon|…`) = popout satellite window: IDEAL line (fastest REAL traverse
+  on record) in green w/ mph labels + BRAKE/APEX/THROTTLE markers, your session-best in blue w/
+  your brake point, grey refs, delta card + table. Review page **"ideal line ↗"** button (next
+  to the lasso) opens it with the current polygon.
 - **Persistent per-session history + cascade delete:** every Q&A is appended to
   `RACECAR_DATA_DIR/ai_history/<user>/<sessionfile>.json` and rendered as a collapsible list
   (newest first; per-item *show region* redraws the polygon, *delete* = `POST .../ai/delete`).
