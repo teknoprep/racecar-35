@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.132"
+#define FIRMWARE_VERSION "0.1.133"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1719,13 +1719,46 @@ static bool parseGpsLine(const String& line) {
     if (n < 6) return false;
     idx[n] = line.length();
     auto field = [&](int k) { return line.substring(idx[k] + 1, idx[k + 1]); };
-    g.fix     = (uint8_t)field(0).toInt();
-    g.sats    = (uint8_t)field(1).toInt();
-    g.lat_deg = field(2).toFloat();
-    g.lon_deg = field(3).toFloat();
-    g.mph     = field(4).toFloat();
-    g.hdg_deg = field(5).toFloat();
-    g.status  = (n >= 7) ? (uint8_t)field(6).toInt() : 0;
+    // Parse into LOCALS first — a corrupted line must not be able to poison
+    // g.* before it has been sanity-checked (v0.1.133).
+    const uint8_t p_fix  = (uint8_t)field(0).toInt();
+    const uint8_t p_sats = (uint8_t)field(1).toInt();
+    const float   p_lat  = field(2).toFloat();
+    const float   p_lon  = field(3).toFloat();
+    const float   p_mph  = field(4).toFloat();
+    const float   p_hdg  = field(5).toFloat();
+    const uint8_t p_stat = (n >= 7) ? (uint8_t)field(6).toInt() : 0;
+
+    // ---- GPS SANITY GATE (v0.1.133) — THE lap-timer killer ----
+    // A single dropped/overflowed UART byte mangles one GPS line, and
+    // String::toFloat() returns 0.0 for anything unparseable. The resulting
+    // (0,0) "null island" fix sits outside every track radius, which used to
+    // WIPE the whole lap timer — so a lap only completed if an ENTIRE ~85 s
+    // lap passed with zero corrupted samples. Measured against a real
+    // Thompson trace with the real firmware: one bad line per ~100 s took
+    // 4 detected laps -> 0. (Server/SD data looked perfect because the Teensy
+    // logs locally and never crosses the UART hop.)
+    // Drop the bad sample and KEEP the last good position instead.
+    if (p_fix >= 2) {
+        if (fabsf(p_lat) < 0.001f && fabsf(p_lon) < 0.001f) return false;  // null island
+        if (fabsf(p_lat) > 90.0f || fabsf(p_lon) > 180.0f)  return false;  // impossible
+        // Teleport check: >500 m between consecutive fixes isn't physics at
+        // 25 Hz (45 000 km/h). Only applied while the last good fix is RECENT
+        // — after a dropout/stale a genuine large jump is expected, and the
+        // 2 s window makes this self-healing (it can never latch onto a dead
+        // position and reject reality forever).
+        if (g.last_ms != 0 && g.fix >= 2 && (millis() - g.last_ms) < 2000) {
+            if (trackDistanceKm(g.lat_deg, g.lon_deg, p_lat, p_lon) > 0.5f) return false;
+        }
+    }
+
+    g.fix     = p_fix;
+    g.sats    = p_sats;
+    g.lat_deg = p_lat;
+    g.lon_deg = p_lon;
+    g.mph     = p_mph;
+    g.hdg_deg = p_hdg;
+    g.status  = p_stat;
     g.last_ms = millis();
 
     // Auto-start recording: once enabled with a track selected, kick off the
@@ -1809,9 +1842,10 @@ static void updateLapTimer() {
     // LAP row keeps the last time as a static fact); START begins a fresh
     // session — resetting on the rising edge also avoids a stale prev_gps_ms
     // producing a huge dt/distance jump on the first update after a restart.
-    static bool was_recording = false;
+    static bool     was_recording = false;
+    static uint16_t offtrack_n    = 0;   // consecutive "not at any track" fixes
     if (!recording) { was_recording = false; return; }
-    if (!was_recording) { lapTimer = LapTimer{}; was_recording = true; }
+    if (!was_recording) { lapTimer = LapTimer{}; was_recording = true; offtrack_n = 0; }
     if (g.fix < 2) return;    // no usable fix — pause, don't reset
 
     // SELECTED track wins (see lapTrackIdx): a picked variant (e.g. Summit
@@ -1822,12 +1856,20 @@ static void updateLapTimer() {
 
     if (tIdx < 0 && !sf_unknown.used) {
         // Not at any known track and no user-captured S/F — nothing to time
-        // against; clear state so display shows "--:--.--". (At an UNKNOWN
-        // track WITH a captured S/F, tIdx stays -1 and effectiveSfLine(-1)
-        // resolves to the captured slot — lap timing works there too.)
-        if (lapTimer.active) lapTimer = LapTimer{};
+        // against. DEBOUNCED (v0.1.133): ONE bad fix must never destroy lap
+        // state. The old code wiped the timer on the FIRST out-of-range
+        // sample, so a corrupted GPS line mid-lap cost the entire lap; at ~1
+        // bad line per lap that meant EVERY lap ("40 laps before 1
+        // registered"). Require ~2 s of CONTINUOUS "nowhere" before clearing,
+        // which is far longer than any corruption burst but still instant on
+        // the scale of actually leaving a circuit.
+        if (++offtrack_n >= 50) {
+            if (lapTimer.active) lapTimer = LapTimer{};
+            offtrack_n = 50;                  // saturate, never wrap
+        }
         return;
     }
+    offtrack_n = 0;                           // back on track
 
     // First activation or track changed — initialize fresh.
     if (!lapTimer.active || lapTimer.track_idx != tIdx) {

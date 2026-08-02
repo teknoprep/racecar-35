@@ -831,6 +831,27 @@ reverts to TRACK+picker when idle) — so the driver can set the line any time, 
 across S/F on an out-lap. STATUS page: the old "CLR S/F" is now a wide maroon **DELETE CUSTOM
 S/F** button (x180-404, only visible when an override exists).
 
+### ⚠️ THE lap-timer killer: one bad GPS line wiped the whole timer (fixed v0.1.133)
+Symptom: "40 laps before 1 registered" — while the SERVER and the SD NDJSON showed every lap
+perfectly. That split is the whole clue: the Teensy logs locally, so only the DASH sees the
+UART hop. Mechanism: a dropped/overflowed UART byte mangles one `GPS,` line → `toFloat()`
+returns 0.0 → position `(0,0)` → outside every track radius → `lapTrackIdx()` = -1 →
+`updateLapTimer()` did `lapTimer = LapTimer{}` **on the first bad sample**, wiping
+`timing_started`/`lap_number`/ghost. A lap therefore only completed if an ENTIRE ~85 s lap
+passed with ZERO corrupt samples. **Measured with the real firmware code on a real Thompson
+trace: 1 bad line per ~100 s took 4 detected laps → 0.**
+Fix (three layers, no geometry change):
+1. `parseGpsLine()` parses into LOCALS then **sanity-gates** before committing to `g.*`:
+   reject null-island (0,0), |lat|>90/|lon|>180, and >500 m teleports between consecutive
+   fixes — the teleport check only applies while the last good fix is <2 s old, so it is
+   self-healing after a real dropout and can never latch onto a dead position.
+2. `updateLapTimer()` **debounces** the off-track clear: ~50 consecutive (~2 s) out-of-range
+   fixes before wiping state.
+3. Rejected samples never reach the crossing test, so `prev_lat/prev_lon` can't be poisoned.
+Result on the same trace: **4/4 laps at every corruption rate up to 15 bad lines/min**, timer
+resets 5 → 0, clean-trace lap times unchanged. Harness: `/tmp/extract_core.py` + a replay of a
+real session pulled via `GET /admin/sessions/get` — **replay real data before theorising.**
+
 ### S/F crossing = PLANE + gate + interpolated instant (v0.1.130) — the "it doesn't see the line" fix
 The old test was "does the path segment prev→cur INTERSECT the stored S/F segment?" A
 web-picked line is only ~10 m long (you click the two edges of the stripe), so passing a few
