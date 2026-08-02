@@ -7986,12 +7986,27 @@ static const char* versionNoV(const char* v) {
     return (v[0] == 'v' || v[0] == 'V') ? v + 1 : v;
 }
 
+// Parse "a.b.c.d" into 4 ints (missing components = 0). Hand-rolled on
+// purpose: these were the ONLY two sscanf() calls in the firmware, and
+// linking sscanf drags in newlib's __ssvfscanf_r + __ssvfiscanf_r — ~17 KB
+// of flash for one version compare. Same semantics for version strings
+// (stops at the first non-digit, leaves the rest zero).
+static void versionParse4(const char* s, int* out) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+    int i = 0;
+    while (i < 4 && *s) {
+        if (*s < '0' || *s > '9') break;
+        int v = 0;
+        while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); ++s; }
+        out[i++] = v;
+        if (*s == '.') ++s; else break;
+    }
+}
+
 static int versionCmp(const char* a, const char* b) {
-    a = versionNoV(a);
-    b = versionNoV(b);
-    int aa[4] = {0,0,0,0}, bb[4] = {0,0,0,0};
-    sscanf(a, "%d.%d.%d.%d", &aa[0],&aa[1],&aa[2],&aa[3]);
-    sscanf(b, "%d.%d.%d.%d", &bb[0],&bb[1],&bb[2],&bb[3]);
+    int aa[4], bb[4];
+    versionParse4(versionNoV(a), aa);
+    versionParse4(versionNoV(b), bb);
     for (int i = 0; i < 4; ++i) if (aa[i] != bb[i]) return aa[i] - bb[i];
     return 0;
 }
