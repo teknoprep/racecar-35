@@ -654,6 +654,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `cl_proto` | uint8 | 0=HTTP, 1=HTTPS, 2=FTP |
 | ~~`cl_strm`~~ | — | **REMOVED in v0.1.66.** Live "stream to cloud" was deleted (not ready, and its mid-session POSTs stalled the loop → GPS STALE). Cloud recording is now **always After Race**. Old stored key is orphaned/harmless. |
 | `cl_email` / `cl_key` | string | Cloud user email (X-User-Email) + API key (X-API-Key, masked). Migrated from legacy `cl_user`/`cl_pass`. |
+| `autost` / `astmph` / `astsec` | bool/uint16/uint16 | **Auto-start recording** (v0.1.131): enable / speed threshold (mph) / **seconds the speed must be HELD continuously** (default 4, range 1-30). The dwell is the fix for spurious starts — the pre-0.1.131 code fired on the FIRST sample above the threshold, so one GPS speed spike or a squirt across the paddock opened a session. ANY dip below the threshold restarts the dwell. The START button turns amber and counts down (`AUTO 3`) while arming. |
 | `auto_trk` | bool | Auto-select closest track on START (skip picker if a clear match exists) |
 | `inet` | uint8 | Internet routing: 0=Ethernet (Teensy/W5500), 1=WiFi (CrowPanel) |
 | `wssid` / `wpass` | string | WiFi SSID / PSK |

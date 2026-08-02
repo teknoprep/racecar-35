@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.130"
+#define FIRMWARE_VERSION "0.1.131"
 
 #include <Preferences.h>
 #include <time.h>
@@ -73,7 +73,7 @@ enum SettingId : uint8_t {
     ST_CL_HOST, ST_CL_PORT, ST_CL_PROTO,
     ST_CL_AUTH_USER, ST_CL_AUTH_PASS,
     ST_AUTO_TRACK,
-    ST_AUTO_START, ST_AUTO_START_MPH,   // auto-start recording + its speed threshold
+    ST_AUTO_START, ST_AUTO_START_MPH, ST_AUTO_START_SEC,   // auto-start recording + threshold + hold time
     ST_TIMEZONE,    // ENUM: cycle through TIMEZONES[]
     ST_GPS_BAUD,    // ENUM: GPS UART baud (sent to Teensy as CFG,gpsbaud,<n>)
     ST_GPS_STATUS,  // INFO: Teensy's GPSBAUD report (locked baud + OK/NO DATA)
@@ -578,6 +578,11 @@ constexpr int32_t  DELTA_SAME_MS = 50;       // |delta| <= this -> "same pace" (
 // yet (one-way bytes harmlessly accumulate in its Serial3 RX buffer);
 // when the SD-card / cloud-streaming feature is implemented Teensy-side
 // it just starts consuming the line.
+// Auto-start dwell: ms remaining before a held over-threshold speed opens a
+// session (0 = not counting). Drives the START button's "AUTO n" countdown so
+// the driver can SEE the arming instead of wondering why it hasn't fired.
+static uint32_t autostart_pending_ms = 0;
+
 static bool recording         = false;
 static int  last_track_idx    = -1;        // TRACKS[] index of the last confirmed track (-1 = none saved)
 static char active_track_name[52] = "";    // full display name (may include config, e.g. "Mid-Ohio Full Course")
@@ -717,9 +722,14 @@ struct Settings {
     bool     auto_select_track = true; // when on, skip picker if a clear closest match exists
 
     // Auto-start recording: when enabled AND a track is selected, the dash
-    // sends REC,1 on its own once GPS speed crosses auto_start_mph.
+    // sends REC,1 on its own once GPS speed has been AT OR ABOVE
+    // auto_start_mph CONTINUOUSLY for auto_start_sec seconds. The dwell is
+    // what makes it trustworthy: a single GPS speed spike, a blip over a bump,
+    // or a quick squirt across the paddock no longer starts a session (the
+    // old code fired on the very first sample above the threshold).
     bool     auto_start       = false;
     uint16_t auto_start_mph   = 25;
+    uint16_t auto_start_sec   = 4;     // seconds the speed must be HELD (1-30)
 
     // Time zone — index into TIMEZONES[] (defined below). Display only;
     // the Teensy's RTC + the wire-format TIME line are always UTC.
@@ -1428,6 +1438,7 @@ static void loadSettings() {
     s.auto_select_track  = prefs.getBool  ("auto_trk", s.auto_select_track);
     s.auto_start         = prefs.getBool  ("autost",   s.auto_start);
     s.auto_start_mph     = prefs.getUShort("astmph",   s.auto_start_mph);
+    s.auto_start_sec     = prefs.getUShort("astsec",   s.auto_start_sec);
     s.timezone_idx       = prefs.getUChar ("tz",       s.timezone_idx);
     s.internet_mode      = prefs.getUChar ("inet",     s.internet_mode);
     prefs.getString      ("wssid",    s.wifi_ssid, sizeof(s.wifi_ssid));
@@ -1520,6 +1531,7 @@ static void saveSettings() {
     prefs.putBool  ("auto_trk", s.auto_select_track);
     prefs.putBool  ("autost",   s.auto_start);
     prefs.putUShort("astmph",   s.auto_start_mph);
+    prefs.putUShort("astsec",   s.auto_start_sec);
     // (sendCfgToTeensy() is called at end of this function so any save also
     // re-syncs the cloud config to the Teensy.)
     prefs.putUChar ("tz",       s.timezone_idx);
@@ -1721,18 +1733,32 @@ static bool parseGpsLine(const String& line) {
     // holding above the threshold) doesn't re-trigger; re-arms only after speed
     // drops back below the threshold.
     {
-        static bool autostart_fired = false;
+        static bool     autostart_fired = false;
+        static uint32_t above_since_ms  = 0;   // when speed FIRST reached the threshold
+        const uint32_t hold_ms = (uint32_t)s.auto_start_sec * 1000UL;
         if (!s.auto_start || active_track_name[0] == '\0') {
             autostart_fired = false;
+            above_since_ms  = 0;
         } else if (g.mph < (float)s.auto_start_mph) {
             autostart_fired = false;                      // slow -> re-arm
-        } else if (!autostart_fired && !recording) {
-            Serial.printf("TRACK,%s\n", active_track_name);
-            Serial.printf("REC,1\n");
-            recording = true; rec_start_ms = millis();
-            autostart_fired = true;
+            above_since_ms  = 0;                          // ANY dip restarts the dwell
+        } else {
+            // At/above the threshold: start (or continue) the dwell timer and
+            // only fire once the speed has been HELD for auto_start_sec. A
+            // single spike can no longer open a session.
+            if (above_since_ms == 0) above_since_ms = millis();
+            if (!autostart_fired && !recording
+                && (millis() - above_since_ms) >= hold_ms) {
+                Serial.printf("TRACK,%s\n", active_track_name);
+                Serial.printf("REC,1\n");
+                recording = true; rec_start_ms = millis();
+                autostart_fired = true;
+            }
         }
         if (recording) autostart_fired = true;            // any session spends the latch
+        autostart_pending_ms = (!recording && s.auto_start && above_since_ms != 0
+                                && hold_ms > (millis() - above_since_ms))
+                             ? (hold_ms - (millis() - above_since_ms)) : 0;
     }
     return true;
 }
@@ -4150,9 +4176,15 @@ static void invalidateAll() {
 }
 
 static void drawRecordButton() {
-    const uint16_t fill   = recording ? TFT_RED   : TFT_GREEN;
+    // Auto-start dwell in progress -> amber button counting down ("AUTO 3"),
+    // so a held-speed arming is visible rather than mysterious.
+    const bool     counting = (!recording && autostart_pending_ms > 0);
+    const uint16_t fill   = recording ? TFT_RED : (counting ? TFT_ORANGE : TFT_GREEN);
     const uint16_t border = TFT_WHITE;
-    const char*    label  = recording ? "STOP"    : "START";
+    char           cbuf[12];
+    if (counting) snprintf(cbuf, sizeof(cbuf), "AUTO %u",
+                           (unsigned)((autostart_pending_ms + 999) / 1000));
+    const char*    label  = recording ? "STOP" : (counting ? cbuf : "START");
 
     if (dash_sprites_ready) {
         spr_recbtn.fillSprite(fill);
@@ -4480,9 +4512,16 @@ static void drawDashPage() {
         }
     }
 
-    if ((int)recording != ld.recording) {
-        drawRecordButton();
-        ld.recording = recording;
+    {
+        // Repaint on record-state change OR each whole second of the auto-start
+        // countdown (encoded into the cached tag so nothing else redraws).
+        const int tag = recording ? -100
+                      : (autostart_pending_ms > 0
+                         ? (int)((autostart_pending_ms + 999) / 1000) : 0);
+        if (tag != ld.recording) {
+            drawRecordButton();
+            ld.recording = tag;
+        }
     }
 
     // ---- Manual UPLOAD button (between START and the speed digit) ----
@@ -5105,6 +5144,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_DEBUG_LOG,     "Debug logging (SD)",   SettingRow::TOGGLE  },
     { ST_AUTO_START,    "Auto start recording", SettingRow::TOGGLE  },
     { ST_AUTO_START_MPH,"Auto start at (mph)",  SettingRow::NUMERIC },
+    { ST_AUTO_START_SEC,"Auto start hold (sec)",SettingRow::NUMERIC },
     { ST_CL_HOST,      "Cloud host (DNS/IP)",   SettingRow::TEXT    },
     { ST_CL_PORT,      "Cloud port",            SettingRow::TEXT    },
     { ST_CL_PROTO,     "Cloud protocol",        SettingRow::ENUM    },
@@ -5152,6 +5192,7 @@ static NumBounds numBounds(SettingId id) {
         case ST_AFR_WARN_LO:  return {  80, 200, 1 };
         case ST_AFR_WARN_HI:  return {  80, 200, 1 };
         case ST_AUTO_START_MPH: return { 5, 150, 5 };  // speed to trigger auto-record
+        case ST_AUTO_START_SEC: return { 1,  30, 1 };  // seconds it must be HELD
         case ST_LAP_OVERLAY:    return { 0,   9, 1 };  // lap popup seconds (0 = off)
         default:         return {    0,     0,   0 };
     }
@@ -5172,6 +5213,7 @@ static uint16_t getNum(SettingId id) {
         case ST_AFR_WARN_LO:  return s.afr_warn_lo_x10;
         case ST_AFR_WARN_HI:  return s.afr_warn_hi_x10;
         case ST_AUTO_START_MPH: return s.auto_start_mph;
+        case ST_AUTO_START_SEC: return s.auto_start_sec;
         case ST_LAP_OVERLAY:    return s.lap_overlay_s;
         default:         return 0;
     }
@@ -5191,6 +5233,7 @@ static void setNum(SettingId id, uint16_t v) {
         case ST_AFR_WARN_LO:  s.afr_warn_lo_x10 = v; break;
         case ST_AFR_WARN_HI:  s.afr_warn_hi_x10 = v; break;
         case ST_AUTO_START_MPH: s.auto_start_mph = v; break;
+        case ST_AUTO_START_SEC: s.auto_start_sec = (uint16_t)(v < 1 ? 1 : (v > 30 ? 30 : v)); break;
         case ST_LAP_OVERLAY:    s.lap_overlay_s  = (uint8_t)(v > 9 ? 9 : v); break;
         default: break;
     }
@@ -6406,8 +6449,8 @@ static bool rowShouldShow(SettingId id) {
         case ST_CL_AUTH_USER:
         case ST_CL_AUTH_PASS:  return s.record_cloud;
 
-        // Auto-start speed only matters when auto-start is enabled.
-        case ST_AUTO_START_MPH: return s.auto_start;
+        // Auto-start speed/hold only matter when auto-start is enabled.
+        case ST_AUTO_START_MPH: case ST_AUTO_START_SEC: return s.auto_start;
         default:           return true;
     }
 }
@@ -6430,7 +6473,8 @@ static int rowGroup(SettingId id) {
         case ST_SHOW_AFR:  case ST_AFR_WARN_LO: case ST_AFR_WARN_HI: case ST_AFR_WARN_COL:
         case ST_SHOW_VOLT: case ST_VOLT_WARN: case ST_VOLT_WARN_COL: return SG_SENSORS;
         case ST_REC_SD: case ST_REC_CLOUD: case ST_AUTO_TRACK:
-        case ST_AUTO_START: case ST_AUTO_START_MPH: return SG_RECORDING;
+        case ST_AUTO_START: case ST_AUTO_START_MPH:
+        case ST_AUTO_START_SEC: return SG_RECORDING;
         case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO:
         case ST_CL_AUTH_USER: case ST_CL_AUTH_PASS: return SG_CLOUD;
         case ST_TIMEZONE: case ST_GPS_BAUD: case ST_GPS_STATUS:
