@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.129"
+#define FIRMWARE_VERSION "0.1.130"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -257,7 +257,37 @@ static struct {
     float    prevLat = 0, prevLon = 0;
     int      lap = 0;                 // current lap being driven (0 = before 1st crossing)
     uint32_t last_cross_ms = 0;
+    // Crossing GATE (v0.1.130, mirrors the dash): the S/F is an infinite PLANE
+    // through the line's midpoint + a lateral gate, not the ~10 m drawn
+    // segment. Passing a few metres wide of a drawn line used to miss the lap
+    // entirely (proven in simulation against real track geometry).
+    bool     gate_ok = false;
+    float    mLat = 0, mLon = 0, kcos = 1;
+    float    nE = 0, nN = 0, tE = 0, tN = 0;
+    float    half_m = 25.0f;
+    float    dir = 0;                 // learned direction through the plane
+    bool     have_dir = false;
 } sf_lap;
+
+static constexpr float SF_GATE_HALF_M_T = 25.0f;
+
+// Rebuild the gate frame from the stored endpoints (called when CFG,sf lands).
+static void buildSfGateT() {
+    sf_lap.gate_ok = false;
+    if (!sf_lap.has_line) return;
+    sf_lap.mLat = (sf_lap.aLat + sf_lap.bLat) * 0.5f;
+    sf_lap.mLon = (sf_lap.aLon + sf_lap.bLon) * 0.5f;
+    sf_lap.kcos = cosf(sf_lap.mLat * 0.017453292519943295f);
+    if (sf_lap.kcos < 0.05f) sf_lap.kcos = 0.05f;
+    const float dE = (sf_lap.bLon - sf_lap.aLon) * 111320.0f * sf_lap.kcos;
+    const float dN = (sf_lap.bLat - sf_lap.aLat) * 111320.0f;
+    const float len = sqrtf(dE * dE + dN * dN);
+    if (len < 0.5f) return;
+    sf_lap.tE = dE / len;   sf_lap.tN = dN / len;
+    sf_lap.nE = -sf_lap.tN; sf_lap.nN = sf_lap.tE;
+    sf_lap.half_m = (len * 0.5f > SF_GATE_HALF_M_T) ? len * 0.5f : SF_GATE_HALF_M_T;
+    sf_lap.gate_ok = true;
+}
 
 // Do path segment P0->P1 and S/F segment A->B intersect? (planar, lon*cos lat)
 static bool segCrossT(float p0Lat, float p0Lon, float p1Lat, float p1Lon,
@@ -276,18 +306,40 @@ static void resetTeensyLap() {
     sf_lap.have_prev = false;
     sf_lap.lap = 0;
     sf_lap.last_cross_ms = 0;
+    sf_lap.have_dir = false;
+    sf_lap.dir = 0;
 }
 
 // Update the lap counter from a fresh fix. First crossing -> lap 1; each later
 // crossing -> lap++. 15 s minimum-lap guard against S/F double-triggers.
 static void updateTeensyLap(uint8_t fix, float lat, float lon) {
     if (!sf_lap.has_line || fix < 2) return;
-    if (sf_lap.have_prev) {
-        if (segCrossT(sf_lap.prevLat, sf_lap.prevLon, lat, lon,
-                      sf_lap.aLat, sf_lap.aLon, sf_lap.bLat, sf_lap.bLon)
-            && (sf_lap.last_cross_ms == 0 || millis() - sf_lap.last_cross_ms >= 15000)) {
-            sf_lap.lap++;
-            sf_lap.last_cross_ms = millis();
+    if (!sf_lap.gate_ok) buildSfGateT();
+    if (sf_lap.have_prev && sf_lap.gate_ok) {
+        // signed distance to the plane (sign flips on crossing) + lateral
+        // offset along the line (must land inside the gate)
+        auto proj = [](float la, float lo, float* s, float* u) {
+            const float dE = (lo - sf_lap.mLon) * 111320.0f * sf_lap.kcos;
+            const float dN = (la - sf_lap.mLat) * 111320.0f;
+            *s = dE * sf_lap.nE + dN * sf_lap.nN;
+            *u = dE * sf_lap.tE + dN * sf_lap.tN;
+        };
+        float sp, up, sc, uc;
+        proj(sf_lap.prevLat, sf_lap.prevLon, &sp, &up);
+        proj(lat, lon, &sc, &uc);
+        if ((sp < 0.0f) != (sc < 0.0f)) {
+            const float den = sp - sc;
+            float f = (fabsf(den) < 1e-6f) ? 0.5f : (sp / den);
+            if (f < 0.0f) f = 0.0f; else if (f > 1.0f) f = 1.0f;
+            const float u_cross = up + f * (uc - up);
+            const float xdir = (sc > sp) ? 1.0f : -1.0f;
+            const bool dir_ok = !sf_lap.have_dir || (xdir * sf_lap.dir > 0.0f);
+            if (fabsf(u_cross) <= sf_lap.half_m && dir_ok
+                && (sf_lap.last_cross_ms == 0 || millis() - sf_lap.last_cross_ms >= 15000)) {
+                sf_lap.lap++;
+                sf_lap.last_cross_ms = millis();
+                if (!sf_lap.have_dir) { sf_lap.dir = xdir; sf_lap.have_dir = true; }
+            }
         }
     }
     sf_lap.prevLat = lat; sf_lap.prevLon = lon; sf_lap.have_prev = true;
@@ -2317,6 +2369,8 @@ static void handleCfgLine(const String& line) {
         sf_lap.aLat=v[0]; sf_lap.aLon=v[1]; sf_lap.bLat=v[2]; sf_lap.bLon=v[3];
         sf_lap.has_line = (v[2] != 0.0f || v[3] != 0.0f);
         sf_lap.have_prev = false;
+        sf_lap.have_dir  = false;
+        buildSfGateT();
         Serial.printf("[cfg] S/F line %s\n", sf_lap.has_line ? "set" : "cleared");
     }
     else if (key == "inet") {

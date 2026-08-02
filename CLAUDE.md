@@ -830,6 +830,29 @@ reverts to TRACK+picker when idle) — so the driver can set the line any time, 
 across S/F on an out-lap. STATUS page: the old "CLR S/F" is now a wide maroon **DELETE CUSTOM
 S/F** button (x180-404, only visible when an override exists).
 
+### S/F crossing = PLANE + gate + interpolated instant (v0.1.130) — the "it doesn't see the line" fix
+The old test was "does the path segment prev→cur INTERSECT the stored S/F segment?" A
+web-picked line is only ~10 m long (you click the two edges of the stripe), so passing a few
+metres wide of it MISSED the lap. Proven in simulation with the REAL firmware code on REAL
+Summit geometry: **−4/−6/−8 m lateral offset = 0 of 5 laps detected**, +4 m @ 60 mph = flaky.
+Now (`SfGate` / `buildSfGate` / `sfGateProject` / `sfGateCross`, mirrored on the Teensy in
+`updateTeensyLap` + `buildSfGateT`):
+- the S/F is an **infinite PLANE** through the line's midpoint; every fix computes the **signed
+  distance** to it; a **sign change = crossing** (so lateral position no longer matters),
+- **lateral gate** `SF_GATE_HALF_M = 25 m` (50 m wide, or the drawn line's own width if wider)
+  keeps a parallel road / distant part of the circuit from triggering,
+- **direction gate**: the travel direction through the plane is learned at the first crossing;
+  later passes must match (a wide gate can otherwise catch the pit lane / wrong-way),
+- the crossing **INSTANT is interpolated** between the two straddling fixes
+  (`t_cross = t_prev + frac·Δt`), so lap time no longer quantizes to the 40 ms sample grid:
+  measured error vs ground truth **2.5–9 ms mean** (was ±40 ms), and `lap_start_ms` is set to
+  `t_cross`, not the sample time,
+- **MIN_LAP_MS no longer applies to the FIRST crossing** — arming is not a lap, so starting a
+  recording shortly before the line no longer silently costs a whole lap.
+⚠️ `struct SfGate` is forward-declared at the top of RaceDash.ino (Arduino auto-prototype rule).
+Harness: `/tmp/extract_core.py` pulls the REAL functions out of RaceDash.ino into a host test —
+re-run it after touching the lap timer.
+
 ### Lap timer / predictive / delta / LAP COUNTER (S/F LINE-crossing, v0.1.82)
 Lap timing runs in `RaceDash.ino` (`updateLapTimer()`) — **only WHILE RECORDING since v0.1.105**:
 START resets `lapTimer` for a fresh session (rising-edge reset also avoids a stale `prev_gps_ms`

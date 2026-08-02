@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.129"
+#define FIRMWARE_VERSION "0.1.130"
 
 #include <Preferences.h>
 #include <time.h>
@@ -44,6 +44,8 @@
 // top of the translation unit, so any type used in a function signature must
 // be visible BEFORE the first function. Real definitions follow below.
 // ---------------------------------------------------------------------------
+struct SfGate;   // S/F crossing gate (v0.1.130) — used by buildSfGate/sfGateCross
+
 enum SettingId : uint8_t {
     // Internet block at the very top — picks whether all internet-bound
     // operations route via Teensy/W5500 (Ethernet) or CrowPanel/ESP32-S3 WiFi.
@@ -528,6 +530,9 @@ struct LapTimer {
     float    prev_lat        = 0.0f;  // previous GPS point (for line-crossing test)
     float    prev_lon        = 0.0f;
     bool     have_prev       = false;
+    uint32_t prev_fix_ms     = 0;     // millis() of the PREVIOUS fix (crossing interpolation)
+    float    sf_dir          = 0.0f;  // learned direction of travel through the S/F plane
+    bool     have_sf_dir     = false; // set at the first crossing
 
     uint32_t last_lap_ms     = 0;     // most recent completed lap time (0 = none)
     float    last_lap_dist   = 0.0f;  // distance of last completed lap (miles)
@@ -548,6 +553,22 @@ static uint32_t lap_overlay_until_ms = 0;   // popup deadline (0 = inactive)
 static int      lap_overlay_lapn     = 0;   // completed lap number
 static bool     lap_overlay_is_best  = false;
 
+// ---------------------------------------------------------------------------
+// S/F CROSSING GATE (v0.1.130). The old test asked "does the path segment
+// prev->cur INTERSECT the stored S/F segment?" — but a hand-drawn line across
+// the stripe is only ~10 m long, so passing 5 m wide of it (different racing
+// line, track width, GPS error) MISSED the lap entirely. Measured with the
+// real firmware on real Summit geometry: -4/-6/-8 m offset = 0 of 5 laps
+// detected, +4 m at 60 mph = flaky ("sometimes it works").
+//
+// Replaced by the standard lap-timer construction: treat the S/F as an
+// infinite PLANE through the line's midpoint, track the SIGNED DISTANCE to it
+// every fix, and declare a crossing when that distance changes sign — gated
+// laterally (|offset along the line| <= SF_GATE_HALF_M) so a parallel road or
+// a distant part of the circuit can't trigger it. The crossing INSTANT is
+// then INTERPOLATED between the two straddling fixes, so lap time no longer
+// quantizes to the 40 ms sample grid or depends on where samples landed.
+constexpr float    SF_GATE_HALF_M = 25.0f;   // lateral half-width of the gate (50 m total)
 constexpr float    LAP_RADIUS_KM = 0.075f;   // 75 m start/finish detection radius
 constexpr uint32_t MIN_LAP_MS    = 15000;    // minimum lap time before a crossing counts
 constexpr int32_t  DELTA_SAME_MS = 50;       // |delta| <= this -> "same pace" (white)
@@ -1218,6 +1239,68 @@ static void effectiveSfLine(int idx, float* aLat, float* aLon,
 
 // Send the active track's S/F line to the Teensy so IT can stamp lap numbers
 // into the recorded NDJSON (CFG,sf,aLat,aLon,bLat,bLon; all zero => none).
+// Local ENU frame at the S/F midpoint: normal = across the line (direction of
+// travel through it), tangent = along the line.
+struct SfGate {
+    bool  valid  = false;
+    float mLat   = 0, mLon = 0;   // midpoint
+    float k      = 1.0f;          // cos(lat): lon-degrees -> metres
+    float nE     = 0, nN = 0;     // unit normal (across)
+    float tE     = 0, tN = 0;     // unit tangent (along)
+    float half_m = SF_GATE_HALF_M;
+};
+
+static void buildSfGate(int idx, SfGate* gt) {
+    *gt = SfGate{};
+    float aLat, aLon, bLat, bLon; bool hasLine;
+    effectiveSfLine(idx, &aLat, &aLon, &bLat, &bLon, &hasLine);
+    if (!hasLine) return;                       // point-only -> radius fallback
+    gt->mLat = (aLat + bLat) * 0.5f;
+    gt->mLon = (aLon + bLon) * 0.5f;
+    gt->k    = cosf(gt->mLat * (float)M_PI / 180.0f);
+    if (gt->k < 0.05f) gt->k = 0.05f;
+    const float dE = (bLon - aLon) * 111320.0f * gt->k;   // tangent, metres
+    const float dN = (bLat - aLat) * 111320.0f;
+    const float len = sqrtf(dE * dE + dN * dN);
+    if (len < 0.5f) return;                     // degenerate line
+    gt->tE = dE / len;  gt->tN = dN / len;
+    gt->nE = -gt->tN;   gt->nN =  gt->tE;       // perpendicular
+    // A deliberately WIDE hand-drawn line is honoured; never narrower than
+    // SF_GATE_HALF_M (which is what fixes the missed laps).
+    gt->half_m = fmaxf(SF_GATE_HALF_M, len * 0.5f);
+    gt->valid  = true;
+}
+
+// Signed distance (m) from a fix to the S/F plane + lateral offset along it.
+static inline void sfGateProject(const SfGate& gt, float lat, float lon,
+                                 float* s, float* u) {
+    const float dE = (lon - gt.mLon) * 111320.0f * gt.k;
+    const float dN = (lat - gt.mLat) * 111320.0f;
+    *s = dE * gt.nE + dN * gt.nN;    // across  (sign flips when we cross)
+    *u = dE * gt.tE + dN * gt.tN;    // along   (must stay inside the gate)
+}
+
+// True when prev->cur crosses the plane INSIDE the gate. *frac = where in the
+// interval (0..1) -> interpolated crossing time; *dir = +1/-1 travel direction
+// through the plane (direction gate: a wide gate must not count a wrong-way or
+// pit-lane pass as a lap).
+static bool sfGateCross(const SfGate& gt, float pLat, float pLon,
+                        float cLat, float cLon, float* frac, float* dir) {
+    if (!gt.valid) return false;
+    float sp, up, sc, uc;
+    sfGateProject(gt, pLat, pLon, &sp, &up);
+    sfGateProject(gt, cLat, cLon, &sc, &uc);
+    if ((sp < 0.0f) == (sc < 0.0f)) return false;      // no sign change
+    const float denom = sp - sc;
+    const float f  = (fabsf(denom) < 1e-6f) ? 0.5f : (sp / denom);
+    const float fc = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+    const float u_cross = up + fc * (uc - up);
+    if (fabsf(u_cross) > gt.half_m) return false;      // passed outside the gate
+    *frac = fc;
+    *dir  = (sc > sp) ? 1.0f : -1.0f;
+    return true;
+}
+
 static void sendSfToTeensy(int idx) {
     float aLat=0,aLon=0,bLat=0,bLon=0; bool hasLine=false;
     effectiveSfLine(idx, &aLat,&aLon,&bLat,&bLon,&hasLine);   // idx<0 = UNKNOWN slot
@@ -1731,9 +1814,11 @@ static void updateLapTimer() {
     }
 
     // Integrate distance: speed (mph) × elapsed hours = miles.
+    const uint32_t t_prev_fix = lapTimer.prev_fix_ms;   // for crossing interpolation
     const float dt_h = (float)(now - lapTimer.prev_gps_ms) * (1.0f / 3600000.0f);
     lapTimer.dist_miles += g.mph * dt_h;
     lapTimer.prev_gps_ms = now;
+    lapTimer.prev_fix_ms = now;
 
     const uint32_t elapsed = now - lapTimer.lap_start_ms;
 
@@ -1767,11 +1852,26 @@ static void updateLapTimer() {
                           dm, (int)lapTimer.timing_started, (int)lapTimer.lap_number);
         }
     }
-    bool crossed = false;
+    bool     crossed = false;
+    float    frac    = 0.0f;       // where in the sample interval we crossed
+    float    xdir    = 0.0f;       // direction through the plane
+    uint32_t t_cross = now;        // INTERPOLATED crossing instant
     if (hasLine) {
-        if (lapTimer.have_prev) {
-            crossed = segmentsCross(lapTimer.prev_lat, lapTimer.prev_lon,
-                                    g.lat_deg, g.lon_deg, aLat, aLon, bLat, bLon);
+        SfGate gt; buildSfGate(tIdx, &gt);
+        if (gt.valid && lapTimer.have_prev) {
+            crossed = sfGateCross(gt, lapTimer.prev_lat, lapTimer.prev_lon,
+                                  g.lat_deg, g.lon_deg, &frac, &xdir);
+            if (crossed) {
+                // Direction gate: once armed, only count passes the SAME way
+                // through the plane (a 50 m gate can otherwise reach the pit
+                // lane or an antiparallel piece of tarmac).
+                if (lapTimer.timing_started && lapTimer.have_sf_dir
+                    && xdir * lapTimer.sf_dir < 0.0f) {
+                    crossed = false;
+                } else if (t_prev_fix != 0 && now > t_prev_fix) {
+                    t_cross = t_prev_fix + (uint32_t)(frac * (float)(now - t_prev_fix));
+                }
+            }
         }
         lapTimer.prev_lat = g.lat_deg;
         lapTimer.prev_lon = g.lon_deg;
@@ -1782,10 +1882,17 @@ static void updateLapTimer() {
         if (lapTimer.left_start && sfKm <= LAP_RADIUS_KM) crossed = true;
     }
 
-    if (crossed && elapsed >= MIN_LAP_MS) {
+    // Lap time is measured between INTERPOLATED crossing instants, so it no
+    // longer quantizes to the sample grid or depends on sample phase.
+    const uint32_t elapsed_x = t_cross - lapTimer.lap_start_ms;
+    // MIN_LAP_MS guards double-triggers on COMPLETED laps only — the FIRST
+    // crossing merely arms the timer and must never be rejected (starting a
+    // recording shortly before the line used to silently cost a whole lap).
+    if (crossed && (!lapTimer.timing_started || elapsed_x >= MIN_LAP_MS)) {
         if (lapTimer.timing_started) {
             lapTimer.lap_number++;            // completed a lap -> now driving the next
-            // Clean completed lap — record it.
+            // Clean completed lap — record it (interpolated, sub-sample exact).
+            const uint32_t elapsed = elapsed_x;
             lapTimer.last_lap_ms   = elapsed;
             lapTimer.last_lap_dist = lapTimer.dist_miles;
             // Track the session's fastest lap and snapshot it as the predictive
@@ -1810,8 +1917,12 @@ static void updateLapTimer() {
             lapTimer.lap_number = 1;          // first crossing -> begin lap 1
         }
         // First crossing just arms the timer; subsequent ones record lap times.
+        if (!lapTimer.have_sf_dir && xdir != 0.0f) {   // learn the racing direction
+            lapTimer.sf_dir      = xdir;
+            lapTimer.have_sf_dir = true;
+        }
         lapTimer.timing_started = true;
-        lapTimer.lap_start_ms   = now;
+        lapTimer.lap_start_ms   = t_cross;   // interpolated, not the sample time
         lapTimer.dist_miles     = 0.0f;
         lapTimer.left_start     = false;
         lapTimer.prev_gps_ms    = now;
