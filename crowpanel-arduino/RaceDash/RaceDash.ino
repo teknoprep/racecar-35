@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.131"
+#define FIRMWARE_VERSION "0.1.132"
 
 #include <Preferences.h>
 #include <time.h>
@@ -9882,6 +9882,39 @@ static void handleTimeSetTap(int x, int y) {
     }
 }
 
+// Why isn't the lap timer running? The chain has FIVE gates (recording, GPS
+// fix, track match, S/F line present, crossing) and any one of them silently
+// shows nothing on the dash. This names the one that's blocking, live, on the
+// STATUS page — so a dead lap timer is diagnosable in the paddock in seconds
+// instead of after the session.
+static uint16_t lapTimerStatus(char* buf, size_t n) {
+    if (!recording) { snprintf(buf, n, "idle - not recording"); return TFT_DARKGREY; }
+    if (g.fix < 2)  { snprintf(buf, n, "WAITING: no GPS fix");  return TFT_YELLOW; }
+    const int tIdx = lapTrackIdx();
+    if (tIdx < 0 && !sf_unknown.used) {
+        snprintf(buf, n, "NO TRACK MATCH + no S/F set");
+        return TFT_RED;
+    }
+    float aLat, aLon, bLat, bLon; bool hasLine;
+    effectiveSfLine(tIdx, &aLat, &aLon, &bLat, &bLon, &hasLine);
+    const int sIdx = sfStorageIdx(tIdx);
+    const char* tn = (sIdx >= 0 && sIdx < N_TRACKS) ? TRACKS[sIdx].name : "unknown trk";
+    if (!hasLine) { snprintf(buf, n, "%s: NO S/F LINE", tn); return TFT_RED; }
+    if (!lapTimer.active) { snprintf(buf, n, "%s: starting", tn); return TFT_YELLOW; }
+    const int dm = (int)(trackDistanceKm(g.lat_deg, g.lon_deg,
+                                         (aLat + bLat) * 0.5f,
+                                         (aLon + bLon) * 0.5f) * 1000.0f);
+    if (!lapTimer.timing_started) {
+        snprintf(buf, n, "%s armed - S/F %dm", tn, dm);
+        return TFT_CYAN;
+    }
+    char t[12];
+    if (lapTimer.last_lap_ms) formatLapTime(lapTimer.last_lap_ms, t, sizeof(t));
+    else                      strncpy(t, "--", sizeof(t));
+    snprintf(buf, n, "L%d  last %s  S/F %dm", lapTimer.lap_number, t, dm);
+    return TFT_GREEN;
+}
+
 static void drawStatusPage() {
     constexpr uint16_t BG  = TFT_BLACK;
     constexpr uint16_t LBL = TFT_DARKGREY;
@@ -9929,6 +9962,7 @@ static void drawStatusPage() {
         tft.drawString("TRACK",   15, 298);
         tft.drawString("REC",     15, 318);
         tft.drawString("ELAPSED", 15, 338);
+        tft.drawString("LAP TMR", 15, 358);
         tft.drawString("DASH",    15, 380);
         tft.drawString("TEENSY",  15, 400);
         tft.drawString("MATCH",   15, 420);
@@ -10067,6 +10101,16 @@ static void drawStatusPage() {
         else                               strncpy(buf, "--:--:--", sizeof(buf));
         tft.setTextColor(VAL, BG);
         tft.drawString(buf, LV, 338);
+    }
+    {
+        // Lap-timer gate diagnostic (v0.1.132) — wide padding: this string is
+        // long and spans to just before the right column.
+        char buf[48];
+        const uint16_t col = lapTimerStatus(buf, sizeof(buf));
+        tft.setTextPadding(305);
+        tft.setTextColor(col, BG);
+        tft.drawString(buf, LV, 358);
+        tft.setTextPadding(LPAD);
     }
 
     tft.setTextPadding(RPAD);
