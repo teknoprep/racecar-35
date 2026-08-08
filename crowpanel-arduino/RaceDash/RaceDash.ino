@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.137"
+#define FIRMWARE_VERSION "0.1.138"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2879,6 +2879,14 @@ static void coachKick(const char* tick_id) {
     if (!s.coach_show) return;
     if (s.internet_mode != 1 || !wifiConnectedNow()) return;
     if (s.cloud_auth_user[0] == '\0') return;
+    // ⚠️ NEVER while the uploader or the sessions list owns the link (v0.1.138).
+    // This crashed and rebooted the board in 0.1.137: an upload already holds a
+    // TLS socket AND ~73 KB of internal RAM for the zblocks compressor, and the
+    // periodic coach fetch would open a SECOND TLS session on top of it — two
+    // mbedtls contexts in the internal heap at once is straight out of memory.
+    // The Teensy link is also mid-ARQ, and a second task adds latency to acks.
+    if (uf.state != UF_IDLE || sl.state != SL_IDLE) return;
+    if (upload_active) return;
     if (tick_id && tick_id[0]) {
         strncpy(coach_tick_id, tick_id, sizeof(coach_tick_id) - 1);
         coach_tick_id[sizeof(coach_tick_id) - 1] = '\0';
@@ -2887,7 +2895,11 @@ static void coachKick(const char* tick_id) {
         coach_last_fetch_ms = millis();
     }
     coach_busy = true;
-    if (xTaskCreatePinnedToCore(coachTask, "coach", 8192, nullptr, 1, nullptr, 0) != pdPASS)
+    // 16 KB stack, NOT 8 KB (v0.1.138). An mbedtls handshake needs well over
+    // 8 KB of stack; 0.1.137 gave this task 8192 and it overflowed the moment
+    // it did TLS — instant crash + reboot. Every other TLS task here uses
+    // 12-16 KB; match the uploader's 16 KB.
+    if (xTaskCreatePinnedToCore(coachTask, "coach", 16384, nullptr, 1, nullptr, 0) != pdPASS)
         coach_busy = false;
 }
 
@@ -11152,7 +11164,8 @@ void loop() {
     // ~25 s after an upload batch (server review is async), then lazily every
     // 5 min. Never while recording — the radio belongs to BT then, and the
     // button is hidden anyway.
-    if (s.coach_show && !recording && !coach_busy) {
+    if (s.coach_show && !recording && !coach_busy
+        && uf.state == UF_IDLE && sl.state == SL_IDLE && !upload_active) {
         const uint32_t nowc = millis();
         const bool due = (coach_refetch_at_ms != 0 && nowc >= coach_refetch_at_ms)
                       || (coach_last_fetch_ms == 0 && nowc > 15000)
