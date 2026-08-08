@@ -498,6 +498,26 @@ VER,teensy,<semver>
   reports EFFECTIVE raw KB/s + ratio (`ZB <n> KB/s (<r>x)` on the Tools page; server logs
   `raw_bytes`/`raw_kbps`/`ratio` in the nettest event — `/nettest` stream-parses frame headers
   without inflating).
+- **⚠️ THE upload killer: the compressor was starving the TLS handshake (fixed v0.1.134).**
+  Field signature (0.1.133, RSSI -43, WiFi fine): `ufdiag st=3 net=3 rh=524234 rt=0 er=TCP
+  connect failed` — ring FULL (512 KB) with `ring_tail == 0`, i.e. the net task never sent one
+  body byte, and the server logged `rx=0`. Cause: `ufNetTask()` called `zbProbeCaps()` +
+  `zbEnsure()` FIRST, taking **~73 KB of INTERNAL RAM** (40 KB hash workspace + 16 KB raw +
+  17 KB out, internal since 0.1.128) plus a TLS connection for `/caps`, BEFORE
+  `ufOpenStream()` ran the real handshake — and mbedtls needs tens of KB of *internal* heap for
+  cert parse + TLS buffers. Marginal heap ⇒ intermittent: 22 MB uploads landed on a lucky
+  retry, then stopped working entirely. Consequence chain: no socket → ring fills → dash stops
+  acking (backpressure) → Teensy stalls → 90 s watchdog → whole-file retry → forever.
+  Fix: **socket FIRST, compressor second** — `ufOpenStream()` no longer terminates the headers
+  (caller appends `X-Body-Format` + the blank line), compression is only enabled when
+  `heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= ZB_MIN_FREE_INTERNAL` (96 KB) *after* the
+  handshake (else stream RAW — slower but always works, server accepts both), connect now
+  **retries 3× with a fresh client each attempt** (a failed WiFiClientSecure can be left
+  wedged), `zbFree()` runs at task exit so the next file's handshake gets the RAM back, and the
+  ufdiag note carries `ih=<free internal KB>`.
+  **Progress bar** now reads `ring_head` (bytes pulled off the car) not `ring_tail` (bytes
+  ack'd by the socket) — ring_tail is 0 for the whole handshake and stays 0 forever on a
+  connect failure, which is exactly the "stuck at 0 then jumps" the driver reported.
 - **Upload speed: sliding-window ARQ (v0.1.102).** `handleQGet()` streams with a **go-back-N
   window (QGET_WIN=16→48 lines in flight since v0.1.127 — 16 was ~38 ms of pipe and drained
   faster than the dash's ack cadence, capping the UART hop ≈ 70 KB/s; 48 ≈ 120 ms rides through

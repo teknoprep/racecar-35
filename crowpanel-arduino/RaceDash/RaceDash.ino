@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.133"
+#define FIRMWARE_VERSION "0.1.134"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2612,18 +2612,6 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
     // writes during streaming almost never block this long; if one does, the
     // stall watchdog in uploadTick() still catches it.
     constexpr int CLOUD_TCP_TIMEOUT_S = 15;
-    if (s.cloud_protocol == 1) {
-        WiFiClientSecure* sec = new WiFiClientSecure();
-        sec->setInsecure();   // TODO: pin server cert when going public
-        sec->setTimeout(CLOUD_TCP_TIMEOUT_S);
-        uf.tcp = sec;
-        uf.tcp_secure = true;
-    } else {
-        WiFiClient* plain = new WiFiClient();
-        plain->setTimeout(CLOUD_TCP_TIMEOUT_S);
-        uf.tcp = plain;
-        uf.tcp_secure = false;
-    }
     // NOTE: only ESP.getFreeHeap() here (a cheap maintained counter). Do NOT
     // call heap_caps_get_largest_free_block() — it walks the whole heap inside
     // a critical section (interrupts off) and on the Advance's large heap that
@@ -2631,9 +2619,36 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
     // ⚠️ NO Serial prints in here since v0.1.114: this runs on the NET TASK,
     // and UART0 is the Teensy link — an interleaved print would corrupt the
     // Q,A ack stream the loop is emitting concurrently.
-    const bool connected = uf.tcp->connect(s.cloud_host, s.cloud_port);
+    //
+    // v0.1.134: CONNECT WITH RETRIES, and record the free INTERNAL heap in the
+    // error. The TLS handshake needs tens of KB of INTERNAL heap (mbedtls
+    // buffers + cert parse); a single failed attempt used to abort the whole
+    // file, which is what produced "TCP connect failed" -> ring fills ->
+    // dash stops acking -> Teensy stalls -> 90 s watchdog -> repeat forever.
+    // A failed WiFiClientSecure can also be left in a bad state, so the client
+    // is destroyed and recreated on each attempt.
+    bool connected = false;
+    for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
+        if (attempt) vTaskDelay(pdMS_TO_TICKS(500));
+        ufCloseTcp();                       // fresh client every attempt
+        if (s.cloud_protocol == 1) {
+            WiFiClientSecure* sec = new WiFiClientSecure();
+            sec->setInsecure();   // TODO: pin server cert when going public
+            sec->setTimeout(CLOUD_TCP_TIMEOUT_S);
+            uf.tcp = sec;
+            uf.tcp_secure = true;
+        } else {
+            WiFiClient* plain = new WiFiClient();
+            plain->setTimeout(CLOUD_TCP_TIMEOUT_S);
+            uf.tcp = plain;
+            uf.tcp_secure = false;
+        }
+        if (!uf.tcp) continue;
+        connected = uf.tcp->connect(s.cloud_host, s.cloud_port);
+    }
     if (!connected) {
-        snprintf(uf.last_err, sizeof(uf.last_err), "TCP connect failed");
+        snprintf(uf.last_err, sizeof(uf.last_err), "TCP connect failed (heap %u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         ufCloseTcp();
         return false;
     }
@@ -2657,9 +2672,7 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
     // size isn't knowable up front (UART lines are re-framed with '\n').
     (void)content_length;   // used for the progress bar by the caller only
     uf.tcp->printf("Transfer-Encoding: chunked\r\n");
-    // Compressed body (v0.1.127): only after the /caps probe said the server
-    // decodes zblocks. Old server -> header absent -> legacy raw body.
-    if (zb_stream_on) uf.tcp->printf("X-Body-Format: zblocks\r\n");
+
     uf.tcp->printf("X-API-Key: %s\r\n",       s.cloud_auth_pass);
     uf.tcp->printf("X-User-Email: %s\r\n",    s.cloud_auth_user);
     uf.tcp->printf("X-Session-Id: %ld\r\n",   sid);
@@ -2669,7 +2682,10 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
     if (strstr(uf.files[uf.files_idx].name, ".dbg."))
         uf.tcp->printf("X-File-Kind: debug\r\n");
     uf.tcp->printf("Connection: close\r\n");
-    uf.tcp->printf("\r\n");
+    // ⚠️ Headers deliberately NOT terminated here (v0.1.134). The caller
+    // (ufNetTask) decides about zblocks compression only AFTER this handshake
+    // succeeds — so it appends X-Body-Format (if any) and the final blank
+    // line. Nothing else calls this function.
     uf.response_len  = 0;   // expected_size/bytes_written managed by the caller:
     return true;             // total file size for the modal, not this segment's
 }
@@ -2747,10 +2763,11 @@ static void ufDiagReport(const char* why) {
     if (ufdiag_busy) return;                                    // one in flight
     if (s.internet_mode != 1 || !wifiConnectedNow()) return;
     snprintf(ufdiag_note, sizeof(ufdiag_note),
-             "ufdiag %s st=%u net=%u rh=%lu rt=%lu lr=%lu er=%.40s f=%.28s",
+             "ufdiag %s st=%u net=%u rh=%lu rt=%lu lr=%lu ih=%u er=%.40s f=%.28s",
              why, (unsigned)uf.state, (unsigned)uf.net_state,
              (unsigned long)uf.ring_head, (unsigned long)uf.ring_tail,
              (unsigned long)uf.lines_recv,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              uf.last_err[0] ? uf.last_err : uf.net_err,   // cause before symptom
              (uf.files_idx >= 0 && uf.files_idx < uf.files_n)
                  ? uf.files[uf.files_idx].name : "-");
@@ -2760,18 +2777,36 @@ static void ufDiagReport(const char* why) {
         ufdiag_busy = false;
 }
 
+// Minimum INTERNAL heap that must remain free AFTER the TLS handshake before
+// we're willing to spend 73 KB of it on the compressor. Below this, stream
+// RAW — slower on the wire but it always works, and the server accepts both.
+static constexpr uint32_t ZB_MIN_FREE_INTERNAL = 96 * 1024;
+
 static void ufNetTask(void*) {
     bool ok = false;
-    zbProbeCaps();                              // no-op once answered (per boot)
-    zb_stream_on = (srv_zblocks == 1) && zbEnsure();
+    zb_stream_on = false;
     zb_fill = 0;
     zb_wire = 0;
     do {
+        // ⚠️ ORDER IS THE WHOLE FIX (v0.1.134). Previously zbProbeCaps() +
+        // zbEnsure() ran FIRST, taking ~73 KB of INTERNAL RAM (and a TLS
+        // connection for /caps) BEFORE this handshake — so mbedtls regularly
+        // couldn't get the internal heap it needs and the upload died with
+        // "TCP connect failed" before a single body byte moved (proven in the
+        // field: rh=524234 rt=0 at RSSI -43). Socket first, compressor second.
         if (!ufOpenStream(uf.expected_size, "/upload")) {
             snprintf(uf.net_err, sizeof(uf.net_err), "%s",
                      uf.last_err[0] ? uf.last_err : "connect failed");
             break;
         }
+        // Socket is up. NOW decide about compression, and only if there's
+        // comfortable internal heap left over.
+        if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= ZB_MIN_FREE_INTERNAL) {
+            zbProbeCaps();                      // no-op once answered (per boot)
+            if (srv_zblocks == 1) zb_stream_on = zbEnsure();
+        }
+        if (zb_stream_on) uf.tcp->printf("X-Body-Format: zblocks\r\n");
+        uf.tcp->printf("\r\n");                 // end of headers (see ufOpenStream)
         bool werr = false;
         while (!werr) {
             if (uf.net_abort) { snprintf(uf.net_err, sizeof(uf.net_err), "aborted"); werr = true; break; }
@@ -2842,6 +2877,9 @@ static void ufNetTask(void*) {
         }
         ok = true;
     } while (false);
+    // Hand the 73 KB of internal RAM back IMMEDIATELY (v0.1.134) rather than
+    // holding it until ufFreeBuf() — the next file's TLS handshake needs it.
+    zbFree();
     uf.net_state = ok ? 2 : 3;
     vTaskDelete(NULL);
 }
@@ -3199,11 +3237,15 @@ static void uploadTick() {
                                           : uf.files[uf.files_idx].size > 0
                                               ? uf.files[uf.files_idx].size
                                               : 1;
-            // Progress = bytes ON THE WIRE. Read the VOLATILE ring_tail
-            // directly during a stream (v0.1.119) — it's the net task's
-            // ground truth; bytes_written is a non-volatile relay of it.
+            // Progress = bytes PULLED OFF THE CAR (ring_head), not bytes
+            // already ack'd by the socket (ring_tail). v0.1.134: ring_tail
+            // sits at 0 for the whole TLS handshake (and stays 0 forever if
+            // the connect fails), which is exactly the "bar stuck at 0 then
+            // jumps" the driver sees. ring_head advances from the very first
+            // Q,L line and can never be more than one ring (512 KB) ahead of
+            // what's been sent, so it's both smooth and honest.
             done = (uf.state == UF_STREAMING || uf.state == UF_STREAM_FINISH)
-                   ? uf.ring_tail : uf.bytes_written;
+                   ? uf.ring_head : uf.bytes_written;
         }
         if (strcmp(upload_file, fname) != 0 ||
             total != upload_total || done != upload_done) {
