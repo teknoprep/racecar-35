@@ -44,8 +44,10 @@ import os
 import pathlib
 import re
 import secrets
+import difflib
 import shutil
 import struct
+import threading
 import time
 import zlib
 import urllib.error
@@ -1836,13 +1838,352 @@ async def sf_picker(request: Request) -> Response:
     return HTMLResponse(p.read_text("utf-8"))
 
 
+# ---------------------------------------------------------------------------
+# AUTO-COACH CHECKLIST
+# ---------------------------------------------------------------------------
+# Every successful session upload kicks a BACKGROUND AI review that distils the
+# session into 1-3 short, actionable checklist items. They live per-user, are
+# de-duplicated against what's already open (so the same advice doesn't pile up
+# session after session), and are tickable from BOTH the web and the dash.
+# Checked items are kept for the web history but are NEVER sent to the dash.
+#   GET  /coach/{user}/open   -> dash: open items only (compact)
+#   GET  /coach/{user}        -> web JSON: open + done
+#   POST /coach/{user}/done   -> {id} tick (accepts "by": display|web)
+#   POST /coach/{user}/reopen -> {id} untick (web only)
+# ---------------------------------------------------------------------------
+COACH_DIR = DATA_DIR / "coach"
+COACH_MAX_ITEMS_PER_SESSION = 3
+COACH_SIM_THRESHOLD = 0.55      # >= this vs an OPEN item => treat as duplicate
+
+
+def _coach_path(user: str) -> pathlib.Path:
+    return COACH_DIR / (safe_name(user) + ".json")
+
+
+def _coach_load(user: str) -> list:
+    p = _coach_path(user)
+    if p.exists():
+        try:
+            d = json.loads(p.read_text("utf-8"))
+            return d if isinstance(d, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _coach_save(user: str, items: list) -> None:
+    p = _coach_path(user)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(items), "utf-8")
+    tmp.replace(p)
+
+
+_COACH_STOP = {"the", "a", "an", "to", "on", "in", "of", "and", "or", "your", "you",
+               "is", "are", "for", "at", "be", "more", "less", "it", "with", "into",
+               "through", "then", "but", "get", "keep", "try"}
+
+
+def _coach_norm(s: str) -> list:
+    toks = re.findall(r"[a-z0-9]+", (s or "").lower())
+    return [t for t in toks if t not in _COACH_STOP]
+
+
+def _coach_similar(a: str, b: str) -> float:
+    """Similarity of two coaching lines. Jaccard on content words catches
+    reworded advice ('brake later into T3' vs 'later braking for turn 3');
+    SequenceMatcher catches near-identical phrasing. Take the max."""
+    ta, tb = set(_coach_norm(a)), set(_coach_norm(b))
+    if not ta or not tb:
+        return 0.0
+    jac = len(ta & tb) / float(len(ta | tb))
+    seq = difflib.SequenceMatcher(None, " ".join(sorted(ta)), " ".join(sorted(tb))).ratio()
+    return max(jac, seq)
+
+
+def _coach_add(user: str, texts: list, session: str, track: str) -> list:
+    """Append new items, skipping anything similar to an already-OPEN item.
+    Ticked items are ignored for dedupe on purpose: if the driver ticked it off
+    and the habit came back, it SHOULD be raised again."""
+    items = _coach_load(user)
+    open_texts = [i.get("text", "") for i in items if not i.get("done")]
+    added = []
+    for t in texts[:COACH_MAX_ITEMS_PER_SESSION]:
+        t = re.sub(r"\s+", " ", (t or "").strip())
+        if len(t) < 6:
+            continue
+        if any(_coach_similar(t, o) >= COACH_SIM_THRESHOLD for o in open_texts):
+            continue
+        it = {"id": secrets.token_hex(6), "ts": int(time.time()), "text": t[:180],
+              "session": session, "track": track,
+              "done": False, "done_ts": None, "done_by": None}
+        items.append(it)
+        open_texts.append(t)
+        added.append(it)
+    if added:
+        _coach_save(user, items)
+    return added
+
+
+def _coach_facts(user_dir: str, p: pathlib.Path) -> Optional[str]:
+    """Compact fact sheet for the AI: lap times + consistency + the physical
+    envelope. Deliberately small — this runs on every upload."""
+    samples = _read_ndjson_samples(p)
+    if not samples:
+        return None
+    info = _apply_lap_meta(_detect_laps(samples), user_dir, p.name)
+    laps = info.get("laps") or []
+    def nums(key):
+        return [s[key] for s in samples
+                if isinstance(s.get(key), (int, float))]
+    spd = nums("speed_mph")
+    ay = [abs(v) for v in nums("ay")]
+    ax = [abs(v) for v in nums("ax")]
+    rpm = nums("rpm")
+    out = []
+    if laps:
+        ts = sorted(l["seconds"] for l in laps)
+        best = ts[0]
+        med = ts[len(ts) // 2]
+        out.append(f"laps={len(laps)} best={best:.2f}s median={med:.2f}s "
+                   f"worst={ts[-1]:.2f}s spread={ts[-1]-best:.2f}s")
+        out.append("lap_times_s=" + ",".join(f"{l['seconds']:.2f}" for l in laps[:25]))
+    else:
+        out.append("laps=0 (no start/finish crossings detected)")
+    if spd:
+        out.append(f"speed_mph max={max(spd):.0f} min_moving="
+                   f"{min([v for v in spd if v > 5] or [0]):.0f}")
+    if ay:
+        out.append(f"peak_lateral_g={max(ay):.2f}")
+    if ax:
+        out.append(f"peak_long_g={max(ax):.2f}")
+    if rpm:
+        out.append(f"max_rpm={int(max(rpm))}")
+    out.append(f"samples={len(samples)}")
+    return "\n".join(out)
+
+
+def _coach_analyze(user_dir: str, p: pathlib.Path, track: str) -> None:
+    """Background worker: review one freshly-uploaded session and file 1-3
+    checklist items. Never raises into the request path."""
+    try:
+        facts = _coach_facts(user_dir, p)
+        if not facts:
+            return
+        system = (
+            "You are a professional race engineer reviewing a driver's track "
+            "session. Reply with ONLY 1 to 3 lines. Each line: '- ' then ONE "
+            "specific, actionable instruction the driver can act on next "
+            "session, at most 14 words, no explanation, no numbering, no "
+            "preamble. Prefer the biggest time gain. If the data is too thin "
+            "for real advice, reply with a single line '- Not enough clean lap "
+            "data to coach from'."
+        )
+        user_msg = f"Track: {track or 'unknown'}\n{facts}"
+        answer, model, usage = _ai_chat(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user_msg}])
+        texts = []
+        for ln in (answer or "").splitlines():
+            ln = ln.strip()
+            m = re.match(r"^[-*\u2022]\s*(.+)$", ln) or re.match(r"^\d+[.)]\s*(.+)$", ln)
+            if m:
+                texts.append(m.group(1).strip())
+        if not texts:
+            # model ignored the format — take the first non-empty sentence
+            first = next((l.strip() for l in (answer or "").splitlines() if l.strip()), "")
+            if first:
+                texts = [first]
+        added = _coach_add(user_dir, texts, p.name, track or "")
+        log.info("coach: %s %s -> %d new item(s) (model=%s)",
+                 user_dir, p.name, len(added), model)
+    except Exception as e:
+        log.warning("coach analyze failed for %s/%s: %s", user_dir, p.name, e)
+
+
+def _coach_kick(user_dir: str, p: pathlib.Path, track: str) -> None:
+    """Fire the review on a daemon thread so the dash's upload response is not
+    delayed by a 10-60 s model call."""
+    if not ai_enabled():
+        return
+    try:
+        threading.Thread(target=_coach_analyze, args=(user_dir, p, track),
+                         daemon=True).start()
+    except Exception as e:
+        log.warning("coach thread spawn failed: %s", e)
+
+
+def _coach_gate(request: Request, user: str, x_api_key: Optional[str]) -> str:
+    """Who may read/modify a user's checklist: the firmware key, that user's own
+    account key, or a logged-in web user allowed to view them."""
+    dirname = safe_name(user)
+    if FIRMWARE_KEY and x_api_key == FIRMWARE_KEY:
+        return dirname
+    if x_api_key:
+        owner = email_for_api_key(x_api_key)
+        if owner and safe_name(owner) == dirname:
+            return dirname
+    if oauth_enabled():
+        u = current_user(request)
+        if u and can_view_dir(str(u.get("email", "")), dirname):
+            return dirname
+        raise HTTPException(status_code=403, detail="not allowed")
+    return dirname   # dev mode
+
+
+@app.get("/coach/{user}/open")
+async def coach_open(request: Request, user: str,
+                     x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    """Open (unticked) items only — what the DASH shows. Checked items are
+    never returned here, by design."""
+    d = _coach_gate(request, user, x_api_key)
+    items = [i for i in _coach_load(d) if not i.get("done")]
+    items.sort(key=lambda i: i.get("ts", 0), reverse=True)
+    return JSONResponse({"ok": True, "count": len(items),
+                         "items": [{"id": i["id"], "text": i["text"],
+                                    "track": i.get("track", ""), "ts": i.get("ts", 0)}
+                                   for i in items[:12]]})
+
+
+@app.get("/coach/{user}")
+async def coach_all(request: Request, user: str,
+                    x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    d = _coach_gate(request, user, x_api_key)
+    items = _coach_load(d)
+    items.sort(key=lambda i: (bool(i.get("done")), -i.get("ts", 0)))
+    return JSONResponse({"ok": True, "items": items})
+
+
+@app.post("/coach/{user}/done")
+async def coach_done(request: Request, user: str,
+                     x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    d = _coach_gate(request, user, x_api_key)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    iid = str(body.get("id", "")).strip()
+    by = "display" if str(body.get("by", "")).lower().startswith("disp") else "web"
+    if not iid:
+        raise HTTPException(status_code=400, detail="id required")
+    items = _coach_load(d)
+    hit = False
+    for i in items:
+        if i.get("id") == iid and not i.get("done"):
+            i["done"] = True
+            i["done_ts"] = int(time.time())
+            i["done_by"] = by
+            hit = True
+    if hit:
+        _coach_save(d, items)
+    open_n = sum(1 for i in items if not i.get("done"))
+    return JSONResponse({"ok": True, "changed": hit, "open": open_n})
+
+
+@app.post("/coach/{user}/reopen")
+async def coach_reopen(request: Request, user: str,
+                       x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    d = _coach_gate(request, user, x_api_key)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    iid = str(body.get("id", "")).strip()
+    items = _coach_load(d)
+    for i in items:
+        if i.get("id") == iid:
+            i["done"] = False
+            i["done_ts"] = None
+            i["done_by"] = None
+    _coach_save(d, items)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/coach", response_class=HTMLResponse)
+async def coach_page(request: Request) -> Response:
+    """Driver checklist: open items with tick boxes + a ticked-off history.
+    Ticking here also removes it from the dash (the dash only ever fetches
+    open items)."""
+    if oauth_enabled() and not current_user(request):
+        return login_redirect(request)
+    u = current_user(request) if oauth_enabled() else None
+    email = str((u or {}).get("email", "")) or "dev"
+    return HTMLResponse(_COACH_HTML.replace("__USER__", json.dumps(safe_name(email))))
+
+
+_COACH_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Driver checklist — racecar-35</title>
+<style>
+ :root{--bg:#0E1014;--surface:#181B22;--line:#2A2F3A;--text:#E6E8EE;--muted:#8A92A3;
+       --primary:#FFB020;--good:#6CD07A}
+ *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);
+   font:15px/1.5 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:24px}
+ h1{font-size:20px;margin:0 0 4px} p.sub{color:var(--muted);font-size:13px;margin:0 0 20px}
+ .wrap{max-width:760px;margin:0 auto}
+ .item{display:flex;gap:14px;align-items:flex-start;background:var(--surface);
+   border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:10px}
+ .item.done{opacity:.5}
+ .cb{width:26px;height:26px;flex:0 0 auto;border:2px solid var(--primary);border-radius:6px;
+   cursor:pointer;display:flex;align-items:center;justify-content:center;font-weight:700;
+   color:#1A1300;background:transparent;font-size:17px;line-height:1}
+ .item.done .cb{background:var(--good);border-color:var(--good)}
+ .txt{flex:1} .meta{color:var(--muted);font-size:12px;margin-top:4px}
+ h2{font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;
+   margin:28px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px}
+ .empty{color:var(--muted);font-style:italic}
+ a{color:var(--primary)}
+</style></head><body><div class="wrap">
+<h1>Driver checklist</h1>
+<p class="sub">Written automatically by the AI review of each uploaded session.
+Ticking an item here removes it from the dash — the dash only ever shows open items.
+&nbsp; <a href="/">← sessions</a></p>
+<div id="open"></div>
+<h2>Ticked off</h2>
+<div id="done"></div>
+</div>
+<script>
+const USER=__USER__;
+const esc=s=>(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function when(ts){ try{return new Date(ts*1000).toLocaleString();}catch(e){return '';} }
+function row(i){
+  const d=document.createElement('div');
+  d.className='item'+(i.done?' done':'');
+  d.innerHTML='<div class="cb">'+(i.done?'\\u2713':'')+'</div><div class="txt">'+esc(i.text)+
+    '<div class="meta">'+esc(i.track||'')+' · '+when(i.ts)+
+    (i.done?(' · ticked '+esc(i.done_by||'')+' '+when(i.done_ts)):'')+'</div></div>';
+  d.querySelector('.cb').addEventListener('click', async ()=>{
+    const url='/coach/'+encodeURIComponent(USER)+(i.done?'/reopen':'/done');
+    await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+                     body:JSON.stringify({id:i.id,by:'web'})});
+    load();
+  });
+  return d;
+}
+async function load(){
+  const r=await fetch('/coach/'+encodeURIComponent(USER));
+  const j=await r.json();
+  const o=document.getElementById('open'), dn=document.getElementById('done');
+  o.innerHTML=''; dn.innerHTML='';
+  const items=j.items||[];
+  const op=items.filter(i=>!i.done), df=items.filter(i=>i.done);
+  if(!op.length) o.innerHTML='<div class="empty">Nothing outstanding — upload a session and the AI will add items here.</div>';
+  op.forEach(i=>o.appendChild(row(i)));
+  if(!df.length) dn.innerHTML='<div class="empty">none yet</div>';
+  df.forEach(i=>dn.appendChild(row(i)));
+}
+load();
+</script></body></html>"""
+
+
 @app.get("/caps")
 async def caps() -> dict:
     """Server capability probe for the dash (public, static). The dash asks
     once per boot before its first upload; 'zblocks' advertises that /upload,
     /stream and /nettest decode the compressed body framing (v0.1.127).
     An old dash never asks; an old server 404s and the dash sends raw."""
-    return {"ok": True, "zblocks": True}
+    return {"ok": True, "zblocks": True, "coach": True}
 
 
 def _zb_decode(data: bytes) -> bytes:
@@ -2194,6 +2535,10 @@ async def _save_body(
                    "session": sid, "track": track, "bytes": len(body), "lines": nl,
                    "wire": wire_len,   # < bytes when the body came in compressed
                    "path": str(out_path.relative_to(DATA_DIR))})
+    # Auto-coach: review this session in the BACKGROUND (never delays the dash's
+    # upload response) and file 1-3 de-duplicated checklist items.
+    if kind != "debug" and mode == "w":
+        _coach_kick(email, out_path, track)
     log.info(
         "received %s mode=%s email=%s session=%s%s track=%s bytes=%d lines=%d -> %s",
         request.client.host if request.client else "?",
