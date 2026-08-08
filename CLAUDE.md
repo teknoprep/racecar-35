@@ -102,6 +102,28 @@ python3 ~/.arduino15/packages/esp32/tools/esptool_py/4.5.1/esptool.py --port /de
 
 **Always disconnect the Teensy↔CrowPanel UART jumpers before flashing the CrowPanel.** UART0 (GPIO 43/44) is shared with the CH340 used for upload — Teensy contention silently corrupts the flash, or you get `The serial TX path seems to be down` from esptool.
 
+## ⚠️ PUBLISH VERIFICATION MUST FAIL HARD (learned the hard way, v0.1.138)
+
+A release was published where the dash **compiles FAILED** (`'sl' was not declared in this
+scope`) yet the manifest still went up as the new version — carrying the PREVIOUS, crashing
+binaries. Cause: the verification loop was
+
+```bash
+for t in rd7 rd5 rdadv; do strings .../$t.bin | grep -qx "$NEW" && echo OK || echo WRONG; done && cp ... && publish
+```
+
+`echo WRONG` **exits 0**, so the `for` loop succeeded, the `&&` chain continued, and stale bins
+from the last build were staged and published under the new version number. A device would then
+"update" to the broken build and believe it was current.
+
+**Rules:**
+1. Build output dirs must be **deleted before each build** (`rm -rf /tmp/rd*_out`) so a failed
+   compile leaves NO stale binary to publish.
+2. Verification must **`exit 1`**, never print-and-continue. Use `set -e` plus
+   `[ "$v" = "$NEW" ] || { echo ABORT; exit 1; }`.
+3. After publishing, **re-download the served binaries** and check the version string inside them
+   AND the sha — trusting the local staging dir is what hid this.
+
 ## ⛳ STANDING ORDERS — do these EVERY update without being asked
 
 This is the default release contract for this repo. When code is changed and the user says

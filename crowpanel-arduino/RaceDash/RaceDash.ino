@@ -2885,7 +2885,9 @@ static void coachKick(const char* tick_id) {
     // periodic coach fetch would open a SECOND TLS session on top of it — two
     // mbedtls contexts in the internal heap at once is straight out of memory.
     // The Teensy link is also mid-ARQ, and a second task adds latency to acks.
-    if (uf.state != UF_IDLE || sl.state != SL_IDLE) return;
+    // (sl.state is checked by the loop scheduler, where it's in scope; the only
+    // other caller is a deliberate user tap on the coach page.)
+    if (uf.state != UF_IDLE) return;
     if (upload_active) return;
     if (tick_id && tick_id[0]) {
         strncpy(coach_tick_id, tick_id, sizeof(coach_tick_id) - 1);
