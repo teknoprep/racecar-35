@@ -71,6 +71,10 @@ API_KEY = os.environ.get("RACECAR_API_KEY", "").strip()
 # back to RACECAR_API_KEY only if unset.
 FIRMWARE_KEY = os.environ.get("RACECAR_FIRMWARE_KEY", "").strip() or API_KEY
 SERVICE_NAME = os.environ.get("RACECAR_SERVICE_NAME", "racecar-35 cloud")
+# Wall-clock start of THIS process. The admin update button watches this: a
+# successful rebuild replaces the process, so a jump here is proof the update
+# actually landed (rather than trusting the host script's own status file).
+_PROC_START = int(time.time())
 MAX_BODY_BYTES = int(os.environ.get("RACECAR_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
 # ---- AI corner analysis (Open WebUI @ ai.blueuc.com, OpenAI-compatible) -----
@@ -2175,6 +2179,59 @@ async def coach_reopen(request: Request, user: str,
             i["done_by"] = None
     _coach_save(d, items)
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# ADMIN: one-click server update
+# ---------------------------------------------------------------------------
+# ⚠️ The app runs INSIDE the container, so it cannot rebuild itself: no docker
+# socket, no git checkout, and `compose up --build` would kill the process
+# serving the request. Mounting docker.sock would also be root-equivalent on
+# the host. So this endpoint only WRITES A REQUEST; a tiny host-side watcher
+# (server/host_updater.sh, run from cron/systemd) performs the real command:
+#     git pull && docker compose -f docker-compose.prod.yml up -d --build
+# and writes progress back to update_status.json in the same volume.
+UPDATE_REQ  = DATA_DIR / "update_request.json"
+UPDATE_STAT = DATA_DIR / "update_status.json"
+
+
+@app.post("/admin/update")
+async def admin_update(request: Request) -> JSONResponse:
+    """Queue a server update for the host watcher to execute."""
+    require_admin(request)
+    u = current_user(request) if oauth_enabled() else None
+    req = {"ts": int(time.time()),
+           "by": str((u or {}).get("email", "dev")),
+           "id": secrets.token_hex(6)}
+    UPDATE_REQ.parent.mkdir(parents=True, exist_ok=True)
+    tmp = UPDATE_REQ.with_suffix(".tmp")
+    tmp.write_text(json.dumps(req), "utf-8")
+    tmp.replace(UPDATE_REQ)
+    log.info("admin update requested by %s (id=%s)", req["by"], req["id"])
+    return JSONResponse({"ok": True, "queued": True, "request": req,
+                         "note": "host watcher will run git pull + compose up -d --build"})
+
+
+@app.get("/admin/update/status")
+async def admin_update_status(request: Request) -> JSONResponse:
+    """Progress written by the host watcher, plus whether a request is pending.
+    After a successful rebuild this process is NEW, so `running_since` moving is
+    itself proof the update landed."""
+    require_admin(request)
+    st = {}
+    if UPDATE_STAT.exists():
+        try:
+            st = json.loads(UPDATE_STAT.read_text("utf-8"))
+        except Exception:
+            st = {"state": "unreadable"}
+    pending = None
+    if UPDATE_REQ.exists():
+        try:
+            pending = json.loads(UPDATE_REQ.read_text("utf-8"))
+        except Exception:
+            pending = {"state": "unreadable"}
+    return JSONResponse({"ok": True, "status": st, "pending": pending,
+                         "running_since": _PROC_START, "now": int(time.time())})
 
 
 @app.get("/coach", response_class=HTMLResponse)
@@ -5012,7 +5069,43 @@ _ADMIN_HTML = (
 <header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
   <span class="crumbs"><a href="/">sessions</a> &rsaquo; admin</span>
   <span style="flex:1"></span>
+  <a class="btn" href="/coach">checklist</a>
   <a class="btn" href="/tools/sfpicker">S/F picker</a>
+  <button class="btn" id="srvupd" title="git pull + docker compose up -d --build (executed by the host watcher)">update server</button>
+  <span class="t-label" id="srvupdmsg" style="margin-right:var(--sp-md)"></span>
+  <script>
+  (function(){
+    var b=document.getElementById('srvupd'), m=document.getElementById('srvupdmsg');
+    if(!b) return;
+    var poll=null, t0=0;
+    function fmt(s){ return s||''; }
+    async function tick(){
+      try{
+        var r=await fetch('/admin/update/status'); var j=await r.json();
+        var st=(j.status&&j.status.state)||'', pend=!!j.pending;
+        if(j.running_since && t0 && j.running_since>t0){
+          m.textContent='updated \\u2713 server restarted'; b.disabled=false;
+          clearInterval(poll); poll=null; return;
+        }
+        m.textContent = pend ? 'queued\\u2026 waiting for host watcher'
+                             : (st ? ('host: '+fmt(st)) : 'queued\\u2026');
+      }catch(e){}
+    }
+    b.addEventListener('click', async function(){
+      if(!confirm('Update the server?\\n\\ngit pull + docker compose up -d --build\\nThe site will restart.')) return;
+      b.disabled=true; m.textContent='requesting\\u2026';
+      try{
+        var s=await (await fetch('/admin/update/status')).json();
+        t0=s.running_since||0;
+        var r=await fetch('/admin/update',{method:'POST'});
+        var j=await r.json();
+        if(!r.ok){ m.textContent='error: '+((j&&j.detail)||r.status); b.disabled=false; return; }
+        m.textContent='queued\\u2026';
+        if(!poll) poll=setInterval(tick,3000);
+      }catch(e){ m.textContent='failed: '+e.message; b.disabled=false; }
+    });
+  })();
+  </script>
   <a class="btn" href="/admin/report" style="margin-right:var(--sp-md)">report</a>
   <a class="btn" href="/admin/canbus" style="margin-right:var(--sp-md)">CAN captures</a>__USER_CHIP__</header>
 <main>
