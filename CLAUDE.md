@@ -245,6 +245,29 @@ JS copy in the same commit** (parse rows → JSON → `const TRACKS = [...]` in 
 Workflow: user picks the line → pastes the generated row into chat → coords get baked into
 firmware (keep the existing facility centre/radius; only the sf endpoints change).
 
+### AI coach checklist (auto on upload) — server + dash (v0.1.137)
+Every successful session upload kicks a **background** AI review (daemon thread, so the dash's
+upload response is never delayed) that distils the session into **1-3 short actionable items**.
+- `_coach_facts()` builds a compact sheet from the SAME lap detection the review UI uses (lap
+  exclusions honoured): lap count/best/median/worst/**spread**, per-lap times, speed envelope,
+  peak lateral + longitudinal g, max rpm. Strict prompt: only `- ` lines, ≤14 words each.
+- **DEDUPE vs currently-OPEN items** (`_coach_similar`, threshold 0.55): Jaccard on content words
+  OR'd with SequenceMatcher, so rewording collapses ('Brake later into Turn 3' ≈ 'Later braking
+  for turn 3' = 0.89) and even same-topic/opposite advice collapses ('later' vs 'earlier' = 0.84).
+  **Ticked items are deliberately NOT deduped against** — if a habit returns it should be raised.
+- Store `/data/coach/<user>.json`; prefs `/data/coach/<user>.prefs.json` `{auto:bool}` (default ON).
+- Endpoints: `GET /coach/{u}/open` (**open items ONLY** — the dash physically cannot see a ticked
+  one), `GET /coach/{u}` (+prefs), `POST /coach/{u}/done {id,by:display|web}`,
+  `POST /coach/{u}/reopen`, `POST /coach/{u}/prefs {auto}`. Manual/back-fill:
+  `POST /sessions/{u}/{f}/coach` (synchronous, **idempotent** — reports `already` instead of
+  duplicating; `?force=1` overrides). Web page `GET /coach` + a **checklist** button on the review
+  page. `/caps` advertises `{"coach":true}`.
+- **Dash**: NVS `coach` (bool, default ON, Settings → "Show coach checklist"); `PAGE_COACH` (17)
+  lists open items, tap a row to tick (POSTs `by:display`, row vanishes); **COACH button under
+  UPLOAD**, hidden while recording / when the list is empty / when the setting is off. All HTTP on
+  a short-lived core-0 task (`coachTask`) so the loop + UART pump never block; fetch on boot,
+  ~25 s after an upload batch (the server review is async), then lazily every 5 min.
+
 ### Combine sessions + YouTube overlay viewer (server)
 
 - **Combine**: index page has a checkbox column + `combine selected` toolbar button →

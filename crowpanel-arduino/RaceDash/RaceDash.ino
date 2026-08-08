@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.136"
+#define FIRMWARE_VERSION "0.1.137"
 
 #include <Preferences.h>
 #include <time.h>
@@ -64,6 +64,7 @@ enum SettingId : uint8_t {
     // warning are gated on the ENGINE RUNNING (parked ignition-on reads ~12.4 V
     // — that's normal, not a failing alternator).
     ST_SHOW_VOLT, ST_VOLT_WARN, ST_VOLT_WARN_COL,
+    ST_COACH_SHOW,                // show the AI coach checklist button on the dash
     // Sensor data source (Direct / MegaSquirt) + AFR display (MS3 mode only).
     // AFR has both a "too rich" (low) and "too lean" (high) warn threshold;
     // either fires the same colour.
@@ -606,6 +607,12 @@ namespace {
   constexpr int UPBTN_Y = 155;
   constexpr int UPBTN_W = 180;
   constexpr int UPBTN_H = 70;
+  // Coach checklist button — directly under UPLOAD. Hidden while recording
+  // (nothing to review mid-session) and whenever the list is empty.
+  constexpr int CHBTN_X = UPBTN_X;
+  constexpr int CHBTN_Y = UPBTN_Y + UPBTN_H + 10;
+  constexpr int CHBTN_W = UPBTN_W;
+  constexpr int CHBTN_H = 60;
   // Speed sits on the right side of the screen (out of the way of the
   // START/STOP button on the left). Drop the decimal at >=100 mph so a
   // 3-digit number stays narrow enough to fit the 400-px bg pad cleanly
@@ -640,6 +647,7 @@ struct Settings {
     // cloud_user repurposed as a free-text USER EMAIL tag for data ownership.
     // Not an auth credential — the Teensy forwards it as X-User-Email header.
     // Real auth (Google OAuth) lives in the cloud-side Docker image.
+    bool     coach_show    = true;       // show the AI coach checklist button on the dash
     char     cloud_auth_user[64] = "";   // user email (X-User-Email)
     char     cloud_auth_pass[96] = "";   // API key (X-API-Key); masked on display
 
@@ -1450,6 +1458,7 @@ static void loadSettings() {
     s.oil_warn_psi       = prefs.getUShort("p_warn",   s.oil_warn_psi);
     s.oil_warn_col       = prefs.getUChar ("p_col",    s.oil_warn_col);
     s.show_volt          = prefs.getBool  ("s_volt",   s.show_volt);
+    s.coach_show         = prefs.getBool  ("coach",    s.coach_show);
     s.volt_warn_x10      = prefs.getUShort("v_warn",   s.volt_warn_x10);
     s.volt_warn_col      = prefs.getUChar ("v_col",    s.volt_warn_col);
     s.sensor_type        = prefs.getUChar ("srctyp",   s.sensor_type);
@@ -1545,6 +1554,7 @@ static void saveSettings() {
     prefs.putUShort("p_warn",   s.oil_warn_psi);
     prefs.putUChar ("p_col",    s.oil_warn_col);
     prefs.putBool  ("s_volt",   s.show_volt);
+    prefs.putBool  ("coach",    s.coach_show);
     prefs.putUShort("v_warn",   s.volt_warn_x10);
     prefs.putUChar ("v_col",    s.volt_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
@@ -1654,6 +1664,7 @@ enum Page : uint8_t {
     PAGE_SENSOR        = 14,  // Sensor source picker (Direct/MegaSquirt/Bluetooth) + BT status
     PAGE_BT_SCAN       = 15,  // BLE OBD-II device scan + select
     PAGE_PID_SCAN      = 16,  // Mode-01 PID scan + map one to the COOLANT function
+    PAGE_COACH         = 17,  // AI coach checklist: tap an item to tick it off
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -1710,6 +1721,24 @@ static uint16_t gpsStatusColor(uint8_t s) {
 // Teensy-side ack_timeout failures. Keep this comfortably above that.
 static constexpr size_t UART_LINE_MAX = 512;
 static String rxBuf;
+
+// ---------------------------------------------------------------------------
+// AI COACH CHECKLIST (v0.1.137)
+// The server reviews every uploaded session and files 1-3 short actionable
+// items. The dash fetches ONLY the open ones (GET /coach/<user>/open — the
+// server never returns ticked items, so a cleared item can't reappear here by
+// construction) and ticking one POSTs it back as done. All HTTP happens on a
+// short-lived core-0 task so the 60 fps loop and the UART pump never block.
+// ---------------------------------------------------------------------------
+static constexpr int COACH_MAX = 3;
+static char     coach_id[COACH_MAX][20]  = {{0}};
+static char     coach_txt[COACH_MAX][108] = {{0}};
+static volatile int  coach_n        = 0;
+static volatile bool coach_busy     = false;   // a task is in flight
+static volatile bool coach_dirty    = false;   // redraw the coach page
+static char     coach_tick_id[20]   = "";      // id to POST done ("" = fetch)
+static uint32_t coach_last_fetch_ms = 0;
+static uint32_t coach_refetch_at_ms = 0;   // scheduled re-fetch (0 = none)
 
 // Teensy-link hygiene (v0.1.135). q_activity_ms = millis() of the last Q,*
 // line SEEN FROM the Teensy — the only reliable signal that it is mid-ARQ
@@ -2759,6 +2788,109 @@ static bool ufTaskWrite(const uint8_t* d, size_t len) {
 static char          ufdiag_note[176];
 static volatile bool ufdiag_busy = false;
 
+// One short-lived task doing EITHER a fetch (coach_tick_id empty) or a tick.
+// Never prints to Serial (UART0 is the Teensy link).
+static void coachTask(void*) {
+    WiFiClient* c = nullptr;
+    if (s.cloud_protocol == 1) {
+        WiFiClientSecure* sec = new WiFiClientSecure();
+        sec->setInsecure(); sec->setTimeout(10); c = sec;
+    } else {
+        c = new WiFiClient(); c->setTimeout(10);
+    }
+    const bool ticking = (coach_tick_id[0] != '\0');
+    if (c->connect(s.cloud_host, s.cloud_port)) {
+        c->setNoDelay(true);
+        if (ticking) {
+            char body[64];
+            const int bn = snprintf(body, sizeof(body),
+                                    "{\"id\":\"%s\",\"by\":\"display\"}", coach_tick_id);
+            c->printf("POST /coach/%s/done HTTP/1.1\r\nHost: %s\r\n"
+                      "Content-Type: application/json\r\nX-API-Key: %s\r\n"
+                      "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+                      s.cloud_auth_user, s.cloud_host, s.cloud_auth_pass, bn, body);
+        } else {
+            c->printf("GET /coach/%s/open HTTP/1.1\r\nHost: %s\r\n"
+                      "X-API-Key: %s\r\nConnection: close\r\n\r\n",
+                      s.cloud_auth_user, s.cloud_host, s.cloud_auth_pass);
+        }
+        // Collect the response (small JSON).
+        static char resp[2048];
+        size_t rn = 0; const uint32_t t0 = millis();
+        while (millis() - t0 < 10000) {
+            while (c->available() && rn + 1 < sizeof(resp)) resp[rn++] = (char)c->read();
+            resp[rn] = '\0';
+            if (!c->connected() && !c->available()) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        resp[rn] = '\0';
+        if (!ticking && strstr(resp, "\"ok\"")) {
+            // Minimal scrape: walk "id":".." / "text":".." pairs in order. A real
+            // JSON parser isn't worth the flash for a fixed 3-field shape.
+            int n = 0;
+            const char* p = resp;
+            while (n < COACH_MAX) {
+                const char* idp = strstr(p, "\"id\":\"");
+                if (!idp) break;
+                idp += 6;
+                const char* ide = strchr(idp, '"');
+                const char* txp = strstr(ide ? ide : idp, "\"text\":\"");
+                if (!ide || !txp) break;
+                txp += 8;
+                const char* txe = strchr(txp, '"');
+                if (!txe) break;
+                size_t il = (size_t)(ide - idp), tl = (size_t)(txe - txp);
+                if (il >= sizeof(coach_id[0]))  il = sizeof(coach_id[0]) - 1;
+                if (tl >= sizeof(coach_txt[0])) tl = sizeof(coach_txt[0]) - 1;
+                memcpy(coach_id[n], idp, il);  coach_id[n][il] = '\0';
+                memcpy(coach_txt[n], txp, tl); coach_txt[n][tl] = '\0';
+                n++;
+                p = txe;
+            }
+            coach_n = n;
+            coach_dirty = true;
+        } else if (ticking && strstr(resp, "\"ok\"")) {
+            // Drop the ticked item locally so the UI updates instantly; the
+            // next fetch is authoritative anyway.
+            for (int i = 0; i < coach_n; ++i) {
+                if (strcmp(coach_id[i], coach_tick_id) == 0) {
+                    for (int j = i; j < coach_n - 1; ++j) {
+                        strcpy(coach_id[j],  coach_id[j + 1]);
+                        strcpy(coach_txt[j], coach_txt[j + 1]);
+                    }
+                    coach_n--;
+                    break;
+                }
+            }
+            coach_dirty = true;
+        }
+    }
+    c->stop();
+    delete c;
+    coach_tick_id[0] = '\0';
+    coach_busy = false;
+    vTaskDelete(NULL);
+}
+
+// Kick a fetch (id=nullptr) or a tick. No-op if one is already running, if the
+// feature is off, or if there's no WiFi/account configured.
+static void coachKick(const char* tick_id) {
+    if (coach_busy) return;
+    if (!s.coach_show) return;
+    if (s.internet_mode != 1 || !wifiConnectedNow()) return;
+    if (s.cloud_auth_user[0] == '\0') return;
+    if (tick_id && tick_id[0]) {
+        strncpy(coach_tick_id, tick_id, sizeof(coach_tick_id) - 1);
+        coach_tick_id[sizeof(coach_tick_id) - 1] = '\0';
+    } else {
+        coach_tick_id[0] = '\0';
+        coach_last_fetch_ms = millis();
+    }
+    coach_busy = true;
+    if (xTaskCreatePinnedToCore(coachTask, "coach", 8192, nullptr, 1, nullptr, 0) != pdPASS)
+        coach_busy = false;
+}
+
 static void ufDiagTask(void*) {
     WiFiClient* c = nullptr;
     if (s.cloud_protocol == 1) {
@@ -3359,6 +3491,11 @@ static void uploadTick() {
         }
         return;
     }
+    // Upload batch finished — the server is AI-reviewing what just landed on a
+    // BACKGROUND thread, so don't fetch instantly: schedule it ~25 s out, by
+    // which time the review has normally filed its items (v0.1.137).
+    if (uf.state == UF_DONE && coach_refetch_at_ms == 0)
+        coach_refetch_at_ms = millis() + 25000;
     if (uf.state == UF_DONE) {
         // Build summary banner once.
         if (upload_result_msg[0] == '\0') {
@@ -4107,6 +4244,7 @@ static void handleTouch() {
             if (abs(dx) < TAP_DXY_MAX && abs(dy) < TAP_DXY_MAX && dur < TAP_MS_MAX) {
                 if (currentPage == PAGE_DASH)          handleDashTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_SETTINGS) handleSettingsTap(tt.startX, tt.startY);
+                else if (currentPage == PAGE_COACH)   handleCoachTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_TOOLS)    handleToolsTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_STATUS)   handleStatusTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_SESSIONS) handleSessionsTap(tt.startX, tt.startY);
@@ -4140,6 +4278,16 @@ static void handleDashTap(int x, int y) {
     }
 
     // Manual UPLOAD button (only acts when visible: idle + queue > 0).
+    // Coach checklist button (only when actually shown — same predicate as the
+    // renderer, so an invisible button can never be tapped).
+    if (s.coach_show && !recording && coach_n > 0 &&
+        x >= CHBTN_X && x < CHBTN_X + CHBTN_W &&
+        y >= CHBTN_Y && y < CHBTN_Y + CHBTN_H) {
+        currentPage     = PAGE_COACH;
+        pageJustEntered = true;
+        coach_dirty     = true;
+        return;
+    }
     if (x >= UPBTN_X && x < UPBTN_X + UPBTN_W &&
         y >= UPBTN_Y && y < UPBTN_Y + UPBTN_H) {
         if (!recording && cloud_queue_depth > 0) {
@@ -4339,6 +4487,7 @@ struct LastDrawn {
     // Composite tag for the manual UPLOAD button: low bit = visible, upper
     // bits = queue count. Sentinel UINT32_MAX = needs redraw.
     uint32_t upbtn_tag    = UINT32_MAX;
+    uint32_t chbtn_tag    = UINT32_MAX;   // coach checklist button (v0.1.137)
     int32_t  lap_number   = INT32_MIN;   // current lap counter shown near the speed
 };
 static LastDrawn ld;
@@ -4760,6 +4909,35 @@ static void drawDashPage() {
                 }
             }
             ld.upbtn_tag = tag;
+        }
+    }
+
+    // ---- Coach checklist button (under UPLOAD, v0.1.137) ----
+    // Visible only when: the setting is on, we're NOT recording (mid-session is
+    // no time to read coaching), and the server actually has open items. Ticked
+    // items never arrive here — the server only serves open ones.
+    {
+        const bool visible = s.coach_show && !recording && coach_n > 0;
+        const uint32_t tag = visible ? (uint32_t)(0x100 | coach_n) : 0;
+        if (tag != ld.chbtn_tag) {
+            if (visible) {
+                tft.fillRect(CHBTN_X, CHBTN_Y, CHBTN_W, CHBTN_H, TFT_PURPLE);
+                tft.drawRect(CHBTN_X,     CHBTN_Y,     CHBTN_W,     CHBTN_H,     TFT_WHITE);
+                tft.drawRect(CHBTN_X + 1, CHBTN_Y + 1, CHBTN_W - 2, CHBTN_H - 2, TFT_WHITE);
+                tft.setFont(&fonts::Font4);
+                tft.setTextSize(1);
+                tft.setTextDatum(textdatum_t::middle_center);
+                tft.setTextColor(TFT_WHITE, TFT_PURPLE);
+                tft.drawString("COACH", CHBTN_X + CHBTN_W / 2, CHBTN_Y + CHBTN_H / 2 - 10);
+                char cb[20];
+                snprintf(cb, sizeof(cb), "%d item%s", (int)coach_n, coach_n == 1 ? "" : "s");
+                tft.setFont(&fonts::Font2);
+                tft.drawString(cb, CHBTN_X + CHBTN_W / 2, CHBTN_Y + CHBTN_H / 2 + 14);
+                tft.setTextDatum(textdatum_t::top_left);
+            } else {
+                tft.fillRect(CHBTN_X, CHBTN_Y, CHBTN_W, CHBTN_H, bg);
+            }
+            ld.chbtn_tag = tag;
         }
     }
 
@@ -5315,6 +5493,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_PSI_WARN_PSI, "Oil low-warn (PSI)",    SettingRow::NUMERIC },
     { ST_PSI_WARN_COL, "Oil warn color",        SettingRow::COLOR   },
     { ST_SHOW_VOLT,    "Show voltage (engine on)", SettingRow::TOGGLE  },
+    { ST_COACH_SHOW,   "Show coach checklist",     SettingRow::TOGGLE  },
     { ST_VOLT_WARN,    "Voltage low-warn (x10)",   SettingRow::NUMERIC },
     { ST_VOLT_WARN_COL,"Voltage warn color",       SettingRow::COLOR   },
     { ST_SENSOR_TYPE,  "Sensor data source",    SettingRow::ENUM    },
@@ -5486,6 +5665,7 @@ static const char* boolValueOnRow(SettingId id) {
         case ST_AUTO_START:  return s.auto_start        ? "ON" : "OFF";
         case ST_SHOW_TEMP:   return s.show_coolant      ? "ON" : "OFF";
         case ST_SHOW_VOLT:   return s.show_volt         ? "ON" : "OFF";
+        case ST_COACH_SHOW:  return s.coach_show        ? "ON" : "OFF";
         case ST_SHOW_PSI:    return s.show_oil_psi      ? "ON" : "OFF";
         case ST_SHOW_AFR:    return s.show_afr          ? "ON" : "OFF";
         default:             return "?";
@@ -5501,6 +5681,7 @@ static bool boolValueOnState(SettingId id) {
         case ST_AUTO_START:  return s.auto_start;
         case ST_SHOW_TEMP:   return s.show_coolant;
         case ST_SHOW_VOLT:   return s.show_volt;
+        case ST_COACH_SHOW:  return s.coach_show;
         case ST_SHOW_PSI:    return s.show_oil_psi;
         case ST_SHOW_AFR:    return s.show_afr;
         default:             return false;
@@ -6656,6 +6837,7 @@ static int rowGroup(SettingId id) {
         case ST_SHOW_PSI:  case ST_PSI_WARN_PSI: case ST_PSI_WARN_COL:
         case ST_SHOW_AFR:  case ST_AFR_WARN_LO: case ST_AFR_WARN_HI: case ST_AFR_WARN_COL:
         case ST_SHOW_VOLT: case ST_VOLT_WARN: case ST_VOLT_WARN_COL: return SG_SENSORS;
+        case ST_COACH_SHOW: return SG_RECORDING;
         case ST_REC_SD: case ST_REC_CLOUD: case ST_AUTO_TRACK:
         case ST_AUTO_START: case ST_AUTO_START_MPH:
         case ST_AUTO_START_SEC: return SG_RECORDING;
@@ -7013,6 +7195,7 @@ static void handleSettingsTap(int x, int y) {
                     case ST_AUTO_START: s.auto_start        = !s.auto_start;        break;
                     case ST_SHOW_TEMP:  s.show_coolant      = !s.show_coolant;      break;
                     case ST_SHOW_VOLT:  s.show_volt         = !s.show_volt;         break;
+                    case ST_COACH_SHOW: s.coach_show        = !s.coach_show;        break;
                     case ST_SHOW_PSI:   s.show_oil_psi      = !s.show_oil_psi;      break;
                     case ST_SHOW_AFR:   s.show_afr          = !s.show_afr;          break;
                     default: break;
@@ -9457,6 +9640,92 @@ static void netTestTask(void*) {
     vTaskDelete(NULL);
 }
 
+// ---------------------------------------------------------------------------
+// Coach checklist page. One row per open item; tap a row to tick it off (it
+// POSTs done and vanishes). BACK returns to the dash.
+// ---------------------------------------------------------------------------
+static constexpr int CO_ROW_Y0 = 96;
+static constexpr int CO_ROW_H  = 92;
+
+static void drawCoachPage() {
+    coach_dirty = false;
+    if (pageJustEntered) {
+        tft.fillScreen(TFT_BLACK);
+        tft.setFont(&fonts::Font4);
+        tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString("COACH CHECKLIST", 400, 30);
+        tft.fillRect(0, 56, 800, 1, TFT_DARKGREY);
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("tap an item to tick it off - it won't come back", 400, 74);
+        // BACK button
+        tft.fillRect(300, 412, 200, 52, TFT_DARKCYAN);
+        tft.drawRect(300, 412, 200, 52, TFT_WHITE);
+        tft.setFont(&fonts::Font4);
+        tft.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+        tft.drawString("BACK", 400, 438);
+        tft.setTextDatum(textdatum_t::top_left);
+        pageJustEntered = false;
+    }
+    const int n = coach_n;
+    for (int i = 0; i < COACH_MAX; ++i) {
+        const int y = CO_ROW_Y0 + i * CO_ROW_H;
+        tft.fillRect(20, y, 760, CO_ROW_H - 10, i < n ? TFT_NAVY : TFT_BLACK);
+        if (i >= n) continue;
+        tft.drawRect(20, y, 760, CO_ROW_H - 10, TFT_WHITE);
+        // tick box
+        tft.drawRect(36, y + 22, 36, 36, TFT_GREEN);
+        tft.drawRect(37, y + 23, 34, 34, TFT_GREEN);
+        tft.setFont(&fonts::Font2);
+        tft.setTextSize(1);
+        tft.setTextDatum(textdatum_t::top_left);
+        tft.setTextColor(TFT_WHITE, TFT_NAVY);
+        // wrap the item text across up to two lines (~62 chars each)
+        const char* t = coach_txt[i];
+        const size_t len = strlen(t);
+        if (len <= 62) {
+            tft.drawString(t, 92, y + 30);
+        } else {
+            size_t cut = 62;
+            while (cut > 30 && t[cut] != ' ') cut--;
+            char l1[68];
+            size_t c1 = cut < sizeof(l1) ? cut : sizeof(l1) - 1;
+            memcpy(l1, t, c1); l1[c1] = '\0';
+            tft.drawString(l1, 92, y + 18);
+            char l2[68];
+            snprintf(l2, sizeof(l2), "%.66s", t + cut + 1);
+            tft.drawString(l2, 92, y + 44);
+        }
+    }
+    if (n == 0) {
+        tft.setFont(&fonts::Font4);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("all clear", 400, CO_ROW_Y0 + 60);
+        tft.setTextDatum(textdatum_t::top_left);
+    }
+}
+
+static void handleCoachTap(int x, int y) {
+    if (x >= 300 && x <= 500 && y >= 412 && y <= 464) {
+        currentPage     = PAGE_DASH;
+        pageJustEntered = true;
+        invalidateAll();
+        return;
+    }
+    if (coach_busy) return;                    // a tick is already in flight
+    for (int i = 0; i < coach_n; ++i) {
+        const int ry = CO_ROW_Y0 + i * CO_ROW_H;
+        if (x >= 20 && x <= 780 && y >= ry && y <= ry + CO_ROW_H - 10) {
+            coachKick(coach_id[i]);            // POST done; row disappears on success
+            coach_dirty = true;
+            return;
+        }
+    }
+}
+
 static void drawToolsPage() {
     if (pageJustEntered) {
         tft.fillScreen(TFT_BLACK);
@@ -10879,6 +11148,21 @@ void loop() {
     // upload got carpet-bombed with CFG until the whole link wedged.
     // Now: push on demand (Teensy reboot -> cfg_resend_req) with a slow 60 s
     // safety net, and only when the link has been Q-SILENT for 10 s.
+    // Coach checklist fetch (v0.1.137): once shortly after boot/WiFi-up, again
+    // ~25 s after an upload batch (server review is async), then lazily every
+    // 5 min. Never while recording — the radio belongs to BT then, and the
+    // button is hidden anyway.
+    if (s.coach_show && !recording && !coach_busy) {
+        const uint32_t nowc = millis();
+        const bool due = (coach_refetch_at_ms != 0 && nowc >= coach_refetch_at_ms)
+                      || (coach_last_fetch_ms == 0 && nowc > 15000)
+                      || (coach_last_fetch_ms != 0 && nowc - coach_last_fetch_ms >= 300000);
+        if (due) {
+            coach_refetch_at_ms = 0;
+            coachKick(nullptr);
+        }
+    }
+
     { static uint32_t lastCfgResend = 0;
       const bool link_busy = (uf.state != UF_IDLE) || (sl.state != SL_IDLE);
       const bool q_quiet   = (q_activity_ms == 0) || (millis() - q_activity_ms >= 10000);
@@ -10968,6 +11252,8 @@ void loop() {
             lastDraw = now;
             drawPidScanPage();
         }
+    } else if (currentPage == PAGE_COACH) {
+        if (pageJustEntered || coach_dirty) drawCoachPage();
     } else if (currentPage == PAGE_SESSIONS) {
         // On entry, kick a Q,LIST so the page populates from the SD queue.
         if (pageJustEntered) {
