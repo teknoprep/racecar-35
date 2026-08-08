@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.139"
+#define FIRMWARE_VERSION "0.1.140"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2304,7 +2304,15 @@ struct UploadFlow {
     char       response[1024];  // accumulated HTTP response (headers + body)
     size_t     response_len;
     char       last_err[180];
-    uint8_t    file_retries;    // per-file retry count (2 automatic retries max)
+    uint8_t    file_retries;    // per-file retry count (6 automatic retries max)
+    // RESUME (v0.1.140). Retries no longer restart from byte 0: the dash asks
+    // the server how much of this session it already holds (partials are now
+    // salvaged server-side), skips that many lines at the Teensy
+    // (Q,GET,<name>,<skip>) and APPENDS via POST /stream. Progress is
+    // monotonic — a stall costs 20 s, never the bytes already delivered.
+    uint32_t   skip_lines;      // lines the server already has (0 = fresh file)
+    uint32_t   resume_bytes;    // bytes the server already has (progress base)
+    volatile uint8_t rq_state;  // resume query: 0 none / 1 running / 2 done
     uint8_t    list_tries;      // Q,LIST re-asks after a 6 s silence (v0.1.121)
     uint32_t   retry_at_ms;     // when UF_RETRY_WAIT re-sends Q,GET / UF_POSTING re-opens
     // Segmented store-and-forward (v0.1.113). The file is pulled over UART
@@ -2453,7 +2461,11 @@ static void ufStartCurrentFile() {
     uf.bytes_written  = 0;
     uf.expected_size  = 0;
     uf.lines_recv     = 0;
-    Serial.printf("Q,GET,%s\n", uf.files[uf.files_idx].name);
+    if (uf.skip_lines > 0)
+        Serial.printf("Q,GET,%s,%lu\n", uf.files[uf.files_idx].name,
+                      (unsigned long)uf.skip_lines);
+    else
+        Serial.printf("Q,GET,%s\n", uf.files[uf.files_idx].name);
     Serial.flush();
     ufEnter(UF_FETCH_HEAD);
 }
@@ -2464,6 +2476,9 @@ static void ufNextFile() {
     ufFreeBuf();
     uf.files_idx++;
     uf.file_retries = 0;
+    uf.skip_lines   = 0;      // resume state is strictly per-file
+    uf.resume_bytes = 0;
+    uf.rq_state     = 0;
     ufStartCurrentFile();
 }
 
@@ -2474,6 +2489,63 @@ static void ufNextFile() {
 // 60 s patient) go-back-N retransmit loop FIRST — otherwise our retry's Q,GET
 // line would be eaten as a stray inside its ack-pump and the retry would hang.
 static void ufDiagReport(const char* why);   // defined near the net task
+
+// RESUME QUERY (v0.1.140): one short-lived core-0 task asking the server how
+// much of the current file it already holds (GET /upload/progress). Sets
+// uf.skip_lines / uf.resume_bytes on success; any failure leaves them at 0,
+// which is exactly the old restart-from-zero behaviour. Never touches Serial.
+static void resumeQueryTask(void*) {
+    uint32_t lines = 0, bytes = 0;
+    WiFiClient* c = nullptr;
+    if (s.cloud_protocol == 1) {
+        WiFiClientSecure* sec = new WiFiClientSecure();
+        sec->setInsecure(); sec->setTimeout(8); c = sec;
+    } else {
+        c = new WiFiClient(); c->setTimeout(8);
+    }
+    if (c && c->connect(s.cloud_host, s.cloud_port)) {
+        const char* fn = uf.files[uf.files_idx].name;
+        const long sid = ufExtractSessionId(fn);
+        char track[52];
+        ufExtractTrack(fn, track, sizeof(track));
+        c->printf("GET /upload/progress?session=%ld&track=%s&kind=%s HTTP/1.1\r\n"
+                  "Host: %s\r\nX-API-Key: %s\r\nX-User-Email: %s\r\n"
+                  "Connection: close\r\n\r\n",
+                  sid, track, strstr(fn, ".dbg.") ? "debug" : "session",
+                  s.cloud_host, s.cloud_auth_pass, s.cloud_auth_user);
+        static char resp[768];
+        size_t rn = 0; const uint32_t t0 = millis();
+        while (millis() - t0 < 8000) {
+            while (c->available() && rn + 1 < sizeof(resp)) resp[rn++] = (char)c->read();
+            resp[rn] = '\0';
+            if (!c->connected() && !c->available()) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        resp[rn] = '\0';
+        const char* lb = strstr(resp, "\"lines\":");
+        const char* bb = strstr(resp, "\"bytes\":");
+        if (strstr(resp, "\"ok\"") && lb && bb) {
+            lines = (uint32_t)strtoul(lb + 8, nullptr, 10);
+            bytes = (uint32_t)strtoul(bb + 8, nullptr, 10);
+        }
+    }
+    if (c) { c->stop(); delete c; }
+    uf.skip_lines   = lines;
+    uf.resume_bytes = bytes;
+    uf.rq_state     = 2;
+    vTaskDelete(NULL);
+}
+
+static void resumeQueryKick() {
+    uf.skip_lines   = 0;
+    uf.resume_bytes = 0;
+    if (s.internet_mode != 1 || !wifiConnectedNow()) { uf.rq_state = 2; return; }
+    uf.rq_state = 1;
+    // 16 KB stack — TLS handshake (the coachTask 8 KB lesson, v0.1.138).
+    if (xTaskCreatePinnedToCore(resumeQueryTask, "ufresume", 16384, nullptr, 1,
+                                nullptr, 0) != pdPASS)
+        uf.rq_state = 2;   // couldn't ask — restart from zero, old behaviour
+}
 
 static void ufFailOrRetry(bool sendAbort) {
     ufDiagReport("fail");   // snapshot BEFORE teardown mutates the state
@@ -2490,8 +2562,12 @@ static void ufFailOrRetry(bool sendAbort) {
         uf.file_retries++;
         Serial.printf("DBG,uf_retry file=%s err=%s\n",
                       uf.files[uf.files_idx].name, uf.last_err);
-        uf.retry_at_ms = millis() + 800;   // let the Teensy exit its loop + settle
+        // 4 s window: the Teensy exits its loop + the resume query (below)
+        // gets time to answer. The UF_RETRY_WAIT handler also WAITS for the
+        // query to finish, so a slow answer delays the retry, never races it.
+        uf.retry_at_ms = millis() + 4000;
         ufEnter(UF_RETRY_WAIT);
+        resumeQueryKick();   // find out how much the server already holds
     } else {
         uf.failed++;
         ufNextFile();
@@ -2983,7 +3059,8 @@ static void ufNetTask(void*) {
         // couldn't get the internal heap it needs and the upload died with
         // "TCP connect failed" before a single body byte moved (proven in the
         // field: rh=524234 rt=0 at RSSI -43). Socket first, compressor second.
-        if (!ufOpenStream(uf.expected_size, "/upload")) {
+        if (!ufOpenStream(uf.expected_size,
+                          uf.skip_lines > 0 ? "/stream" : "/upload")) {
             snprintf(uf.net_err, sizeof(uf.net_err), "%s",
                      uf.last_err[0] ? uf.last_err : "connect failed");
             break;
@@ -3259,7 +3336,9 @@ static bool parseQLine(const String& line) {
         uf.bufcap        = cap;
         uf.buflen        = 0;
         uf.lines_recv    = 0;
-        uf.next_seq      = 1;
+        // Resume: the Teensy numbers the first line it SENDS as skip+1, so the
+        // ARQ dedup must expect exactly that (v0.1.140).
+        uf.next_seq      = uf.skip_lines + 1;
         uf.expected_size = sz;      // modal progress (total file bytes)
         uf.bytes_written = 0;
         uf.ring_head     = 0;
@@ -3343,6 +3422,19 @@ static bool parseQLine(const String& line) {
         return true;
     }
     if (strncmp(p, "EOF", 3) == 0 && uf.state == UF_STREAMING) {
+        if (uf.skip_lines > 0 && uf.lines_recv == 0) {
+            // Resume asked to skip PAST the end: the server already has the
+            // whole file (a prior attempt finished but its response was lost).
+            // Nothing to send — abort the socket and count it as uploaded.
+            Serial.printf("DBG,uf_resume_complete file=%s skip=%lu\n",
+                          uf.files[uf.files_idx].name, (unsigned long)uf.skip_lines);
+            ufStopNetTask();
+            ufCloseTcp();
+            uf.del_mask |= (uint16_t)(1u << uf.files_idx);
+            uf.uploaded++;
+            ufNextFile();
+            return true;
+        }
         // File fully queued — the net task drains the ring tail, writes the
         // chunked terminator, and reads the response. We just watch it.
         uf.net_eof  = true;
@@ -3410,7 +3502,11 @@ static int ufParseResponse(char* body_snip, size_t body_snip_sz) {
 static void uploadTick() {
     // Scheduled single-retry of the current file (see ufFailOrRetry).
     if (uf.state == UF_RETRY_WAIT) {
-        if ((int32_t)(millis() - uf.retry_at_ms) >= 0) ufStartCurrentFile();
+        // Wait for BOTH the settle timer and the resume query (rq_state 1 =
+        // still asking the server how much it has). A hung query self-clears
+        // inside the task via its own timeouts.
+        if ((int32_t)(millis() - uf.retry_at_ms) >= 0 && uf.rq_state != 1)
+            ufStartCurrentFile();
         return;
     }
     if (uf.state == UF_IDLE) return;
@@ -3433,8 +3529,11 @@ static void uploadTick() {
             // jumps" the driver sees. ring_head advances from the very first
             // Q,L line and can never be more than one ring (512 KB) ahead of
             // what's been sent, so it's both smooth and honest.
-            done = (uf.state == UF_STREAMING || uf.state == UF_STREAM_FINISH)
-                   ? uf.ring_head : uf.bytes_written;
+            // Resume: count what the server already holds, so try 3 starting
+            // at 62% SHOWS 62% instead of restarting the bar at zero.
+            done = uf.resume_bytes
+                 + ((uf.state == UF_STREAMING || uf.state == UF_STREAM_FINISH)
+                    ? uf.ring_head : uf.bytes_written);
         }
         // Redraw throttle (v0.1.136). `done` advances on EVERY Q,L line
         // (~250/s measured), and each modal redraw repaints several
