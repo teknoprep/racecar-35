@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.141"
+#define FIRMWARE_VERSION "0.1.142"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2419,6 +2419,14 @@ static void ufEnter(UploadFlowState s) {
 }
 
 static void ufStartListing() {
+    // ORPHANED-RECORDING INSURANCE (v0.1.142). If a REC,1 was ever left
+    // unmatched (dash power-cycled/OTA'd mid-session — the dash boots with
+    // recording=false and never says REC,0), the Teensy is STILL writing the
+    // queue file at 25 Hz while we try to stream it out: reads fight the
+    // writer + its sync cycles, the file keeps growing, and the upload can
+    // never reach EOF. closeSession() is idempotent, so force it. Harmless
+    // no-op when nothing is open.
+    Serial.printf("REC,0\n");
     ufReset();
     ufEnter(UF_LISTING);
     Serial.println("Q,LIST");
@@ -3197,6 +3205,7 @@ static void slEnter(SessionsListState st) {
 // (not next to ufStartListing) because it needs the `sl` global above.
 static void ufStartSelected() {
     ufReset();
+    Serial.printf("REC,0\n");   // same orphaned-recording insurance as ufStartListing
     for (int i = 0; i < sl.count && uf.files_n < (int)(sizeof(uf.files) / sizeof(uf.files[0])); ++i) {
         if (!sl.selected[i]) continue;
         strncpy(uf.files[uf.files_n].name, sl.files[i], sizeof(uf.files[0].name) - 1);
