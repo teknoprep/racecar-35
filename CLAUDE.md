@@ -167,6 +167,25 @@ mid-stream (the “uploads die at ~70 lines” bug).
   `X-API-Key`). Setting `RACECAR_API_KEY` does NOT break dash uploads anymore (server accepts
   per-user keys), but keep firmware on its own `RACECAR_FIRMWARE_KEY`.
 
+**Server box + one-click update (v: admin update button).** The repo on the server host lives at
+**`/docker/racecar.api.blueuc.com`** (so `server/` = `/docker/racecar.api.blueuc.com/server`,
+data volume = `.../server/data`). The `/admin` header has an **update server** button, but the
+app runs INSIDE the container and cannot rebuild itself (no docker socket, no git checkout, and
+`compose up --build` would kill the request). So it's split: `POST /admin/update` writes
+`<data>/update_request.json`; **`server/host_updater.sh`** runs on the HOST from a systemd timer,
+executes `git pull && docker compose -f docker-compose.prod.yml up -d --build`, and reports
+`pulling/building/done/failed` via `<data>/update_status.json`. The button polls
+`GET /admin/update/status` and declares success when `running_since` (`_PROC_START`) JUMPS — a
+rebuild replaces the process, which is proof the update landed. The script is **self-locating**
+(it derives repo/data/compose paths from its own location), consumes the request BEFORE running
+so a failure can't loop, and uses `flock`. Install once, in place — do NOT copy it to
+/usr/local/bin (that breaks self-location):
+```bash
+cd /docker/racecar.api.blueuc.com && sudo ./server/host_updater.sh --install   # systemd timer, 30 s
+./server/host_updater.sh --status     # show detected paths + last result
+./server/host_updater.sh --now        # force an update now
+```
+
 **Redeploying the server** (only when `server/app/main.py` etc. change; on the box hosting
 `racecar.api.blueuc.com`, external nginx `proxy_default` already routes `/firmware/*`):
 ```bash
