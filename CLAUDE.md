@@ -498,6 +498,21 @@ VER,teensy,<semver>
   reports EFFECTIVE raw KB/s + ratio (`ZB <n> KB/s (<r>x)` on the Tools page; server logs
   `raw_bytes`/`raw_kbps`/`ratio` in the nettest event — `/nettest` stream-parses frame headers
   without inflating).
+- **⚠️ THE OTHER upload killer: a 17-line CFG burst every 5 s (fixed v0.1.135).** Found by
+  putting a scope on the actual wire (`/dev/ttyUSB0` @921600 taps the dash's UART0 = the Teensy
+  link): the dash was re-sending the ENTIRE config burst — 17 lines, ~500 bytes — **every 5
+  seconds, forever**, and the corruption in the capture appeared ONLY inside those bursts
+  (isolated `DTEMP`/`TCHrate` lines were always clean). CLAUDE.md has warned since v0.1.79 that
+  a CFG burst mid-ARQ desyncs the Teensy's per-line ACK wait and aborts the transfer — the
+  guard was `(uf.state != UF_IDLE) || (sl.state != SL_IDLE)`, which **lies**: the dash returns
+  to `UF_IDLE` the instant an upload fails while the Teensy keeps retransmitting `Q,L` for up to
+  120 s of ARQ patience. So every failed upload got carpet-bombed with CFG until the link
+  wedged. Fix: resend is now **event-driven** — `RST,teensy,…` (Teensy announces its own reboot)
+  sets `cfg_resend_req`, which is what the periodic blast was really approximating — with a slow
+  60 s safety net, and gated on `q_activity_ms` (millis of the last `Q,*` line SEEN FROM the
+  Teensy) being quiet for 10 s. Also deleted a leftover `TCHrate touched/s=…` debug printf that
+  fired onto UART0 every single second. **Lesson: the dash's own state machine is not evidence
+  that the link is free — only Teensy silence is.**
 - **⚠️ THE upload killer: the compressor was starving the TLS handshake (fixed v0.1.134).**
   Field signature (0.1.133, RSSI -43, WiFi fine): `ufdiag st=3 net=3 rh=524234 rt=0 er=TCP
   connect failed` — ring FULL (512 KB) with `ring_tail == 0`, i.e. the net task never sent one

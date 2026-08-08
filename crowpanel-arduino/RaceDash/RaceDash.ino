@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.134"
+#define FIRMWARE_VERSION "0.1.135"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1710,6 +1710,15 @@ static uint16_t gpsStatusColor(uint8_t s) {
 // Teensy-side ack_timeout failures. Keep this comfortably above that.
 static constexpr size_t UART_LINE_MAX = 512;
 static String rxBuf;
+
+// Teensy-link hygiene (v0.1.135). q_activity_ms = millis() of the last Q,*
+// line SEEN FROM the Teensy — the only reliable signal that it is mid-ARQ
+// (the dash's own uf/sl state lies: it returns to idle on failure while the
+// Teensy retransmits for up to 120 s). cfg_resend_req is set when the Teensy
+// announces a reboot (RST,teensy) so its config is restored event-driven
+// instead of by blind periodic bursts.
+static uint32_t q_activity_ms  = 0;
+static bool     cfg_resend_req = false;
 
 static bool parseGpsLine(const String& line) {
     int idx[8], n = 0;
@@ -3517,6 +3526,14 @@ static bool parseTestLine(const String& line) {
 static bool parseWupLine(const String& line);
 
 static bool parseLine(const String& line) {
+    // Track ANY Q,* traffic from the Teensy (v0.1.135). The dash's own
+    // uf/sl state is NOT sufficient to know the link is free: when an upload
+    // fails the dash returns to UF_IDLE while the Teensy is still grinding
+    // through its 120 s ARQ retransmit loop, happily sending Q,L lines. The
+    // periodic CFG resend used that stale "idle" to inject a 17-line burst
+    // straight into the middle of the ARQ exchange.
+    if (line.startsWith("Q,")) q_activity_ms = millis();
+
     if (line.startsWith("GPS,")) {
         const bool ok = parseGpsLine(line);
         if (ok) updateLapTimer();
@@ -3591,6 +3608,10 @@ static bool parseLine(const String& line) {
         // — shown on the STATUS HEALTH bar for the comms-death diagnosis.
         strncpy(teensy_reset_reason, line.substring(11).c_str(), sizeof(teensy_reset_reason) - 1);
         teensy_reset_reason[sizeof(teensy_reset_reason) - 1] = 0;
+        // The Teensy just booted, so its config is default — push ours ONCE,
+        // now. This is what the old 5 s CFG carpet-bombing was really for
+        // (v0.1.135); event-driven, so the link stays quiet the rest of the time.
+        cfg_resend_req = true;
         return true;
     }
     return false;
@@ -3733,8 +3754,9 @@ static void handleTouch() {
     if (pollNow - lastReadMs >= TOUCH_POLL_MS) {
         lastReadMs = pollNow;
         ts.read();
-        { static uint32_t _tc=0,_rc=0,_tp=0; _rc++; if(ts.isTouched)_tc++; uint32_t _n=millis();  // TEMP rate probe
-          if(_n-_tp>=1000){_tp=_n; Serial.printf("TCHrate touched/s=%lu reads/s=%lu\n",(unsigned long)_tc,(unsigned long)_rc); _tc=0; _rc=0;} }
+        // (v0.1.135: removed a leftover "TCHrate touched/s=.. reads/s=.." debug
+        // printf that fired EVERY SECOND onto UART0 — UART0 is the Teensy link,
+        // so this was permanent noise in the middle of the Q,* ARQ exchange.)
     }
     const bool raw = ts.isTouched;
 
@@ -10718,10 +10740,22 @@ void loop() {
     // a sessions list/delete. The Teensy handles Q,GET/Q,DEL in a blocking
     // per-line-ACK loop; injecting a 12-line CFG burst into that exchange
     // desynced its ACK wait and aborted the transfer (~5 s in = ~67 lines).
+    // v0.1.135: this used to fire EVERY 5 SECONDS — a 17-line, ~500-byte CFG
+    // burst onto the Teensy link, forever. CLAUDE.md has warned since v0.1.79
+    // that a CFG burst mid-ARQ desyncs the Teensy's per-line ACK wait and
+    // aborts the transfer; the guard below only checked the DASH's own upload
+    // state, which goes back to UF_IDLE the instant an upload fails while the
+    // Teensy keeps retransmitting Q,L for up to 120 s. Result: every failed
+    // upload got carpet-bombed with CFG until the whole link wedged.
+    // Now: push on demand (Teensy reboot -> cfg_resend_req) with a slow 60 s
+    // safety net, and only when the link has been Q-SILENT for 10 s.
     { static uint32_t lastCfgResend = 0;
       const bool link_busy = (uf.state != UF_IDLE) || (sl.state != SL_IDLE);
-      if (!link_busy && millis() - lastCfgResend >= 5000) {
-          lastCfgResend = millis();
+      const bool q_quiet   = (q_activity_ms == 0) || (millis() - q_activity_ms >= 10000);
+      const bool due       = cfg_resend_req || (millis() - lastCfgResend >= 60000);
+      if (due && !link_busy && q_quiet) {
+          lastCfgResend  = millis();
+          cfg_resend_req = false;
           sendCfgToTeensy();
       } }
 
