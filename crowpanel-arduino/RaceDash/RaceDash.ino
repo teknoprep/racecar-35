@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.142"
+#define FIRMWARE_VERSION "0.1.143"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2470,6 +2470,21 @@ static void ufStartCurrentFile() {
     uf.bytes_written  = 0;
     uf.expected_size  = 0;
     uf.lines_recv     = 0;
+    // v0.1.143: EVERY attempt asks the server what it already holds — not just
+    // retries. The first attempt of a NEW batch used to go mode=w with skip=0,
+    // OVERWRITING whatever a previous batch had banked (watched it happen:
+    // 14:35 banked 74 lines via mode=a, 14:43's fresh button press wiped them
+    // back to zero). Cross-batch resume is the whole point. The settle delay
+    // also covers the Teensy's post-abort recovery, so ufFailOrRetry no longer
+    // needs its own longer window.
+    resumeQueryKick();
+    uf.retry_at_ms = millis() + 900;
+    ufEnter(UF_RETRY_WAIT);
+}
+
+// Emit the (possibly skip-resumed) Q,GET once the resume query has answered.
+// Called ONLY from the UF_RETRY_WAIT handler.
+static void ufSendQGet() {
     if (uf.skip_lines > 0)
         Serial.printf("Q,GET,%s,%lu\n", uf.files[uf.files_idx].name,
                       (unsigned long)uf.skip_lines);
@@ -2575,9 +2590,8 @@ static void ufFailOrRetry(bool sendAbort) {
         // 4 s window: the Teensy exits its loop + the resume query (below)
         // gets time to answer. The UF_RETRY_WAIT handler also WAITS for the
         // query to finish, so a slow answer delays the retry, never races it.
-        uf.retry_at_ms = millis() + 4000;
-        ufEnter(UF_RETRY_WAIT);
-        resumeQueryKick();   // find out how much the server already holds
+        ufStartCurrentFile();   // zeroes counters, queries the server, waits
+                                // out the settle, then re-sends Q,GET
     } else {
         uf.failed++;
         ufNextFile();
@@ -3526,7 +3540,7 @@ static void uploadTick() {
         // still asking the server how much it has). A hung query self-clears
         // inside the task via its own timeouts.
         if ((int32_t)(millis() - uf.retry_at_ms) >= 0 && uf.rq_state != 1)
-            ufStartCurrentFile();
+            ufSendQGet();
         return;
     }
     if (uf.state == UF_IDLE) return;
