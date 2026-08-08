@@ -1925,6 +1925,41 @@ def _coach_add(user: str, texts: list, session: str, track: str) -> list:
     return added
 
 
+def _coach_prefs_path(user: str) -> pathlib.Path:
+    return COACH_DIR / (safe_name(user) + ".prefs.json")
+
+
+def _coach_prefs(user: str) -> dict:
+    """Per-user coach settings. auto=True => review every upload automatically.
+    Default ON (that's the feature people expect); turn it off to keep the AI
+    cost/latency on a manual, per-session click instead."""
+    p = _coach_prefs_path(user)
+    out = {"auto": True}
+    if p.exists():
+        try:
+            d = json.loads(p.read_text("utf-8"))
+            if isinstance(d, dict):
+                out["auto"] = bool(d.get("auto", True))
+        except Exception:
+            pass
+    return out
+
+
+def _coach_set_prefs(user: str, auto: bool) -> dict:
+    p = _coach_prefs_path(user)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"auto": bool(auto)}), "utf-8")
+    tmp.replace(p)
+    return {"auto": bool(auto)}
+
+
+def _coach_has_for_session(user: str, filename: str) -> bool:
+    """Has this session already been reviewed? (Any item, ticked or not, that
+    came from it.) Used to keep the manual 'generate' button idempotent."""
+    return any(i.get("session") == filename for i in _coach_load(user))
+
+
 def _coach_facts(user_dir: str, p: pathlib.Path) -> Optional[str]:
     """Compact fact sheet for the AI: lap times + consistency + the physical
     envelope. Deliberately small — this runs on every upload."""
@@ -2003,8 +2038,13 @@ def _coach_analyze(user_dir: str, p: pathlib.Path, track: str) -> None:
 
 def _coach_kick(user_dir: str, p: pathlib.Path, track: str) -> None:
     """Fire the review on a daemon thread so the dash's upload response is not
-    delayed by a 10-60 s model call."""
+    delayed by a 10-60 s model call. Respects the per-user auto setting — when
+    off, nothing happens on upload and the driver generates it by hand from the
+    review page instead."""
     if not ai_enabled():
+        return
+    if not _coach_prefs(user_dir).get("auto", True):
+        log.info("coach: auto-review OFF for %s — skipping %s", user_dir, p.name)
         return
     try:
         threading.Thread(target=_coach_analyze, args=(user_dir, p, track),
@@ -2051,7 +2091,45 @@ async def coach_all(request: Request, user: str,
     d = _coach_gate(request, user, x_api_key)
     items = _coach_load(d)
     items.sort(key=lambda i: (bool(i.get("done")), -i.get("ts", 0)))
-    return JSONResponse({"ok": True, "items": items})
+    return JSONResponse({"ok": True, "items": items, "prefs": _coach_prefs(d)})
+
+
+@app.post("/coach/{user}/prefs")
+async def coach_set_prefs(request: Request, user: str,
+                          x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    """Toggle automatic review-on-upload for this user. Body {auto: bool}."""
+    d = _coach_gate(request, user, x_api_key)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    return JSONResponse({"ok": True, "prefs": _coach_set_prefs(d, bool(body.get("auto", True)))})
+
+
+@app.post("/sessions/{user}/{filename}/coach")
+async def session_coach_generate(request: Request, user: str, filename: str) -> JSONResponse:
+    """Manually run the coach review for ONE session — the path used when
+    auto-review is off (or when an upload predates the feature). Idempotent:
+    refuses if this session already produced items, unless ?force=1."""
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    if not ai_enabled():
+        raise HTTPException(status_code=503,
+                            detail="AI is not configured (set RACECAR_AI_API_KEY)")
+    p = _resolve_session(user, filename)
+    d = safe_name(user)
+    force = str(request.query_params.get("force", "")).strip() in ("1", "true", "yes")
+    if not force and _coach_has_for_session(d, p.name):
+        return JSONResponse({"ok": True, "already": True, "added": 0,
+                            "detail": "this session has already been reviewed"})
+    before = len(_coach_load(d))
+    _coach_analyze(d, p, _track_key(p.name))   # synchronous: the user clicked and is waiting
+    items = _coach_load(d)
+    added = [i for i in items if i.get("session") == p.name]
+    return JSONResponse({"ok": True, "already": False,
+                         "added": max(0, len(items) - before),
+                         "items": [{"id": i["id"], "text": i["text"], "done": i.get("done", False)}
+                                   for i in added]})
 
 
 @app.post("/coach/{user}/done")
@@ -2139,6 +2217,12 @@ _COACH_HTML = """<!doctype html>
 <p class="sub">Written automatically by the AI review of each uploaded session.
 Ticking an item here removes it from the dash — the dash only ever shows open items.
 &nbsp; <a href="/">← sessions</a></p>
+<div class="item" style="align-items:center">
+  <div class="cb" id="autocb" title="review every upload automatically"></div>
+  <div class="txt"><b>Auto-review every upload</b>
+    <div class="meta" id="automsg">When off, nothing is created on upload — generate it by hand
+    from a session's review page.</div></div>
+</div>
 <div id="open"></div>
 <h2>Ticked off</h2>
 <div id="done"></div>
@@ -2161,9 +2245,21 @@ function row(i){
   });
   return d;
 }
+let PREFS={auto:true};
+const autocb=document.getElementById('autocb');
+autocb.addEventListener('click', async ()=>{
+  PREFS.auto=!PREFS.auto;
+  await fetch('/coach/'+encodeURIComponent(USER)+'/prefs',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({auto:PREFS.auto})});
+  load();
+});
 async function load(){
   const r=await fetch('/coach/'+encodeURIComponent(USER));
   const j=await r.json();
+  PREFS=j.prefs||{auto:true};
+  autocb.textContent = PREFS.auto ? '\\u2713' : '';
+  autocb.style.background = PREFS.auto ? 'var(--good)' : 'transparent';
+  autocb.style.borderColor = PREFS.auto ? 'var(--good)' : 'var(--primary)';
   const o=document.getElementById('open'), dn=document.getElementById('done');
   o.innerHTML=''; dn.innerHTML='';
   const items=j.items||[];
@@ -6014,6 +6110,7 @@ _REVIEW_HTML = (
           <button id="ai-draw" class="btn">circle a section</button>
           <button id="ai-clear" class="btn">clear</button>
           <button id="ai-line" class="btn" title="popout: fastest real line through this section vs yours, with brake/apex/throttle markers and speed labels">ideal line ↗</button>
+          <button id="ai-coach" class="btn" title="run the whole-session review that normally happens automatically on upload, and file 1-3 checklist items">checklist</button>
           <span style="flex:1"></span>
           <label class="t-label" style="display:flex;align-items:center;gap:6px">model
             <select id="ai-model" class="cmp-input" style="width:auto;min-width:160px"></select>
@@ -6927,6 +7024,21 @@ _REVIEW_HTML = (
       el('ai-ask').disabled=false;
     }
     el('ai-ask').addEventListener('click', ask);
+    // Manual whole-session coach review — the path used when auto-review is
+    // off, or for sessions uploaded before the feature existed. Idempotent
+    // server-side: it reports "already reviewed" rather than duplicating.
+    el('ai-coach').addEventListener('click', async ()=>{
+      const b=el('ai-coach'); b.disabled=true; const old=b.textContent; b.textContent='reviewing\u2026';
+      try{
+        const r=await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/coach',
+                            {method:'POST'});
+        const j=await r.json();
+        if(!r.ok) status.textContent='checklist error: '+((j&&j.detail)||('HTTP '+r.status));
+        else if(j.already) status.textContent='already reviewed — see the checklist';
+        else status.textContent='checklist: '+(j.added||0)+' item(s) added';
+      }catch(e){ status.textContent='checklist failed: '+e.message; }
+      b.disabled=false; b.textContent=old;
+    });
     el('ai-line').addEventListener('click', ()=>{
       if (pts.length<3){ status.textContent='circle a section of track first'; return; }
       const enc = pts.map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join('|');
