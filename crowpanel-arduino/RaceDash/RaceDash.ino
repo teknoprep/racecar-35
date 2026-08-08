@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.138"
+#define FIRMWARE_VERSION "0.1.139"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2443,6 +2443,16 @@ static void ufStartCurrentFile() {
     uf.bytes_done     = 0;
     uf.seg_eof        = false;
     uf.post_tries     = 0;
+    // Zero the byte counters for THIS attempt (v0.1.139). They used to keep the
+    // dead attempt's totals, so after a stall the modal sat at e.g. "rt=11k
+    // rh=11k" — phantom progress for bytes the server never kept, next to a
+    // stale error. The bar must restart at 0 for each attempt. `total` falls
+    // back to the size from Q,LIST, so it stays stable across retries.
+    uf.ring_head      = 0;
+    uf.ring_tail      = 0;
+    uf.bytes_written  = 0;
+    uf.expected_size  = 0;
+    uf.lines_recv     = 0;
     Serial.printf("Q,GET,%s\n", uf.files[uf.files_idx].name);
     Serial.flush();
     ufEnter(UF_FETCH_HEAD);
@@ -2470,7 +2480,13 @@ static void ufFailOrRetry(bool sendAbort) {
     ufStopNetTask();
     ufCloseTcp();
     if (sendAbort) { Serial.printf("Q,ABORT\n"); Serial.flush(); }
-    if (uf.file_retries < 2 && uf.files_idx < uf.files_n) {
+    // 2 -> 6 retries (v0.1.139). Field evidence across five sessions: this SD
+    // card stalls reads at 5-11 KB on the first attempt(s) and then streams the
+    // whole file perfectly on a later one (26 / 37 / 41 / 42 lines, then 39,001
+    // lines clean). Retrying IS the working recovery, so giving up after 2 was
+    // failing files the card would have delivered on attempt 3-4. Each attempt
+    // now costs ~20 s (the Teensy-stall detector), so 6 is bounded at ~2 min.
+    if (uf.file_retries < 6 && uf.files_idx < uf.files_n) {
         uf.file_retries++;
         Serial.printf("DBG,uf_retry file=%s err=%s\n",
                       uf.files[uf.files_idx].name, uf.last_err);
@@ -8111,7 +8127,7 @@ static void drawUploadModal() {
         case UF_FETCH_HEAD:    phase = "Preparing...";           break;
         case UF_STREAMING:     phase = "Streaming to cloud...";  break;
         case UF_POSTING:       phase = "Streaming to cloud...";  break;
-        case UF_RETRY_WAIT:    phase = "Retrying...";            break;
+        case UF_RETRY_WAIT:    phase = "Stalled - retrying";     break;
         case UF_STREAM_FINISH: phase = "Finalizing...";          break;
         case UF_DELETING:      phase = "Cleaning up...";      break;
         default: break;
@@ -8123,11 +8139,16 @@ static void drawUploadModal() {
     tft.setTextPadding(UM_CARD_W - 40);
     // Append "n/N" when the batch has more than one file, so a multi-session
     // drain shows which one it's on instead of looking like it restarted.
-    char phbuf[64];
+    char phbuf[72];
+    char att[16] = "";
+    // Attempt number matters: "attempt 2" explains why the bar restarted.
+    if (uf.file_retries > 0)
+        snprintf(att, sizeof(att), "  try %u", (unsigned)(uf.file_retries + 1));
     if (uf.files_n > 1 && uf.files_idx < uf.files_n)
-        snprintf(phbuf, sizeof(phbuf), "%s  %d/%d", phase, uf.files_idx + 1, uf.files_n);
+        snprintf(phbuf, sizeof(phbuf), "%s  %d/%d%s", phase,
+                 uf.files_idx + 1, uf.files_n, att);
     else
-        snprintf(phbuf, sizeof(phbuf), "%s", phase);
+        snprintf(phbuf, sizeof(phbuf), "%s%s", phase, att);
     tft.drawString(phbuf, UM_CARD_X + UM_CARD_W / 2, UM_CARD_Y + 30);
     tft.setTextPadding(0);
 
@@ -8170,9 +8191,16 @@ static void drawUploadModal() {
     }
     char line[80];
     const int pct = (int)((uint64_t)done * 100 / total);
-    if (upload_total <= 1) {
-        // Nothing known yet (Q,LIST/Q,GET outstanding) — say so instead of
-        // showing a meaningless "0 / 0 KB".
+    if (uf.state == UF_FETCH_HEAD) {
+        // Q,GET is out; the Teensy has to OPEN the file (which is exactly where
+        // a tired SD card stalls). Show that, not a byte count — there is
+        // genuinely no progress to report yet.
+        snprintf(line, sizeof(line), "waiting for the car to open the file...");
+    } else if (uf.state == UF_RETRY_WAIT) {
+        const uint32_t left = (uf.retry_at_ms > millis())
+                              ? (uf.retry_at_ms - millis() + 999) / 1000 : 0;
+        snprintf(line, sizeof(line), "restarting this file in %lus", (unsigned long)left);
+    } else if (upload_total <= 1) {
         snprintf(line, sizeof(line), "reading queue...");
     } else {
         char amt[40], extra[32] = "";
@@ -8213,12 +8241,17 @@ static void drawUploadModal() {
     {
         // Error preference: last_err first — net_err is often just "aborted",
         // which is the SYMPTOM of the loop's abort, not the cause (v0.1.120).
+        // Mark it as HISTORY: a stale "stalled at ..." sitting next to a live
+        // retry made it look like the current attempt had already failed.
         const char* derr = uf.last_err[0] ? uf.last_err : uf.net_err;
-        char diag[110];
-        snprintf(diag, sizeof(diag), "S%u N%u rt=%luK rh=%luK %.48s",
+        char diag[130];
+        snprintf(diag, sizeof(diag), "S%u N%u rt=%luK rh=%luK %s%.48s",
+                 // "last:" so a historical error can't be mistaken for the
+                 // current attempt's state
                  (unsigned)uf.state, (unsigned)uf.net_state,
                  (unsigned long)(uf.ring_tail / 1024),
-                 (unsigned long)(uf.ring_head / 1024), derr);
+                 (unsigned long)(uf.ring_head / 1024),
+                 derr[0] ? "last: " : "", derr);
         tft.setFont(&fonts::Font2);
         tft.setTextColor(TFT_LIGHTGREY, TFT_NAVY);
         tft.setTextDatum(textdatum_t::middle_center);
