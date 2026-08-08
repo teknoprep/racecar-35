@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.140"
+#define FIRMWARE_VERSION "0.1.141"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2312,6 +2312,7 @@ struct UploadFlow {
     // monotonic — a stall costs 20 s, never the bytes already delivered.
     uint32_t   skip_lines;      // lines the server already has (0 = fresh file)
     uint32_t   resume_bytes;    // bytes the server already has (progress base)
+    uint32_t   prev_skip;       // skip at the PREVIOUS attempt (progress detector)
     volatile uint8_t rq_state;  // resume query: 0 none / 1 running / 2 done
     uint8_t    list_tries;      // Q,LIST re-asks after a 6 s silence (v0.1.121)
     uint32_t   retry_at_ms;     // when UF_RETRY_WAIT re-sends Q,GET / UF_POSTING re-opens
@@ -2478,6 +2479,7 @@ static void ufNextFile() {
     uf.file_retries = 0;
     uf.skip_lines   = 0;      // resume state is strictly per-file
     uf.resume_bytes = 0;
+    uf.prev_skip    = 0;
     uf.rq_state     = 0;
     ufStartCurrentFile();
 }
@@ -3339,6 +3341,15 @@ static bool parseQLine(const String& line) {
         // Resume: the Teensy numbers the first line it SENDS as skip+1, so the
         // ARQ dedup must expect exactly that (v0.1.140).
         uf.next_seq      = uf.skip_lines + 1;
+        // PROGRESS-AWARE RETRY BUDGET (v0.1.141). The 6-attempt cap exists to
+        // stop futile loops - but with resume, an attempt that BANKED lines is
+        // not futile. If the server holds more than it did last attempt, reset
+        // the budget: a sick card banking 100 lines per try now finishes a 40k
+        // line file unattended instead of dying after 6 tries and demanding
+        // the button be pressed over and over. Only 6 CONSECUTIVE zero-
+        // progress attempts give up.
+        if (uf.skip_lines > uf.prev_skip) uf.file_retries = 0;
+        uf.prev_skip = uf.skip_lines;
         uf.expected_size = sz;      // modal progress (total file bytes)
         uf.bytes_written = 0;
         uf.ring_head     = 0;
