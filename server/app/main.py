@@ -2553,6 +2553,66 @@ def _upload_event(d: dict) -> None:
         pass
 
 
+
+def _resolve_upload_target(x_user_email, x_session_id, x_track_name,
+                           x_api_key, web_user, kind: str):
+    """Filename derivation shared by /upload, /stream, partial-salvage and
+    /upload/progress — MUST stay byte-identical across them or resume breaks."""
+    key_email = email_for_api_key(x_api_key) if x_api_key else None
+    email = safe_name(x_user_email or (web_user or {}).get("email") or key_email)
+    sid_raw = (x_session_id or "").strip()
+    sid_overridden = False
+    try:
+        sid_int = int(sid_raw) if sid_raw else 0
+    except ValueError:
+        sid_int = 0
+    if not reasonable_epoch(sid_int):
+        sid_int = int(time.time())
+        sid_overridden = True
+    sid = safe_name(str(sid_int), default=str(int(time.time())))
+    raw_track = (x_track_name or "").strip()
+    if raw_track.lower().endswith(".ndjson"):
+        raw_track = raw_track[: -len(".ndjson")]
+    if raw_track.startswith("session_"):
+        raw_track = raw_track[len("session_"):]
+    if raw_track.startswith(f"{sid}_"):
+        raw_track = raw_track[len(sid) + 1:]
+    if kind == "debug" and raw_track.lower().endswith(".dbg"):
+        raw_track = raw_track[: -len(".dbg")]
+    track = safe_name(raw_track, default="UNKNOWN")
+    if kind == "debug":
+        filename = f"{sid}_{track}.dbg.ndjson"
+        out_path = DATA_DIR / "debug" / email / filename
+    else:
+        filename = f"{sid}_{track}.ndjson"
+        out_path = session_dir_for(email) / filename
+    return email, sid, sid_int, sid_overridden, track, filename, out_path
+
+
+def _zb_decode_partial(data: bytes) -> bytes:
+    """Best-effort zblocks decode: complete frames only, silently dropping a
+    trailing truncated frame. For salvaging interrupted uploads."""
+    out = bytearray()
+    off = 0
+    n = len(data)
+    while off + 10 <= n:
+        if data[off:off + 2] != b"ZB":
+            break
+        rl, cl = struct.unpack_from("<II", data, off + 2)
+        if rl == 0 or cl == 0 or rl > (1 << 20) or cl > (1 << 20) or off + 10 + cl > n:
+            break
+        try:
+            d = zlib.decompressobj(-15)
+            raw = d.decompress(data[off + 10:off + 10 + cl]) + d.flush()
+        except Exception:
+            break
+        if len(raw) != rl:
+            break
+        out += raw
+        off += 10 + cl
+    return bytes(out)
+
+
 async def _save_body(
     request: Request,
     x_api_key: Optional[str],
@@ -2584,6 +2644,12 @@ async def _save_body(
     elif oauth_enabled():
         web_user = current_user(request)
 
+    # Resolve the target BEFORE reading the body so an interrupted read can
+    # still salvage what arrived (resume support, v: resume).
+    email, sid, sid_int, sid_overridden, track, filename, out_path = \
+        _resolve_upload_target(x_user_email, x_session_id, x_track_name,
+                               x_api_key, web_user, kind)
+    _zb_hdr = (request.headers.get("x-body-format") or "").strip().lower() == "zblocks"
     _rx = 0
     try:
         _chunks: list[bytes] = []
@@ -2592,6 +2658,25 @@ async def _save_body(
             _rx += len(_chunk)
         body = b"".join(_chunks)
     except Exception as e:
+        # SALVAGE (v: resume): keep every complete line that made it. Without
+        # this, a stalled UART meant the retry restarted from byte 0 forever —
+        # a file that can't stream end-to-end in ONE pass could NEVER land.
+        try:
+            part = b"".join(_chunks)
+            if _zb_hdr:
+                part = _zb_decode_partial(part)
+            nl_at = part.rfind(b"\n")
+            part = part[:nl_at + 1] if nl_at >= 0 else b""
+            if part and kind != "debug":
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(out_path, "wb" if mode == "w" else "ab") as f:
+                    f.write(part)
+                _upload_event({"ev": "partial_saved", "ip": _client_host,
+                               "session": sid, "track": track, "mode": mode,
+                               "bytes": len(part), "lines": part.count(b"\n"),
+                               "file_total": out_path.stat().st_size})
+        except Exception as se:
+            log.warning("partial salvage failed: %s", se)
         # Client aborted mid-stream (dropped WiFi, TLS reset, chunked framing
         # error). This is the smoking gun for "upload died partway" — and
         # bytes_received says HOW FAR it got before dying (0 = the body never
@@ -2630,54 +2715,12 @@ async def _save_body(
     else:
         validation = validate_ndjson_body(body)
 
-    # A per-user API key (X-API-Key) namespaces the upload under its owner
-    # when no explicit X-User-Email is supplied.
-    key_email = email_for_api_key(x_api_key) if x_api_key else None
-    email = safe_name(x_user_email or (web_user or {}).get("email") or key_email)
 
-    # Sanitize + epoch-sanity-check the session id. If the firmware uploads
-    # something we can't interpret as a real epoch (RTC not set, all zeros,
-    # millis()-as-epoch fallback) we substitute the current server time so
-    # the file's display row, filename, and review page header all read as
-    # "right now" rather than 1970-01-01.
-    sid_raw = (x_session_id or "").strip()
-    sid_overridden = False
-    try:
-        sid_int = int(sid_raw) if sid_raw else 0
-    except ValueError:
-        sid_int = 0
-    if not reasonable_epoch(sid_int):
-        sid_int = int(time.time())
-        sid_overridden = True
-    sid = safe_name(str(sid_int), default=str(int(time.time())))
-
-    # Defensive cleanup so filenames stay tidy even if a client sends a
-    # filename-ish track (older firmware sent the whole SD basename here):
-    #   - drop a trailing ".ndjson" so we don't double the extension
-    #   - strip a leading "session_" prefix
-    #   - if the track still begins with "<sid>_", drop that duplicate id
-    raw_track = (x_track_name or "").strip()
-    if raw_track.lower().endswith(".ndjson"):
-        raw_track = raw_track[: -len(".ndjson")]
-    if raw_track.startswith("session_"):
-        raw_track = raw_track[len("session_"):]
-    if raw_track.startswith(f"{sid}_"):
-        raw_track = raw_track[len(sid) + 1:]
-    if kind == "debug" and raw_track.lower().endswith(".dbg"):
-        raw_track = raw_track[: -len(".dbg")]   # avoid ...dbg.dbg.ndjson
-    track = safe_name(raw_track, default="UNKNOWN")
-    if kind == "debug":
-        filename = f"{sid}_{track}.dbg.ndjson"
-        ddir = DATA_DIR / "debug" / email
-        ddir.mkdir(parents=True, exist_ok=True)
-        out_path = ddir / filename
-    else:
-        filename = f"{sid}_{track}.ndjson"
-        out_path = session_dir_for(email) / filename
-
+    # (email/sid/track/out_path resolved above, before the body read.)
     # Open in the requested mode. 'wb' overwrites (AfterRace whole-file POSTs
     # so retries are idempotent), 'ab' appends (live streaming).
     flags = "wb" if mode == "w" else "ab"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, flags) as f:
         f.write(body)
 
@@ -2719,6 +2762,44 @@ async def _save_body(
             "session_id_overridden": sid_overridden,
         }
     )
+
+
+@app.get("/upload/progress")
+async def upload_progress(
+    request: Request,
+    session: str = Query(""),
+    track: str = Query(""),
+    kind: str = Query(""),
+    x_api_key: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None),
+) -> JSONResponse:
+    """RESUME support: the dash asks how many bytes/lines of a session the
+    server already holds (whole-file POSTs + salvaged partials), then re-pulls
+    from the Teensy with Q,GET,<file>,<skip_lines> and appends via /stream.
+    Auth mirrors /upload (master key, per-user key, or logged-in web user)."""
+    web_user = None
+    if API_KEY and x_api_key != API_KEY:
+        web_user = current_user(request) if oauth_enabled() else None
+        if not web_user and not (x_api_key and email_for_api_key(x_api_key)):
+            raise HTTPException(status_code=401, detail="invalid api key")
+    elif oauth_enabled():
+        web_user = current_user(request)
+    _, _, _, _, _, filename, out_path = _resolve_upload_target(
+        x_user_email, session, track, x_api_key, web_user,
+        "debug" if kind == "debug" else "")
+    if not out_path.exists():
+        return JSONResponse({"ok": True, "exists": False, "bytes": 0, "lines": 0,
+                             "file": filename})
+    data_len = out_path.stat().st_size
+    lines = 0
+    with open(out_path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            lines += chunk.count(b"\n")
+    return JSONResponse({"ok": True, "exists": True, "bytes": data_len,
+                         "lines": lines, "file": filename})
 
 
 @app.post("/upload")
