@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.135"
+#define FIRMWARE_VERSION "0.1.136"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2263,6 +2263,7 @@ struct UploadFlow {
     int      files_idx;
     int      uploaded;
     int      failed;
+    uint16_t del_mask;          // bit i = files[i] uploaded OK, delete at batch end (v0.1.136)
     // Streaming TCP socket. Owned. Polymorphic across WiFiClient (HTTP) and
     // WiFiClientSecure (HTTPS); deleted via base virtual destructor.
     WiFiClient* tcp;
@@ -2387,8 +2388,25 @@ static void ufStartListing() {
 }
 
 
+// Fire the deferred Q,DEL for every file that uploaded OK this batch (see the
+// del_mask note in the UF_STREAM_FINISH success path). Fire-and-forget: the
+// Q,DEL,OK replies are ignored, because a lost delete only costs one harmless
+// re-upload next time, whereas doing these mid-batch costs 90 s of SD stall.
+static void ufFlushPendingDeletes() {
+    if (!uf.del_mask) return;
+    for (int i = 0; i < uf.files_n && i < 16; ++i) {
+        if (uf.del_mask & (uint16_t)(1u << i)) {
+            Serial.printf("Q,DEL,%s\n", uf.files[i].name);
+            Serial.flush();
+            delay(2);   // don't blast 16 deletes into one UART burst
+        }
+    }
+    uf.del_mask = 0;
+}
+
 static void ufStartCurrentFile() {
     if (uf.files_idx >= uf.files_n) {
+        ufFlushPendingDeletes();   // batch done — now it's safe to delete
         ufEnter(UF_DONE);
         return;
     }
@@ -3256,8 +3274,16 @@ static void uploadTick() {
             done = (uf.state == UF_STREAMING || uf.state == UF_STREAM_FINISH)
                    ? uf.ring_head : uf.bytes_written;
         }
-        if (strcmp(upload_file, fname) != 0 ||
-            total != upload_total || done != upload_done) {
+        // Redraw throttle (v0.1.136). `done` advances on EVERY Q,L line
+        // (~250/s measured), and each modal redraw repaints several
+        // full-width padded strings — at that rate the drawing steals loop
+        // time from the UART pump, which IS the upload bottleneck. Cap to
+        // ~5 Hz, but never delay a name/total change or a reset.
+        static uint32_t last_ui_ms = 0;
+        const bool ui_force = (strcmp(upload_file, fname) != 0)
+                              || (total != upload_total) || (done < upload_done);
+        if (ui_force || (done != upload_done && now - last_ui_ms >= 200)) {
+            last_ui_ms   = now;
             strncpy(upload_file, fname, sizeof(upload_file) - 1);
             upload_file[sizeof(upload_file) - 1] = '\0';
             upload_total = total;
@@ -3288,9 +3314,16 @@ static void uploadTick() {
             ufStopNetTask();
             ufCloseTcp();
             if (code >= 200 && code < 300) {
-                Serial.printf("Q,DEL,%s\n", uf.files[uf.files_idx].name);
-                Serial.flush();
-                ufEnter(UF_DELETING);
+                // v0.1.136: DO NOT delete now. Deleting a multi-MB file makes
+                // the SD card run internal garbage collection, which then
+                // silences the NEXT file's reads for 30-90 s (bench-proven:
+                // first attempt dies ~26 lines, retry clean). Deletes are
+                // therefore deferred to the END of the batch, off the critical
+                // path. Losing a delete is harmless — the server keys on
+                // session id with mode='w', so a re-upload just overwrites.
+                uf.del_mask |= (uint16_t)(1u << uf.files_idx);
+                uf.uploaded++;
+                ufNextFile();
             } else {
                 if (code > 0 && body[0]) {
                     snprintf(uf.last_err, sizeof(uf.last_err),
@@ -3376,7 +3409,23 @@ static void uploadTick() {
         // sides and the retry ran clean. Wait out the pause instead of
         // shooting a stream that's merely stalled; genuinely dead links still
         // die (Teensy patience 120 s > our 90 s).
-        case UF_STREAMING:      timeout_ms = 90000;  since = now - uf.last_rx_ms;       break;
+        // v0.1.136: the 90 s blanket was paying for the WRONG stall. Two very
+        // different things look like "no UART data":
+        //  - ring DRAINED + net task healthy => the TEENSY is silent, i.e. SD
+        //    garbage collection (triggered by the previous file's delete).
+        //    Waiting does NOT help — the RETRY is what clears it. Measured on
+        //    the bench: first attempt died at 26 lines / 5,679 B, then the
+        //    retry streamed 15,000 lines at 250/s without a pause. So burning
+        //    90 s here is pure dead time; 20 s is plenty to be sure it's stuck.
+        //  - ring FULL => the NETWORK is the bottleneck (paddock WiFi can drop
+        //    to zero for 30 s+). Keep the full 90 s patience there (v0.1.115).
+        case UF_STREAMING: {
+            const bool ring_drained = (uf.ring_head == uf.ring_tail);
+            const bool net_ok       = (uf.net_state == 1);
+            timeout_ms = (ring_drained && net_ok) ? 20000 : 90000;
+            since      = now - uf.last_rx_ms;
+            break;
+        }
         // (UF_POSTING gone; UF_STREAM_FINISH watches net-task progress in its
         // own block above, not UART activity — no entry here.)
         case UF_DELETING:       timeout_ms = 6000;   since = now - uf.state_entered_ms; break;
@@ -3620,12 +3669,28 @@ static uint32_t uart_last_ok_ms = 0;   // last successfully PARSED line from the
 static uint32_t uart_reinit_ms  = 0;
 static uint16_t uart_reinits    = 0;
 
+// Does this line prove the Teensy is running its normal loop()? Only real
+// telemetry does (v0.1.136). Stray Q,* lines do NOT: when the dash reboots
+// mid-upload the Teensy is still inside its BLOCKING ARQ retransmit loop,
+// spraying Q,L lines and running no loop() at all — so no GPS/ENG/IMU ever
+// arrives. Those Q,L lines still "parse" (they're recognised and discarded),
+// which used to keep uart_last_ok_ms permanently fresh and the recovery
+// watchdog permanently asleep. That is the "reboot the screen and it never
+// re-talks to the Teensy" failure.
+static bool uartLineIsTelemetry(const String& s) {
+    return s.startsWith("GPS,")  || s.startsWith("ENG,")  || s.startsWith("ECU,")
+        || s.startsWith("IMU,")  || s.startsWith("TIME,") || s.startsWith("HLTH,")
+        || s.startsWith("SD,")   || s.startsWith("CLD,")  || s.startsWith("ETH,")
+        || s.startsWith("VER,")  || s.startsWith("RST,");
+}
+
 static void pumpUart() {
     while (Serial.available()) {
         char c = (char)Serial.read();
         if (c == '\r') continue;
         if (c == '\n') {
-            if (parseLine(rxBuf)) uart_last_ok_ms = millis();
+            const bool handled = parseLine(rxBuf);
+            if (handled && uartLineIsTelemetry(rxBuf)) uart_last_ok_ms = millis();
             rxBuf = "";
         }
         else if (rxBuf.length() < UART_LINE_MAX) { rxBuf += c; }
@@ -3642,11 +3707,18 @@ static void pumpUart() {
 // recovery and a reinit would drop in-flight ARQ bytes).
 static void uartLinkTick() {
     const uint32_t now = millis();
-    if (uart_last_ok_ms == 0) {
-        if (now < 20000) return;             // boot grace — Teensy may still be starting
-    }
-    if (now - uart_last_ok_ms < 15000) return;
-    if (now - uart_reinit_ms  < 15000) return;
+    // Recovery cadence (v0.1.136). The old 20 s boot grace + 15 s retry is why
+    // "unplug and replug the display and it never reconnects to the Teensy...
+    // then after a minute or two it comes back" — it was never permanent, just
+    // 3-6 slow cycles. If we have NEVER seen telemetry (fresh boot, confused
+    // UART, or a Teensy wedged in a zombie stream), probe at 4 s and then every
+    // 5 s; once the link has been healthy, fall back to the lazy 15 s cadence.
+    const bool     never_ok = (uart_last_ok_ms == 0);
+    const uint32_t grace    = never_ok ? 4000 : 15000;
+    const uint32_t period   = never_ok ? 5000 : 15000;
+    if (now < grace) return;
+    if (!never_ok && now - uart_last_ok_ms < 15000) return;
+    if (now - uart_reinit_ms  < period) return;
     if (uf.state != UF_IDLE || sl.state != SL_IDLE) return;   // mid-transfer: leave it alone
     uart_reinit_ms = now;
     uart_reinits++;
@@ -3657,6 +3729,12 @@ static void uartLinkTick() {
     delay(5);
     Serial.setRxBufferSize(32768);           // must precede begin() (ESP32 core)
     Serial.begin(921600);
+    // Q,ABORT FIRST (v0.1.136): the usual reason we hear nothing is that the
+    // Teensy is wedged in a zombie Q,GET retransmit loop (dash rebooted
+    // mid-upload) where it runs no loop() and emits no telemetry. Its ack pump
+    // DOES match Q,ABORT, so this frees it in ~15 s instead of waiting out its
+    // 120 s ARQ patience — or forever, if it keeps getting re-triggered.
+    Serial.printf("Q,ABORT\n");
     Serial.printf("VER?\n");                 // poke — any reply revives uart_last_ok_ms
     Serial.printf("DBG,uart_reinit n=%u\n", (unsigned)uart_reinits);
 }
@@ -7846,7 +7924,14 @@ static void drawUploadModal() {
     tft.setTextColor(TFT_WHITE, TFT_NAVY);
     tft.setTextDatum(textdatum_t::middle_center);
     tft.setTextPadding(UM_CARD_W - 40);
-    tft.drawString(phase, UM_CARD_X + UM_CARD_W / 2, UM_CARD_Y + 30);
+    // Append "n/N" when the batch has more than one file, so a multi-session
+    // drain shows which one it's on instead of looking like it restarted.
+    char phbuf[64];
+    if (uf.files_n > 1 && uf.files_idx < uf.files_n)
+        snprintf(phbuf, sizeof(phbuf), "%s  %d/%d", phase, uf.files_idx + 1, uf.files_n);
+    else
+        snprintf(phbuf, sizeof(phbuf), "%s", phase);
+    tft.drawString(phbuf, UM_CARD_X + UM_CARD_W / 2, UM_CARD_Y + 30);
     tft.setTextPadding(0);
 
     // Filename (truncated visually by the padded background).
@@ -7868,21 +7953,54 @@ static void drawUploadModal() {
     if (fillW > 0)
         tft.fillRect(UM_BAR_X + 2, UM_BAR_Y + 2, fillW, UM_BAR_H - 4, barColor);
 
-    // Bytes / percentage line
-    char line[64];
+    // ---- Bytes / percent / RATE / ETA (v0.1.136) ----
+    // Rate is sampled on a ~700 ms cadence and lightly smoothed: steady enough
+    // to read, but it visibly collapses toward 0 when the Teensy stalls, which
+    // is exactly when the driver wants to know something is wrong.
+    static uint32_t rt_last_ms   = 0;
+    static uint32_t rt_last_done = 0;
+    static float    rt_bps       = 0.0f;
+    {
+        const uint32_t nr = millis();
+        if (rt_last_ms == 0 || done < rt_last_done) {          // new file / reset
+            rt_last_ms = nr; rt_last_done = done; rt_bps = 0.0f;
+        } else if (nr - rt_last_ms >= 700) {
+            const float inst = (float)(done - rt_last_done) * 1000.0f
+                             / (float)(nr - rt_last_ms);
+            rt_bps     = (rt_bps <= 0.0f) ? inst : (rt_bps * 0.6f + inst * 0.4f);
+            rt_last_ms = nr; rt_last_done = done;
+        }
+    }
+    char line[80];
     const int pct = (int)((uint64_t)done * 100 / total);
-    if (upload_total >= 1024 * 1024) {
-        snprintf(line, sizeof(line), "%lu.%lu / %lu.%lu MB   %d%%",
-                 (unsigned long)(done  / (1024UL*1024UL)),
-                 (unsigned long)((done  % (1024UL*1024UL)) / 104858UL),   // 0-9 = 1/10 MB
-                 (unsigned long)(total / (1024UL*1024UL)),
-                 (unsigned long)((total % (1024UL*1024UL)) / 104858UL),
-                 pct);
+    if (upload_total <= 1) {
+        // Nothing known yet (Q,LIST/Q,GET outstanding) — say so instead of
+        // showing a meaningless "0 / 0 KB".
+        snprintf(line, sizeof(line), "reading queue...");
     } else {
-        snprintf(line, sizeof(line), "%lu / %lu KB   %d%%",
-                 (unsigned long)(done  / 1024UL),
-                 (unsigned long)(total / 1024UL),
-                 pct);
+        char amt[40], extra[32] = "";
+        if (upload_total >= 1024 * 1024)
+            snprintf(amt, sizeof(amt), "%lu.%lu / %lu.%lu MB  %d%%",
+                     (unsigned long)(done  / (1024UL*1024UL)),
+                     (unsigned long)((done  % (1024UL*1024UL)) / 104858UL),
+                     (unsigned long)(total / (1024UL*1024UL)),
+                     (unsigned long)((total % (1024UL*1024UL)) / 104858UL),
+                     pct);
+        else
+            snprintf(amt, sizeof(amt), "%lu / %lu KB  %d%%",
+                     (unsigned long)(done / 1024UL),
+                     (unsigned long)(total / 1024UL), pct);
+        if (rt_bps > 512.0f && done < total) {
+            const uint32_t eta = (uint32_t)(((float)(total - done)) / rt_bps);
+            if (eta < 6000) {
+                if (eta >= 60) snprintf(extra, sizeof(extra), "  %.0fK/s  %lu:%02lu",
+                                        rt_bps / 1024.0f,
+                                        (unsigned long)(eta / 60), (unsigned long)(eta % 60));
+                else           snprintf(extra, sizeof(extra), "  %.0fK/s  %lus",
+                                        rt_bps / 1024.0f, (unsigned long)eta);
+            }
+        }
+        snprintf(line, sizeof(line), "%s%s", amt, extra);
     }
     tft.setFont(&fonts::Font4);
     tft.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -10527,6 +10645,18 @@ void setup() {
     Serial.begin(921600);
     rxBuf.reserve(UART_LINE_MAX);
     delay(800);
+    // Discard whatever landed in the RX buffer during boot (v0.1.136). The ROM
+    // bootloader runs UART0 at 115200 while the Teensy is already transmitting
+    // at 921600, so the FIFO fills with framing garbage before our begin() —
+    // starting the line parser on that means the first lines are junk.
+    while (Serial.available()) (void)Serial.read();
+    rxBuf = "";
+    // We may have just rebooted (power blip / USB unplug) while the Teensy was
+    // mid-upload. It would then be stuck in its blocking retransmit loop with
+    // no telemetry for up to 120 s. Kill any such zombie stream immediately
+    // (v0.1.136) — harmless when there isn't one.
+    Serial.printf("Q,ABORT\n");
+    Serial.flush();
     Serial.printf("\n=== racecar-35 dash %s boot, firmware v%s ===\n",
                   DASH_BOARD_NAME, FIRMWARE_VERSION);
 

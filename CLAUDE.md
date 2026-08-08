@@ -498,6 +498,27 @@ VER,teensy,<semver>
   reports EFFECTIVE raw KB/s + ratio (`ZB <n> KB/s (<r>x)` on the Tools page; server logs
   `raw_bytes`/`raw_kbps`/`ratio` in the nettest event — `/nettest` stream-parses frame headers
   without inflating).
+- **⚠️ SD garbage collection after a delete kills the NEXT file (fixed v0.1.136).** Bench-proven
+  by tapping the dash's TX during a real upload: `Q,GET` → acks reach seq **26** → **90.8 s of
+  total silence** → `DBG,uf_timeout state=3 stalled at 5679/0 B` → retry → **15,000 lines at
+  250/s without a single pause**. The trigger is the PREVIOUS file's `Q,DEL`: deleting a
+  multi-MB file makes the card run internal GC, which then blocks the next file's reads.
+  Fixes: (1) **deletes are deferred to the END of the batch** (`uf.del_mask` bitmask,
+  `ufFlushPendingDeletes()` at `ufStartCurrentFile()`'s exhaustion path) so GC is off the
+  critical path — a lost delete is harmless because the server keys on session id with
+  `mode='w'`; (2) the `UF_STREAMING` watchdog now **distinguishes the two stalls**: ring
+  DRAINED + net task healthy = Teensy-side stall → retry after **20 s** (waiting does not help);
+  ring FULL = network stall → keep the full 90 s patience (v0.1.115).
+- **⚠️ Dash reboot → "never re-talks to the Teensy" (fixed v0.1.136).** It was never permanent,
+  just 60-120 s: the recovery watchdog waited a **20 s** boot grace then retried every **15 s**
+  (3-6 cycles). Compounding it, stray `Q,*` lines from a Teensy stuck in its BLOCKING ARQ
+  retransmit loop (which emits NO telemetry) still "parsed", so `uart_last_ok_ms` stayed fresh
+  and the watchdog never fired at all. Fixes: only **real telemetry** credits link health
+  (`uartLineIsTelemetry()` — GPS/ENG/ECU/IMU/TIME/HLTH/SD/CLD/ETH/VER/RST); first probe at
+  **4 s** then every **5 s** until telemetry appears (lazy 15 s once healthy); `Q,ABORT` is sent
+  at boot AND on every watchdog poke (the Teensy's ack pump matches it, freeing a zombie stream
+  instead of waiting out its 120 s patience); and the boot-time RX FIFO is drained because the
+  ROM bootloader runs UART0 at 115200 while the Teensy is already sending at 921600.
 - **⚠️ THE OTHER upload killer: a 17-line CFG burst every 5 s (fixed v0.1.135).** Found by
   putting a scope on the actual wire (`/dev/ttyUSB0` @921600 taps the dash's UART0 = the Teensy
   link): the dash was re-sending the ENTIRE config burst — 17 lines, ~500 bytes — **every 5
