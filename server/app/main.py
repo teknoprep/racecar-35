@@ -1938,24 +1938,26 @@ def _coach_prefs(user: str) -> dict:
     Default ON (that's the feature people expect); turn it off to keep the AI
     cost/latency on a manual, per-session click instead."""
     p = _coach_prefs_path(user)
-    out = {"auto": True}
+    out = {"auto": True, "tz": ""}
     if p.exists():
         try:
             d = json.loads(p.read_text("utf-8"))
             if isinstance(d, dict):
                 out["auto"] = bool(d.get("auto", True))
+                out["tz"] = str(d.get("tz", ""))[:64]
         except Exception:
             pass
     return out
 
 
-def _coach_set_prefs(user: str, auto: bool) -> dict:
+def _coach_set_prefs(user: str, auto: bool, tz: str = "") -> dict:
     p = _coach_prefs_path(user)
     p.parent.mkdir(parents=True, exist_ok=True)
+    d = {"auto": bool(auto), "tz": str(tz or "")[:64]}
     tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"auto": bool(auto)}), "utf-8")
+    tmp.write_text(json.dumps(d), "utf-8")
     tmp.replace(p)
-    return {"auto": bool(auto)}
+    return d
 
 
 def _coach_has_for_session(user: str, filename: str) -> bool:
@@ -2002,10 +2004,13 @@ def _coach_facts(user_dir: str, p: pathlib.Path) -> Optional[str]:
     return "\n".join(out)
 
 
-def _coach_analyze(user_dir: str, p: pathlib.Path, track: str) -> None:
+def _coach_analyze(user_dir: str, p: pathlib.Path, track: str,
+                   force: bool = False) -> None:
     """Background worker: review one freshly-uploaded session and file 1-3
     checklist items. Never raises into the request path."""
     try:
+        if not force and _coach_has_for_session(user_dir, p.name):
+            return                      # already reviewed (e.g. w then resumed a)
         facts = _coach_facts(user_dir, p)
         if not facts:
             return
@@ -2107,7 +2112,9 @@ async def coach_set_prefs(request: Request, user: str,
         body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
     except Exception:
         raise HTTPException(status_code=400, detail="invalid JSON body")
-    return JSONResponse({"ok": True, "prefs": _coach_set_prefs(d, bool(body.get("auto", True)))})
+    cur = _coach_prefs(d)
+    return JSONResponse({"ok": True, "prefs": _coach_set_prefs(
+        d, bool(body.get("auto", cur["auto"])), str(body.get("tz", cur["tz"])))})
 
 
 @app.post("/sessions/{user}/{filename}/coach")
@@ -2127,7 +2134,7 @@ async def session_coach_generate(request: Request, user: str, filename: str) -> 
         return JSONResponse({"ok": True, "already": True, "added": 0,
                             "detail": "this session has already been reviewed"})
     before = len(_coach_load(d))
-    _coach_analyze(d, p, _track_key(p.name))   # synchronous: the user clicked and is waiting
+    _coach_analyze(d, p, _track_key(p.name), force=True)   # synchronous + explicit
     items = _coach_load(d)
     added = [i for i in items if i.get("session") == p.name]
     return JSONResponse({"ok": True, "already": False,
@@ -2234,6 +2241,89 @@ async def admin_update_status(request: Request) -> JSONResponse:
                          "running_since": _PROC_START, "now": int(time.time())})
 
 
+_KNOWN_TRACKS: list = []
+
+@app.get("/tracks")
+async def known_tracks(request: Request) -> JSONResponse:
+    """Known track names for the rename dropdown — parsed once from the
+    S/F picker's embedded firmware TRACKS[] (kept current by the release
+    process), primary entries only."""
+    global _KNOWN_TRACKS
+    if not _KNOWN_TRACKS:
+        try:
+            import re as _re
+            html_src = (pathlib.Path(__file__).parent / "sf_picker.html").read_text("utf-8")
+            m = _re.search(r"const TRACKS = (\[.*?\]);", html_src, _re.S)
+            if m:
+                _KNOWN_TRACKS = sorted(t["name"] for t in json.loads(m.group(1))
+                                       if not t.get("aux"))
+        except Exception as e:
+            log.warning("tracks parse failed: %s", e)
+    return JSONResponse({"ok": True, "tracks": _KNOWN_TRACKS})
+
+
+@app.post("/sessions/{user}/{filename}/rename")
+async def session_rename(request: Request, user: str, filename: str) -> JSONResponse:
+    """Change a session's TRACK (renames the file to <sid>_<track>.ndjson and
+    moves every sidecar with it: AI history, lap exclusions, video link, share
+    tokens, coach items). Owner-or-admin."""
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    new_track = safe_name(str(body.get("track", "")).strip(), default="")
+    if not new_track:
+        raise HTTPException(status_code=400, detail="track required")
+    p = _resolve_session(user, filename)
+    d = safe_name(user)
+    sid = p.name.split("_", 1)[0]
+    suffix = "-combined.ndjson" if p.name.endswith("-combined.ndjson") else ".ndjson"
+    new_name = f"{sid}_{new_track}{suffix}"
+    if new_name == p.name:
+        return JSONResponse({"ok": True, "file": p.name, "unchanged": True})
+    dst = p.parent / new_name
+    if dst.exists():
+        raise HTTPException(status_code=409, detail=f"{new_name} already exists")
+    shutil.move(str(p), str(dst))
+    # sidecars — every one keyed by (user, filename)
+    for fn in (_ai_history_path, _lap_meta_path, _video_meta_path):
+        try:
+            src = fn(d, p.name)
+            if src.exists():
+                dstm = fn(d, new_name)
+                dstm.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dstm))
+        except Exception as e:
+            log.warning("rename sidecar %s failed: %s", fn.__name__, e)
+    try:   # share tokens reference the filename inside their json
+        if SHARE_DIR.exists():
+            for tf in SHARE_DIR.glob("*.json"):
+                try:
+                    td = json.loads(tf.read_text("utf-8"))
+                    if td.get("user") == d and td.get("filename") == p.name:
+                        td["filename"] = new_name
+                        tf.write_text(json.dumps(td), "utf-8")
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning("rename shares failed: %s", e)
+    try:   # coach items carry the session filename
+        items = _coach_load(d)
+        ch = False
+        for i in items:
+            if i.get("session") == p.name:
+                i["session"] = new_name
+                ch = True
+        if ch:
+            _coach_save(d, items)
+    except Exception:
+        pass
+    log.info("renamed %s/%s -> %s", d, p.name, new_name)
+    return JSONResponse({"ok": True, "file": new_name})
+
+
 @app.get("/coach", response_class=HTMLResponse)
 async def coach_page(request: Request) -> Response:
     """Driver checklist: open items with tick boxes + a ticked-off history.
@@ -2280,6 +2370,17 @@ Ticking an item here removes it from the dash — the dash only ever shows open 
     <div class="meta" id="automsg">When off, nothing is created on upload — generate it by hand
     from a session's review page.</div></div>
 </div>
+<div class="item" style="align-items:center">
+  <div class="txt"><b>Timezone</b>
+  <div class="meta">Stored preference (pages render in your browser's local time by default).</div></div>
+  <select id="tzsel" style="background:var(--bg);color:var(--text);border:1px solid var(--line);
+    border-radius:6px;padding:8px">
+    <option value="">(browser local)</option>
+    <option>America/New_York</option><option>America/Chicago</option>
+    <option>America/Denver</option><option>America/Phoenix</option>
+    <option>America/Los_Angeles</option><option>UTC</option>
+  </select>
+</div>
 <div id="open"></div>
 <h2>Ticked off</h2>
 <div id="done"></div>
@@ -2304,6 +2405,10 @@ function row(i){
 }
 let PREFS={auto:true};
 const autocb=document.getElementById('autocb');
+document.getElementById('tzsel').addEventListener('change', async (e)=>{
+  await fetch('/coach/'+encodeURIComponent(USER)+'/prefs',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({tz:e.target.value})});
+});
 autocb.addEventListener('click', async ()=>{
   PREFS.auto=!PREFS.auto;
   await fetch('/coach/'+encodeURIComponent(USER)+'/prefs',{method:'POST',
@@ -2314,6 +2419,7 @@ async function load(){
   const r=await fetch('/coach/'+encodeURIComponent(USER));
   const j=await r.json();
   PREFS=j.prefs||{auto:true};
+  try{ document.getElementById('tzsel').value = PREFS.tz||''; }catch(e){}
   autocb.textContent = PREFS.auto ? '\\u2713' : '';
   autocb.style.background = PREFS.auto ? 'var(--good)' : 'transparent';
   autocb.style.borderColor = PREFS.auto ? 'var(--good)' : 'var(--primary)';
@@ -2733,8 +2839,8 @@ async def _save_body(
                    "path": str(out_path.relative_to(DATA_DIR))})
     # Auto-coach: review this session in the BACKGROUND (never delays the dash's
     # upload response) and file 1-3 de-duplicated checklist items.
-    if kind != "debug" and mode == "w":
-        _coach_kick(email, out_path, track)
+    if kind != "debug":
+        _coach_kick(email, out_path, track)   # ok on mode=a == resumed file COMPLETED
     log.info(
         "received %s mode=%s email=%s session=%s%s track=%s bytes=%d lines=%d -> %s",
         request.client.host if request.client else "?",
@@ -5632,7 +5738,7 @@ def _user_chip_html(user: Optional[dict]) -> str:
     admin_link = ''
     if is_admin_email(str(user.get("email", ""))):
         admin_link = '<a class="btn" href="/admin">admin</a>'
-    return f'<span class="pill good">{email}</span><a class="btn" href="/account">account</a>{admin_link}<a class="btn" href="/logout">logout</a>'
+    return f'<span class="pill good">{email}</span><a class="btn" href="/coach">checklist</a><a class="btn" href="/account">account</a>{admin_link}<a class="btn" href="/logout">logout</a>'
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -7224,6 +7330,67 @@ _REVIEW_HTML = (
       b.addEventListener('click', ()=>{ el('ai-prompt').value=b.dataset.q; ask(); });
     });
     loadModels();
+
+    // ---- session tools: change TRACK + this session's coach checklist ----
+    (function(){
+      var row=document.createElement('div'); row.className='ai-row';
+      row.innerHTML='<label class="t-label">track '+
+        '<select id="trk-sel" class="cmp-input" style="width:auto;min-width:170px"></select></label>'+
+        '<input id="trk-custom" class="cmp-input" style="display:none;width:170px" placeholder="custom track name">'+
+        '<button id="trk-save" class="btn">rename session</button>'+
+        '<span class="t-label" id="trk-msg"></span>';
+      var host=el('ai-draw').parentNode; host.parentNode.insertBefore(row, host.nextSibling);
+      var chd=document.createElement('div'); chd.id='sess-coach';
+      host.parentNode.insertBefore(chd, row.nextSibling);
+      var sel=document.getElementById('trk-sel'), cus=document.getElementById('trk-custom'),
+          msg=document.getElementById('trk-msg');
+      fetch('/tracks').then(function(r){return r.json();}).then(function(j){
+        (j.tracks||[]).forEach(function(t){ var o=document.createElement('option');
+          o.value=t; o.textContent=t; sel.appendChild(o); });
+        var o=document.createElement('option'); o.value='__custom__'; o.textContent='(custom...)';
+        sel.appendChild(o);
+        var curTrack=FILE.replace(/^[0-9]+_/,'').replace(/(-combined)?\.ndjson$/,'').replace(/_/g,' ');
+        for(var i=0;i<sel.options.length;i++)
+          if(sel.options[i].value.toLowerCase().replace(/_/g,' ')===curTrack.toLowerCase()){sel.selectedIndex=i;break;}
+      });
+      sel.addEventListener('change', function(){ cus.style.display = sel.value==='__custom__' ? '' : 'none'; });
+      document.getElementById('trk-save').addEventListener('click', function(){
+        var t = sel.value==='__custom__' ? cus.value.trim() : sel.value;
+        if(!t){ msg.textContent='pick a track'; return; }
+        msg.textContent='renaming...';
+        fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/rename',
+              {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({track:t})})
+        .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+        .then(function(x){
+          if(!x.ok){ msg.textContent='error: '+(x.j.detail||'failed'); return; }
+          if(x.j.unchanged){ msg.textContent='already that track'; return; }
+          location.href='/review/'+encodeURIComponent(USER)+'/'+encodeURIComponent(x.j.file);
+        }).catch(function(e){ msg.textContent='failed: '+e.message; });
+      });
+      function loadSessCoach(){
+        fetch('/coach/'+encodeURIComponent(USER)).then(function(r){return r.json();}).then(function(j){
+          var items=(j.items||[]).filter(function(i){return i.session===FILE;});
+          if(!items.length){ chd.innerHTML=''; return; }
+          var h='<div class="t-label" style="margin:6px 0 4px">CHECKLIST FROM THIS SESSION</div>';
+          items.forEach(function(i){
+            h+='<div style="display:flex;gap:10px;align-items:center;margin:4px 0">'+
+               '<button class="btn sc-tick" data-id="'+i.id+'" '+(i.done?'disabled':'')+
+               ' style="min-width:34px">'+(i.done?'\u2713':'\u25a1')+'</button>'+
+               '<span style="'+(i.done?'opacity:.5':'')+'">'+
+               i.text.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</span></div>';
+          });
+          chd.innerHTML=h;
+          chd.querySelectorAll('.sc-tick').forEach(function(b){
+            b.addEventListener('click', function(){
+              fetch('/coach/'+encodeURIComponent(USER)+'/done',{method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({id:b.dataset.id,by:'web'})}).then(loadSessCoach);
+            });
+          });
+        }).catch(function(e){});
+      }
+      loadSessCoach();
+    })();
   })();
 })();
 </script>
