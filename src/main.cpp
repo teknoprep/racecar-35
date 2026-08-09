@@ -67,12 +67,13 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.143"
+#define FIRMWARE_VERSION "0.1.144"
 
 #include <SPI.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
 #include <SdFat.h>
+#include "zdeflate_teensy.h"   // compress session blocks BEFORE the UART bottleneck
 #include <TimeLib.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 #include <FreqMeasureMulti.h>
@@ -408,10 +409,15 @@ static void listSdContents();                     // SDLS diagnostic: dump /sess
 static void handleQList();                         // dash-initiated upload: list queue
 static void handleQGet(const char* basename);     // dash-initiated upload: stream file
 static void handleQDel(const char* basename);     // dash-initiated upload: delete file
+static void handleQPrevList();                    // archived /sessions files
+static void handleQArchive(const char* basename); // move uploaded queue file into history
+static void handleQLaps(const char* args);        // lap-time summary for on-SD review
 static void openCanSniff();                       // CAN sniffer: open /cansniff/ file
 static void closeCanSniff();                      // CAN sniffer: flush + close
 static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf);
 static void emitCanSniffStatus();                 // CANSNIFF wire emit to dash
+static bool q_get_previous = false;               // Q,PGET selects /sessions
+static bool q_del_previous = false;               // Q,PDEL selects /sessions
 // CAN sniffer state — declared early so handleDashCommand() (above pumpCAN)
 // can toggle it. Defined/used by the CAN + SD sections below.
 static bool     cansniff_active = false;
@@ -558,8 +564,24 @@ static void handleDashCommand(const String& line) {
     } else if (line == "Q,LIST") {
         handleQList();
     } else if (line.startsWith("Q,GET,")) {
+        q_get_previous = false;
         handleQGet(line.substring(6).c_str());
+    } else if (line.startsWith("Q,PGET,")) {
+        q_get_previous = true;
+        handleQGet(line.substring(7).c_str());
+        q_get_previous = false;
+    } else if (line == "Q,PLIST") {
+        handleQPrevList();
+    } else if (line.startsWith("Q,LAPS,")) {
+        handleQLaps(line.substring(7).c_str());
+    } else if (line.startsWith("Q,ARCHIVE,")) {
+        handleQArchive(line.substring(10).c_str());
+    } else if (line.startsWith("Q,PDEL,")) {
+        q_del_previous = true;
+        handleQDel(line.substring(7).c_str());
+        q_del_previous = false;
     } else if (line.startsWith("Q,DEL,")) {
+        q_del_previous = false;
         handleQDel(line.substring(6).c_str());
     } else if (line == "QUEUE,DRAIN") {
         // Dash UPLOAD button: kick the queue walker immediately instead of
@@ -2812,14 +2834,16 @@ static void scanQueue() {
 // Filename safety: callers may only reference files in /queue/. We sanitize
 // to a single path component (no '/' or '..') to avoid escapes.
 // ---------------------------------------------------------------------------
-static bool qBasenameSafe(const char* name, char* out, size_t out_sz) {
+static bool qBasenameSafeDir(const char* dir, const char* name, char* out, size_t out_sz) {
     if (!name || !*name) return false;
     for (const char* p = name; *p; ++p) {
         if (*p == '/' || *p == '\\' || *p == ' ') return false;
     }
     if (strstr(name, "..") != nullptr) return false;
-    if (snprintf(out, out_sz, "/queue/%s", name) >= (int)out_sz) return false;
-    return true;
+    return snprintf(out, out_sz, "%s/%s", dir, name) < (int)out_sz;
+}
+static bool qBasenameSafe(const char* name, char* out, size_t out_sz) {
+    return qBasenameSafeDir("/queue", name, out, out_sz);
 }
 
 static void handleQList() {
@@ -2852,6 +2876,98 @@ static void handleQList() {
     dir.close();
     DASH_SERIAL.println(F("Q,END"));
     Serial.printf("[Q] LIST: emitted %d file(s)\n", count);
+}
+
+static void handleQPrevList() {
+    if (!sdReady() || !sdFat.exists("/sessions")) {
+        DASH_SERIAL.println(F("Q,PEND")); return;
+    }
+    File32 dir;
+    if (!dir.open("/sessions", O_READ)) { DASH_SERIAL.println(F("Q,PEND")); return; }
+    File32 entry;
+    while (entry.openNext(&dir, O_READ)) {
+        if (!entry.isDir()) {
+            char name[80]; entry.getName(name, sizeof(name));
+            // Companion diagnostics stay archived but do not clutter the
+            // driver's session/lap browser.
+            if (strstr(name, ".dbg.ndjson") == nullptr)
+                DASH_SERIAL.printf("Q,PFILE,%s,%lu\n", name, (unsigned long)entry.fileSize());
+        }
+        entry.close();
+    }
+    dir.close();
+    DASH_SERIAL.println(F("Q,PEND"));
+}
+
+static void handleQArchive(const char* basename) {
+    char src[96], dst[96];
+    if (!qBasenameSafeDir("/queue", basename, src, sizeof(src)) ||
+        !qBasenameSafeDir("/sessions", basename, dst, sizeof(dst))) {
+        DASH_SERIAL.println(F("Q,ARCHIVE,FAIL,bad_name")); return;
+    }
+    if (!sdFat.exists("/sessions")) sdFat.mkdir("/sessions");
+    if (!sdFat.exists(src)) {
+        DASH_SERIAL.println(sdFat.exists(dst) ? F("Q,ARCHIVE,OK") : F("Q,ARCHIVE,FAIL,missing"));
+        return;
+    }
+    // A same-named archived session is already the durable copy. Remove the
+    // queue duplicate rather than overwriting history through a rename quirk.
+    if (sdFat.exists(dst)) {
+        if (sdFat.remove(src)) DASH_SERIAL.println(F("Q,ARCHIVE,OK"));
+        else DASH_SERIAL.println(F("Q,ARCHIVE,FAIL,remove"));
+    } else if (sdFat.rename(src, dst)) DASH_SERIAL.println(F("Q,ARCHIVE,OK"));
+    else DASH_SERIAL.println(F("Q,ARCHIVE,FAIL,rename"));
+    scanQueue(); emitCloudStatus();
+}
+
+static void handleQLaps(const char* args) {
+    // args: "C,<name>" (/queue/current) or "P,<name>" (/sessions/previous).
+    if (!args || args[0] == '\0' || args[1] != ',') { DASH_SERIAL.println(F("Q,LAPSEND,bad_args")); return; }
+    char path[112];
+    if (!qBasenameSafeDir(args[0] == 'P' ? "/sessions" : "/queue",
+                          args + 2, path, sizeof(path))) {
+        DASH_SERIAL.println(F("Q,LAPSEND,bad_name")); return;
+    }
+    File32 f;
+    if (!f.open(path, O_READ)) { DASH_SERIAL.println(F("Q,LAPSEND,open_failed")); return; }
+    char line[420]; size_t n = 0;
+    int current_lap = -1, emitted = 0;
+    double lap_start_ms = 0.0;
+    auto parseLapLine = [&]() {
+        line[n] = '\0';
+        const char* lp = strstr(line, "\"lap\":");
+        const char* tp = strstr(line, "\"t\":");
+        const char* mp = strstr(line, "\"t_ms\":");
+        if (lp && (tp || mp)) {
+            const int lap = atoi(lp + 6);
+            const double tm = tp ? strtod(tp + 4, nullptr) * 1000.0
+                                 : strtod(mp + 7, nullptr);
+            if (lap >= 1 && current_lap < 1) {
+                current_lap = lap; lap_start_ms = tm;
+            } else if (lap > current_lap && current_lap >= 1) {
+                const uint32_t dur = tm > lap_start_ms ? (uint32_t)(tm - lap_start_ms + 0.5) : 0;
+                if (dur >= 1000 && emitted < 64) {
+                    DASH_SERIAL.printf("Q,LAP,%d,%lu\n", current_lap, (unsigned long)dur);
+                    emitted++;
+                }
+                current_lap = lap; lap_start_ms = tm;
+            }
+        }
+        n = 0;
+    };
+    static uint8_t rb[4096];
+    while (true) {
+        const int rn = f.read(rb, sizeof(rb));
+        if (rn <= 0) break;
+        for (int i = 0; i < rn; ++i) {
+            const char ch = (char)rb[i];
+            if (ch == '\n') parseLapLine();
+            else if (ch != '\r' && n + 1 < sizeof(line)) line[n++] = ch;
+        }
+    }
+    if (n) parseLapLine();
+    f.close();
+    DASH_SERIAL.printf("Q,LAPSEND,%d\n", emitted);
 }
 
 // Wait for the dash to acknowledge the previous Q,L line. Per-line ACKs are
@@ -2890,7 +3006,8 @@ static long qPumpAcksOnce(long best) {
                 q_abort = true;
             } else if (strncmp(line, "UPLOAD,CANCEL", 13) == 0 ||
                        strncmp(line, "Q,LIST", 6) == 0 ||
-                       strncmp(line, "Q,GET,", 6) == 0) {
+                       strncmp(line, "Q,GET,", 6) == 0 ||
+                       strncmp(line, "Q,PGET,", 7) == 0) {
                 // v0.1.121: a NEW queue request (or an explicit cancel) arriving
                 // MID-STREAM means the dash abandoned this stream — without
                 // this, we'd sit DEAF in the (120 s patient) retransmit loop
@@ -2913,7 +3030,157 @@ static long qPumpAcksOnce(long best) {
     return best;
 }
 
+// CRC-protected, pre-UART compressed transfer (v0.1.144).
+//
+// The old Q,L protocol pushed the full NDJSON file over the 921600-baud link,
+// then compressed it on the display -- after the real bottleneck. Q,Z instead
+// deflates each 16 KB raw block on the 600 MHz Teensy, base64-wraps the
+// compressed bytes for coexistence with the line-oriented control protocol,
+// and lets the display forward the resulting native zblocks frames unchanged.
+// Typical session data shrinks 6-7x before it touches the long UART wire.
+// Large compressor scratch belongs in non-cached RAM2, not RAM1/stack. This
+// leaves the real-time loop and libraries their normal tightly-coupled RAM.
+DMAMEM static ZDeflWS qz_zws;
+DMAMEM static uint8_t qz_raw[ZDEF_BLOCK_MAX];
+DMAMEM static uint8_t qz_comp[ZDEF_BOUND(ZDEF_BLOCK_MAX)];
+DMAMEM static char qz_b64[((ZDEF_BOUND(ZDEF_BLOCK_MAX) + 2) / 3) * 4 + 1];
+
+static uint32_t qCrc32(const uint8_t* p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    while (n--) {
+        c ^= *p++;
+        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+static size_t qBase64(const uint8_t* in, size_t n, char* out, size_t cap) {
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const size_t need = ((n + 2) / 3) * 4;
+    if (cap <= need) return 0;
+    size_t i = 0, o = 0;
+    while (i < n) {
+        const size_t rem = n - i;
+        const uint32_t a = in[i++];
+        const uint32_t b = rem > 1 ? in[i++] : 0;
+        const uint32_t c = rem > 2 ? in[i++] : 0;
+        const uint32_t v = (a << 16) | (b << 8) | c;
+        out[o++] = tab[(v >> 18) & 63]; out[o++] = tab[(v >> 12) & 63];
+        out[o++] = rem > 1 ? tab[(v >> 6) & 63] : '=';
+        out[o++] = rem > 2 ? tab[v & 63] : '=';
+    }
+    out[o] = '\0';
+    return o;
+}
+
 static void handleQGet(const char* args) {
+    char namebuf[96];
+    uint32_t skip = 0;
+    strncpy(namebuf, args, sizeof(namebuf) - 1);
+    namebuf[sizeof(namebuf) - 1] = '\0';
+    if (char* comma = strrchr(namebuf, ',')) {
+        if (comma[1] >= '0' && comma[1] <= '9') {
+            skip = (uint32_t)strtoul(comma + 1, nullptr, 10);
+            *comma = '\0';
+        }
+    }
+    if (!sdReady()) { DASH_SERIAL.println(F("Q,ERR,nosd")); return; }
+    char path[96];
+    if (!qBasenameSafeDir(q_get_previous ? "/sessions" : "/queue",
+                          namebuf, path, sizeof(path))) {
+        DASH_SERIAL.println(F("Q,ERR,bad_name")); return;
+    }
+    File32 f;
+    if (!f.open(path, O_READ)) {
+        Serial.printf("[QZ] GET %s: open failed\n", path);
+        DASH_SERIAL.println(F("Q,ERR,open_failed"));
+        return;
+    }
+    const uint32_t raw_size = f.fileSize();
+
+    // Resume remains line-based because the server stores decoded NDJSON and
+    // reports its durable complete-line count. Seek to exactly that boundary.
+    if (skip) {
+        uint32_t skipped = 0, pos = 0;
+        static uint8_t sb[4096];
+        bool found = false;
+        while (!found) {
+            const int rn = f.read(sb, sizeof(sb));
+            if (rn <= 0) break;
+            for (int i = 0; i < rn; ++i) {
+                if (sb[i] == '\n' && ++skipped == skip) {
+                    pos += (uint32_t)i + 1; found = true; break;
+                }
+            }
+            if (!found) pos += (uint32_t)rn;
+        }
+        f.seekSet(pos);
+    }
+
+    DASH_SERIAL.printf("Q,ZDATA,%s,%lu\n", namebuf, (unsigned long)raw_size);
+    DASH_SERIAL.flush();
+    q_abort = false;
+
+    uint32_t seq = 1;             // compressed-frame sequence is per attempt
+    uint32_t total_lines = skip;
+    uint32_t retransmits = 0;
+
+    while (!q_abort) {
+        const int rn = f.read(qz_raw, sizeof(qz_raw));
+        if (rn <= 0) break;
+        uint32_t block_lines = 0;
+        for (int i = 0; i < rn; ++i) if (qz_raw[i] == '\n') block_lines++;
+        const size_t cn = zdeflate(&qz_zws, qz_raw, (size_t)rn,
+                                   qz_comp, sizeof(qz_comp));
+        const size_t bn = cn ? qBase64(qz_comp, cn, qz_b64, sizeof(qz_b64)) : 0;
+        if (!cn || !bn) {
+            f.close(); DASH_SERIAL.println(F("Q,ERR,compress_failed")); return;
+        }
+        const uint32_t crc = qCrc32(qz_comp, cn);
+
+        auto sendBlock = [&]() {
+            DASH_SERIAL.printf("Q,Z,%lu,%u,%lu,%u,%08lX,",
+                               (unsigned long)seq, (unsigned)rn,
+                               (unsigned long)block_lines, (unsigned)cn,
+                               (unsigned long)crc);
+            DASH_SERIAL.write((const uint8_t*)qz_b64, bn);
+            DASH_SERIAL.write('\n');
+            DASH_SERIAL.flush();
+        };
+        sendBlock();
+
+        bool acked = false;
+        long best = (long)seq - 1;
+        for (int attempt = 0; attempt < 20 && !acked && !q_abort; ++attempt) {
+            const uint32_t t0 = millis();
+            while (millis() - t0 < 2000) {
+                best = qPumpAcksOnce(best);
+                if (q_abort) break;
+                if (best >= (long)seq) { acked = true; break; }
+                delay(1);
+            }
+            if (!acked && !q_abort) { retransmits++; sendBlock(); }
+        }
+        if (q_abort) break;
+        if (!acked) {
+            f.close(); DASH_SERIAL.println(F("Q,ERR,ack_timeout")); return;
+        }
+        total_lines += block_lines;
+        seq++;
+    }
+    f.close();
+    if (q_abort) return;
+    DASH_SERIAL.printf("Q,EOF,%lu\n", (unsigned long)total_lines);
+    DASH_SERIAL.flush();
+    Serial.printf("[QZ] GET %s: raw=%lu lines=%lu blocks=%lu retransmits=%lu\n",
+                  namebuf, (unsigned long)raw_size, (unsigned long)total_lines,
+                  (unsigned long)(seq - 1), (unsigned long)retransmits);
+}
+
+// Legacy raw-line sender kept temporarily as a rollback/reference seam. New
+// lockstep firmware always enters handleQGet() above and advertises Q,ZDATA.
+static void handleQGetLegacy(const char* args) {
     // v0.1.113: args = "<basename>[,<skip_lines>]". skip_lines lets the dash
     // pull the file in PSRAM-sized SEGMENTS (store-and-forward upload): it
     // aborts the stream when its segment buffer fills, POSTs the segment with
@@ -3096,7 +3363,8 @@ static void handleQDel(const char* basename) {
         return;
     }
     char path[96];
-    if (!qBasenameSafe(basename, path, sizeof(path))) {
+    if (!qBasenameSafeDir(q_del_previous ? "/sessions" : "/queue",
+                          basename, path, sizeof(path))) {
         DASH_SERIAL.println(F("Q,DEL,FAIL,bad_name"));
         return;
     }
@@ -3105,6 +3373,11 @@ static void handleQDel(const char* basename) {
         return;
     }
     if (sdFat.remove(path)) {
+        if (q_del_previous) {
+            char dbg[112]; snprintf(dbg, sizeof(dbg), "%s", path);
+            char* ext = strstr(dbg, ".ndjson");
+            if (ext) { strcpy(ext, ".dbg.ndjson"); if (sdFat.exists(dbg)) sdFat.remove(dbg); }
+        }
         DASH_SERIAL.println(F("Q,DEL,OK"));
         scanQueue();
         emitCloudStatus();

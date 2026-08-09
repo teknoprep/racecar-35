@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.143"
+#define FIRMWARE_VERSION "0.1.144"
 
 #include <Preferences.h>
 #include <time.h>
@@ -114,6 +114,7 @@ enum UploadFlowState : uint8_t {
     UF_STREAM_FINISH,   // body sent, draining HTTP response from socket
     UF_DELETING,        // Q,DEL sent, awaiting Q,DEL,OK
     UF_RETRY_WAIT,      // stream failed once; brief pause, then re-Q,GET same file
+    UF_CANCELLING,      // local cancel requested; task/socket teardown in progress
     UF_DONE,
 };
 enum SessionsListState : uint8_t {
@@ -1665,6 +1666,7 @@ enum Page : uint8_t {
     PAGE_BT_SCAN       = 15,  // BLE OBD-II device scan + select
     PAGE_PID_SCAN      = 16,  // Mode-01 PID scan + map one to the COOLANT function
     PAGE_COACH         = 17,  // AI coach checklist: tap an item to tick it off
+    PAGE_LAP_REVIEW    = 18,  // on-SD session lap list opened from Sessions
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -1719,7 +1721,10 @@ static uint16_t gpsStatusColor(uint8_t s) {
 // NDJSON sample. The Teensy-side line buffer is 320 bytes, so 256 here was
 // too small and could drop perfectly valid samples mid-upload, leading to
 // Teensy-side ack_timeout failures. Keep this comfortably above that.
-static constexpr size_t UART_LINE_MAX = 512;
+// Q,Z carries one base64-wrapped compressed 16 KB raw block. Typical lines
+// are 2-4 KB; incompressible fallback is just under 22 KB. The hardware RX
+// ring is 32 KB, so keep one complete frame plus control traffic.
+static constexpr size_t UART_LINE_MAX = 24576;
 static String rxBuf;
 
 // ---------------------------------------------------------------------------
@@ -2282,6 +2287,7 @@ static void openUploadModal(const char* filename, uint32_t total) {
 struct UfPendingFile {
     char     name[80];
     uint32_t size;
+    bool     previous;   // true = archived /sessions file (re-upload, never auto-delete)
 };
 
 struct UploadFlow {
@@ -2332,8 +2338,10 @@ struct UploadFlow {
     // file streams car -> cloud in ONE continuous pass, and a slow network
     // shows up only as the ring filling (UART ARQ backpressure), never as a
     // blocked UI loop or a starved ACK stream.
-    volatile uint32_t ring_head;   // total bytes queued by the UART producer
-    volatile uint32_t ring_tail;   // total bytes sent by the net task
+    volatile uint32_t ring_head;   // encoded bytes queued by the UART producer
+    volatile uint32_t ring_tail;   // encoded bytes sent by the net task
+    volatile uint32_t raw_received;// raw NDJSON bytes represented by accepted Q,Z frames
+    bool              source_zblocks; // Teensy already compressed before UART
     volatile bool     net_eof;     // producer: file fully queued
     volatile bool     net_abort;   // loop asks the task to bail + close
     volatile uint8_t  net_state;   // 0 idle / 1 running / 2 done / 3 failed
@@ -2442,7 +2450,7 @@ static void ufFlushPendingDeletes() {
     if (!uf.del_mask) return;
     for (int i = 0; i < uf.files_n && i < 16; ++i) {
         if (uf.del_mask & (uint16_t)(1u << i)) {
-            Serial.printf("Q,DEL,%s\n", uf.files[i].name);
+            Serial.printf("Q,ARCHIVE,%s\n", uf.files[i].name);
             Serial.flush();
             delay(2);   // don't blast 16 deletes into one UART burst
         }
@@ -2470,6 +2478,8 @@ static void ufStartCurrentFile() {
     uf.bytes_written  = 0;
     uf.expected_size  = 0;
     uf.lines_recv     = 0;
+    uf.raw_received   = 0;
+    uf.source_zblocks = false;
     // v0.1.143: EVERY attempt asks the server what it already holds — not just
     // retries. The first attempt of a NEW batch used to go mode=w with skip=0,
     // OVERWRITING whatever a previous batch had banked (watched it happen:
@@ -2477,7 +2487,13 @@ static void ufStartCurrentFile() {
     // back to zero). Cross-batch resume is the whole point. The settle delay
     // also covers the Teensy's post-abort recovery, so ufFailOrRetry no longer
     // needs its own longer window.
-    resumeQueryKick();
+    if (uf.files[uf.files_idx].previous) {
+        // Explicit "re-upload previous" means overwrite/recreate the server
+        // copy even if /upload/progress says it already exists.
+        uf.skip_lines = 0; uf.resume_bytes = 0; uf.rq_state = 2;
+    } else {
+        resumeQueryKick();
+    }
     uf.retry_at_ms = millis() + 900;
     ufEnter(UF_RETRY_WAIT);
 }
@@ -2485,11 +2501,12 @@ static void ufStartCurrentFile() {
 // Emit the (possibly skip-resumed) Q,GET once the resume query has answered.
 // Called ONLY from the UF_RETRY_WAIT handler.
 static void ufSendQGet() {
+    const char* getcmd = uf.files[uf.files_idx].previous ? "Q,PGET" : "Q,GET";
     if (uf.skip_lines > 0)
-        Serial.printf("Q,GET,%s,%lu\n", uf.files[uf.files_idx].name,
+        Serial.printf("%s,%s,%lu\n", getcmd, uf.files[uf.files_idx].name,
                       (unsigned long)uf.skip_lines);
     else
-        Serial.printf("Q,GET,%s\n", uf.files[uf.files_idx].name);
+        Serial.printf("%s,%s\n", getcmd, uf.files[uf.files_idx].name);
     Serial.flush();
     ufEnter(UF_FETCH_HEAD);
 }
@@ -3091,11 +3108,17 @@ static void ufNetTask(void*) {
         }
         // Socket is up. NOW decide about compression, and only if there's
         // comfortable internal heap left over.
-        if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= ZB_MIN_FREE_INTERNAL) {
-            zbProbeCaps();                      // no-op once answered (per boot)
+        if (uf.source_zblocks) {
+            // Teensy compressed before the UART bottleneck. The ring already
+            // contains native ZB frames; forward them unchanged and spend no
+            // ESP internal heap/CPU on a redundant second compression pass.
+            zb_stream_on = false;
+        } else if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) >= ZB_MIN_FREE_INTERNAL) {
+            zbProbeCaps();                      // legacy raw sender fallback
             if (srv_zblocks == 1) zb_stream_on = zbEnsure();
         }
-        if (zb_stream_on) uf.tcp->printf("X-Body-Format: zblocks\r\n");
+        if (uf.source_zblocks || zb_stream_on)
+            uf.tcp->printf("X-Body-Format: zblocks\r\n");
         uf.tcp->printf("\r\n");                 // end of headers (see ufOpenStream)
         bool werr = false;
         while (!werr) {
@@ -3200,6 +3223,18 @@ struct SessionsList {
 };
 static SessionsList sl = {};
 static int sessions_scroll_y = 0;
+static bool sessions_previous_tab = false;
+
+struct LapReviewState {
+    char file[80];
+    uint32_t times_ms[64];
+    int lap_numbers[64];
+    int count;
+    bool loading;
+    bool dirty;
+    int page;
+};
+static LapReviewState lap_review = {};
 
 static void slReset() {
     memset(&sl, 0, sizeof(sl));
@@ -3225,6 +3260,7 @@ static void ufStartSelected() {
         strncpy(uf.files[uf.files_n].name, sl.files[i], sizeof(uf.files[0].name) - 1);
         uf.files[uf.files_n].name[sizeof(uf.files[0].name) - 1] = '\0';
         uf.files[uf.files_n].size = sl.sizes[i];
+        uf.files[uf.files_n].previous = sessions_previous_tab;
         uf.files_n++;
     }
     if (uf.files_n == 0) { ufEnter(UF_DONE); return; }
@@ -3235,7 +3271,7 @@ static void ufStartSelected() {
 static void sessionsRequestList() {
     slReset();
     slEnter(SL_LISTING);
-    Serial.println("Q,LIST");
+    Serial.println(sessions_previous_tab ? "Q,PLIST" : "Q,LIST");
     Serial.flush();
 }
 
@@ -3257,8 +3293,47 @@ static void slStartDelete(bool delete_all) {
     sl.del_idx = sl_next_to_delete(0);
     if (sl.del_idx < 0) return;                // nothing selected
     slEnter(SL_DELETING);
-    Serial.printf("Q,DEL,%s\n", sl.files[sl.del_idx]);
+    Serial.printf(sessions_previous_tab ? "Q,PDEL,%s\n" : "Q,DEL,%s\n",
+                  sl.files[sl.del_idx]);
     Serial.flush();
+}
+
+static uint32_t ufCrc32Ring(uint32_t pos, uint32_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    while (n--) {
+        c ^= uf.buf[pos++ % uf.bufcap];
+        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+static int ufB64Val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+// Decode base64 directly into an uncommitted part of the PSRAM ring. ring_head
+// is advanced only after length + CRC validate, so a corrupt long-wire frame
+// is harmless and the Teensy simply retransmits it.
+static bool ufDecodeB64Ring(const char* s, uint32_t out_pos, uint32_t want) {
+    uint32_t out = 0, acc = 0; int bits = 0;
+    for (; *s; ++s) {
+        if (*s == '=') break;
+        const int v = ufB64Val(*s);
+        if (v < 0) return false;
+        acc = (acc << 6) | (uint32_t)v; bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (out >= want) return false;
+            uf.buf[(out_pos + out) % uf.bufcap] = (uint8_t)((acc >> bits) & 0xFF);
+            out++;
+        }
+    }
+    return out == want;
 }
 
 static bool parseQLine(const String& line) {
@@ -3271,11 +3346,30 @@ static bool parseQLine(const String& line) {
     // Q,DEL,OK | Q,DEL,FAIL,<reason>
     const char* p = line.c_str() + 2;   // skip 'Q,'
 
+    if (strncmp(p, "LAP,", 4) == 0 && lap_review.loading) {
+        const char* a = p + 4; char* e = nullptr;
+        const int lapn = (int)strtol(a, &e, 10);
+        if (e && *e == ',' && lap_review.count < 64) {
+            lap_review.lap_numbers[lap_review.count] = lapn;
+            lap_review.times_ms[lap_review.count] = (uint32_t)strtoul(e + 1, nullptr, 10);
+            lap_review.count++;
+            // Paint once at LAPSEND, not once per UART row (no flashing).
+        }
+        return true;
+    }
+    if (strncmp(p, "LAPSEND", 7) == 0 && lap_review.loading) {
+        lap_review.loading = false;
+        lap_review.dirty = true;
+        return true;
+    }
+
     // PAGE_SESSIONS consumer (preferred when it's actively listing/deleting).
     // Yields to an active UPLOAD listing so a stuck/lingering SL_LISTING can't
     // hijack the upload's Q,FILE/Q,END responses (-> upload sees an empty queue).
-    if (strncmp(p, "FILE,", 5) == 0 && sl.state == SL_LISTING && uf.state != UF_LISTING) {
-        const char* rest = p + 5;
+    const bool sl_file_line = (!sessions_previous_tab && strncmp(p, "FILE,", 5) == 0)
+                           || ( sessions_previous_tab && strncmp(p, "PFILE,", 6) == 0);
+    if (sl_file_line && sl.state == SL_LISTING && uf.state != UF_LISTING) {
+        const char* rest = p + (sessions_previous_tab ? 6 : 5);
         const char* comma = strchr(rest, ',');
         if (!comma || sl.count >= SESSIONS_MAX_FILES) return true;
         const size_t name_len = (size_t)(comma - rest);
@@ -3285,10 +3379,13 @@ static bool parseQLine(const String& line) {
         sl.sizes[sl.count] = (uint32_t)strtoul(comma + 1, nullptr, 10);
         sl.selected[sl.count] = false;
         sl.count++;
-        sl.dirty = true;
+        // Batch paint at END/PEND; repainting the whole list per FILE line
+        // was the other source of visible flashing on page entry.
         return true;
     }
-    if (strncmp(p, "END", 3) == 0 && sl.state == SL_LISTING && uf.state != UF_LISTING) {
+    if (((!sessions_previous_tab && strncmp(p, "END", 3) == 0) ||
+         ( sessions_previous_tab && strncmp(p, "PEND", 4) == 0)) &&
+        sl.state == SL_LISTING && uf.state != UF_LISTING) {
         slEnter(SL_IDLE);
         return true;
     }
@@ -3305,7 +3402,8 @@ static bool parseQLine(const String& line) {
             sessionsRequestList();
         } else {
             sl.del_idx = next;
-            Serial.printf("Q,DEL,%s\n", sl.files[sl.del_idx]);
+            Serial.printf(sessions_previous_tab ? "Q,PDEL,%s\n" : "Q,DEL,%s\n",
+                          sl.files[sl.del_idx]);
             Serial.flush();
             sl.state_entered_ms = millis();
         }
@@ -3322,6 +3420,7 @@ static bool parseQLine(const String& line) {
         memcpy(uf.files[uf.files_n].name, rest, name_len);
         uf.files[uf.files_n].name[name_len] = '\0';
         uf.files[uf.files_n].size = (uint32_t)strtoul(comma + 1, nullptr, 10);
+        uf.files[uf.files_n].previous = false;
         uf.files_n++;
         return true;
     }
@@ -3333,8 +3432,9 @@ static bool parseQLine(const String& line) {
         }
         return true;
     }
-    if (strncmp(p, "DATA,", 5) == 0 && uf.state == UF_FETCH_HEAD) {
-        const char* rest = p + 5;
+    const bool is_zdata = (strncmp(p, "ZDATA,", 6) == 0);
+    if ((is_zdata || strncmp(p, "DATA,", 5) == 0) && uf.state == UF_FETCH_HEAD) {
+        const char* rest = p + (is_zdata ? 6 : 5);
         const char* comma = strchr(rest, ',');
         if (!comma) return true;
         const uint32_t sz = (uint32_t)strtoul(comma + 1, nullptr, 10);
@@ -3361,9 +3461,12 @@ static bool parseQLine(const String& line) {
         uf.bufcap        = cap;
         uf.buflen        = 0;
         uf.lines_recv    = 0;
-        // Resume: the Teensy numbers the first line it SENDS as skip+1, so the
-        // ARQ dedup must expect exactly that (v0.1.140).
-        uf.next_seq      = uf.skip_lines + 1;
+        uf.raw_received  = 0;
+        uf.source_zblocks = is_zdata;
+        // Raw Q,L sequence numbers are absolute line numbers. Compressed Q,Z
+        // frames use a fresh per-attempt block sequence beginning at one;
+        // durable resume remains the server's decoded complete-line count.
+        uf.next_seq      = is_zdata ? 1 : (uf.skip_lines + 1);
         // PROGRESS-AWARE RETRY BUDGET (v0.1.141). The 6-attempt cap exists to
         // stop futile loops - but with resume, an attempt that BANKED lines is
         // not futile. If the server holds more than it did last attempt, reset
@@ -3398,6 +3501,52 @@ static bool parseQLine(const String& line) {
         ufEnter(UF_STREAMING);
         return true;
     }
+    // Pre-UART compressed block from Teensy:
+    // Z,<seq>,<raw_len>,<line_count>,<comp_len>,<crc32hex>,<base64>
+    if (strncmp(p, "Z,", 2) == 0 && uf.state == UF_STREAMING && uf.source_zblocks) {
+        const char* s0 = p + 2; char* e = nullptr;
+        const uint32_t seq = (uint32_t)strtoul(s0, &e, 10); if (!e || *e++ != ',') return true;
+        const uint32_t raw_n = (uint32_t)strtoul(e, &e, 10); if (!e || *e++ != ',') return true;
+        const uint32_t line_n = (uint32_t)strtoul(e, &e, 10); if (!e || *e++ != ',') return true;
+        const uint32_t comp_n = (uint32_t)strtoul(e, &e, 10); if (!e || *e++ != ',') return true;
+        const uint32_t crc = (uint32_t)strtoul(e, &e, 16); if (!e || *e++ != ',') return true;
+        const char* b64 = e;
+
+        if (seq == uf.next_seq) {
+            if (!uf.buf || raw_n == 0 || raw_n > ZDEF_BLOCK_MAX ||
+                comp_n == 0 || comp_n > ZDEF_BOUND(ZDEF_BLOCK_MAX)) return true;
+            const uint32_t need = comp_n + 10;  // native server zblocks frame
+            const uint32_t free_b = uf.bufcap - (uf.ring_head - uf.ring_tail);
+            if (free_b < need) return true;     // backpressure: no ACK -> retransmit
+
+            const uint32_t frame = uf.ring_head;
+            // Frame header expected by server._zb_decode: 'ZB', raw LE32, comp LE32.
+            const uint8_t hdr[10] = {
+                'Z','B', (uint8_t)raw_n, (uint8_t)(raw_n >> 8),
+                (uint8_t)(raw_n >> 16), (uint8_t)(raw_n >> 24),
+                (uint8_t)comp_n, (uint8_t)(comp_n >> 8),
+                (uint8_t)(comp_n >> 16), (uint8_t)(comp_n >> 24)
+            };
+            for (uint32_t i = 0; i < 10; ++i) uf.buf[(frame + i) % uf.bufcap] = hdr[i];
+            if (!ufDecodeB64Ring(b64, frame + 10, comp_n) ||
+                ufCrc32Ring(frame + 10, comp_n) != crc) {
+                // Corrupt/noisy frame: leave ring_head untouched and re-ACK
+                // the last good block. Sender retransmits this exact frame.
+                Serial.printf("Q,A,%lu\n", (unsigned long)(uf.next_seq - 1));
+                Serial.flush();
+                return true;
+            }
+            uf.ring_head += need;
+            uf.raw_received += raw_n;
+            uf.lines_recv += line_n;
+            uf.next_seq++;
+        }
+        uf.last_rx_ms = millis();
+        Serial.printf("Q,A,%lu\n", (unsigned long)(uf.next_seq - 1));
+        Serial.flush();
+        return true;
+    }
+
     if (strncmp(p, "L,", 2) == 0 && uf.state == UF_STREAMING) {
         // Sequence-numbered line: L,<seq>,<data>. Stop-and-wait ARQ so a
         // dropped/corrupted byte on the UART wire costs one retransmit, not the
@@ -3464,7 +3613,8 @@ static bool parseQLine(const String& line) {
                           uf.files[uf.files_idx].name, (unsigned long)uf.skip_lines);
             ufStopNetTask();
             ufCloseTcp();
-            uf.del_mask |= (uint16_t)(1u << uf.files_idx);
+            if (!uf.files[uf.files_idx].previous)
+                uf.del_mask |= (uint16_t)(1u << uf.files_idx);
             uf.uploaded++;
             ufNextFile();
             return true;
@@ -3534,6 +3684,19 @@ static int ufParseResponse(char* body_snip, size_t body_snip_sz) {
 }
 
 static void uploadTick() {
+    // Cancellation is local-first: the UI returns immediately, while this
+    // lightweight state waits for the core-0 owner to release its socket/ring.
+    // Never retry and never wait for the obsolete UPLOAD,DONE,CANCELLED flow.
+    if (uf.state == UF_CANCELLING) {
+        if (uf.net_state == 1 && millis() - uf.state_entered_ms < 3000) return;
+        ufStopNetTask();
+        ufCloseTcp();
+        ufFreeBuf();
+        memset(&uf, 0, sizeof(uf));
+        uf.state = UF_IDLE;
+        upload_locally_cancelled = false;
+        return;
+    }
     // Scheduled single-retry of the current file (see ufFailOrRetry).
     if (uf.state == UF_RETRY_WAIT) {
         // Wait for BOTH the settle timer and the resume query (rq_state 1 =
@@ -3567,7 +3730,8 @@ static void uploadTick() {
             // at 62% SHOWS 62% instead of restarting the bar at zero.
             done = uf.resume_bytes
                  + ((uf.state == UF_STREAMING || uf.state == UF_STREAM_FINISH)
-                    ? uf.ring_head : uf.bytes_written);
+                    ? (uf.source_zblocks ? uf.raw_received : uf.ring_head)
+                    : uf.bytes_written);
         }
         // Redraw throttle (v0.1.136). `done` advances on EVERY Q,L line
         // (~250/s measured), and each modal redraw repaints several
@@ -3616,7 +3780,8 @@ static void uploadTick() {
                 // therefore deferred to the END of the batch, off the critical
                 // path. Losing a delete is harmless — the server keys on
                 // session id with mode='w', so a re-upload just overwrites.
-                uf.del_mask |= (uint16_t)(1u << uf.files_idx);
+                if (!uf.files[uf.files_idx].previous)
+                    uf.del_mask |= (uint16_t)(1u << uf.files_idx);
                 uf.uploaded++;
                 ufNextFile();
             } else {
@@ -4110,6 +4275,8 @@ static void uploadTick();
 static void handleSessionsTap(int x, int y);
 static void drawSessionsPage();
 static void sessionsRequestList();
+static void drawLapReviewPage();
+static void handleLapReviewTap(int x, int y);
 static void drawOtaModal();
 static void handleOtaModalTap(int x, int y);
 static void otaTick();
@@ -4300,7 +4467,7 @@ static void handleTouch() {
         tt.startMs = millis();
         tt.active  = true;
         tt.gesture = GESTURE_NONE;
-        tt.scrollAtStart = settingsScrollY;
+        tt.scrollAtStart = (currentPage == PAGE_SESSIONS) ? sessions_scroll_y : settingsScrollY;
         Serial.printf("TS x=%ld y=%ld pg=%d\n", (long)x, (long)y, (int)currentPage);  // TEMP touch debug
         // Slider grab: claim the gesture so swipe/scroll can't steal it, and
         // apply immediately so a plain tap also sets the value.
@@ -4332,7 +4499,8 @@ static void handleTouch() {
         // Classify on first significant movement.
         if (tt.gesture == GESTURE_NONE
             && (abs(dxFromStart) > GESTURE_THRESH || abs(dyFromStart) > GESTURE_THRESH)) {
-            if (currentPage == PAGE_SETTINGS && abs(dyFromStart) > abs(dxFromStart)) {
+            if ((currentPage == PAGE_SETTINGS || currentPage == PAGE_SESSIONS)
+                && abs(dyFromStart) > abs(dxFromStart)) {
                 tt.gesture = GESTURE_DRAG_V;
             } else {
                 tt.gesture = GESTURE_SWIPE_H;
@@ -4340,9 +4508,15 @@ static void handleTouch() {
         }
 
         if (tt.gesture == GESTURE_DRAG_V) {
-            settingsScrollY = tt.scrollAtStart - dyFromStart;
-            clampSettingsScroll();
-            settingsDirty = true;
+            if (currentPage == PAGE_SESSIONS) {
+                const int maxScroll = max(0, sl.count * 36 - (334 - 92));
+                sessions_scroll_y = constrain(tt.scrollAtStart - dyFromStart, 0, maxScroll);
+                sl.dirty = true;
+            } else {
+                settingsScrollY = tt.scrollAtStart - dyFromStart;
+                clampSettingsScroll();
+                settingsDirty = true;
+            }
         }
 
         tt.lastX = x; tt.lastY = y;
@@ -4411,6 +4585,7 @@ static void handleTouch() {
                 else if (currentPage == PAGE_TOOLS)    handleToolsTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_STATUS)   handleStatusTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_SESSIONS) handleSessionsTap(tt.startX, tt.startY);
+                else if (currentPage == PAGE_LAP_REVIEW) handleLapReviewTap(tt.startX, tt.startY);
             }
         }
         tt.active = false;
@@ -8217,13 +8392,13 @@ static void handleWifiScannerTap(int x, int y) {
 
 // ---------------------------------------------------------------------------
 // Upload progress modal — full-screen, blocks all other input. Driven by the
-// Teensy's UPLOAD,START/PROG/DONE lines emitted from httpPost() while it
-// streams a session/queue file. Only escape is the CANCEL button, which
-// emits UPLOAD,CANCEL to the Teensy. After CANCEL, no further uploads will
-// start until the system is power-cycled (the Teensy latches uploads_disabled).
+// dash-driven Q,* uploader. CANCEL is local-first: Q,ABORT releases the
+// Teensy sender, the net task is asked to stop, and the UI returns immediately.
 // ---------------------------------------------------------------------------
 namespace {
-    constexpr int UM_CARD_X = 100, UM_CARD_Y = 110, UM_CARD_W = 600, UM_CARD_H = 260;
+    // Taller card: the old 260 px card put status text at y=296/318 directly
+    // ON TOP of the cancel button at y=300..356.
+    constexpr int UM_CARD_X = 100, UM_CARD_Y = 75, UM_CARD_W = 600, UM_CARD_H = 335;
     constexpr int UM_BAR_X  = UM_CARD_X + 30, UM_BAR_Y = UM_CARD_Y + 130;
     constexpr int UM_BAR_W  = UM_CARD_W - 60, UM_BAR_H = 32;
     constexpr int UM_BTN_X  = UM_CARD_X + (UM_CARD_W - 220) / 2;
@@ -8261,6 +8436,7 @@ static void drawUploadModal() {
         case UF_STREAMING:     phase = "Streaming to cloud...";  break;
         case UF_POSTING:       phase = "Streaming to cloud...";  break;
         case UF_RETRY_WAIT:    phase = "Stalled - retrying";     break;
+        case UF_CANCELLING:    phase = "Cancelling...";          break;
         case UF_STREAM_FINISH: phase = "Finalizing...";          break;
         case UF_DELETING:      phase = "Cleaning up...";      break;
         default: break;
@@ -8409,23 +8585,26 @@ static void drawUploadModal() {
 }
 
 static void handleUploadModalTap(int x, int y) {
-    // Only the CANCEL button is tappable. Everything else: ignored.
+    // Only the CANCEL button is tappable. Cancellation belongs to the DASH's
+    // Q,* state machine now -- UPLOAD,CANCEL was the obsolete Teensy-initiated
+    // uploader and could leave this modal waiting 20-120 seconds for an ACK
+    // that never exists.
     if (x >= UM_BTN_X && x <= UM_BTN_X + UM_BTN_W &&
         y >= UM_BTN_Y && y <= UM_BTN_Y + UM_BTN_H) {
-        if (!upload_locally_cancelled) {
-            Serial.println("UPLOAD,CANCEL");
-            upload_locally_cancelled = true;
-        }
-        // Update button to a 'cancelling...' indication while waiting for
-        // the Teensy's DONE,CANCELLED ack.
-        tft.fillRect(UM_BTN_X, UM_BTN_Y, UM_BTN_W, UM_BTN_H, TFT_DARKGREY);
-        tft.drawRect(UM_BTN_X, UM_BTN_Y, UM_BTN_W, UM_BTN_H, TFT_WHITE);
-        tft.setFont(&fonts::Font4);
-        tft.setTextSize(1);
-        tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
-        tft.setTextDatum(textdatum_t::middle_center);
-        tft.drawString("CANCELLING...", UM_BTN_X + UM_BTN_W/2, UM_BTN_Y + UM_BTN_H/2);
-        tft.setTextDatum(textdatum_t::top_left);
+        if (uf.state == UF_CANCELLING || uf.state == UF_IDLE) return;
+        Serial.println("Q,ABORT");
+        Serial.flush();
+        uf.net_abort = true;
+        ufEnter(UF_CANCELLING);
+
+        // Return control instantly. uploadTick() performs bounded asynchronous
+        // task/socket cleanup; a blocked Teensy consumes Q,ABORT when it wakes.
+        upload_active = false;
+        upload_result_msg[0] = '\0';
+        currentPage = (Page)upload_return_page;
+        pageJustEntered = true;
+        settingsDirty = true;
+        invalidateAll();
     }
 }
 
@@ -10187,19 +10366,21 @@ static void handleToolsTap(int x, int y) {
 namespace {
     constexpr int SES_HEAD_Y       = 0;
     constexpr int SES_HEAD_H       = 42;
-    constexpr int SES_BODY_TOP     = 52;
-    constexpr int SES_BODY_BOTTOM  = 400;   // leaves room for footer
+    constexpr int SES_TAB_Y        = 44;
+    constexpr int SES_TAB_H        = 42;
+    constexpr int SES_BODY_TOP     = 92;
+    constexpr int SES_BODY_BOTTOM  = 334;   // leaves room for action footer
     constexpr int SES_ROW_H        = 36;
     constexpr int SES_ROW_PAD_Y    = 4;
     constexpr int SES_CB_X         = 16;    // checkbox left
     constexpr int SES_CB_SIZE      = 22;    // checkbox edge length
     constexpr int SES_NAME_X       = 54;    // filename left
     constexpr int SES_SIZE_X       = 670;   // right-aligned size
-    constexpr int SES_FOOT_Y       = 408;
+    constexpr int SES_FOOT_Y       = 344;
     constexpr int SES_FOOT_H       = 64;
-    constexpr int SES_BTN_UP_X     = 16;    // Upload (n) — selected files only
+    constexpr int SES_BTN_UP_X     = 16;
     constexpr int SES_BTN_DEL_X    = 280;
-    constexpr int SES_BTN_DELALL_X = 544;
+    constexpr int SES_BTN_REV_X    = 544;
     constexpr int SES_BTN_W        = 240;
     constexpr int SES_BTN_H        = SES_FOOT_H;
 }
@@ -10237,10 +10418,23 @@ static void drawSessionsPage() {
     } else if (sl.state == SL_DELETING) {
         snprintf(hdr, sizeof(hdr), "deleting %d / %d", sl.del_done, sl.del_done + sl.del_fail + 1);
     } else {
-        snprintf(hdr, sizeof(hdr), "%d in queue", sl.count);
+        snprintf(hdr, sizeof(hdr), "%d %s", sl.count,
+                 sessions_previous_tab ? "previous" : "current");
     }
     tft.drawString(hdr, 784, SES_HEAD_Y + SES_HEAD_H / 2);
     tft.fillRect(0, SES_HEAD_Y + SES_HEAD_H - 1, 800, 1, TFT_DARKGREY);
+
+    // Current / Previous tabs. Current = queue still needing action; Previous
+    // = archived sessions retained on SD after a successful upload.
+    const uint16_t curc = sessions_previous_tab ? TFT_DARKGREY : TFT_NAVY;
+    const uint16_t prevc = sessions_previous_tab ? TFT_NAVY : TFT_DARKGREY;
+    tft.fillRect(16, SES_TAB_Y, 376, SES_TAB_H, curc);
+    tft.fillRect(408, SES_TAB_Y, 376, SES_TAB_H, prevc);
+    tft.drawRect(16, SES_TAB_Y, 376, SES_TAB_H, TFT_WHITE);
+    tft.drawRect(408, SES_TAB_Y, 376, SES_TAB_H, TFT_WHITE);
+    tft.setFont(&fonts::Font4); tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, curc); tft.drawString("CURRENT", 204, SES_TAB_Y + SES_TAB_H/2);
+    tft.setTextColor(TFT_WHITE, prevc); tft.drawString("PREVIOUS", 596, SES_TAB_Y + SES_TAB_H/2);
 
     // Body: scrollable list. Each row gets a checkbox, filename, size.
     tft.setTextDatum(textdatum_t::middle_left);
@@ -10251,7 +10445,9 @@ static void drawSessionsPage() {
         if (sl.state == SL_LISTING)
             tft.drawString("loading queue...", 400, SES_BODY_TOP + 80);
         else
-            tft.drawString("no queued sessions", 400, SES_BODY_TOP + 80);
+            tft.drawString(sessions_previous_tab ? "no previous sessions on SD"
+                                                    : "nothing waiting to upload",
+                           400, SES_BODY_TOP + 80);
     } else {
         for (int i = 0; i < sl.count; ++i) {
             const int y = SES_BODY_TOP + SES_ROW_PAD_Y + i * SES_ROW_H - sessions_scroll_y;
@@ -10282,23 +10478,23 @@ static void drawSessionsPage() {
         }
     }
 
-    // Footer: Upload selected / Delete selected / Delete All.
+    // Footer: selected sessions can be uploaded, deleted, or reviewed.
     const int selected_n = sessions_selected_count();
-    const bool up_enabled   = sl.state == SL_IDLE && selected_n > 0;
-    const bool del_enabled  = sl.state == SL_IDLE && selected_n > 0;
-    const bool dall_enabled = sl.state == SL_IDLE && sl.count > 0;
-    const uint16_t up_fill   = up_enabled   ? TFT_DARKGREEN : TFT_DARKGREY;
-    const uint16_t del_fill  = del_enabled  ? TFT_MAROON : TFT_DARKGREY;
-    const uint16_t dall_fill = dall_enabled ? TFT_RED    : TFT_DARKGREY;
+    const bool up_enabled  = sl.state == SL_IDLE && selected_n > 0;
+    const bool del_enabled = sl.state == SL_IDLE && selected_n > 0;
+    const bool rev_enabled = sl.state == SL_IDLE && selected_n == 1 && !recording;
+    const uint16_t up_fill  = up_enabled  ? TFT_DARKGREEN : TFT_DARKGREY;
+    const uint16_t del_fill = del_enabled ? TFT_MAROON : TFT_DARKGREY;
+    const uint16_t rev_fill = rev_enabled ? TFT_NAVY : TFT_DARKGREY;
     tft.fillRect(SES_BTN_UP_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, up_fill);
     tft.drawRect(SES_BTN_UP_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, TFT_WHITE);
     tft.drawRect(SES_BTN_UP_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
     tft.fillRect(SES_BTN_DEL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, del_fill);
     tft.drawRect(SES_BTN_DEL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, TFT_WHITE);
     tft.drawRect(SES_BTN_DEL_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
-    tft.fillRect(SES_BTN_DELALL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, dall_fill);
-    tft.drawRect(SES_BTN_DELALL_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, TFT_WHITE);
-    tft.drawRect(SES_BTN_DELALL_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
+    tft.fillRect(SES_BTN_REV_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, rev_fill);
+    tft.drawRect(SES_BTN_REV_X, SES_FOOT_Y, SES_BTN_W, SES_BTN_H, TFT_WHITE);
+    tft.drawRect(SES_BTN_REV_X + 1, SES_FOOT_Y + 1, SES_BTN_W - 2, SES_BTN_H - 2, TFT_WHITE);
     tft.setFont(&fonts::Font4);
     tft.setTextDatum(textdatum_t::middle_center);
     tft.setTextColor(TFT_WHITE, up_fill);
@@ -10311,12 +10507,21 @@ static void drawSessionsPage() {
     if (selected_n > 0) snprintf(delLabel, sizeof(delLabel), "Delete (%d)", selected_n);
     else                snprintf(delLabel, sizeof(delLabel), "Delete");
     tft.drawString(delLabel, SES_BTN_DEL_X + SES_BTN_W / 2, SES_FOOT_Y + SES_BTN_H / 2);
-    tft.setTextColor(TFT_WHITE, dall_fill);
-    tft.drawString("Delete all", SES_BTN_DELALL_X + SES_BTN_W / 2, SES_FOOT_Y + SES_BTN_H / 2);
+    tft.setTextColor(TFT_WHITE, rev_fill);
+    tft.drawString("Review", SES_BTN_REV_X + SES_BTN_W / 2, SES_FOOT_Y + SES_BTN_H / 2);
     tft.setTextDatum(textdatum_t::top_left);
 }
 
 static void handleSessionsTap(int x, int y) {
+    // Current / Previous tabs.
+    if (y >= SES_TAB_Y && y < SES_TAB_Y + SES_TAB_H && sl.state == SL_IDLE) {
+        const bool want_prev = x >= 400;
+        if (want_prev != sessions_previous_tab) {
+            sessions_previous_tab = want_prev;
+            sessionsRequestList();
+        }
+        return;
+    }
     // Footer buttons first.
     if (y >= SES_FOOT_Y && y <= SES_FOOT_Y + SES_FOOT_H) {
         if (x >= SES_BTN_UP_X && x < SES_BTN_UP_X + SES_BTN_W) {
@@ -10340,9 +10545,19 @@ static void handleSessionsTap(int x, int y) {
             }
             return;
         }
-        if (x >= SES_BTN_DELALL_X && x < SES_BTN_DELALL_X + SES_BTN_W) {
-            if (sl.state == SL_IDLE && sl.count > 0) {
-                slStartDelete(/*delete_all=*/true);
+        if (x >= SES_BTN_REV_X && x < SES_BTN_REV_X + SES_BTN_W) {
+            if (sl.state == SL_IDLE && sessions_selected_count() == 1 && !recording) {
+                int idx = -1;
+                for (int i = 0; i < sl.count; ++i) if (sl.selected[i]) { idx = i; break; }
+                if (idx >= 0) {
+                    memset(&lap_review, 0, sizeof(lap_review));
+                    strncpy(lap_review.file, sl.files[idx], sizeof(lap_review.file) - 1);
+                    lap_review.loading = true; lap_review.dirty = true;
+                    Serial.printf("Q,LAPS,%c,%s\n", sessions_previous_tab ? 'P' : 'C', sl.files[idx]);
+                    Serial.flush();
+                    currentPage = PAGE_LAP_REVIEW;
+                    pageJustEntered = true;
+                }
             }
             return;
         }
@@ -10356,6 +10571,69 @@ static void handleSessionsTap(int x, int y) {
     if (idx < 0 || idx >= sl.count) return;
     sl.selected[idx] = !sl.selected[idx];
     sl.dirty = true;
+}
+
+static void drawLapReviewPage() {
+    constexpr int ROW0 = 82, RH = 34, PER = 9;
+    if (pageJustEntered) { tft.fillScreen(TFT_BLACK); pageJustEntered = false; }
+    else tft.fillRect(0, 0, 800, 480, TFT_BLACK);
+
+    tft.setFont(&fonts::Font4); tft.setTextDatum(textdatum_t::middle_center);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("LAP REVIEW", 400, 22);
+    tft.setFont(&fonts::Font2); tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setTextPadding(760); tft.drawString(lap_review.file, 400, 52); tft.setTextPadding(0);
+
+    if (lap_review.loading) {
+        tft.setFont(&fonts::Font4); tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.drawString("reading lap times from SD...", 400, 190);
+    } else if (lap_review.count == 0) {
+        tft.setFont(&fonts::Font4); tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("no completed lap stamps in this session", 400, 190);
+    } else {
+        uint32_t best = 0xFFFFFFFFu;
+        for (int i = 0; i < lap_review.count; ++i)
+            if (lap_review.times_ms[i] < best) best = lap_review.times_ms[i];
+        const int start = lap_review.page * PER;
+        const int end = min(lap_review.count, start + PER);
+        tft.setFont(&fonts::Font4);
+        for (int i = start; i < end; ++i) {
+            const int y = ROW0 + (i - start) * RH;
+            char tm[24], row[64]; formatLapTime(lap_review.times_ms[i], tm, sizeof(tm));
+            snprintf(row, sizeof(row), "LAP %d     %s%s", lap_review.lap_numbers[i], tm,
+                     lap_review.times_ms[i] == best ? "   BEST" : "");
+            tft.setTextColor(lap_review.times_ms[i] == best ? TFT_GREEN : TFT_WHITE, TFT_BLACK);
+            tft.drawString(row, 400, y);
+        }
+    }
+
+    const int pages = max(1, (lap_review.count + PER - 1) / PER);
+    const uint16_t pc = lap_review.page > 0 ? TFT_NAVY : TFT_DARKGREY;
+    const uint16_t nc = lap_review.page + 1 < pages ? TFT_NAVY : TFT_DARKGREY;
+    tft.fillRect(16, 420, 220, 50, pc); tft.drawRect(16, 420, 220, 50, TFT_WHITE);
+    tft.fillRect(290, 420, 220, 50, TFT_MAROON); tft.drawRect(290, 420, 220, 50, TFT_WHITE);
+    tft.fillRect(564, 420, 220, 50, nc); tft.drawRect(564, 420, 220, 50, TFT_WHITE);
+    tft.setFont(&fonts::Font4); tft.setTextColor(TFT_WHITE, pc); tft.drawString("PREV", 126, 445);
+    tft.setTextColor(TFT_WHITE, TFT_MAROON); tft.drawString("BACK", 400, 445);
+    tft.setTextColor(TFT_WHITE, nc); tft.drawString("NEXT", 674, 445);
+    if (pages > 1) {
+        char pg[24]; snprintf(pg, sizeof(pg), "%d / %d", lap_review.page + 1, pages);
+        tft.setFont(&fonts::Font2); tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        tft.drawString(pg, 400, 400);
+    }
+    tft.setTextDatum(textdatum_t::top_left);
+    lap_review.dirty = false;
+}
+
+static void handleLapReviewTap(int x, int y) {
+    if (y < 410) return;
+    constexpr int PER = 9;
+    const int pages = max(1, (lap_review.count + PER - 1) / PER);
+    if (x < 250 && lap_review.page > 0) { lap_review.page--; lap_review.dirty = true; }
+    else if (x > 550 && lap_review.page + 1 < pages) { lap_review.page++; lap_review.dirty = true; }
+    else if (x >= 250 && x <= 550) {
+        currentPage = PAGE_SESSIONS; pageJustEntered = true; sl.dirty = true;
+    }
 }
 
 static void handleConfigPickerTap(int x, int y) {
@@ -11436,14 +11714,14 @@ void loop() {
     } else if (currentPage == PAGE_COACH) {
         if (pageJustEntered || coach_dirty) drawCoachPage();
     } else if (currentPage == PAGE_SESSIONS) {
-        // On entry, kick a Q,LIST so the page populates from the SD queue.
-        if (pageJustEntered) {
-            sessionsRequestList();
+        // Event-driven only. The old unconditional 250 ms body wipe was the
+        // visible "delete screen flashing" even when absolutely nothing moved.
+        if (pageJustEntered) sessionsRequestList();
+        if (pageJustEntered || (sl.dirty && now - lastDraw >= 33)) {
+            lastDraw = now; drawSessionsPage();
         }
-        if (pageJustEntered || sl.dirty || now - lastDraw >= 250) {
-            lastDraw = now;
-            drawSessionsPage();
-        }
+    } else if (currentPage == PAGE_LAP_REVIEW) {
+        if (pageJustEntered || lap_review.dirty) { lastDraw = now; drawLapReviewPage(); }
     } else if (currentPage == PAGE_OTA) {
         otaTick();
         if (pageJustEntered || ota_modal_dirty || now - lastDraw >= 250) {

@@ -547,6 +547,18 @@ VER,teensy,<semver>
   on every re-begin path. Context: the racing-only stales show `avail=0` (module silent, 51% of
   the 1783087863 session, 8-min outages, fine when parked) — mrst>0 = reboots (power/wiring),
   mrst==0 with msss advancing = module alive but mute (UART wire/antenna path).
+- **Pre-UART compressed uploads (v0.1.144).** Compression now happens on the **Teensy before
+  the actual bottleneck**, not only on the screen after the full raw file crossed UART. `Q,GET`
+  responds `Q,ZDATA,<name>,<raw_size>` then CRC-protected frames
+  `Q,Z,<seq>,<raw_len>,<line_count>,<comp_len>,<crc32>,<base64-deflate>`; the dash validates +
+  base64-decodes directly into its PSRAM ring as native `ZB` frames and forwards them unchanged
+  with `X-Body-Format: zblocks`. Typical 27 MB NDJSON now sends ~4 MB over the long UART wire.
+  Frames use stop-and-wait cumulative `Q,A,<seq>` and resume is still the server's durable decoded
+  complete-line count. Legacy `Q,L` remains parsed as a rollback seam. The upload modal was also
+  fixed: its status/diagnostic rows no longer overlap CANCEL; CANCEL locally enters
+  `UF_CANCELLING`, emits `Q,ABORT`, aborts the net task, and returns to the UI immediately instead
+  of waiting 20-120 s on the obsolete `UPLOAD,CANCEL` path. Progress uses represented RAW bytes
+  (`raw_received`) rather than compressed ring offsets.
 - **Compressed uploads — "zblocks" (v0.1.127).** The dash→cloud socket is hard-capped ~70 KB/s
   by lwIP's `TCP_SND_BUF=5744` ÷ path RTT (compile-time, not fixable without a core rebuild), so
   the uploader now **deflate-compresses the HTTP body**: `zdeflate.h` (tiny raw-DEFLATE,
@@ -627,6 +639,16 @@ VER,teensy,<semver>
   side needed NO protocol change (it already ACKs the highest CONTIGUOUS seq — a gap re-acks the
   last good one = natural NAK; 32 KB RX ring; window ~5 KB ≪ ring so TCP-flush backpressure just
   stalls the window). `qPumpAcksOnce()` keeps STATIC parse state — ack lines straddle calls now.
+- **On-SD Current / Previous session browser + lap review (v0.1.144).** PAGE_SESSIONS now has
+  CURRENT (`/queue`, still needs upload/action) and PREVIOUS (`/sessions`, retained history)
+  tabs plus Upload / Delete / Review actions. Successful current uploads send `Q,ARCHIVE`
+  instead of deleting, so the session (and its separately archived `.dbg`) remains on SD;
+  explicit Previous Upload uses `Q,PGET` and overwrites/recreates the server copy. Previous
+  delete uses `Q,PDEL` and removes its debug sidecar too. Review sends
+  `Q,LAPS,<C|P>,<name>`; the Teensy scans stamped `"lap"` transitions and replies
+  `Q,LAP,<n>,<ms>` ... `Q,LAPSEND,<count>`. PAGE_LAP_REVIEW shows 9 laps/page, highlights
+  best, and has PREV/BACK/NEXT. The Sessions page is now event-driven (the unconditional
+  250 ms whole-body repaint that made it flash is gone); drag redraw remains capped ~30 Hz.
 - **Sessions page "Upload (n)" (v0.1.102).** Third footer button uploads ONLY the checkbox-
   selected files (`ufStartSelected()` skips Q,LIST) — e.g. push a 300 KB `.dbg` up without
   waiting behind a 4 MB session. Same radio-handover guard as the dash UPLOAD button
