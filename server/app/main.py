@@ -7349,7 +7349,7 @@ _REVIEW_HTML = (
           o.value=t; o.textContent=t; sel.appendChild(o); });
         var o=document.createElement('option'); o.value='__custom__'; o.textContent='(custom...)';
         sel.appendChild(o);
-        var curTrack=FILE.replace(/^[0-9]+_/,'').replace(/(-combined)?\.ndjson$/,'').replace(/_/g,' ');
+        var curTrack=FILE.replace(/^[0-9]+_/,'').replace(/(-combined)?[.]ndjson$/,'').replace(/_/g,' ');
         for(var i=0;i<sel.options.length;i++)
           if(sel.options[i].value.toLowerCase().replace(/_/g,' ')===curTrack.toLowerCase()){sel.selectedIndex=i;break;}
       });
