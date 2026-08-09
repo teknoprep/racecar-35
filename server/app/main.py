@@ -1966,6 +1966,49 @@ def _coach_has_for_session(user: str, filename: str) -> bool:
     return any(i.get("session") == filename for i in _coach_load(user))
 
 
+def _corner_table(samples: list, laps: list) -> list:
+    """Corners of the BEST lap, numbered from S/F, with direction. Heading is
+    computed from consecutive moving fixes; a corner = contiguous span where
+    the cumulative heading change exceeds 30 deg. Geographic headings increase
+    clockwise, so positive delta = RIGHT."""
+    if not laps:
+        return []
+    rel, _ = _relative_seconds(samples)
+    best = min(laps, key=lambda l: l["seconds"])
+    idx = [i for i, sm in enumerate(samples)
+           if best["t_start"] <= rel[i] <= best["t_end"]
+           and isinstance(sm.get("lat"), (int, float))
+           and isinstance(sm.get("speed_mph"), (int, float))
+           and sm.get("speed_mph", 0) > 15]
+    if len(idx) < 50:
+        return []
+    import math as _m
+    hd = []
+    for a, b in zip(idx, idx[1:]):
+        sa, sb = samples[a], samples[b]
+        dE = (sb["lon"] - sa["lon"]) * _m.cos(_m.radians(sa["lat"]))
+        dN = sb["lat"] - sa["lat"]
+        hd.append((_m.degrees(_m.atan2(dE, dN)), b))
+    out = []
+    acc = 0.0; start_i = None; min_mph = 1e9; n = 0
+    for k in range(1, len(hd)):
+        d = hd[k][0] - hd[k - 1][0]
+        if d > 180: d -= 360
+        if d < -180: d += 360
+        if abs(d) > 1.0 and (acc == 0 or (d > 0) == (acc > 0)):
+            if start_i is None: start_i = hd[k][1]; min_mph = 1e9
+            acc += d
+            min_mph = min(min_mph, samples[hd[k][1]].get("speed_mph", 999))
+        else:
+            if start_i is not None and abs(acc) >= 30:
+                n += 1
+                out.append(f"T{n} {'RIGHT' if acc > 0 else 'LEFT'} "
+                           f"{abs(acc):.0f}deg min={min_mph:.0f}mph")
+                if n >= 20: break
+            acc = 0.0; start_i = None
+    return out
+
+
 def _coach_facts(user_dir: str, p: pathlib.Path) -> Optional[str]:
     """Compact fact sheet for the AI: lap times + consistency + the physical
     envelope. Deliberately small — this runs on every upload."""
@@ -2001,6 +2044,11 @@ def _coach_facts(user_dir: str, p: pathlib.Path) -> Optional[str]:
     if rpm:
         out.append(f"max_rpm={int(max(rpm))}")
     out.append(f"samples={len(samples)}")
+    corners = _corner_table(samples, laps)
+    if corners:
+        out.append("CORNERS of the best lap, numbered FROM START/FINISH "
+                   "(T1 = first corner after S/F), direction included:")
+        out.extend(corners)
     return "\n".join(out)
 
 
@@ -2018,10 +2066,12 @@ def _coach_analyze(user_dir: str, p: pathlib.Path, track: str,
             "You are a professional race engineer reviewing a driver's track "
             "session. Reply with ONLY 1 to 3 lines. Each line: '- ' then ONE "
             "specific, actionable instruction the driver can act on next "
-            "session, at most 14 words, no explanation, no numbering, no "
-            "preamble. Prefer the biggest time gain. If the data is too thin "
-            "for real advice, reply with a single line '- Not enough clean lap "
-            "data to coach from'."
+            "session, at most 16 words, no explanation, no numbering, no "
+            "preamble. Prefer the biggest time gain. When referring to a "
+            "corner you MUST use the names from the CORNERS table exactly, "
+            "e.g. 'T4 (left)' - T1 is the first corner after start/finish; "
+            "never say vague things like 'near-stop point'. If the data is "
+            "too thin, reply '- Not enough clean lap data to coach from'."
         )
         user_msg = f"Track: {track or 'unknown'}\n{facts}"
         answer, model, usage = _ai_chat(
@@ -7310,7 +7360,7 @@ _REVIEW_HTML = (
     el('ai-coach').addEventListener('click', async ()=>{
       const b=el('ai-coach'); b.disabled=true; const old=b.textContent; b.textContent='reviewing\u2026';
       try{
-        const r=await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/coach',
+        const r=await fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/coach?force=1',
                             {method:'POST'});
         const j=await r.json();
         if(!r.ok) status.textContent='checklist error: '+((j&&j.detail)||('HTTP '+r.status));
@@ -7321,7 +7371,12 @@ _REVIEW_HTML = (
     });
     el('ai-line').addEventListener('click', ()=>{
       if (pts.length<3){ status.textContent='circle a section of track first'; return; }
-      const enc = pts.map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join('|');
+      // Decimate: hundreds of lasso points blow the server's request-line
+      // limit ('request too large'). ~50 vertices keeps the polygon shape
+      // and the URL ~1.5 KB.
+      const step = Math.max(1, Math.ceil(pts.length/50));
+      const dec = pts.filter((_,i)=> i%step===0 );
+      const enc = dec.map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join('|');
       window.open('/lineview/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+
                   '?pts='+encodeURIComponent(enc), 'lineview',
                   'width=1200,height=850,menubar=no,toolbar=no');
