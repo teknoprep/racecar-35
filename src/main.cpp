@@ -1318,6 +1318,23 @@ static void saveImuCal() {
     EEPROM.put(IMUCAL_EE_ADDR, s);   // .put == update: only writes changed bytes
 }
 
+// Diagnostic: scan the whole Wire bus and report every ACKing address.
+// Distinguishes "AD0 floating -> device at 0x69" from "SDA/SCL swapped or
+// broken wire -> nothing ACKs at all". Runs when the MPU probe fails.
+static void scanI2CBus() {
+    uint8_t found = 0;
+    Serial.print(F("[i2c] scanning Wire (SDA=18, SCL=19): "));
+    for (uint8_t a = 0x08; a <= 0x77; a++) {
+        Wire.beginTransmission(a);
+        if (Wire.endTransmission(true) == 0) {
+            Serial.printf("0x%02X ", a);
+            found++;
+        }
+    }
+    if (found == 0) Serial.print(F("NO devices ACK (bus dead: swapped/loose SDA-SCL, or no pull-ups)"));
+    Serial.println();
+}
+
 static bool setupIMU() {
     Wire.begin();
     Wire.setClock(400000);
@@ -1327,6 +1344,7 @@ static bool setupIMU() {
     Wire.write(0x00);
     if (Wire.endTransmission(true) != 0) {
         Serial.println(F("MPU-6050 NOT found on Wire (SDA=18, SCL=19)"));
+        scanI2CBus();
         return false;
     }
     // DLPF = 44 Hz bandwidth (CONFIG reg 0x1A = 0x03) — attenuates
