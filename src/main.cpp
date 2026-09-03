@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.144"
+#define FIRMWARE_VERSION "0.1.146"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -401,7 +401,7 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float gx, float gy, float gz, int lap);
 static void handleCfgLine(const String& line);   // cloud section below
 static bool sdReady();                            // SD status helper, defined below
-static void detectSD();                           // SD detect, defined below
+static void detectSD(bool quick = false, bool force = false);   // SD detect, defined below
 static void emitSdStatus();                       // SD wire emit, defined below
 static void scanQueue();                          // /queue/ walker, defined below
 static void emitCloudStatus();                    // CLD wire emit, defined below
@@ -631,8 +631,8 @@ static void handleUsbCommand(const String& line) {
     } else if (line == "SDRE") {
         // Manual SD re-detection. Useful from `pio device monitor` to test
         // recovery without rebooting or physically replugging the card.
-        Serial.println(F("[sd] manual re-detect requested via USB"));
-        detectSD();
+        Serial.println(F("[sd] manual re-detect requested via USB (forced: DAT3 probe bypassed)"));
+        detectSD(false, true);
         emitSdStatus();
         if (sdReady()) {
             scanQueue();
@@ -1757,20 +1757,93 @@ static bool sdReady() { return sd_card_status == SD_CARD_READY; }
 // documented in SdFat/src/common/SysCall.h (e.g. 0x14 = card init timeout).
 static uint8_t sd_last_err  = 0;
 static uint8_t sd_last_data = 0;
+// Result of the last DAT3 slot probe (see sdCardPresent). Lets the loop poll
+// and the USB log tell "slot empty" apart from "card present but won't init".
+static bool    sd_slot_empty = true;
 
-static void detectSD() {
+// ---------------------------------------------------------------------------
+// Card-presence probe WITHOUT touching the SDIO controller (v0.1.145).
+//
+// Why: with the slot EMPTY, every SdFat begin() attempt burned ~2.0 s (two
+// 1 s BUSY_TIMEOUTs inside SdioTeensy.cpp — the uSDHC never flags a command
+// timeout on a floating bus) and detectSD() made 8 + 4 attempts = ~25 s. Boot
+// sat there 25 s, and the loop's 3 s re-poll re-entered it immediately, so
+// with no card the Teensy emitted ONE telemetry burst every ~25 s: dash GPS
+// STALE, RPM frozen, "Teensy stopped talking". Measured on the bench 2026-09.
+//
+// How: the Teensy 4.1 socket has no card-detect switch, but the SD Physical
+// Layer spec REQUIRES every card to connect a 10-90 kOhm pull-up to DAT3 at
+// power-up (it exists precisely for host card detection; only ACMD42 disables
+// it and SdFat never issues ACMD42). DAT3 is pad GPIO_SD_B0_05 = Teensy pin
+// 46. So: drive DAT3 low for a moment (discharge), release it with NO pull
+// (pinMode INPUT on T4 = floating), and read back. Card in slot -> its pull-up
+// recharges the line to 3.3 V within ~1 us (50k x ~15 pF); empty slot -> the
+// discharged line just floats at ~0 V (nA leakage, negligible drift in 150 us).
+// Then hand the pad back to the uSDHC exactly as SdioTeensy configures it.
+// Whole probe ~150 us. Only valid while NOTHING is mounted (no transfer can be
+// in flight) — callers guarantee that.
+// ---------------------------------------------------------------------------
+constexpr uint8_t SD_DAT3_PIN = 46;
+static bool sdCardPresent() {
+    pinMode(SD_DAT3_PIN, OUTPUT);
+    digitalWriteFast(SD_DAT3_PIN, LOW);
+    delayMicroseconds(20);                 // discharge the line
+    pinMode(SD_DAT3_PIN, INPUT);           // T4 INPUT = no pull, no keeper
+    delayMicroseconds(50);                 // card pull-up (if any) recharges in ~1 us
+    int hi = 0;
+    for (int i = 0; i < 5; i++) {
+        if (digitalReadFast(SD_DAT3_PIN)) hi++;
+        delayMicroseconds(20);
+    }
+    // Restore the uSDHC routing + 47k pull-up (mirrors SdioTeensy enableGPIO(true)).
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_SD_B0_05 = 0;
+    // (same bit layout SdioTeensy.h uses: PKE|DSE(7)|SPEED(2)|PUE|PUS(1)=47k up)
+    IOMUXC_SW_PAD_CTL_PAD_GPIO_SD_B0_05 =
+        IOMUXC_PAD_PKE | IOMUXC_PAD_DSE(7) | IOMUXC_PAD_SPEED(2) |
+        IOMUXC_PAD_PUE | IOMUXC_PAD_PUS(1);
+    return hi >= 3;   // majority of 5 samples
+}
+
+// Mount / classify the card.
+//   quick=false (boot, SDRE, post-format): probe the slot; if a card is present
+//     run the retry dance, but BOUNDED by wall time (~3 s of begin() attempts)
+//     instead of a fixed 8 tries — a card that won't answer ACMD41 for 3 s
+//     straight isn't going to on try 8, and the loop's backoff poll picks up
+//     any late bloomer within seconds anyway.
+//   quick=true  (loop poll after the DAT3 probe said a card is present): ONE
+//     begin() attempt, no delays; "card init OK but no filesystem" is inferred
+//     from sdErrorCode()==0 after a failed begin() (SdBase::begin = cardBegin
+//     && Vol::begin — a volume failure leaves the card error clear), so no
+//     second rawCard.begin() is needed.
+//   force=true: skip the DAT3 probe and hit the controller regardless (manual
+//     SDRE escape hatch in case a non-compliant card lacks the pull-up).
+static void detectSD(bool quick, bool force) {
     sd_total_mb = sd_free_mb = 0;
     sd_last_err = sd_last_data = 0;
 
-    // Aggressive SDIO bring-up. The user's card + Teensy 4.1 slot combo can
-    // require up to ~1 s of retries after a cold boot or unclean reset to
-    // mount. 8 attempts * 100 ms gives the card plenty of time to settle.
+    if (!force) {
+        sd_slot_empty = !sdCardPresent();
+        if (sd_slot_empty) {
+            // Empty slot: no SdFat calls at all (each would stall ~2 s).
+            sd_card_status = SD_CARD_NONE;
+            return;
+        }
+    } else {
+        sd_slot_empty = false;
+    }
+
+    // Card present. SDIO bring-up: the user's card + Teensy 4.1 slot combo can
+    // require up to ~1 s of retries after a cold boot or unclean reset.
     bool mounted = false;
-    for (int attempt = 0; attempt < 8 && !mounted; ++attempt) {
+    const uint32_t t0 = millis();
+    const int max_attempts = quick ? 1 : 8;
+    for (int attempt = 0; attempt < max_attempts && !mounted; ++attempt) {
         if (sdFat.begin(SdioConfig(FIFO_SDIO))) {
             mounted = true;
             break;
         }
+        if (quick) break;
+        if (millis() - t0 > 3000) break;   // wall-time bound (bad card = ~2 s/attempt)
         delay(100);
     }
 
@@ -1787,21 +1860,27 @@ static void detectSD() {
     sd_last_err  = sdFat.sdErrorCode();
     sd_last_data = sdFat.sdErrorData();
 
-    // Mount failed. Probe the raw card to distinguish 'no card present' from
-    // 'card present but FS unmountable'. Same retry budget for symmetry.
-    SdioCard rawCard;
-    for (int attempt = 0; attempt < 4; ++attempt) {
+    if (sd_last_err == 0 && sdFat.card()) {
+        // Card initialised fine, the FAT volume didn't mount -> needs a format.
+        sd_card_status = SD_CARD_NEEDS_FMT;
+        sd_total_mb = (uint32_t)(sdFat.card()->sectorCount() / 2048ULL);
+        return;
+    }
+
+    if (!quick) {
+        // Belt-and-suspenders raw-card probe to distinguish 'card present but
+        // FS unmountable' from a genuine init failure. ONE attempt (~2 s max).
+        SdioCard rawCard;
         if (rawCard.begin(SdioConfig(FIFO_SDIO))) {
             sd_card_status = SD_CARD_NEEDS_FMT;
             sd_total_mb = (uint32_t)(rawCard.sectorCount() / 2048ULL);
             sd_last_err = sd_last_data = 0;   // FS issue, not card issue
             return;
         }
-        delay(100);
     }
     sd_card_status = SD_CARD_NONE;
-    Serial.printf("[sd] detect FAILED  err=0x%02X data=0x%02X\n",
-                  sd_last_err, sd_last_data);
+    Serial.printf("[sd] card present but init FAILED  err=0x%02X data=0x%02X (%lu ms)\n",
+                  sd_last_err, sd_last_data, (unsigned long)(millis() - t0));
 }
 
 static void emitSdStatus() {
@@ -1814,19 +1893,26 @@ static void emitSdStatus() {
             DASH_SERIAL.printf("SD,FMT,%lu\n", (unsigned long)sd_total_mb);
             break;
         case SD_CARD_NONE:
-            DASH_SERIAL.printf("SD,NONE,%02X%02X\n", sd_last_err, sd_last_data);
+            // Empty slot -> bare SD,NONE (dash shows "No card"). Card present but
+            // init failed -> carry the SdFat error so the dash shows "err 0x..".
+            if (sd_slot_empty) DASH_SERIAL.printf("SD,NONE\n");
+            else DASH_SERIAL.printf("SD,NONE,%02X%02X\n", sd_last_err, sd_last_data);
             break;
         case SD_CARD_ERROR:
             DASH_SERIAL.printf("SD,ERR\n");    break;
         case SD_CARD_FORMATTING:
             DASH_SERIAL.printf("SD,ACTIVE\n"); break;
     }
-    Serial.printf("[sd] %s  total=%luMB free=%luMB\n",
+    Serial.printf("[sd] %s  total=%luMB free=%luMB%s\n",
                   sd_card_status == SD_CARD_READY      ? "READY"        :
                   sd_card_status == SD_CARD_NEEDS_FMT  ? "NEEDS_FORMAT" :
                   sd_card_status == SD_CARD_FORMATTING ? "FORMATTING"   :
                   sd_card_status == SD_CARD_ERROR      ? "ERROR"        : "NONE",
-                  (unsigned long)sd_total_mb, (unsigned long)sd_free_mb);
+                  (unsigned long)sd_total_mb, (unsigned long)sd_free_mb,
+                  sd_card_status == SD_CARD_NONE
+                      ? (sd_slot_empty ? "  (slot empty per DAT3 probe; polling 1 Hz)"
+                                       : "  (card detected but init failed)")
+                      : "");
 }
 
 // Diagnostic: list SD directories with file sizes (triggered by USB "SDLS").
@@ -4033,17 +4119,53 @@ void loop() {
     canDiagReport();   // 1 Hz CAN health line to USB serial + dash (self-throttled)
     healthTick();      // 1 Hz temps + battery (heat/brownout diagnostics), always on
 
-    // Periodic SD card recheck. SDIO occasionally misses a card on boot —
-    // particularly if the card was inserted while the Teensy was already
-    // powered. Poll every 3 s while we don't have a healthy mount, and
-    // re-emit SD,* so the dash UI updates. Don't poke a working card.
-    static uint32_t last_sd_poll_ms = 0;
+    // Periodic SD card recheck while we don't have a healthy mount (card
+    // inserted after boot, or missed by SDIO at boot). Don't poke a working card.
+    //
+    // v0.1.145: this used to call detectSD() every 3 s, and with an EMPTY slot
+    // detectSD() blocked ~25 s (see sdCardPresent) — the loop was frozen ~99 %
+    // of the time. Now: a ~150 us DAT3 presence probe at 1 Hz, and the SDIO
+    // controller is only touched when a card is physically detected. A card
+    // that is present but refuses to init (bad/power-starved card, or one still
+    // settling right after insertion) gets ONE quick begin() attempt with
+    // exponential backoff 2 s -> 30 s, so even that worst case stalls the loop
+    // at most ~2 s per 30 s while the dash shows the SdFat error code.
+    static uint32_t last_sd_poll_ms   = 0;
+    static uint32_t sd_retry_wait_ms  = 0;     // backoff for present-but-failing
+    static uint32_t sd_last_try_ms    = 0;
     if ((sd_card_status == SD_CARD_NONE || sd_card_status == SD_CARD_ERROR) &&
         !recording_active &&
-        millis() - last_sd_poll_ms >= 3000) {
+        millis() - last_sd_poll_ms >= 1000) {
         last_sd_poll_ms = millis();
         const SdCardStatus before = sd_card_status;
-        detectSD();
+        const bool present = sdCardPresent();
+        if (!present) {
+            // Empty slot: cheap, no SdFat calls. Reset the backoff so a fresh
+            // insertion gets an immediate mount attempt.
+            sd_retry_wait_ms = 0;
+            if (!sd_slot_empty) {
+                // Card was just REMOVED (or a failing card pulled out).
+                sd_slot_empty = true;
+                sd_last_err = sd_last_data = 0;
+                sd_card_status = SD_CARD_NONE;
+                Serial.println(F("[sd] poll: card removed (DAT3 low)"));
+                emitSdStatus();
+            }
+        } else if (millis() - sd_last_try_ms >= sd_retry_wait_ms) {
+            sd_last_try_ms = millis();
+            if (sd_slot_empty) Serial.println(F("[sd] poll: card detected (DAT3 high) — mounting"));
+            const uint32_t t0 = millis();
+            detectSD(/*quick=*/true);
+            const uint32_t dt = millis() - t0;
+            if (sd_card_status == SD_CARD_NONE) {
+                // Present but won't init: back off 2 -> 4 -> ... -> 30 s.
+                sd_retry_wait_ms = sd_retry_wait_ms ? (sd_retry_wait_ms * 2 > 30000 ? 30000 : sd_retry_wait_ms * 2) : 2000;
+                Serial.printf("[sd] poll: init failed in %lu ms, next try in %lu s\n",
+                              (unsigned long)dt, (unsigned long)(sd_retry_wait_ms / 1000));
+            } else {
+                sd_retry_wait_ms = 0;
+            }
+        }
         if (sd_card_status != before) {
             Serial.printf("[sd] poll: status %d -> %d\n",
                           (int)before, (int)sd_card_status);

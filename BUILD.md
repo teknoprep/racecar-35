@@ -9,7 +9,7 @@ There are **two independent toolchains** — they are NOT interchangeable (see C
 | Artifact(s) | Toolchain | Source |
 | --- | --- | --- |
 | `teensy41-dash.hex` | **PlatformIO** (`platform = teensy`, `board = teensy41`) | `src/main.cpp`, `platformio.ini` |
-| `crowpanel7-dash.bin`, `crowpanel5-dash.bin`, `crowpanel5adv-dash.bin` | **arduino-cli** + `esp32:esp32@2.0.14` | `crowpanel-arduino/RaceDash/` |
+| `crowpanel7-dash.bin`, `crowpanel5-dash.bin`, `crowpanel5adv-dash.bin`, `crowpanel7adv-dash.bin` | **arduino-cli** + `esp32:esp32@2.0.14` | `crowpanel-arduino/RaceDash/` |
 
 > The three CrowPanel bins are one source (`RaceDash.ino`) built three times with a different
 > `-DDASH_BOARD` and a per-board `FlashSize` (Advance = `16M`, both Basics = `4M`).
@@ -128,7 +128,12 @@ $CLI compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra
 $CLI compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5 $trim"  --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd5_build   --output-dir /tmp/rd5_out   crowpanel-arduino/RaceDash
 # 5" Advance (crowpanel5adv), 16M
 $CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51 $trim" --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
+# 7" Advance (crowpanel7adv), 16M  (v0.1.145+; same electrical config as the 5" Advance)
+$CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=71 $trim" --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd7adv_build --output-dir /tmp/rd7adv_out crowpanel-arduino/RaceDash
 ```
+**A fresh `--build-path` compiles the whole ESP32 core (~10+ min).** Run first-time builds
+of a new variant in the background (`nohup … &`) or they'll blow past an agent's command
+timeout; subsequent builds in the same path take under a minute.
 Rules (from CLAUDE.md): use `compiler.cpp.extra_flags` (NOT `build.extra_flags`, which carries
 the required USB-mode flags), and a **distinct `--build-path` per board** so the `-DDASH_BOARD`
 define can't cross-contaminate the cache. The APP binary is `RaceDash.ino.bin` in each
@@ -182,9 +187,10 @@ cp .pio/build/teensy41/firmware.hex firmware/teensy41-dash.hex
 cp /tmp/rd7_out/RaceDash.ino.bin    firmware/crowpanel7-dash.bin
 cp /tmp/rd5_out/RaceDash.ino.bin    firmware/crowpanel5-dash.bin
 cp /tmp/rdadv_out/RaceDash.ino.bin  firmware/crowpanel5adv-dash.bin
+cp /tmp/rd7adv_out/RaceDash.ino.bin firmware/crowpanel7adv-dash.bin
 
-sha256sum firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin firmware/crowpanel5adv-dash.bin
-stat -c'%n %s' firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin firmware/crowpanel5adv-dash.bin
+sha256sum firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin firmware/crowpanel5adv-dash.bin firmware/crowpanel7adv-dash.bin
+stat -c'%n %s' firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin firmware/crowpanel5adv-dash.bin firmware/crowpanel7adv-dash.bin
 ```
 Then hand-edit `firmware/manifest.json`: set **every** `version` to the new number, paste the
 recomputed `sha256` + `size` into each entry, keep each `board` field, and keep the legacy

@@ -37,10 +37,11 @@ declare -A BOARD=(
   [crowpanel7-dash.bin]=crowpanel7
   [crowpanel5-dash.bin]=crowpanel5
   [crowpanel5adv-dash.bin]=crowpanel5adv
+  [crowpanel7adv-dash.bin]=crowpanel7adv
 )
 
 # 1. Upload each binary artifact.
-for f in teensy41-dash.hex crowpanel7-dash.bin crowpanel5-dash.bin crowpanel5adv-dash.bin; do
+for f in teensy41-dash.hex crowpanel7-dash.bin crowpanel5-dash.bin crowpanel5adv-dash.bin crowpanel7adv-dash.bin; do
   [ -f "$FW/$f" ] || { echo "missing $FW/$f (build first)"; exit 1; }
   echo "-> uploading $f ($(stat -c%s "$FW/$f") bytes)"
   curl -fsS -X POST "$BASE/firmware/upload?name=$f" \
@@ -67,6 +68,7 @@ MAN="$(mktemp)"
   emit_entry crowpanel7    crowpanel7    crowpanel7-dash.bin;    echo ","
   emit_entry crowpanel5    crowpanel5    crowpanel5-dash.bin;    echo ","
   emit_entry crowpanel5adv crowpanel5adv crowpanel5adv-dash.bin; echo ","
+  emit_entry crowpanel7adv crowpanel7adv crowpanel7adv-dash.bin; echo ","
   # legacy alias: key "crowpanel" but board mirrors crowpanel7
   emit_entry crowpanel     crowpanel7    crowpanel7-dash.bin
   echo ""

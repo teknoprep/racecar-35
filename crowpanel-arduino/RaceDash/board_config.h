@@ -10,6 +10,7 @@
 //   DASH_BOARD == 7   -> CrowPanel ESP32 7.0" V3.0 (Basic RGB)  -> "crowpanel7"
 //   DASH_BOARD == 5   -> CrowPanel ESP32 5.0" V3.0 (Basic RGB)  -> "crowpanel5"
 //   DASH_BOARD == 51  -> CrowPanel Advance 5.0" (HMI IPS, S3)    -> "crowpanel5adv"
+//   DASH_BOARD == 71  -> CrowPanel Advance 7.0" (HMI IPS, S3)    -> "crowpanel7adv"
 //
 // IDENTITY IS BAKED AT THE FIRST USB FLASH. We never auto-detect the panel at
 // runtime (a wrong RGB-timing guess = an unrecoverable black screen). The
@@ -20,6 +21,7 @@
 //   7":       --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7"   FlashSize=4M
 //   5" Basic: --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5"   FlashSize=4M
 //   5" Adv:   --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51"  FlashSize=16M
+//   7" Adv:   --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=71"  FlashSize=16M
 //
 // Sources of truth:
 //   7"/5" Basic: Elecrow CrowPanel V3.0 course file gfx_conf.h (CrowPanel_70 /
@@ -27,6 +29,12 @@
 //   5" Advance:  Elecrow CrowPanel-Advance-5 repo, example V1.2_and_V1.3
 //                (LovyanGFX_Driver.h + main.cpp). N16R8, OPI PSRAM, GT911 on
 //                15/16, backlight via an I2C coprocessor at 0x30.
+//   7" Advance:  Elecrow CrowPanel-Advance-7 repo. Its LovyanGFX_Driver.h is
+//                the SAME shared "..._4_3_5_0_7_0" file as the 5" Advance —
+//                identical RGB pin map, porches, polarities, PSRAM framebuffer,
+//                GT911 pins and 0x30 coprocessor (verified 2026-09 across every
+//                V1.0/V1.2/V1.3-1.5 example + factory source). Only the board id
+//                differs; the 7" glass may want its own pclk — see the note.
 // ===========================================================================
 #pragma once
 
@@ -163,14 +171,23 @@
 #define DASH_SWIPE_MS_MAX     1500
 
 // ---------------------------------------------------------------------------
-#elif DASH_BOARD == 51
+#elif DASH_BOARD == 51 || DASH_BOARD == 71
 // ---------------------------------------------------------------------------
-// CrowPanel Advance 5.0" (HMI IPS, ESP32-S3-WROOM-1-N16R8). Verified against
-// Elecrow's example V1.2_and_V1.3 (LovyanGFX_Driver.h + main.cpp). This is a
-// different platform from the Basic panels: inverted sync polarities, GT911 on
-// 15/16, backlight + reset via an I2C coprocessor at 0x30 (no PCA9557).
+// CrowPanel Advance 5.0" / 7.0" (HMI IPS, ESP32-S3-WROOM-1-N16R8). Verified
+// against Elecrow's example V1.2_and_V1.3 (5") / V1.3_and_V1.4_and_V1.5 (7")
+// (LovyanGFX_Driver.h + main.cpp) — one shared vendor driver file, identical
+// electrical config on both sizes. This is a different platform from the Basic
+// panels: inverted sync polarities, GT911 on 15/16, backlight + reset via an
+// I2C coprocessor at 0x30 (no PCA9557). Coprocessor DIALECT differs by board
+// revision (5" V1.1 / 7" V1.2 = ladder; 5" V1.2+ / 7" V1.3+ = linear) — see
+// Settings::adv_rev in RaceDash.ino.
+#if DASH_BOARD == 71
+#define DASH_BOARD_ID   "crowpanel7adv"
+#define DASH_BOARD_NAME "crowpanel-7.0-adv"
+#else
 #define DASH_BOARD_ID   "crowpanel5adv"
 #define DASH_BOARD_NAME "crowpanel-5.0-adv"
+#endif
 #define DASH_IS_ADVANCE 1
 
 #define DASH_PIN_D0  GPIO_NUM_21   // B0
@@ -198,6 +215,8 @@
 // our stock arduino-cli build (80 MHz PSRAM) 18 MHz starves the framebuffer DMA
 // -> diagonal scan-out tearing; 12 MHz is below this panel's lock threshold
 // (drifting solid colors). 15 MHz is the search midpoint (also our 7" value).
+// 7" Advance starts at the same 15 MHz (its Basic 7" sibling is field-proven
+// there); if the 7" IPS glass tears or drifts, tune THIS value per board.
 #define DASH_FREQ_WRITE  15000000
 
 #define DASH_HSYNC_FRONT_PORCH 8
@@ -225,7 +244,7 @@
 
 // ---------------------------------------------------------------------------
 #else
-#error "Unsupported DASH_BOARD — set -DDASH_BOARD=7, 5, or 51"
+#error "Unsupported DASH_BOARD — set -DDASH_BOARD=7, 5, 51, or 71"
 #endif
 
 // Manifest section token for this board's OTA entry, e.g. "\"crowpanel5adv\"".

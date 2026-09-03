@@ -62,7 +62,7 @@ $cli = "C:\Users\ChrisRawlings\AppData\Local\Programs\Arduino IDE\resources\app\
 & $cli upload  --fqbn $fqbn -p COM3 $sketch
 ```
 
-**Multi-board (one source tree, THREE display panels).** `RaceDash.ino` is panel-agnostic; the
+**Multi-board (one source tree, FOUR display panels).** `RaceDash.ino` is panel-agnostic; the
 only board-specific values (RGB pin map, panel timing + sync polarities, touch I2C pins,
 backlight method, LCD-reset method) live in `crowpanel-arduino/RaceDash/board_config.h`,
 selected at compile time by `-DDASH_BOARD`. **Each panel also needs its own FlashSize** in the
@@ -73,6 +73,22 @@ FQBN:
 | `7` (default) | `crowpanel7` | CrowPanel 7.0" V3.0 (Basic RGB) | `4M` | PCA9557 reset, touch 19/20, GPIO2 PWM backlight |
 | `5` | `crowpanel5` | CrowPanel 5.0" V3.0 (Basic RGB) | `4M` | same family as 7", different pin map/porches |
 | `51` | `crowpanel5adv` | CrowPanel **Advance** 5.0" (HMI IPS, N16R8) | `16M` | inverted sync polarity, touch 15/16, **I2C 0x30 coprocessor** backlight, NO PCA9557, GPIO 38 is an RGB data pin |
+| `71` | `crowpanel7adv` | CrowPanel **Advance** 7.0" (HMI IPS, N16R8) | `16M` | **electrically identical to the 5" Advance** (Elecrow ships ONE shared `..._4_3_5_0_7_0` LovyanGFX driver for 4.3/5/7) — same `board_config.h` block, only the board id differs (v0.1.145) |
+
+**⚠️ Advance 0x30 backlight coprocessor has TWO DIALECTS (v0.1.145, the "display does not boot"
+incident).** Same STC8H1K28 at I²C 0x30, incompatible firmwares by hardware revision (Elecrow
+README "Version update points"): **ladder** dialect (5" V1.1 / 7" V1.2): `0x05`=off,
+`0x06..0x09`, `0x10`=max, `0x19`=activate touch, and "send `0x10` FIRST, then the level";
+**linear** dialect (5" V1.2+ / 7" V1.3+): `0`=max … `244`=min, `245`=off, `250`=activate
+touch. Our code was written against linear; a ladder-dialect unit sent `0` boots perfectly (banner,
+touch, sprites all OK on serial) into a BLACK screen. The chip is write-only (reads return 0xFF)
+so there is no auto-detect. Fix: boot sends BOTH (`0` then `0x10`; touch-activate `250` + `0x19`)
+so any revision lights up, and Settings → **Panel revision** (NVS `advrev`, Advance-only row:
+`Auto` / `Old rev (ladder)` / `New rev (linear)`) picks the dialect for the brightness slider.
+**Auto sends both with the ladder LAST** — a ladder unit can never go dark from a wrong guess
+(unrecoverable from the UI), a linear unit merely sits at ~95 % until its revision is picked.
+Fingerprint a factory-fresh unit from its vendor banner @115200: `命令 0x18 发送成功` (hex
+printed) = ladder firmware; `命令 发送成功` (no hex) = linear firmware.
 
 Use `compiler.cpp.extra_flags` (empty by default), NOT `build.extra_flags` (which carries the
 required USB-mode flags — overriding it bricks the build). Use a distinct `--build-path` per
@@ -89,18 +105,31 @@ get swapped on the bench between commands — re-check each time, don't trust th
 ```bash
 # Hardware check via flash size:
 python3 ~/.arduino15/packages/esp32/tools/esptool_py/4.5.1/esptool.py --port /dev/ttyUSB0 flash_id | grep -iE "flash size|MAC"
-#   16 MB  -> CrowPanel Advance 5" -> build crowpanel5adv (DASH_BOARD=51, FlashSize=16M)
+#   16 MB  -> a CrowPanel Advance (5" crowpanel5adv DASH_BOARD=51 OR 7" crowpanel7adv DASH_BOARD=71, both FlashSize=16M)
 #    4 MB  -> a Basic panel (7" crowpanel7 OR 5" crowpanel5, both FlashSize=4M)
 ```
 - Flash size distinguishes the **Advance (16M)** from the **Basic 4M** boards; it does NOT tell
-  7" from 5" Basic (both 4M) — for those, go by which panel is physically plugged in (and/or
-  the MAC: the Advance on this bench is `1c:db:d4:4d:67:04`).
+  7" from 5" within a family — for those, go by which panel is physically plugged in (and/or
+  the MAC). Known bench MACs: 5" Advance (linear rev) `1c:db:d4:4d:67:04`; 5" Advance V1.1
+  (ladder rev) `98:88:e0:13:99:a0` (killed 2026-09-02 by 5 V on the HY2.0 3V3_OUT pin — see
+  the Advance power note below); 7" Advance (linear rev) `1c:db:d4:4e:3e:e4`.
 - **After flashing, confirm the boot banner** over `/dev/ttyUSB0` @ 921600 prints the expected
-  `crowpanel-…` board id (`crowpanel-5.0`, `crowpanel-5.0-adv`, `crowpanel-7.0`). A mismatch =
+  `crowpanel-…` board id (`crowpanel-5.0`, `crowpanel-5.0-adv`, `crowpanel-7.0`,
+  `crowpanel-7.0-adv`). A mismatch =
   wrong build flashed (e.g. Basic firmware on the Advance → touch on 19/20 instead of 15/16 =
   dead touch, wrong RGB pins = garbled display).
 
 **Always disconnect the Teensy↔CrowPanel UART jumpers before flashing the CrowPanel.** UART0 (GPIO 43/44) is shared with the CH340 used for upload — Teensy contention silently corrupts the flash, or you get `The serial TX path seems to be down` from esptool.
+
+**⚠️ Advance UART connectors — only ONE accepts 5 V (a board died learning this, 2026-09-02).**
+Per the Elecrow V1.1 schematic: **J10, the XH2.54 (2.54 mm, larger) UART header = GND / +5V_IN /
+TXD0_H / RXD0_H** — 5 V input via Schottky into the buck; TX/RX sit behind BSS138 level shifters
+pulled to VIN, so it is the 5 V-tolerant, power-capable UART. **J2, the HY2.0 (2.0 mm, small)
+UART header = GND / 3V3_OUT / ESP_TXD0 / ESP_RXD0** — `3V3_OUT` is an OUTPUT tied to the ESP32's
+3.3 V rail through an always-on AO3401 (gate grounded, no reverse blocking); 5 V there = 5 V on
+the ESP32-S3's VDD (abs max 3.6 V) → dead chip. Symptom: CH340 still enumerates (its VCC is USB
+VBUS, not 3V3) but the ROM bootloader is silent (`esptool` "No serial data received") and the
+green PWR LED (fed from 3V3) tells you whether the rail itself survived.
 
 ## ⚠️ PUBLISH VERIFICATION MUST FAIL HARD (learned the hard way, v0.1.138)
 
@@ -131,10 +160,12 @@ This is the default release contract for this repo. When code is changed and the
 
 1. **Bump the version** in BOTH `FIRMWARE_VERSION` defines (`src/main.cpp` + `RaceDash.ino`) to
    the same new number. Every artifact ships at one identical version (lockstep).
-2. **Rebuild ALL FOUR artifacts** even if only one side changed: `teensy`, `crowpanel7`,
-   `crowpanel5`, `crowpanel5adv`. The three dash bins are one source built with different
-   `-DDASH_BOARD` (and the Advance uses `FlashSize=16M`, the Basics `4M`).
-3. **Update `firmware/manifest.json`**: set every `version` to the new number, recompute every
+2. **Rebuild ALL FIVE artifacts** even if only one side changed: `teensy`, `crowpanel7`,
+   `crowpanel5`, `crowpanel5adv`, `crowpanel7adv` (v0.1.145+). The four dash bins are one
+   source built with different `-DDASH_BOARD` (the two Advance builds use `FlashSize=16M`, the
+   Basics `4M`).
+3. **Update the manifest** (`publish_firmware.sh` generates the server one; it now emits the
+   `crowpanel7adv` entry too): set every `version` to the new number, recompute every
    `sha256` + `size`, keep each entry's `board` field, and keep the legacy `crowpanel` entry
    mirroring `crowpanel7`. A stale sha aborts OTA on the device.
 4. **Check-then-flash, every time** — if a panel is connected on USB: FIRST run `esptool
@@ -812,6 +843,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
 | `lapov` | uint8 | **Finish-line lap-time popup duration** in seconds, 0–9 (default 3, 0 = off). Dash-only (no CFG). Settings → "Lap time popup (sec)". |
+| `advrev` | uint8 | **Advance 0x30 backlight-coprocessor dialect** (v0.1.145): 0=Auto (send both, ladder last), 1=Old rev/ladder (5" V1.1, 7" V1.2), 2=New rev/linear (5" V1.2+, 7" V1.3+). Dash-only (no CFG); row hidden on Basic panels. Settings → "Panel revision". See the Advance dialect note in the build section. |
 | `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
 | `sf_unk` | blob | **UNKNOWN-track S/F** (one `SfOverride`, v0.1.129) — the ONLY on-car S/F capture left. SET S/F (STATUS page / dash TRACK button while recording) works ONLY when `lapTrackIdx() < 0`; lap timing + Teensy `CFG,sf` stamping run against it at unmapped tracks. DELETE S/F clears it. |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **⚠️ IGNORED since v0.1.129 for KNOWN tracks** — the baked S/F (web-managed via `/tools/sfpicker`) is the ONLY source; a stale on-device capture used to silently beat a freshly baked line and kill lap timing (the Summit Point incident). Blob still loaded/saved for back-compat, never consulted. On-car capture now exists ONLY for UNKNOWN tracks (`sf_unk` above). The dash LAP row shows a CYAN `SF <dist>` countdown (pre-arm, while recording) so a misplaced S/F is visible on lap 1. Historical: struct size changed in 0.1.82 (pre-0.1.82 blobs ignored once).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. **v0.1.112: a capture below 5 mph stores a POINT (radius method) — GPS heading is garbage at rest, so the old parked capture built a line pointing anywhere and silently killed lap detection for the whole track (the Thompson incident). Rolling capture (≥5 mph) builds the perpendicular line. The STATUS button label now shows live distance to the effective S/F (`custom`/`default`, meters); a maroon **CLR S/F** sub-button (only when an override exists) wipes a bad override trackside; `updateLapTimer()` emits a 20 s `DBG,lap trk=… ovr=… d_sf=…m armed=… laps=…` breadcrumb.** Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |

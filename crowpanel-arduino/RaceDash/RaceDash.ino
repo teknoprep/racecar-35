@@ -26,7 +26,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.144"
+#define FIRMWARE_VERSION "0.1.146"
 
 #include <Preferences.h>
 #include <time.h>
@@ -35,7 +35,7 @@
 #include <LovyanGFX.hpp>
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
-#include "board_config.h"   // per-panel RGB pin map + timing (DASH_BOARD 7|5)
+#include "board_config.h"   // per-panel RGB pin map + timing (DASH_BOARD 7|5|51|71)
 #include "obd_ble.h"       // Bluetooth-LE OBD-II (ELM327) client for sensor_type==2
 #include "zdeflate.h"      // tiny raw-DEFLATE for compressed uploads (v0.1.127 zblocks)
 
@@ -51,6 +51,7 @@ enum SettingId : uint8_t {
     // operations route via Teensy/W5500 (Ethernet) or CrowPanel/ESP32-S3 WiFi.
     // SSID/pass/status rows are hidden when Mode=Ethernet.
     ST_BRIGHTNESS = 0,            // LCD backlight slider — top of the settings list
+    ST_PANEL_REV,                 // Advance only: 0x30 backlight coprocessor dialect (v0.1.145)
     ST_INET_MODE,
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
     ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_RPM_SPIKE, ST_GPS_FILTER, ST_LAP_OVERLAY, ST_ALERTS,
@@ -748,6 +749,17 @@ struct Settings {
     // applyBrightness() (Advance: I2C 0x30 coprocessor; Basic: GPIO 2 PWM).
     uint8_t  brightness       = 100;
 
+    // CrowPanel Advance hardware revision — selects the 0x30 backlight
+    // coprocessor DIALECT (v0.1.145). Elecrow shipped two incompatible STC8H1K28
+    // firmwares behind the same I2C address:
+    //   V1.1     : discrete codes 0x05 (OFF) 0x06..0x09 (dim->bright) 0x10 (MAX);
+    //              0x19 = activate touch
+    //   V1.2/1.3 : linear 0 (MAX) .. 244 (min), 245 = OFF; 250 = activate touch
+    // 0 = Auto (send BOTH, V1.1 ladder last: a V1.1 unit always lights up, a
+    // V1.2 unit sits near full brightness until its revision is picked),
+    // 1 = V1.1, 2 = V1.2/1.3. Ignored on the Basic panels. NVS "advrev".
+    uint8_t  adv_rev          = 0;
+
     // Debug logging master switch. When ON the Teensy writes an on-SD
     // "<session>.dbg.ndjson" health log per recording (uploaded best-effort as
     // X-File-Kind: debug). OFF = no debug files at all. Sent as CFG,dbg_on.
@@ -765,6 +777,12 @@ const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt", "Bluetooth" };
 // physically impossible RPM jump from the current value (electrical noise).
 const char* const SPIKE_FILTER_NAMES[] = { "Off", "Mild", "Normal", "Strong" };
 constexpr int N_SPIKE_FILTER = 4;
+// Advance 0x30 coprocessor dialect. Revision numbering differs per panel size
+// (5": V1.1 = ladder, V1.2+ = linear; 7": V1.2 = ladder, V1.3+ = linear), so
+// the setting names the DIALECT, not a board revision.
+//   "Old rev (ladder)" = 5" V1.1 / 7" V1.2      "New rev (linear)" = 5" V1.2+ / 7" V1.3+
+const char* const ADV_REV_NAMES[] = { "Auto", "Old rev (ladder)", "New rev (linear)" };
+constexpr int N_ADV_REV = 3;
 constexpr int N_SENSOR_TYPE = 3;
 // Tach pulses/rev choices (the Direct-mode RPM divider). Value shown = pulses
 // per crank rev = divider. Stored x10 so 0.5 works. Sent as CFG,rpmppr,<x10>.
@@ -1488,6 +1506,7 @@ static void loadSettings() {
     s.afr_warn_hi_x10    = prefs.getUShort("afr_hi",   s.afr_warn_hi_x10);
     s.afr_warn_col       = prefs.getUChar ("afr_col",  s.afr_warn_col);
     s.brightness         = prefs.getUChar ("bright",   s.brightness);
+    s.adv_rev            = prefs.getUChar ("advrev",   s.adv_rev) % N_ADV_REV;
     if (s.timezone_idx >= N_TIMEZONES) s.timezone_idx = 0;   // sanitise stale NVS
     if (s.brightness < 10) s.brightness = 10;               // never fully dark
     {
@@ -1576,28 +1595,46 @@ static void saveSettings() {
     prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
     prefs.putUChar ("afr_col",  s.afr_warn_col);
     prefs.putUChar ("bright",   s.brightness);
+    prefs.putUChar ("advrev",   s.adv_rev);
     prefs.end();
     sendCfgToTeensy();   // keep Teensy in sync after every settings save
 }
 
 // Apply LCD brightness (0-100 %). Board-aware via board_config.h:
-//   Advance (DASH_IS_ADVANCE): backlight coprocessor at I2C 0x30. It takes
-//     DISCRETE command codes, NOT a linear value — valid backlight levels (from
-//     the vendor factory firmware's PWM ladder) are exactly these 7 codes,
-//     brightest -> dimmest. Sending arbitrary bytes makes the coprocessor
-//     misbehave (visible backlight flicker), so we snap to the ladder.
+//   Advance (DASH_IS_ADVANCE): backlight coprocessor at I2C 0x30 — TWO dialects
+//     exist (see Settings::adv_rev). V1.2/1.3 takes a linear level 0..245
+//     (0 = brightest, 245 = off); V1.1 takes a 6-step ladder 0x05 (off),
+//     0x06..0x09, 0x10 (max). We map the 10..100 % slider onto whichever the
+//     user selected; in Auto we send BOTH with the ladder LAST (a V1.1 unit
+//     given only the linear code stays BLACK — that was the "display does not
+//     boot" on the second Advance unit, 2026-09).
 //   Basic 7"/5":              GPIO 2 PWM on ledc channel 1 (duty 0-255).
 // Called at boot (after loadSettings) and live while the brightness slider drags.
+#if DASH_IS_ADVANCE
+static void advCoproCmd(uint8_t cmd);   // defined near setup()
+static uint8_t advLinearLevel(uint8_t pct) {           // V1.2/1.3: 100 % -> 0, 10 % -> ~221
+    return (uint8_t)(245 - (uint32_t)pct * 245 / 100);
+}
+static uint8_t advLadderLevel(uint8_t pct) {           // V1.1: never 0x05 (off) from the slider
+    if (pct >= 90) return 0x10;                         // max
+    const uint8_t step = (uint8_t)(((uint32_t)(pct < 10 ? 0 : pct - 10) * 4) / 80);  // 0..3
+    return (uint8_t)(0x06 + (step > 3 ? 3 : step));    // 0x06..0x09
+}
+#endif
 static void applyBrightness(uint8_t pct) {
     if (pct > 100) pct = 100;
 #if DASH_IS_ADVANCE
-    // The 0x30 coprocessor takes a backlight level 0..245 (0 = brightest,
-    // 245 = off) per the vendor example. Map the 10..100 % slider linearly
-    // across that range (100 % -> 0 brightest, 10 % -> ~221 dim-but-on).
-    const uint8_t v = (uint8_t)(245 - (uint32_t)pct * 245 / 100);
-    Wire.beginTransmission(0x30);
-    Wire.write(v);
-    Wire.endTransmission();
+    // Ladder dialect rule (Elecrow 7" README): "first send 0x10 to turn on the
+    // screen, THEN send another value to adjust the brightness" — so a dim
+    // level is always preceded by 0x10. (On a linear-dialect unit 0x10 = level
+    // 16 ≈ 93 %, harmless.)
+    const uint8_t lad = advLadderLevel(pct);
+    switch (s.adv_rev) {
+        case 1:  advCoproCmd(0x10); if (lad != 0x10) advCoproCmd(lad); break;   // ladder
+        case 2:  advCoproCmd(advLinearLevel(pct)); break;                        // linear
+        default: advCoproCmd(advLinearLevel(pct));                               // Auto: both,
+                 advCoproCmd(0x10); if (lad != 0x10) advCoproCmd(lad); break;    // ladder last
+    }
 #else
     ledcWrite(1, (uint32_t)pct * 255 / 100);
 #endif
@@ -4468,7 +4505,9 @@ static void handleTouch() {
         tt.active  = true;
         tt.gesture = GESTURE_NONE;
         tt.scrollAtStart = (currentPage == PAGE_SESSIONS) ? sessions_scroll_y : settingsScrollY;
-        Serial.printf("TS x=%ld y=%ld pg=%d\n", (long)x, (long)y, (int)currentPage);  // TEMP touch debug
+        // (v0.1.146: removed TEMP "TS ..." touch debug printf — UART0 is the
+        // Teensy link; stray prints there corrupt upload ACK streams. Same
+        // lesson as the v0.1.135 TCHrate removal.)
         // Slider grab: claim the gesture so swipe/scroll can't steal it, and
         // apply immediately so a plain tap also sets the value.
         {
@@ -4528,7 +4567,8 @@ static void handleTouch() {
         const int      dx  = tt.lastX - tt.startX;
         const int      dy  = tt.lastY - tt.startY;
         const uint32_t dur = millis() - tt.startMs;
-        Serial.printf("TR g=%d dx=%d dy=%d dur=%lu\n", (int)tt.gesture, dx, dy, (unsigned long)dur);  // TEMP touch debug
+        // (v0.1.146: removed TEMP "TR ..." touch debug printf — see note at the
+        // touch-start handler.)
 
         if (tt.gesture == GESTURE_DRAG_V) {
             // Snap the settings scroll to a row boundary on release so every
@@ -5806,6 +5846,7 @@ struct SettingRow {
 };
 static const SettingRow ROWS[ST_COUNT] = {
     { ST_BRIGHTNESS,   "Brightness",            SettingRow::SLIDER  },
+    { ST_PANEL_REV,    "Panel revision",        SettingRow::ENUM    },
     { ST_LAP_OVERLAY,  "Lap time popup (sec)",  SettingRow::NUMERIC },
     { ST_INET_MODE,    "Internet",              SettingRow::ENUM    },
     { ST_WIFI_SSID,    "WiFi network (SSID)",   SettingRow::TEXT    },
@@ -7086,6 +7127,7 @@ static const char* enumValue(SettingId id) {
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
         case ST_RPM_SPIKE:   return SPIKE_FILTER_NAMES[s.rpm_spike % N_SPIKE_FILTER];
         case ST_GPS_FILTER:  return SPIKE_FILTER_NAMES[s.gps_filter % N_SPIKE_FILTER];
+        case ST_PANEL_REV:   return ADV_REV_NAMES[s.adv_rev % N_ADV_REV];
         case ST_RPM_DIV:     return RPM_PPR_NAMES[rpmPprIndex()];
         case ST_GPS_BAUD: {
             static char b[24];
@@ -7109,6 +7151,7 @@ static const char* enumValue(SettingId id) {
 static bool rowShouldShow(SettingId id) {
     switch (id) {
         case ST_REC_SD:    return sd_card_status == 2;  // hidden unless card is READY
+        case ST_PANEL_REV: return DASH_IS_ADVANCE;      // 0x30 coprocessor dialect: Advance only
         // (ST_SD_FORMAT row never appears in the settings list anymore —
         //  the maintenance action moved to PAGE_TOOLS.)
         // WiFi credential + status rows only meaningful when mode=WiFi.
@@ -7163,7 +7206,7 @@ static bool rowShouldShow(SettingId id) {
 enum SettingsGroup : int { SG_DISPLAY, SG_NET, SG_RPM, SG_SENSORS, SG_RECORDING, SG_CLOUD, SG_TIME };
 static int rowGroup(SettingId id) {
     switch (id) {
-        case ST_BRIGHTNESS: case ST_LAP_OVERLAY: return SG_DISPLAY;
+        case ST_BRIGHTNESS: case ST_PANEL_REV: case ST_LAP_OVERLAY: return SG_DISPLAY;
         case ST_INET_MODE:
         case ST_WIFI_SSID: case ST_WIFI_PASS: case ST_WIFI_STATUS: return SG_NET;
         case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_RPM_SPIKE:
@@ -7580,6 +7623,11 @@ static void handleSettingsTap(int x, int y) {
                     // out) — open the dedicated GPS page for deliberate selection.
                     openGpsPage();
                     return;
+                } else if (r.id == ST_PANEL_REV) {
+                    // Re-apply immediately so the user SEES whether the chosen
+                    // dialect drives this unit's backlight (Auto is always safe).
+                    s.adv_rev = (s.adv_rev + 1) % N_ADV_REV;
+                    applyBrightness(s.brightness);
                 } else if (r.id == ST_RPM_SPIKE) {
                     s.rpm_spike = (s.rpm_spike + 1) % N_SPIKE_FILTER;
                     Serial.printf("CFG,rpmspk,%u\n", (unsigned)s.rpm_spike);
@@ -11343,9 +11391,13 @@ static void handleStatusTap(int x, int y) {
 }
 
 #if DASH_IS_ADVANCE
-// CrowPanel Advance: the GT911 (0x5D) and a backlight/reset coprocessor (0x30)
-// share Wire (I2C_NUM_0) on SDA 15 / SCL 16. Backlight + screen activation are
-// I2C commands to 0x30 (0 = brightest, 245 = off, 250 = activate touch screen).
+// CrowPanel Advance: the GT911 (0x5D) and a backlight/reset coprocessor (0x30,
+// STC8H1K28) share Wire (I2C_NUM_0) on SDA 15 / SCL 16. Backlight + screen
+// activation are single-byte I2C commands to 0x30 — in TWO hardware-revision
+// dialects (Elecrow README "Version update points"):
+//   V1.1     : 0x05 off, 0x06..0x09, 0x10 max; 0x19 activate touch
+//   V1.2/1.3 : 0 max .. 244 min, 245 off;     250  activate touch
+// See Settings::adv_rev / applyBrightness(). Boot-time code below sends BOTH.
 static bool advI2cPresent(uint8_t addr) {
     Wire.beginTransmission(addr);
     return Wire.endTransmission() == 0;
@@ -11406,7 +11458,8 @@ void setup() {
         // answer, kick them awake (cmd 250 + GPIO 1 toggle) and retry.
         uint32_t t0 = millis();
         while (!(advI2cPresent(0x30) && advI2cPresent(0x5D))) {
-            advCoproCmd(250);                     // activate touch screen
+            advCoproCmd(250);                     // activate touch screen (V1.2/1.3)
+            advCoproCmd(0x19);                    // activate touch screen (V1.1)
             pinMode(1, OUTPUT); digitalWrite(1, LOW);
             delay(120);
             pinMode(1, INPUT);
@@ -11418,12 +11471,21 @@ void setup() {
         }
     }
 
+    {
+        // Diagnostic only: does the 0x30 coprocessor answer a READ? (Neither
+        // vendor dialect documents one; if some firmware returns an ID byte
+        // this is where we'd auto-detect the revision.) Harmless if it NAKs.
+        const uint8_t n = Wire.requestFrom((uint8_t)0x30, (uint8_t)1);
+        if (n) Serial.printf("Advance 0x30 read: 0x%02X\n", Wire.read());
+        else   Serial.println("Advance 0x30 read: NAK (write-only)");
+    }
+
     tft.begin();                                  // RGB only (no PCA9557)
     tft.fillScreen(TFT_BLACK);
 
     ts.begin(0x5D);                               // GT911 on Wire (15/16), addr 0x5D
     ts.setRotation(DASH_TOUCH_ROTATION);          // verify on first boot; flip if mirrored
-    Serial.println("Advance 5\" panel + GT911 (0x5D) init");
+    Serial.println("Advance panel (" DASH_BOARD_NAME ") + GT911 (0x5D) init");
 
     tft.setTextSize(1);
     delay(200);
@@ -11472,10 +11534,15 @@ void setup() {
     setupDashSprites();
 
 #if DASH_IS_ADVANCE
-    // Advance: backlight is an I2C command to the 0x30 coprocessor (0 =
-    // brightest). Turned on AFTER sprites are ready so no garbage frame shows.
+    // Advance: backlight is an I2C command to the 0x30 coprocessor. Turned on
+    // AFTER sprites are ready so no garbage frame shows. Send BOTH dialects at
+    // max (0 = V1.2/1.3 brightest, then 0x10 = V1.1 max; on a V1.2 unit 0x10
+    // merely reads as level 16 of 245 ≈ 93 %) — whichever revision this is, the
+    // panel lights. applyBrightness() below then applies the saved level in
+    // the configured dialect.
     advCoproCmd(0);
-    Serial.println("backlight on (i2c 0x30)");
+    advCoproCmd(0x10);
+    Serial.println("backlight on (i2c 0x30, both dialects)");
 #else
     // Basic 7"/5": GPIO 2 PWM on ledc channel 1. Keep ledc attached (don't
     // override with digitalWrite) so applyBrightness() can dim it. Full on
@@ -11490,6 +11557,10 @@ void setup() {
 
     loadSettings();
     applyBrightness(s.brightness);   // honour the saved brightness on both paths
+#if DASH_IS_ADVANCE
+    Serial.printf("Advance panel revision setting: %s (backlight dialect)\n",
+                  ADV_REV_NAMES[s.adv_rev % N_ADV_REV]);
+#endif
     Serial.printf("settings: rpm[%u..%u] alerts=%d a1=%uRPM/%uHz/%s aM=%uRPM/%uHz/%s\n",
                   s.rpm_min, s.rpm_max, (int)s.alerts_enabled,
                   s.alert1_rpm, s.alert1_hz, PALETTE_NAMES[s.alert1_color_idx],
