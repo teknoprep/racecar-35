@@ -6,7 +6,8 @@
 //   ENG,<rpm>[,<oil_psi_x10>,<coolant_f_x10>]   (3-field form, back-compat to 1)
 //
 // Two pages, swipeable:
-//   PAGE_DASH      — RPM bar + huge speed + L (HDG/LAT/LON) / R (FIX/SATS/GPS)
+//   PAGE_DASH      — RPM bar + delta bar + huge speed; TEMP/PSI/VOLT bottom-left,
+//                    PRED/LAP/BEST middle, LAP n / GPS 3D / TIME right (v0.1.147)
 //   PAGE_SETTINGS  — adjustable thresholds for the RPM bar, alert thresholds,
 //                    blink rates and colors. Persisted to NVS via Preferences.
 // Swipe right→left enters settings; left→right returns to dash.
@@ -26,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.146"
+#define FIRMWARE_VERSION "0.1.147"
 
 #include <Preferences.h>
 #include <time.h>
@@ -150,10 +151,44 @@ static TAMC_GT911 ts(DASH_TOUCH_SDA, DASH_TOUCH_SCL, (uint8_t)-1, (uint8_t)-1, 8
 // board_config.h (selected by DASH_BOARD). Touch is GT911 on Wire, set up
 // separately in setup() so LovyanGFX never initialises I2C_NUM_1.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Framebuffer colour depth (v0.1.147). DASH_FB_RGB332=1 runs the panel from an
+// 8-bit RGB332 framebuffer instead of 16-bit RGB565.
+//
+// WHY: on the ESP32-S3 the LCD is fed by GDMA straight out of the PSRAM
+// framebuffer with NO bounce buffer (LovyanGFX Bus_RGB, IDF 4.4 — bounce
+// buffers only exist in IDF 5). Every PSRAM stall (our sprite pushes, WiFi,
+// and the constant flash-cache misses of a 1.25 MB program on a 16 KB icache
+// — flash and PSRAM share the SPI bus) delays pixels; the error accumulates
+// down the frame and resets at VSYNC = the "bottom of the screen shakes".
+// RGB332 HALVES the LCD DMA's PSRAM bandwidth (30 -> 15 MB/s at 15 MHz pclk),
+// halves the framebuffer (768 -> 384 KB) and halves every sprite push, so
+// stalls that used to starve the DMA now fit in its slack. Cost: 256 colours
+// — fine for a flat-colour dash (LovyanGFX expands 3-3-2 onto the 16 panel
+// lines via its rgb332 signal table; the author left this path in, just
+// never enabled by default). Flip to 0 to go back to RGB565.
+// ---------------------------------------------------------------------------
+#ifndef DASH_FB_RGB332
+#define DASH_FB_RGB332 1
+#endif
+#if DASH_FB_RGB332
+class Panel_RGB_Dash : public lgfx::Panel_RGB {
+public:
+    Panel_RGB_Dash() {
+        _write_depth = lgfx::color_depth_t::rgb332_1Byte;
+        _read_depth  = lgfx::color_depth_t::rgb332_1Byte;
+    }
+};
+static constexpr int DASH_SPRITE_DEPTH = 8;
+#else
+using Panel_RGB_Dash = lgfx::Panel_RGB;
+static constexpr int DASH_SPRITE_DEPTH = 16;
+#endif
+
 class LGFX : public lgfx::LGFX_Device {
 public:
     lgfx::Bus_RGB     _bus_instance;
-    lgfx::Panel_RGB   _panel_instance;
+    Panel_RGB_Dash    _panel_instance;
     lgfx::Light_PWM   _light_instance;
     // No Touch_GT911 here — touch is handled separately by TAMC on Wire so
     // LovyanGFX never initialises I2C_NUM_1 and never steals the touch pins.
@@ -241,19 +276,19 @@ LGFX tft;
 // "TEMP: 250\xB0F" line fits without clipping.
 // ---------------------------------------------------------------------------
 namespace {
-    LGFX_Sprite spr_rpm_bar(&tft);     // inside the RPM bar border
     LGFX_Sprite spr_rpm_text(&tft);    // RPM number under the bar
     LGFX_Sprite spr_speed(&tft);       // huge centred MPH digits
     LGFX_Sprite spr_temp(&tft);        // "TEMP: ..." line
     LGFX_Sprite spr_psi(&tft);         // "PSI:  ..." line
     LGFX_Sprite spr_afr(&tft);         // "AFR:  ..." line (MS3 mode only)
     LGFX_Sprite spr_rec_badge(&tft);   // REC ● N  /  queue: N  /  REC ? no ack
-    LGFX_Sprite spr_fix(&tft);         // FIX value (right column)
-    LGFX_Sprite spr_sats(&tft);        // SATS value (right column)
-    LGFX_Sprite spr_gps(&tft);         // GPS status value (right column)
+    LGFX_Sprite spr_gps(&tft);         // GPS fix quality "3D" (right column, Font4) (v0.1.147)
+    LGFX_Sprite spr_sess_time(&tft);   // session elapsed H:MM:SS (right column) (v0.1.147)
     LGFX_Sprite spr_pred(&tft);        // predictive lap time (middle column)
     LGFX_Sprite spr_lap(&tft);         // last lap time (middle column)
-    LGFX_Sprite spr_delta(&tft);       // predictive delta vs best lap (middle column)
+    LGFX_Sprite spr_best(&tft);        // session-best lap time (middle column) (v0.1.147)
+    LGFX_Sprite spr_delta_bar(&tft);   // ±delta bar under the RPM bar (v0.1.147)
+    LGFX_Sprite spr_warn(&tft);        // sensor-warning block (OIL/TEMP/VOLT/AFR) (v0.1.147)
     LGFX_Sprite spr_track_name(&tft);  // active track name under TRACK btn
     LGFX_Sprite spr_recbtn(&tft);      // START/STOP button face
     LGFX_Sprite spr_upbtn(&tft);       // manual queue-upload button
@@ -264,29 +299,30 @@ static bool   dash_sprites_ready = false;
 static void setupDashSprites() {
     auto mk = [](LGFX_Sprite& s, int w, int h) -> bool {
         s.setPsram(true);          // request PSRAM backing store
-        s.setColorDepth(16);       // match RGB565 panel format
+        s.setColorDepth(DASH_SPRITE_DEPTH);   // match the panel framebuffer so pushSprite is a plain memcpy
         return s.createSprite(w, h) != nullptr;
     };
     // Inner-of-border for the RPM bar so the static white border outline
     // drawn directly on the framebuffer at pageJustEntered isn't clobbered.
     dash_sprites_ready =
-        mk(spr_rpm_bar,    756, 76)  &&
         mk(spr_rpm_text,   110, 26)  &&
         mk(spr_speed,      360, 200) &&    // covers Font7-size-4 (≈192 px tall)
         mk(spr_temp,       240, 38)  &&
         mk(spr_psi,        240, 38)  &&
         mk(spr_afr,        240, 38)  &&
         mk(spr_rec_badge,  220, 22)  &&
-        mk(spr_fix,        110, 24)  &&
-        mk(spr_sats,        60, 24)  &&
-        mk(spr_gps,        110, 24)  &&
+        mk(spr_gps,        110, 28)  &&
+        mk(spr_sess_time,  120, 28)  &&
         mk(spr_pred,       150, 28)  &&
         mk(spr_lap,        150, 28)  &&
-        mk(spr_delta,      150, 28)  &&
+        mk(spr_best,       150, 28)  &&
+        mk(spr_delta_bar,  756, 16)  &&
+        mk(spr_warn,       260, 140) &&
         mk(spr_track_name, 320, 22)  &&
         mk(spr_recbtn,     160, 70)  &&
         mk(spr_upbtn,      180, 70);
-    if (dash_sprites_ready) Serial.println("dash sprites: ok");
+    if (dash_sprites_ready) Serial.printf("dash sprites: ok (framebuffer %d bpp)\n",
+                                          (int)(tft.getColorDepth() & 0xFF));
     else                    Serial.println("WARNING: dash sprite alloc failed \u2014 dash will fall back to direct draw");
 }
 
@@ -363,6 +399,15 @@ static char     sd_err_hex[8]    = "";   // last SdFat err code (hex from SD,NON
 // Active session state — updated from SD,REC,<0|1>,<file>,<samples> lines.
 // The dash uses this to show a REC indicator + a live sample count.
 static bool     sd_session_active  = false;
+static uint32_t sd_rec_hb_ms       = 0;      // millis() of the last SD,REC,<0|1> line (1 Hz heartbeat while recording)
+// REC handshake watchdog (v0.1.147). TRACK,+REC,1 (and REC,0) used to be sent
+// exactly ONCE over the long cabin->trunk wire that we KNOW mangles bytes.
+// One bad byte = the Teensy never opens a file, the dash shows STOP + an
+// amber "REC ?" forever, and nothing is recorded ("sometimes it won't
+// record"). recHandshakeTick() re-sends until the Teensy's SD,REC heartbeat
+// agrees with the dash; the Teensy handler is idempotent (0.1.147).
+static uint32_t rec_hs_last_ms = 0;
+static uint16_t rec_hs_tries   = 0;
 static char     sd_session_file[80] = "";
 static uint32_t sd_session_samples = 0;
 
@@ -1704,6 +1749,7 @@ enum Page : uint8_t {
     PAGE_PID_SCAN      = 16,  // Mode-01 PID scan + map one to the COOLANT function
     PAGE_COACH         = 17,  // AI coach checklist: tap an item to tick it off
     PAGE_LAP_REVIEW    = 18,  // on-SD session lap list opened from Sessions
+    PAGE_TEST_SRC      = 19,  // "Start test mode": TEENSY (records real SD session) or SCREEN (local sim) (v0.1.147)
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -2223,6 +2269,7 @@ static bool parseSdLine(const String& line) {
         //   c1=after SD, c2=after REC, c3=after 0|1, c4=after filename
         const int c4 = (c3 >= 0) ? line.indexOf(',', c3 + 1) : -1;
         sd_session_active = (c3 >= 0) ? (line.substring(c2 + 1, c3).toInt() != 0) : false;
+        sd_rec_hb_ms = millis();
         if (c3 >= 0) {
             const int end = (c4 >= 0) ? c4 : (int)line.length();
             line.substring(c3 + 1, end).toCharArray(sd_session_file, sizeof(sd_session_file));
@@ -4186,7 +4233,11 @@ static bool uartLineIsTelemetry(const String& s) {
         || s.startsWith("VER,")  || s.startsWith("RST,");
 }
 
+static bool sim_active_fwd();   // (sim block is defined below pumpUart)
 static void pumpUart() {
+    // Screen-side simulator owns the telemetry while it runs: drain and drop
+    // anything a connected Teensy sends so two sources never fight (v0.1.147).
+    if (sim_active_fwd()) { while (Serial.available()) (void)Serial.read(); return; }
     while (Serial.available()) {
         char c = (char)Serial.read();
         if (c == '\r') continue;
@@ -4239,6 +4290,188 @@ static void uartLinkTick() {
     Serial.printf("Q,ABORT\n");
     Serial.printf("VER?\n");                 // poke — any reply revives uart_last_ok_ms
     Serial.printf("DBG,uart_reinit n=%u\n", (unsigned)uart_reinits);
+}
+
+// ---------------------------------------------------------------------------
+// SCREEN-SIDE TELEMETRY SIMULATOR (v0.1.147) — "test mode without a Teensy".
+//
+// Tools -> Start test mode -> SCREEN. The dash synthesizes the EXACT wire lines
+// the Teensy would send (GPS, ENG, ECU, IMU, TIME, HLTH, SD,REC, CLD, VER) and
+// feeds them through the real parser (simInject -> parseLine), so every
+// consumer — GPS sanity gates, lap timer + S/F gate, delta bar, PRED/BEST,
+// shift flash, sensor-warning block, REC handshake — runs the same code it
+// runs on track. Nothing is recorded anywhere (that's the TEENSY test mode).
+//
+// The car drives a 250 m circle that passes THROUGH the selected track's real
+// S/F line (perpendicularly, at its midpoint), so laps genuinely count and
+// lap times vary ~±2 % lap-to-lap (BEST / delta move). RPM follows a 5-gear
+// sawtooth vs speed (hits the shift alert every gear). Sensor demo: coolant
+// sweeps 180->228 F over 90 s; oil dips to 8 psi for 6 s every 75 s; battery
+// dips to 11.8 V for 8 s every 120 s (VOLT only shows in MS3/BT modes).
+//
+// While the sim runs, real Teensy input on UART0 is DRAINED AND IGNORED (two
+// sources would fight). Outgoing dash->Teensy commands still go out; harmless.
+// ---------------------------------------------------------------------------
+static bool     sim_active   = false;
+static uint32_t sim_t0_ms    = 0;
+static uint32_t sim_last_ms  = 0;     // last 25 Hz sample
+static uint32_t sim_hb_ms    = 0;     // last 1 Hz status burst
+static int      sim_track    = -1;
+static float    sim_cx_lat = 0, sim_cx_lon = 0;   // circle centre (deg)
+static float    sim_theta    = 0;     // current angle on the circle (rad)
+static float    sim_theta0   = 0;     // angle of the S/F midpoint
+static float    sim_mph      = 0;
+static uint32_t sim_lap      = 0;     // laps completed (drives the per-lap speed factor)
+static uint32_t sim_samples  = 0;
+static constexpr float  SIM_R_M = 250.0f;   // circle radius, metres (~50 s laps)
+
+static bool sim_active_fwd() { return sim_active; }
+
+static void simInject(const char* line) {
+    String sl(line);
+    if (parseLine(sl) && uartLineIsTelemetry(sl)) uart_last_ok_ms = millis();
+}
+
+// Pick the track whose S/F the circle should pass through: the selected
+// track if it has an S/F, else the first non-aux TRACKS[] entry that does.
+static int simPickTrack() {
+    float a, b, c, d; bool hl;
+    if (last_track_idx >= 0 && last_track_idx < N_TRACKS) {
+        effectiveSfLine(last_track_idx, &a, &b, &c, &d, &hl);
+        if (a != 0.0f || b != 0.0f) return last_track_idx;
+    }
+    for (int i = 0; i < N_TRACKS; ++i) {
+        if (TRACKS[i].aux) continue;
+        effectiveSfLine(i, &a, &b, &c, &d, &hl);
+        if (a != 0.0f || b != 0.0f) return i;
+    }
+    return -1;
+}
+
+static void simStart() {
+    sim_track = simPickTrack();
+    float aLat = 39.0f, aLon = -78.0f, bLat = 0, bLon = 0; bool hasLine = false;
+    if (sim_track >= 0) effectiveSfLine(sim_track, &aLat, &aLon, &bLat, &bLon, &hasLine);
+    // S/F midpoint M and along-line unit vector u (local metres, x=E, y=N).
+    const float mLat = hasLine ? (aLat + bLat) * 0.5f : aLat;
+    const float mLon = hasLine ? (aLon + bLon) * 0.5f : aLon;
+    const float mPerDegLat = 110540.0f;
+    const float mPerDegLon = 111320.0f * cosf(mLat * (float)M_PI / 180.0f);
+    float ux = 1.0f, uy = 0.0f;
+    if (hasLine) {
+        ux = (bLon - aLon) * mPerDegLon; uy = (bLat - aLat) * mPerDegLat;
+        const float n = sqrtf(ux * ux + uy * uy);
+        if (n > 0.1f) { ux /= n; uy /= n; } else { ux = 1.0f; uy = 0.0f; }
+    }
+    // Centre C = M +/- R*u  -> M lies on the circle and the tangent there is
+    // perpendicular to the S/F line = a clean perpendicular crossing. Pick the
+    // sign that puts C on the TRACK-CENTRE side of the line so the whole
+    // circle stays inside the track's radius_km (lapTrackIdx() would otherwise
+    // drop the track on the far side and reset the lap timer mid-lap).
+    if (sim_track >= 0) {
+        const float cE = (TRACKS[sim_track].lon - mLon) * mPerDegLon;
+        const float cN = (TRACKS[sim_track].lat - mLat) * mPerDegLat;
+        if (cE * ux + cN * uy < 0.0f) { ux = -ux; uy = -uy; }
+    }
+    sim_cx_lon = mLon + (SIM_R_M * ux) / mPerDegLon;
+    sim_cx_lat = mLat + (SIM_R_M * uy) / mPerDegLat;
+    sim_theta0 = atan2f(-uy, -ux);          // angle of M as seen from C
+    sim_theta  = sim_theta0 - 0.6f;         // start ~180 m before the line (out-lap)
+    sim_mph    = 45.0f;
+    sim_lap    = 0;
+    sim_samples = 0;
+    sim_t0_ms = sim_last_ms = sim_hb_ms = millis();
+    sim_active = true;
+    // One-shot status so the dash looks like it has a healthy Teensy.
+    char l[96];
+    snprintf(l, sizeof(l), "VER,teensy,%s", FIRMWARE_VERSION);  simInject(l);
+    simInject("SD,READY,32000,30500");
+    simInject("CLD,1,0");
+    Serial.printf("DBG,sim start track=%d hasLine=%d\n", sim_track, (int)hasLine);
+}
+
+static void simStop() {
+    if (!sim_active) return;
+    sim_active = false;
+    if (recording) {                        // leave a clean state: stop the dash session
+        recording = false;
+        Serial.printf("REC,0\n");
+    }
+    simInject("SD,REC,0,,0");
+    Serial.printf("DBG,sim stop samples=%lu laps=%lu\n",
+                  (unsigned long)sim_samples, (unsigned long)sim_lap);
+}
+
+static void simTick() {
+    if (!sim_active) return;
+    const uint32_t now = millis();
+    if (now - sim_last_ms < 40) return;     // 25 Hz
+    const float dt = (now - sim_last_ms) / 1000.0f;
+    sim_last_ms = now;
+    const float t = (now - sim_t0_ms) / 1000.0f;
+
+    // ---- speed profile around the lap (+ per-lap variation) ----
+    const float phase = sim_theta - sim_theta0;
+    const float lapFactor = 1.0f + 0.02f * sinf((float)sim_lap * 1.7f + 0.4f);
+    const float target = (45.0f + 40.0f * (0.5f + 0.5f * sinf(2.0f * phase + 0.6f))) * lapFactor;
+    const float prev_mph = sim_mph;
+    sim_mph += (float)((target - sim_mph) * fminf(1.0f, dt * 1.5f));   // smooth accel/brake
+    const float v_mps = sim_mph * 0.44704f;
+    const float th_prev = sim_theta;
+    sim_theta += (v_mps / SIM_R_M) * dt;
+    // Lap bookkeeping for the speed factor (the REAL lap count comes from the
+    // dash's own S/F gate on the injected GPS — this is only the sim's notion).
+    const float k_prev = floorf((th_prev  - sim_theta0) / (2.0f * (float)M_PI));
+    const float k_now  = floorf((sim_theta - sim_theta0) / (2.0f * (float)M_PI));
+    if (k_now > k_prev) sim_lap++;
+
+    // ---- position + heading ----
+    const float mPerDegLat = 110540.0f;
+    const float mPerDegLon = 111320.0f * cosf(sim_cx_lat * (float)M_PI / 180.0f);
+    const float lat = sim_cx_lat + (SIM_R_M * sinf(sim_theta)) / mPerDegLat;
+    const float lon = sim_cx_lon + (SIM_R_M * cosf(sim_theta)) / mPerDegLon;
+    const float vx = -sinf(sim_theta), vy = cosf(sim_theta);       // E, N
+    float hdg = atan2f(vx, vy) * 180.0f / (float)M_PI; if (hdg < 0) hdg += 360.0f;
+
+    // ---- engine: 5-gear sawtooth vs speed ----
+    int gear = 1 + (int)(sim_mph / 22.0f); if (gear > 5) gear = 5;
+    const float inBand = sim_mph - (gear - 1) * 22.0f;                 // 0..22 mph
+    unsigned rpm = (unsigned)(1200.0f + inBand * (6600.0f / 22.0f));
+    if (rpm > 7900) rpm = 7900;
+
+    // ---- sensors (demo schedules) ----
+    const int clt_x10 = (int)(1800.0f + 480.0f * (0.5f + 0.5f * sinf(t / 90.0f * 2.0f * (float)M_PI)));   // 180..228 F (warn default 220)
+    int psi_x10 = (int)(250.0f + rpm / 25.0f);
+    if (fmodf(t, 75.0f) < 6.0f && t > 20.0f) psi_x10 = 80;                 // OIL demo dip
+    int bat_x10 = 138;
+    if (fmodf(t, 120.0f) < 8.0f && t > 40.0f) bat_x10 = 118;               // VOLT demo dip
+    const int afr_x10 = (int)(147.0f + 8.0f * sinf(t / 7.0f));
+    const int map_x10 = (int)(300.0f + 700.0f * (inBand / 22.0f));
+    const int tps_x10 = (int)(1000.0f * (inBand / 22.0f));
+    const int iat_x10 = 950;
+
+    // ---- IMU: lateral g from the circle, longitudinal from the speed delta ----
+    const float ay_g = (v_mps * v_mps / SIM_R_M) / 9.81f;
+    const float ax_g = ((sim_mph - prev_mph) * 0.44704f / (dt > 0 ? dt : 0.04f)) / 9.81f;
+
+    char l[160];
+    snprintf(l, sizeof(l), "GPS,3,14,%.6f,%.6f,%.1f,%.1f,2", lat, lon, sim_mph, hdg);  simInject(l);
+    snprintf(l, sizeof(l), "ENG,%u,%d,%d", rpm, psi_x10, clt_x10);                              simInject(l);
+    snprintf(l, sizeof(l), "ECU,%u,%d,%d,%d,%d,%d,%d", rpm, clt_x10, map_x10, tps_x10, afr_x10, iat_x10, bat_x10); simInject(l);
+    snprintf(l, sizeof(l), "IMU,%.2f,%.2f,1.00f,0.0f,0.0f,%.1f", ax_g, ay_g, (v_mps / SIM_R_M) * 180.0f / (float)M_PI); simInject(l);
+    sim_samples++;
+
+    if (now - sim_hb_ms >= 1000) {
+        sim_hb_ms = now;
+        snprintf(l, sizeof(l), "TIME,%lu", (unsigned long)time(nullptr));                simInject(l);
+        snprintf(l, sizeof(l), "HLTH,452,381,-9999,%d", bat_x10);                        simInject(l);
+        if (recording) {
+            snprintf(l, sizeof(l), "SD,REC,1,/queue/session_SIM_%s.ndjson,%lu",
+                     active_track_name[0] ? "track" : "UNKNOWN", (unsigned long)sim_samples);
+            simInject(l);
+        }
+        simInject("CLD,1,0");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4320,6 +4553,8 @@ static void otaTick();
 static void otaStart();
 static void drawToolsPage();
 static void handleToolsTap(int x, int y);
+static void drawTestSrcPage();
+static void handleTestSrcTap(int x, int y);
 static bool parseVerLine(const String& line);
 static void handleStatusTap(int x, int y);
 
@@ -4623,6 +4858,7 @@ static void handleTouch() {
                 else if (currentPage == PAGE_SETTINGS) handleSettingsTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_COACH)   handleCoachTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_TOOLS)    handleToolsTap(tt.startX, tt.startY);
+                else if (currentPage == PAGE_TEST_SRC) handleTestSrcTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_STATUS)   handleStatusTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_SESSIONS) handleSessionsTap(tt.startX, tt.startY);
                 else if (currentPage == PAGE_LAP_REVIEW) handleLapReviewTap(tt.startX, tt.startY);
@@ -4736,6 +4972,25 @@ namespace {
   constexpr int RPM_BAR_Y = 10;
   constexpr int RPM_BAR_W = 760;
   constexpr int RPM_BAR_H = 80;
+  // v0.1.147 layout additions.
+  // Shift-alert FLASH BAND: only y 0..FLASH_BAND_H flashes the alert colour
+  // (RPM bar + RPM number + delta bar). Everything below stays black and is
+  // never repainted by the flash — that full-screen fillScreen per half-cycle
+  // (up to 16×/s) tearing against the LCD scan WAS the shift flicker.
+  constexpr int FLASH_BAND_H = 130;
+  // Delta bar (live gap vs session-best at the same point on track), as wide
+  // as the RPM bar, 12 px thick, directly under the RPM number. Sprite is 16
+  // tall so the centre tick can poke 2 px above/below the bar.
+  constexpr int DBAR_X       = RPM_BAR_X + 2;        // 22
+  constexpr int DBAR_W       = RPM_BAR_W - 4;        // 756
+  constexpr int DBAR_SPR_Y   = 113;                  // sprite top (bar rows 3..14)
+  constexpr int DBAR_H       = 12;
+  constexpr int DBAR_FULL_MS = 2000;                 // ±2.0 s = full deflection
+  constexpr int DBAR_DEAD_MS = 100;                  // ±0.10 s dead-band = no fill
+  // Sensor-warning BLOCK: the bottom-left region that holds the TEMP/PSI/VOLT/
+  // AFR rows. A warning flashes THIS block (name + live value) at 2 Hz instead
+  // of the whole screen; speed/laps/RPM/GPS stay live.
+  constexpr int WARN_X = 0, WARN_Y = 340, WARN_W = 260, WARN_H = 140;
 }
 
 // Smooth green→yellow→red gradient between rpm_min and rpm_max.
@@ -4745,6 +5000,10 @@ static uint16_t rpmBarColor(uint16_t rpm) {
     float ratio = (rpm <= lo) ? 0.0f
                 : (rpm >= hi) ? 1.0f
                 : (float)(rpm - lo) / (float)(hi - lo);
+    // Quantize to 24 steps (v0.1.147): a continuous gradient recoloured the
+    // WHOLE filled bar on nearly every rpm tick. 24 steps is visually still a
+    // smooth ramp but a full-width repaint now happens ~every 4% of range.
+    ratio = floorf(ratio * 24.0f + 0.5f) / 24.0f;
     float rf = (ratio <= 0.5f) ? (ratio * 2.0f) : 1.0f;
     float gf = (ratio <= 0.5f) ? 1.0f           : (1.0f - (ratio - 0.5f) * 2.0f);
     return tft.color565((uint8_t)(rf * 255), (uint8_t)(gf * 255), 0);
@@ -4763,15 +5022,22 @@ static constexpr uint16_t ENGINE_RUNNING_RPM = 500;
 // flash with the warning NAME (v0.1.110). Priority: OIL (engine-killing) >
 // TEMP > VOLT > AFR. Mirrors the per-line warn_active conditions in
 // drawDashPage; returns false when nothing is warning.
-static bool activeSensorWarning(const char** label, uint16_t* color) {
+// `val` (optional) receives the live reading for the warning block, e.g.
+// "12.0 psi" / "231F" / "11.9V" / "16.2" (v0.1.147).
+static bool activeSensorWarning(const char** label, uint16_t* color,
+                                char* val = nullptr, size_t valn = 0) {
     const uint32_t nowMs   = millis();
     const bool             fromMs3  = (s.sensor_type == 1);
     const bool             fromBt   = (s.sensor_type == 2);
     const bool             ecuStale = (ecu.last_ms == 0) || (nowMs - ecu.last_ms > 2000);
+    auto put = [&](const char* fmt, int x10) {
+        if (val && valn) snprintf(val, valn, fmt, x10 / 10, (x10 < 0 ? -x10 : x10) % 10);
+    };
     // OIL — low pressure (direct A2 transducer in every mode)
     if (s.show_oil_psi && eng.oil_psi_x10 >= 0
         && eng.oil_psi_x10 <= (int)s.oil_warn_psi * 10) {
-        *label = "OIL"; *color = PALETTE[s.oil_warn_col]; return true;
+        *label = "OIL"; *color = PALETTE[s.oil_warn_col];
+        put("%d.%d psi", eng.oil_psi_x10); return true;
     }
     // TEMP — coolant over threshold (source per sensor_type)
     {
@@ -4780,7 +5046,9 @@ static bool activeSensorWarning(const char** label, uint16_t* color) {
         const bool fault = (coolant < 0) || (fromMs3 && ecuStale)
                            || (fromBt && !obd::dataFresh());
         if (s.show_coolant && !fault && coolant >= (int)s.coolant_warn_f * 10) {
-            *label = "TEMP"; *color = PALETTE[s.coolant_warn_col]; return true;
+            *label = "TEMP"; *color = PALETTE[s.coolant_warn_col];
+            if (val && valn) snprintf(val, valn, "%dF", coolant / 10);
+            return true;
         }
     }
     // VOLT — low system voltage WHILE RUNNING (failing alternator/belt).
@@ -4790,14 +5058,16 @@ static bool activeSensorWarning(const char** label, uint16_t* color) {
         if (fromBt && obd::dataFresh() && obd::voltX10() > 0) v = obd::voltX10();
         else if (fromMs3 && !ecuStale && ecu.bat_x10 > 0)     v = ecu.bat_x10;
         if (v > 0 && v <= (int)s.volt_warn_x10) {
-            *label = "VOLT"; *color = PALETTE[s.volt_warn_col]; return true;
+            *label = "VOLT"; *color = PALETTE[s.volt_warn_col];
+            put("%d.%dV", v); return true;
         }
     }
     // AFR — out of band (MS3 mode only)
     if (s.show_afr && fromMs3 && !ecuStale && ecu.afr_x10 >= 0
         && (ecu.afr_x10 < (int)s.afr_warn_lo_x10
             || ecu.afr_x10 > (int)s.afr_warn_hi_x10)) {
-        *label = "AFR"; *color = PALETTE[s.afr_warn_col]; return true;
+        *label = "AFR"; *color = PALETTE[s.afr_warn_col];
+        put("%d.%d", ecu.afr_x10); return true;
     }
     return false;
 }
@@ -4831,18 +5101,20 @@ static uint16_t computeBgColor() {
 // when the new value differs from the cached one — this is what eliminates
 // the per-frame flicker. Dirtied to force-redraw on bg state changes.
 struct LastDrawn {
-    uint16_t bg          = 0xDEAD;
+    uint16_t bg          = 0xDEAD;   // (kept for compat; the dash body bg is always black now)
+    uint16_t flash_bg    = 0xDEAD;   // shift-alert band colour last painted (v0.1.147)
     int16_t  rpm_fillW   = -1;       // last drawn bar fill width in px
     uint16_t rpm_color   = 0;        // last drawn bar fill color
     int32_t  rpm_text    = -1;       // last drawn RPM number under the bar (sentinel = redraw)
     int16_t  spd_int     = -1;       // whole-MPH integer for stable equality checks
-    uint8_t  fix         = 0xFF;
-    uint8_t  sats        = 0xFF;
-    uint8_t  status      = 0xFF;
+    uint8_t  gps_tag     = 0xFF;     // (fix | status<<4) behind the "GPS 3D" value (v0.1.147)
     int8_t   recording   = -1;       // -1=never drawn; 0=stopped; 1=recording
     uint32_t pred_lap_cs = UINT32_MAX;   // predictive lap time in centiseconds
     uint32_t last_lap_cs = UINT32_MAX;   // last completed lap time in centiseconds
-    int32_t  delta_cs    = INT32_MIN;    // predictive delta vs best (centiseconds, signed; INT32_MIN=redraw)
+    uint32_t best_lap_cs = UINT32_MAX;   // session-best lap time in centiseconds (v0.1.147)
+    int16_t  delta_bar_px = INT16_MIN;   // delta bar fill (signed px; INT16_MAX = no ghost) (v0.1.147)
+    uint32_t sess_time_s = UINT32_MAX;   // session elapsed seconds last drawn (v0.1.147)
+    uint32_t warn_tag    = 0;            // sensor-warning block content tag (0 = block not shown)
     uint32_t track_tag   = UINT32_MAX;   // first 4 bytes of active_track_name; UINT32_MAX = needs redraw
     // Coolant temp / oil PSI cached state — value is x10 fixed-point (INT32_MIN
     // = redraw on next paint). The col_tag composes the current show flag,
@@ -4871,12 +5143,13 @@ struct LastDrawn {
 static LastDrawn ld;
 static void invalidateAll() {
     ld.rpm_fillW = -1; ld.rpm_text = -1; ld.spd_int = -1;
-    ld.fix = 0xFF; ld.sats = 0xFF; ld.status = 0xFF;
+    ld.gps_tag = 0xFF;
     ld.recording = -1;
     ld.rec_badge_tag = 0xFF; ld.rec_samples = UINT32_MAX; ld.cld_queue = UINT32_MAX;
     ld.upbtn_tag = UINT32_MAX;
-    ld.pred_lap_cs = UINT32_MAX; ld.last_lap_cs = UINT32_MAX;
-    ld.delta_cs    = INT32_MIN;
+    ld.pred_lap_cs = UINT32_MAX; ld.last_lap_cs = UINT32_MAX; ld.best_lap_cs = UINT32_MAX;
+    ld.delta_bar_px = INT16_MIN; ld.sess_time_s = UINT32_MAX; ld.warn_tag = 0;
+    ld.flash_bg = 0xDEAD;
     ld.lap_number  = INT32_MIN;
     ld.track_tag   = UINT32_MAX;
     ld.temp_x10 = INT32_MIN; ld.temp_col_tag = UINT32_MAX;
@@ -4952,49 +5225,69 @@ static void drawDashPage() {
         // parser's freshness timestamps. The next received line refills.
     }
 
-    const uint16_t bg = computeBgColor();
+    // v0.1.147: the shift-alert colour is confined to the top FLASH BAND; the
+    // body of the dash is ALWAYS black. `flashBg` is what the band paints,
+    // `bg` (black) is what every other element paints behind itself.
+    const uint16_t flashBg = computeBgColor();
+    const uint16_t bg      = TFT_BLACK;
 
-    // ---- full-screen sensor warning flash (v0.1.110) -----------------------
-    // When a sensor warning (OIL / TEMP / VOLT / AFR) is active, the WHOLE
-    // screen flashes its warn color at 2 Hz with the warning NAME huge in the
-    // middle — a glance tells you WHAT is wrong, not just that something is.
-    // The ON phase suppresses the normal dash render (like the lap popup);
-    // the OFF phase falls through to it (so the RPM shift flash still shows
-    // interleaved). Transitions force a full repaint via pageJustEntered.
+    // ---- sensor warning BLOCK (v0.1.147; was full-screen since v0.1.110) ----
+    // When a sensor warning (OIL / TEMP / VOLT / AFR) is active, the bottom-
+    // left SENSOR BLOCK (the TEMP/PSI/VOLT/AFR rows) flashes the warn colour
+    // at 2 Hz showing the NAME big and the LIVE VALUE under it — a glance
+    // tells you what's wrong AND how bad. Speed / laps / RPM / GPS stay live.
+    // Runs independently of the shift band (both can flash at once). The OFF
+    // phase repaints the normal sensor rows over black. One 260×140 sprite
+    // push per half-cycle — no more 768 KB fillScreen tearing twice a second.
+    bool warn_block_on = false;
     {
-        static bool        warn_shown = false;   // colored label frame on screen
-        static const char* warn_drawn = nullptr;
-        const char* wl = nullptr; uint16_t wc = 0;
-        const bool  wactive = activeSensorWarning(&wl, &wc);
-        if (wactive && (((millis() / 250) & 1) == 0)) {   // 2 Hz, ON phase
-            if (!warn_shown || warn_drawn != wl) {
-                tft.fillScreen(wc);
-                tft.setFont(&fonts::Font4);
-                tft.setTextSize(6);                        // ~156 px tall
-                tft.setTextDatum(textdatum_t::middle_center);
-                tft.setTextColor(TFT_BLACK, wc);
-                tft.drawString(wl, 400, 240);
-                tft.setTextSize(1);
-                tft.setTextDatum(textdatum_t::top_left);
-                warn_shown = true; warn_drawn = wl;
+        const char* wl = nullptr; uint16_t wc = 0; char wv[16] = "";
+        const bool  wactive = activeSensorWarning(&wl, &wc, wv, sizeof(wv));
+        warn_block_on = wactive && (((millis() / 250) & 1) == 0);   // 2 Hz ON phase
+        if (warn_block_on) {
+            uint32_t tag = 0x80000000u | (uint32_t)wc;
+            for (const char* p = wl; *p; ++p) tag = tag * 31u + (uint8_t)*p;
+            for (const char* p = wv; *p; ++p) tag = tag * 31u + (uint8_t)*p;
+            if (tag != ld.warn_tag) {
+                if (dash_sprites_ready) {
+                    spr_warn.fillSprite(wc);
+                    spr_warn.setTextDatum(textdatum_t::middle_center);
+                    spr_warn.setTextColor(TFT_BLACK);
+                    spr_warn.setFont(&fonts::Font4);
+                    spr_warn.setTextSize(2);                       // ~52 px name
+                    spr_warn.drawString(wl, WARN_W / 2, 50);
+                    spr_warn.setTextSize(1);
+                    spr_warn.drawString(wv, WARN_W / 2, 108);
+                    spr_warn.pushSprite(WARN_X, WARN_Y);
+                } else {
+                    tft.fillRect(WARN_X, WARN_Y, WARN_W, WARN_H, wc);
+                    tft.setTextDatum(textdatum_t::middle_center);
+                    tft.setTextColor(TFT_BLACK, wc);
+                    tft.setFont(&fonts::Font4);
+                    tft.setTextSize(2);
+                    tft.drawString(wl, WARN_X + WARN_W / 2, WARN_Y + 50);
+                    tft.setTextSize(1);
+                    tft.drawString(wv, WARN_X + WARN_W / 2, WARN_Y + 108);
+                    tft.setTextDatum(textdatum_t::top_left);
+                }
+                ld.warn_tag = tag;
             }
-            return;
-        }
-        if (warn_shown) {   // leaving the ON phase (or warning cleared)
-            warn_shown = false; warn_drawn = nullptr;
-            pageJustEntered = true;
+        } else if (ld.warn_tag != 0) {
+            // Leaving the ON phase (or warning cleared): black the block and
+            // force the sensor rows to repaint themselves over it.
+            ld.warn_tag = 0;
+            tft.fillRect(WARN_X, WARN_Y, WARN_W, WARN_H, TFT_BLACK);
+            ld.temp_x10 = INT32_MIN; ld.psi_x10 = INT32_MIN;
+            ld.afr_x10  = INT32_MIN; ld.volt_x10 = INT32_MIN;
         }
     }
 
-    // Full repaint when bg state flips OR we just entered the page. After
-    // that, every other element only repaints when its value changed —
-    // text uses textColor(fg, bg) so character cells redraw their own bg
-    // and we never go through a "blanked" intermediate frame. That kills
-    // the flicker.
-    if (pageJustEntered || bg != ld.bg) {
-        tft.fillScreen(bg);
-        tft.drawRect(RPM_BAR_X,     RPM_BAR_Y,     RPM_BAR_W,     RPM_BAR_H,     TFT_DARKGREY);
-        tft.drawRect(RPM_BAR_X + 1, RPM_BAR_Y + 1, RPM_BAR_W - 2, RPM_BAR_H - 2, TFT_DARKGREY);
+    // Full repaint ONLY on page entry (v0.1.147 — no longer on every alert
+    // flash). After that, every element repaints only when its value changed;
+    // text uses textColor(fg, bg) so cells redraw their own bg and we never
+    // go through a "blanked" intermediate frame.
+    if (pageJustEntered) {
+        tft.fillScreen(TFT_BLACK);
 
         // Static labels — drawn once on entry/bg-flip, not per frame.
         // Force size 1 explicitly: previous draws (boot, settings exit) may
@@ -5012,10 +5305,9 @@ static void drawDashPage() {
         // (26 px, "slightly bigger" per driver request) — labels stay Font2.
         tft.drawString("PRED", 264, 378);    // middle column — predictive lap time
         tft.drawString("LAP",  264, 406);    // middle column — last completed lap time
-        tft.drawString("DELTA",264, 434);    // middle column — predictive delta vs best lap
-        tft.drawString("FIX",  620, 380);
-        tft.drawString("SATS", 620, 405);
-        tft.drawString("GPS",  620, 430);
+        tft.drawString("BEST", 264, 434);    // middle column — session-best lap (v0.1.147; was DELTA)
+        tft.drawString("GPS",  620, 384);    // right column — fix quality "3D" (v0.1.147; was FIX/SATS/GPS)
+        tft.drawString("TIME", 620, 412);    // right column — session elapsed H:MM:SS (v0.1.147)
 
         // (TRACK / SET S/F button is drawn by the dynamic block below — it
         //  changes with recording/armed state since v0.1.115.)
@@ -5025,16 +5317,38 @@ static void drawDashPage() {
         invalidateAll();
     }
 
+    // ---- Shift-alert FLASH BAND (v0.1.147) ----
+    // When the alert colour flips, repaint ONLY the band's background-only
+    // strips (top margin, left/right margins, the gap between the bar and the
+    // delta bar) and invalidate the three band sprites so they re-push with
+    // the new colour behind them, in LCD scan order (top -> bottom). ~63 KB
+    // of fills + 3 sprite pushes instead of a 768 KB fillScreen + ~20 pushes.
+    if (flashBg != ld.flash_bg) {
+        const uint16_t border = (flashBg == TFT_BLACK) ? TFT_DARKGREY : TFT_WHITE;
+        tft.fillRect(0, 0, 800, RPM_BAR_Y, flashBg);                                   // top margin
+        tft.fillRect(0, RPM_BAR_Y, RPM_BAR_X, FLASH_BAND_H - RPM_BAR_Y, flashBg);      // left margin
+        tft.fillRect(RPM_BAR_X + RPM_BAR_W, RPM_BAR_Y, 800 - RPM_BAR_X - RPM_BAR_W,
+                     FLASH_BAND_H - RPM_BAR_Y, flashBg);                               // right margin
+        tft.drawRect(RPM_BAR_X,     RPM_BAR_Y,     RPM_BAR_W,     RPM_BAR_H,     border);
+        tft.drawRect(RPM_BAR_X + 1, RPM_BAR_Y + 1, RPM_BAR_W - 2, RPM_BAR_H - 2, border);
+        tft.fillRect(RPM_BAR_X, RPM_BAR_Y + RPM_BAR_H, RPM_BAR_W,
+                     DBAR_SPR_Y - (RPM_BAR_Y + RPM_BAR_H), flashBg);                   // gap: bar -> delta bar
+        tft.fillRect(RPM_BAR_X, DBAR_SPR_Y + 16, RPM_BAR_W,
+                     FLASH_BAND_H - (DBAR_SPR_Y + 16), flashBg);                       // gap: delta bar -> body
+        ld.rpm_fillW = -1; ld.rpm_text = -1; ld.delta_bar_px = INT16_MIN;
+        ld.flash_bg = flashBg;
+    }
+
     // ---- RPM bar fill ----
-    // Sprite-buffered: render the full inner band into spr_rpm_bar and DMA it
+    // (v0.1.147: no longer sprite-buffered — see the PSRAM-bandwidth note below.)
+    // Was: render the full inner band into a 756x76 sprite and DMA it
     // across so the user never sees a half-filled bar mid-LCD-scan. The
-    // outer white border was painted directly to the framebuffer on page
-    // entry and isn't touched here.
+    // outer border was painted by the band block above and isn't touched here.
     {
         const int iw = RPM_BAR_W - 4;
         const int ih = RPM_BAR_H - 4;
         int      fillW = 0;
-        uint16_t fillColor = bg;
+        uint16_t fillColor = flashBg;
         if (eng.rpm >= s.rpm_min && s.rpm_max > s.rpm_min) {
             const uint32_t rpmClamped = (eng.rpm > s.rpm_max) ? s.rpm_max : eng.rpm;
             fillW = (int)(((rpmClamped - s.rpm_min) * (uint32_t)iw)
@@ -5042,17 +5356,28 @@ static void drawDashPage() {
             fillColor = rpmBarColor(eng.rpm);
         }
         if (fillW != ld.rpm_fillW || fillColor != ld.rpm_color) {
-            if (dash_sprites_ready) {
-                spr_rpm_bar.fillSprite(bg);
-                if (fillW > 0)
-                    spr_rpm_bar.fillRect(0, 0, fillW, ih, fillColor);
-                spr_rpm_bar.pushSprite(RPM_BAR_X + 2, RPM_BAR_Y + 2);
-            } else {
-                const int ix = RPM_BAR_X + 2;
-                const int iy = RPM_BAR_Y + 2;
-                if (fillW < ld.rpm_fillW)
-                    tft.fillRect(ix + fillW, iy, ld.rpm_fillW - fillW, ih, bg);
+            const int ix = RPM_BAR_X + 2;
+            const int iy = RPM_BAR_Y + 2;
+            // v0.1.147 PSRAM-bandwidth fix: the bar used to re-push its whole
+            // 756x76 (115 KB) sprite on EVERY rpm tick (25 Hz) = ~6 MB/s of
+            // PSRAM traffic fighting the LCD DMA -> bottom-of-screen shake.
+            // Now: full sprite push only when the colour/band state changes
+            // (invalidated: ld.rpm_fillW == -1, or the gradient colour moved);
+            // otherwise paint just the DELTA band with a narrow fillRect.
+            // Solid fills are as scan-safe as a sprite push (single step, no
+            // fill-then-draw) but WRITE-only: no sprite render, no 115 KB read.
+            if (ld.rpm_fillW < 0) {                       // invalidated: paint everything
+                if (fillW > 0)  tft.fillRect(ix, iy, fillW, ih, fillColor);
+                if (fillW < iw) tft.fillRect(ix + fillW, iy, iw - fillW, ih, flashBg);
+            } else if (fillColor != ld.rpm_color) {       // gradient step moved: recolour the fill
                 if (fillW > 0) tft.fillRect(ix, iy, fillW, ih, fillColor);
+                if (fillW < ld.rpm_fillW)
+                    tft.fillRect(ix + fillW, iy, ld.rpm_fillW - fillW, ih, flashBg);
+            } else {                                      // same colour: delta band only
+                if (fillW < ld.rpm_fillW)
+                    tft.fillRect(ix + fillW, iy, ld.rpm_fillW - fillW, ih, flashBg);
+                else if (fillW > ld.rpm_fillW)
+                    tft.fillRect(ix + ld.rpm_fillW, iy, fillW - ld.rpm_fillW, ih, fillColor);
             }
             ld.rpm_fillW = fillW;
             ld.rpm_color = fillColor;
@@ -5060,20 +5385,26 @@ static void drawDashPage() {
     }
 
     // ---- RPM number, just under the bar at the right edge (Font2) ----
-    if ((int32_t)eng.rpm != ld.rpm_text) {
+    // Rate-capped to 10 Hz (v0.1.147): the number is informational; re-pushing
+    // it at 25 Hz was pure PSRAM churn. Invalidation (-1) always paints.
+    static uint32_t rpm_text_ms = 0;
+    if ((int32_t)eng.rpm != ld.rpm_text
+        && (ld.rpm_text < 0 || nowMs - rpm_text_ms >= 100)) {
+        rpm_text_ms = nowMs;
         char rpmBuf[8]; snprintf(rpmBuf, sizeof(rpmBuf), "%u", (unsigned)eng.rpm);
+        const uint16_t rpmCol = (flashBg == TFT_BLACK) ? TFT_LIGHTGREY : TFT_BLACK;  // contrast on a lit band
         if (dash_sprites_ready) {
-            spr_rpm_text.fillSprite(bg);
+            spr_rpm_text.fillSprite(flashBg);
             spr_rpm_text.setFont(&fonts::Font2);
             spr_rpm_text.setTextSize(1);
-            spr_rpm_text.setTextColor(TFT_LIGHTGREY);
+            spr_rpm_text.setTextColor(rpmCol);
             spr_rpm_text.setTextDatum(textdatum_t::top_right);
             spr_rpm_text.drawString(rpmBuf, 108, 0);
             spr_rpm_text.pushSprite(RPM_BAR_X + RPM_BAR_W - 108, RPM_BAR_Y + RPM_BAR_H + 4);
         } else {
             tft.setTextSize(1);
             tft.setFont(&fonts::Font2);
-            tft.setTextColor(TFT_LIGHTGREY, bg);
+            tft.setTextColor(rpmCol, flashBg);
             tft.setTextDatum(textdatum_t::top_right);
             tft.setTextPadding(80);
             tft.drawString(rpmBuf, RPM_BAR_X + RPM_BAR_W, RPM_BAR_Y + RPM_BAR_H + 4);
@@ -5082,22 +5413,79 @@ static void drawDashPage() {
         ld.rpm_text = eng.rpm;
     }
 
+    // ---- DELTA BAR (v0.1.147) — live gap vs session-best, as a bar ----
+    // Directly under the RPM number, as wide as the RPM bar, 12 px thick.
+    // White centre tick = even with best. Fill grows RIGHT/RED when slower,
+    // LEFT/GREEN when faster. ±DBAR_DEAD_MS shows no fill (grey ticks mark
+    // the dead-band); ±DBAR_FULL_MS = full deflection. Empty dark bar until a
+    // ghost lap exists or when not recording.
+    {
+        const int32_t deltaMs = recording ? predictiveDeltaMs() : INT32_MIN;
+        const int     halfW   = DBAR_W / 2 - 1;                  // 377 px each side
+        int16_t px;
+        if (deltaMs == INT32_MIN) {
+            px = INT16_MAX;                                       // no ghost -> empty bar
+        } else {
+            int32_t d = deltaMs;
+            if (d >  DBAR_FULL_MS) d =  DBAR_FULL_MS;
+            if (d < -DBAR_FULL_MS) d = -DBAR_FULL_MS;
+            if (d > -DBAR_DEAD_MS && d < DBAR_DEAD_MS) px = 0;
+            else px = (int16_t)((d * halfW) / DBAR_FULL_MS);
+        }
+        static uint32_t dbar_ms = 0;   // 10 Hz cap (v0.1.147); invalidation always paints
+        if (px != ld.delta_bar_px
+            && (ld.delta_bar_px == INT16_MIN || nowMs - dbar_ms >= 100)) {
+            dbar_ms = nowMs;
+            const int      cx     = DBAR_W / 2;                   // 378
+            const int      deadPx = (DBAR_DEAD_MS * halfW) / DBAR_FULL_MS;   // ~18 px
+            const uint16_t frame  = (flashBg == TFT_BLACK) ? 0x4208 /*#404040*/ : TFT_BLACK;
+            const uint16_t trough = (flashBg == TFT_BLACK) ? 0x10A2 /*#101010*/ : 0x2104;
+            if (dash_sprites_ready) {
+                LGFX_Sprite& sp = spr_delta_bar;
+                sp.fillSprite(flashBg);
+                sp.fillRect(0, 2, DBAR_W, DBAR_H, trough);
+                sp.drawRect(0, 2, DBAR_W, DBAR_H, frame);
+                if (px != INT16_MAX) {
+                    if (px > 0) sp.fillRect(cx,      3, px,  DBAR_H - 2, TFT_RED);
+                    if (px < 0) sp.fillRect(cx + px, 3, -px, DBAR_H - 2, TFT_GREEN);
+                }
+                sp.fillRect(cx - deadPx, 2 + DBAR_H - 4, 1, 4, TFT_DARKGREY);   // dead-band ticks
+                sp.fillRect(cx + deadPx, 2 + DBAR_H - 4, 1, 4, TFT_DARKGREY);
+                sp.fillRect(cx - 1, 0, 2, 16, TFT_WHITE);                        // centre tick
+                sp.pushSprite(DBAR_X, DBAR_SPR_Y);
+            } else {
+                const int X = DBAR_X, Y = DBAR_SPR_Y;
+                tft.fillRect(X, Y, DBAR_W, 16, flashBg);
+                tft.fillRect(X, Y + 2, DBAR_W, DBAR_H, trough);
+                tft.drawRect(X, Y + 2, DBAR_W, DBAR_H, frame);
+                if (px != INT16_MAX) {
+                    if (px > 0) tft.fillRect(X + cx,      Y + 3, px,  DBAR_H - 2, TFT_RED);
+                    if (px < 0) tft.fillRect(X + cx + px, Y + 3, -px, DBAR_H - 2, TFT_GREEN);
+                }
+                tft.fillRect(X + cx - deadPx, Y + 2 + DBAR_H - 4, 1, 4, TFT_DARKGREY);
+                tft.fillRect(X + cx + deadPx, Y + 2 + DBAR_H - 4, 1, 4, TFT_DARKGREY);
+                tft.fillRect(X + cx - 1, Y, 2, 16, TFT_WHITE);
+            }
+            ld.delta_bar_px = px;
+        }
+    }
+
     // ---- Finish-line lap-time popup ----
-    // Shows the just-completed lap time HUGE over everything BELOW the RPM
-    // bar + RPM number (driver keeps the live bar). The RPM warning flash
-    // takes precedence: while the alert bg is flashing (bg != black) the
-    // popup hides; if the popup window is still open when the flash ends it
-    // re-draws. Ends after s.lap_overlay_s seconds -> full clean repaint.
+    // Shows the just-completed lap time HUGE over everything BELOW the flash
+    // band (driver keeps the live RPM bar + delta bar). The RPM shift flash
+    // takes precedence: while the band is flashing the popup hides; if the
+    // popup window is still open when the flash ends it re-draws. Ends after
+    // s.lap_overlay_s seconds -> full clean repaint.
     {
         static bool popup_on = false;
-        const bool alert_flashing = (bg != TFT_BLACK);
+        const bool alert_flashing = (flashBg != TFT_BLACK);
         const bool want = (lap_overlay_until_ms != 0)
                           && (millis() < lap_overlay_until_ms)
                           && !alert_flashing;
         if (want) {
             if (!popup_on) {
                 popup_on = true;
-                const int top = RPM_BAR_Y + RPM_BAR_H + 26;   // below bar + RPM number
+                const int top = FLASH_BAND_H;   // below bar + RPM number + delta bar (v0.1.147)
                 tft.fillRect(0, top, 800, 480 - top, TFT_BLACK);
                 char cap[24];
                 snprintf(cap, sizeof(cap), lap_overlay_is_best ? "LAP %d  -  BEST" : "LAP %d",
@@ -5163,7 +5551,9 @@ static void drawDashPage() {
                 tft.setTextSize(1);
             }
             ld.spd_int = (int16_t)spd_int;
-            ld.recording = -1;        // speed redraw can clip the button — force its repaint
+            // (v0.1.147: dropped the `ld.recording = -1` force-repaint of the START
+            //  button here — the speed pad spans x 400..760, the buttons end at
+            //  x 390; it was a stale leftover costing a 22 KB push per mph.)
         }
     }
 
@@ -5326,8 +5716,12 @@ static void drawDashPage() {
     //
     // States:
     //   - hidden                  when dash thinks recording=false
-    //   - amber "REC ? no ack"    when dash sent REC,1 but Teensy hasn't
-    //                             acked SD,REC,1,... within a grace window
+    //   - amber "REC ? retry N"   when dash sent REC,1 but Teensy hasn't
+    //                             acked SD,REC,1,... — the handshake watchdog
+    //                             (recHandshakeTick, v0.1.147) is re-sending
+    //                             TRACK+REC,1 every 2 s; N = attempts so far
+    //   - red   "REC x NO SD"     same, but the Teensy reports the card is
+    //                             NONE/UNFORMATTED/ERR — retrying can't fix it
     //   - red   "REC ● N"         when both sides agree, N samples on disk
     // Plus a small cyan "queue: N" replacement when idle + backlog > 0.
     {
@@ -5337,14 +5731,18 @@ static void drawDashPage() {
         const bool grace_passed = (rec_start_ms != 0) &&
                                   (millis() - rec_start_ms > ackGrace);
         const bool warn = dash_rec && !teensy_ok && grace_passed;
+        // sd_card_status: 0 NONE, 1 FMT(unformatted), 2 READY, 3 ERR, 4 ACTIVE
+        const bool sd_bad = warn && (sd_card_status == 0 || sd_card_status == 1 || sd_card_status == 3);
         const uint8_t tag = (uint8_t)((dash_rec ? 1 : 0) |
                                      (teensy_ok ? 2 : 0) |
-                                     (warn     ? 4 : 0));
+                                     (warn     ? 4 : 0) |
+                                     (sd_bad   ? 8 : 0) |
+                                     (warn ? (uint8_t)((rec_hs_tries & 0x0F) << 4) : 0));
         const uint32_t samples = teensy_ok ? sd_session_samples : 0;
         const uint32_t qd      = (!dash_rec) ? cloud_queue_depth : 0;
         if (tag != ld.rec_badge_tag || samples != ld.rec_samples || qd != ld.cld_queue) {
-            // Band: just below the RPM number's baseline (y=94), above START (y=155).
-            constexpr int BX = 30, BY = 125, BW = 220, BH = 22;
+            // Band: below the delta bar (ends y=129), above START (y=155).
+            constexpr int BX = 30, BY = 132, BW = 220, BH = 22;
             if (dash_sprites_ready) {
                 spr_rec_badge.fillSprite(bg);
                 spr_rec_badge.setFont(&fonts::Font2);
@@ -5355,10 +5753,17 @@ static void drawDashPage() {
                     spr_rec_badge.setTextColor(TFT_WHITE);
                     char buf[24]; snprintf(buf, sizeof(buf), "REC  %lu", (unsigned long)samples);
                     spr_rec_badge.drawString(buf, 18, BH/2);
+                } else if (sd_bad) {
+                    spr_rec_badge.fillCircle(6, BH/2, 5, TFT_RED);
+                    spr_rec_badge.setTextColor(TFT_RED);
+                    spr_rec_badge.drawString(sd_card_status == 1 ? "REC x SD UNFORMATTED"
+                                           : sd_card_status == 3 ? "REC x SD ERROR"
+                                                                 : "REC x NO SD CARD", 18, BH/2);
                 } else if (warn) {
                     spr_rec_badge.fillCircle(6, BH/2, 5, TFT_ORANGE);
                     spr_rec_badge.setTextColor(TFT_ORANGE);
-                    spr_rec_badge.drawString("REC ? no ack", 18, BH/2);
+                    char buf[24]; snprintf(buf, sizeof(buf), "REC ? retry %u", (unsigned)rec_hs_tries);
+                    spr_rec_badge.drawString(buf, 18, BH/2);
                 } else if (qd > 0) {
                     spr_rec_badge.setTextColor(TFT_CYAN);
                     char qbuf[20]; snprintf(qbuf, sizeof(qbuf), "queue: %lu", (unsigned long)qd);
@@ -5375,10 +5780,17 @@ static void drawDashPage() {
                     tft.setTextColor(TFT_WHITE, bg);
                     char buf[24]; snprintf(buf, sizeof(buf), "REC  %lu", (unsigned long)samples);
                     tft.drawString(buf, BX + 18, BY + BH/2);
+                } else if (sd_bad) {
+                    tft.fillCircle(BX + 6, BY + BH/2, 5, TFT_RED);
+                    tft.setTextColor(TFT_RED, bg);
+                    tft.drawString(sd_card_status == 1 ? "REC x SD UNFORMATTED"
+                                 : sd_card_status == 3 ? "REC x SD ERROR"
+                                                       : "REC x NO SD CARD", BX + 18, BY + BH/2);
                 } else if (warn) {
                     tft.fillCircle(BX + 6, BY + BH/2, 5, TFT_ORANGE);
                     tft.setTextColor(TFT_ORANGE, bg);
-                    tft.drawString("REC ? no ack", BX + 18, BY + BH/2);
+                    char buf[24]; snprintf(buf, sizeof(buf), "REC ? retry %u", (unsigned)rec_hs_tries);
+                    tft.drawString(buf, BX + 18, BY + BH/2);
                 } else if (qd > 0) {
                     tft.setTextColor(TFT_CYAN, bg);
                     char qbuf[20]; snprintf(qbuf, sizeof(qbuf), "queue: %lu", (unsigned long)qd);
@@ -5406,6 +5818,10 @@ static void drawDashPage() {
         tft.drawString(fmtBuf, x, y);
     };
 
+    // v0.1.147: while the sensor-warning block is lit (ON phase) it OWNS this
+    // region — skip the rows so they don't paint over it. On the OFF phase the
+    // block handler has already invalidated them, so they repaint over black.
+    if (!warn_block_on) {
     constexpr int SENS_X      = 20;
     constexpr int SENS_TEMP_Y = 358;
     constexpr int SENS_PSI_Y  = 398;
@@ -5435,7 +5851,10 @@ static void drawDashPage() {
                            | ((uint32_t)fault << 8)
                            | ((uint32_t)warn_active)
                            | ((uint32_t)fromMs3 << 12);   // re-render on source flip
-        const int32_t  val = s.show_coolant ? (int32_t)coolant : INT32_MIN + 1;
+        // Key the redraw on the DISPLAYED integer degrees, not the raw x10 —
+        // 0.1 F of sensor jitter used to re-push this 18 KB sprite at 25 Hz,
+        // starving the LCD's PSRAM DMA (v0.1.147 tearing fix).
+        const int32_t  val = s.show_coolant ? (int32_t)((coolant + 5) / 10) : INT32_MIN + 1;
         if (val != ld.temp_x10 || tag != ld.temp_col_tag) {
             char buf[24] = "";
             uint16_t col = TFT_WHITE;
@@ -5480,7 +5899,7 @@ static void drawDashPage() {
                            | ((uint32_t)s.oil_warn_col << 16)
                            | ((uint32_t)fault << 8)
                            | ((uint32_t)warn_active);
-        const int32_t  val = s.show_oil_psi ? (int32_t)eng.oil_psi_x10 : INT32_MIN + 1;
+        const int32_t  val = s.show_oil_psi ? (int32_t)((eng.oil_psi_x10 + 5) / 10) : INT32_MIN + 1;   // displayed integer psi (v0.1.147)
         if (val != ld.psi_x10 || tag != ld.psi_col_tag) {
             char buf[24] = "";
             uint16_t col = TFT_WHITE;
@@ -5618,44 +6037,60 @@ static void drawDashPage() {
             }
         }
     }
+    }   // !warn_block_on
 
-    // Restore the small font so the FIX/SATS/GPS block below renders correctly.
     tft.setFont(&fonts::Font2);
     tft.setTextDatum(textdatum_t::top_left);
 
-    // Right column: FIX / SATS / GPS. Sprite-buffered so the value flips are
-    // atomic to the LCD scan; the static labels at x=620 were painted once on
-    // pageJustEntered and aren't touched here.
+    // Right column (v0.1.147): ONE line of GPS fix quality ("3D" green / "2D"
+    // yellow / "--" red, "OFF"/"STALE" when the link/module says so — sats
+    // and the raw status live on the STATUS page) + session elapsed TIME.
+    // Font4 values, sprite-buffered; the static labels at x=620 were painted
+    // once on pageJustEntered.
     {
-        auto drawTextSprite = [&](LGFX_Sprite& s, int sx, int sy,
-                                  const char* str, uint16_t col) {
+        auto drawF4Sprite = [&](LGFX_Sprite& s, int sx, int sy,
+                                const char* str, uint16_t col) {
             s.fillSprite(bg);
-            s.setFont(&fonts::Font2);
+            s.setFont(&fonts::Font4);
             s.setTextSize(1);
             s.setTextDatum(textdatum_t::top_left);
             s.setTextColor(col);
             s.drawString(str, 0, 0);
             s.pushSprite(sx, sy);
         };
-        if (g.fix != ld.fix) {
-            const uint16_t col = (g.fix >= 3) ? TFT_GREEN : (g.fix >= 2) ? TFT_YELLOW : TFT_RED;
-            char buf[8]; snprintf(buf, sizeof(buf), "%-5s", fixName(g.fix));
-            if (dash_sprites_ready) drawTextSprite(spr_fix, 680, 380, buf, col);
-            else                    drawValue(680, 380, buf, col);
-            ld.fix = g.fix;
+        auto drawF4Direct = [&](int x, int y, int pad, const char* str, uint16_t col) {
+            tft.setFont(&fonts::Font4);
+            tft.setTextDatum(textdatum_t::top_left);
+            tft.setTextPadding(pad);
+            tft.setTextColor(col, bg);
+            tft.drawString(str, x, y);
+            tft.setTextPadding(0);
+        };
+        const uint8_t gtag = (uint8_t)((g.fix & 0x0F) | ((g.status & 0x0F) << 4));
+        if (gtag != ld.gps_tag) {
+            const char* txt; uint16_t col;
+            if      (g.status == 0) { txt = "OFF";   col = TFT_RED;    }
+            else if (g.status == 3) { txt = "STALE"; col = TFT_ORANGE; }
+            else if (g.fix >= 3)    { txt = "3D";    col = TFT_GREEN;  }
+            else if (g.fix == 2)    { txt = "2D";    col = TFT_YELLOW; }
+            else                    { txt = "--";    col = TFT_RED;    }
+            if (dash_sprites_ready) drawF4Sprite(spr_gps, 680, 378, txt, col);
+            else                    drawF4Direct(680, 378, 110, txt, col);
+            ld.gps_tag = gtag;
         }
-        if (g.sats != ld.sats) {
-            char buf[8]; snprintf(buf, sizeof(buf), "%2u", (unsigned)g.sats);
-            if (dash_sprites_ready) drawTextSprite(spr_sats, 680, 405, buf, TFT_WHITE);
-            else                    drawValue(680, 405, buf, TFT_WHITE);
-            ld.sats = g.sats;
-        }
-        if (g.status != ld.status) {
-            char buf[8]; snprintf(buf, sizeof(buf), "%-5s", gpsStatusName(g.status));
-            const uint16_t col = gpsStatusColor(g.status);
-            if (dash_sprites_ready) drawTextSprite(spr_gps, 680, 430, buf, col);
-            else                    drawValue(680, 430, buf, col);
-            ld.status = g.status;
+        // Session TIME: runs while recording, freezes at STOP (total time out).
+        static uint32_t sess_len_ms = 0;
+        if (recording && rec_start_ms != 0) sess_len_ms = millis() - rec_start_ms;
+        const uint32_t secs = sess_len_ms / 1000;
+        if (secs != ld.sess_time_s) {
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu",
+                     (unsigned long)(secs / 3600), (unsigned long)((secs / 60) % 60),
+                     (unsigned long)(secs % 60));
+            const uint16_t col = recording ? TFT_WHITE : TFT_LIGHTGREY;
+            if (dash_sprites_ready) drawF4Sprite(spr_sess_time, 680, 406, buf, col);
+            else                    drawF4Direct(680, 406, 120, buf, col);
+            ld.sess_time_s = secs;
         }
     }
 
@@ -5666,7 +6101,12 @@ static void drawDashPage() {
         // Blank (grey --) when not recording — lap timing is session-only.
         const uint32_t predMs = recording ? predictiveLapMs() : 0;
         const uint32_t cs = predMs / 10;
-        if (cs != ld.pred_lap_cs) {
+        // 10 Hz cap (v0.1.147): hundredths tick 25x/s; the eye can't read that
+        // and each repaint is a PSRAM sprite push. Invalidation always paints.
+        static uint32_t pred_ms = 0;
+        if (cs != ld.pred_lap_cs
+            && (ld.pred_lap_cs == UINT32_MAX || nowMs - pred_ms >= 100)) {
+            pred_ms = nowMs;
             char buf[12];
             uint16_t col;
             if (predMs == 0) {
@@ -5753,37 +6193,25 @@ static void drawDashPage() {
         }
     }
 
-    // DELTA — live gap vs the session's best lap at the same point on track.
-    // Green when ahead of best pace, white when within DELTA_SAME_MS (even),
-    // red when behind, grey until a ghost (best) lap has been recorded.
+    // BEST (v0.1.147; replaces the DELTA text row — the delta is now the bar
+    // under the RPM bar). Fastest completed lap this session, green. Grey --
+    // until one lap has been completed. Survives STOP (static fact).
     {
-        // Blank (grey --) when not recording — lap timing is session-only.
-        const int32_t deltaMs = recording ? predictiveDeltaMs() : INT32_MIN;
-        const int32_t cs = (deltaMs == INT32_MIN) ? INT32_MIN : deltaMs / 10;
-        if (cs != ld.delta_cs) {
+        const uint32_t bestMs = lapTimer.best_lap_ms;
+        const uint32_t cs = bestMs / 10;
+        if (cs != ld.best_lap_cs) {
             char buf[12];
             uint16_t col;
-            if (deltaMs == INT32_MIN) {
-                snprintf(buf, sizeof(buf), "--.--");
-                col = TFT_DARKGREY;
-            } else {
-                const int32_t a = deltaMs < 0 ? -deltaMs : deltaMs;
-                snprintf(buf, sizeof(buf), "%c%u.%02u",
-                         deltaMs < 0 ? '-' : '+',
-                         (unsigned)(a / 1000), (unsigned)((a % 1000) / 10));
-                // faster=green, within DELTA_SAME_MS=white (same), slower=red.
-                col = (deltaMs < -DELTA_SAME_MS) ? TFT_GREEN
-                    : (deltaMs >  DELTA_SAME_MS) ? TFT_RED
-                                                 : TFT_WHITE;
-            }
+            if (bestMs == 0) { snprintf(buf, sizeof(buf), "--:--.--"); col = TFT_DARKGREY; }
+            else             { formatLapTime(bestMs, buf, sizeof(buf)); col = TFT_GREEN; }
             if (dash_sprites_ready) {
-                spr_delta.fillSprite(bg);
-                spr_delta.setFont(&fonts::Font4);
-                spr_delta.setTextSize(1);
-                spr_delta.setTextDatum(textdatum_t::top_left);
-                spr_delta.setTextColor(col);
-                spr_delta.drawString(buf, 0, 0);
-                spr_delta.pushSprite(325, 428);
+                spr_best.fillSprite(bg);
+                spr_best.setFont(&fonts::Font4);
+                spr_best.setTextSize(1);
+                spr_best.setTextDatum(textdatum_t::top_left);
+                spr_best.setTextColor(col);
+                spr_best.drawString(buf, 0, 0);
+                spr_best.pushSprite(325, 428);
             } else {
                 tft.setFont(&fonts::Font4);
                 tft.setTextDatum(textdatum_t::top_left);
@@ -5792,7 +6220,7 @@ static void drawDashPage() {
                 tft.drawString(buf, 325, 428);
                 tft.setTextPadding(0);
             }
-            ld.delta_cs = cs;
+            ld.best_lap_cs = cs;
         }
     }
 
@@ -10211,19 +10639,27 @@ static void drawToolsPage() {
     // session, exercising the SD-write + cloud-upload pipeline without
     // needing real sensors. STOP closes the session, which triggers upload
     // via either Ethernet (when W5500 lands) or WiFi-via-dash.
-    const uint16_t b3_fill = test_mode_active ? TFT_DARKGREEN : TFT_NAVY;
+    // v0.1.147: two flavours — TEENSY (existing: Teensy generates + records a
+    // real SD session) or SCREEN (dash-local simulator, no Teensy needed).
+    // Idle tap opens PAGE_TEST_SRC to choose; active tap stops whichever runs.
+    const bool     any_test = test_mode_active || sim_active;
+    const uint16_t b3_fill  = any_test ? TFT_DARKGREEN : TFT_NAVY;
     tft.fillRect(TOOLS_BTN_X, TOOLS_BTN3_Y, TOOLS_BTN_W, TOOLS_BTN_H, b3_fill);
     tft.drawRect(TOOLS_BTN_X, TOOLS_BTN3_Y, TOOLS_BTN_W, TOOLS_BTN_H, TFT_WHITE);
     tft.drawRect(TOOLS_BTN_X+1, TOOLS_BTN3_Y+1, TOOLS_BTN_W-2, TOOLS_BTN_H-2, TFT_WHITE);
     tft.setFont(&fonts::Font4);
     tft.setTextColor(TFT_WHITE, b3_fill);
-    tft.drawString(test_mode_active ? "Stop test mode" : "Start test mode",
+    tft.drawString(sim_active        ? "Stop test mode  (SCREEN sim)"
+                 : test_mode_active ? "Stop test mode  (TEENSY)"
+                                    : "Start test mode",
                    TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 22);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b3_fill);
-    const char* b3sub = test_mode_active
-        ? "recording synthetic data — tap to stop + upload"
-        : "record synthetic session for cloud upload test";
+    const char* b3sub = sim_active
+        ? "dash is simulating laps/RPM/sensors locally — tap to stop"
+        : test_mode_active
+        ? "Teensy recording synthetic data — tap to stop + upload"
+        : "synthetic data: you'll be asked TEENSY (records to SD) or SCREEN (no Teensy)";
     tft.drawString(b3sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 47);
 
     // ---- Button 4: CAN sniffer ----
@@ -10365,13 +10801,20 @@ static void handleToolsTap(int x, int y) {
         }
         return;
     }
-    // Button 3: Test mode toggle
+    // Button 3: Test mode. Active -> stop whichever flavour runs. Idle -> ask.
     if (x >= TOOLS_BTN_X && x <= TOOLS_BTN_X + TOOLS_BTN_W &&
         y >= TOOLS_BTN3_Y && y <= TOOLS_BTN3_Y + TOOLS_BTN_H) {
-        Serial.printf(test_mode_active ? "TESTSTOP\n" : "TESTSTART\n");
-        // Optimistically flip the local state so the button re-paints
-        // immediately; the Teensy TEST,<0|1> reply will reconcile.
-        test_mode_active = !test_mode_active;
+        if (sim_active) {
+            simStop();
+        } else if (test_mode_active) {
+            Serial.printf("TESTSTOP\n");
+            // Optimistically flip the local state so the button re-paints
+            // immediately; the Teensy TEST,<0|1> reply will reconcile.
+            test_mode_active = false;
+        } else {
+            currentPage = PAGE_TEST_SRC;
+            pageJustEntered = true;
+        }
         return;
     }
     // Button 5: WiFi speed test (v0.1.116)
@@ -10400,6 +10843,77 @@ static void handleToolsTap(int x, int y) {
         pageJustEntered = true;
         return;
     }
+}
+
+// ---------------------------------------------------------------------------
+// PAGE_TEST_SRC (v0.1.147) — "Start test mode" asks WHO generates the data.
+//   TEENSY: existing behaviour — TESTSTART; the Teensy synthesizes GPS/RPM/IMU
+//           and records a REAL SD session (exercises SD + upload pipeline).
+//   SCREEN: dash-local simulator (simStart) — no Teensy needed. Exercises the
+//           UI: laps via the real S/F gate, delta bar, PRED/BEST, shift flash,
+//           sensor-warning block, REC handshake. Records nothing.
+// Tap-only modal (CANCEL is the way out, like the keyboards).
+// ---------------------------------------------------------------------------
+namespace {
+    constexpr int TSRC_X = 60, TSRC_W = 680;
+    constexpr int TSRC_A_Y = 80,  TSRC_A_H = 110;   // TEENSY
+    constexpr int TSRC_B_Y = 210, TSRC_B_H = 110;   // SCREEN
+    constexpr int TSRC_C_Y = 350, TSRC_C_H = 60;    // CANCEL
+}
+
+static void drawTestSrcPage() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setFont(&fonts::Font4);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(textdatum_t::middle_center);
+    tft.drawString("TEST DATA SOURCE", 400, 21);
+    tft.fillRect(0, 42, 800, 1, TFT_DARKGREY);
+    tft.setFont(&fonts::Font2);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Who should generate the synthetic telemetry?", 400, 60);
+
+    auto button = [&](int y, int h, uint16_t fill, const char* title,
+                      const char* l1, const char* l2) {
+        tft.fillRect(TSRC_X, y, TSRC_W, h, fill);
+        tft.drawRect(TSRC_X,     y,     TSRC_W,     h,     TFT_WHITE);
+        tft.drawRect(TSRC_X + 1, y + 1, TSRC_W - 2, h - 2, TFT_WHITE);
+        tft.setFont(&fonts::Font4);
+        tft.setTextColor(TFT_WHITE, fill);
+        tft.drawString(title, 400, y + 28);
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_LIGHTGREY, fill);
+        if (l1) tft.drawString(l1, 400, y + 60);
+        if (l2) tft.drawString(l2, 400, y + 82);
+    };
+    button(TSRC_A_Y, TSRC_A_H, TFT_NAVY, "TEENSY",
+           "Teensy generates GPS/RPM/IMU and RECORDS a real SD session",
+           "needs the Teensy link  -  exercises SD write + cloud upload");
+    button(TSRC_B_Y, TSRC_B_H, TFT_DARKGREEN, "SCREEN",
+           "Dash simulates telemetry locally  -  NO Teensy needed",
+           "laps on the selected track's S/F, delta bar, shift flash, sensor warnings");
+    button(TSRC_C_Y, TSRC_C_H, 0x4208 /*#404040*/, "CANCEL", nullptr, nullptr);
+
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("SCREEN mode ignores a connected Teensy until stopped (Tools -> Stop test mode)", 400, 440);
+    tft.setTextDatum(textdatum_t::top_left);
+    pageJustEntered = false;
+}
+
+static void handleTestSrcTap(int x, int y) {
+    if (x < TSRC_X || x > TSRC_X + TSRC_W) return;
+    if (y >= TSRC_A_Y && y <= TSRC_A_Y + TSRC_A_H) {
+        Serial.printf("TESTSTART\n");
+        test_mode_active = true;     // optimistic; Teensy TEST,1 reconciles
+    } else if (y >= TSRC_B_Y && y <= TSRC_B_Y + TSRC_B_H) {
+        simStart();
+    } else if (y >= TSRC_C_Y && y <= TSRC_C_Y + TSRC_C_H) {
+        // cancel
+    } else {
+        return;
+    }
+    currentPage = PAGE_TOOLS;
+    pageJustEntered = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -11654,6 +12168,7 @@ static void dashHealthTick() {
 
 void loop() {
     pumpUart();
+    simTick();        // screen-side telemetry simulator, 25 Hz when active (v0.1.147)
     uartLinkTick();   // hard-reinit UART0 if the Teensy link goes silent (v0.1.122)
     handleTouch();
     dashHealthTick();  // 1 Hz ESP32 temp -> Teensy (heat diagnostics)
@@ -11691,6 +12206,34 @@ void loop() {
             coach_refetch_at_ms = 0;
             coachKick(nullptr);
         }
+    }
+
+    // ---- REC handshake watchdog (v0.1.147) ----
+    // want_on : dash says recording, Teensy hasn't confirmed (no SD,REC,1 yet,
+    //           or its open failed) -> re-send TRACK + REC,1 every 2 s.
+    // want_off: dash says stopped, but a FRESH (<3 s) Teensy heartbeat still
+    //           says SD,REC,1 (our REC,0 was lost) -> re-send REC,0 every 2 s.
+    // Both gated like the CFG resend: never mid-transfer, never while the
+    // Teensy is emitting Q,* (a stray line mid-ARQ desyncs it). Idempotent on
+    // the Teensy side, so an "extra" one is harmless.
+    {
+        const uint32_t nowh      = millis();
+        const bool link_busy = (uf.state != UF_IDLE) || (sl.state != SL_IDLE) || upload_active;
+        const bool q_quiet   = (q_activity_ms == 0) || (nowh - q_activity_ms >= 3000);
+        const bool hb_fresh  = (sd_rec_hb_ms != 0) && (nowh - sd_rec_hb_ms < 3000);
+        const bool want_on   = recording  && !sd_session_active && (nowh - rec_start_ms >= 1500);
+        const bool want_off  = !recording &&  sd_session_active && hb_fresh;
+        if ((want_on || want_off) && !link_busy && q_quiet && (nowh - rec_hs_last_ms >= 2000)) {
+            rec_hs_last_ms = nowh;
+            if (want_on) {
+                if (rec_hs_tries < 65535) rec_hs_tries++;
+                Serial.printf("TRACK,%s\n", active_track_name[0] ? active_track_name : "UNKNOWN");
+                Serial.printf("REC,1\n");
+            } else {
+                Serial.printf("REC,0\n");
+            }
+        }
+        if (!want_on) rec_hs_tries = 0;
     }
 
     { static uint32_t lastCfgResend = 0;
@@ -11756,6 +12299,8 @@ void loop() {
         // visibly and the OTA gating subtext (WiFi connected? mode?) reflects
         // changes promptly. Cheap — only two buttons painted.
         if (pageJustEntered || now - lastDraw >= 250) { lastDraw = now; drawToolsPage(); }
+    } else if (currentPage == PAGE_TEST_SRC) {
+        if (pageJustEntered) { lastDraw = now; drawTestSrcPage(); }
     } else if (currentPage == PAGE_GPS) {
         // Redraw on entry, on any tap (gps_page_dirty), and 1 Hz for live status.
         if (pageJustEntered || gps_page_dirty || now - lastDraw >= 1000) {

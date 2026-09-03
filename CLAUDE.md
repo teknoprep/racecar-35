@@ -752,7 +752,21 @@ VER,teensy,<semver>
 
 ### CrowPanel → Teensy (control)
 ```
-REC,<0|1>          # start/stop recording
+REC,<0|1>          # start/stop recording.
+                   # ⚠️ REC HANDSHAKE WATCHDOG (v0.1.147) — fixes "shows STOP + amber REC ?
+                   #   but records nothing". TRACK,+REC,1 used to be sent exactly ONCE over
+                   #   the wire we KNOW mangles bytes: one bad byte = Teensy never opens a
+                   #   file, dash shows STOP forever, nothing recorded. Dash: while
+                   #   recording && !sd_session_active (1.5 s grace) re-send TRACK,+REC,1
+                   #   every 2 s (badge "REC ? retry N"; red "REC x NO SD CARD/UNFORMATTED/
+                   #   ERROR" when sd_card_status says the card is the problem); while
+                   #   !recording but a FRESH (<3 s) SD,REC,1 heartbeat says the Teensy is
+                   #   still recording (our REC,0 was lost) re-send REC,0. Gated like the
+                   #   CFG resend (never mid-transfer, never while the Teensy emits Q,*).
+                   #   Teensy: REC is IDEMPOTENT — repeat REC,1 with the session open →
+                   #   re-ack SD,REC,1; with the open FAILED (card not ready at that
+                   #   instant) → retry openSession() with the SAME start time; repeat
+                   #   REC,0 while stopped → re-ack SD,REC,0.
 TRACK,<name>       # set the current track name (sent immediately before REC,1)
 CFG,<key>,<value>  # push settings (incl. srctyp, cloud, inet, and sf = active
                    #   track's S/F LINE: CFG,sf,aLat,aLon,bLat,bLon -> Teensy
@@ -859,23 +873,82 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 
 `clampInvariants()` enforces `rpm_min < rpm_max`, `alert1_rpm < alertmax_rpm`, `alert1_hz < alertmax_hz` after every mutation.
 
-### Full-screen sensor warning flash (v0.1.110)
-When a sensor warning is active on the dash page, the **whole screen flashes
-the warn colour at 2 Hz with the warning NAME** (Font4×6, centered):
-`OIL` (psi ≤ warn) > `TEMP` (coolant ≥ warn) > `VOLT` (low volts while
-running) > `AFR` (out of band) — highest priority wins (`activeSensorWarning()`
-next to `computeBgColor()`; it mirrors the per-line warn_active conditions).
-The ON phase early-returns from `drawDashPage()` (same pattern as the lap
-popup); the OFF phase renders the normal dash, so the **RPM shift flash shows
-interleaved** (shift lights themselves are unchanged — colour-only, no label).
-Transitions force a full repaint via `pageJustEntered`.
+### Sensor warning BLOCK (v0.1.147; was full-screen v0.1.110–0.1.146)
+When a sensor warning is active on the dash page, the **bottom-left sensor block**
+(`WARN_X/Y/W/H` = 0,340,260×140 — the region holding the TEMP/PSI/VOLT/AFR rows)
+flashes the warn colour at 2 Hz with the warning **NAME (Font4×2) and its LIVE
+VALUE** (`OIL / 12.0 psi`, `TEMP / 231F`, `VOLT / 11.9V`, `AFR / 16.2`):
+`OIL` > `TEMP` > `VOLT` > `AFR` — highest priority wins (`activeSensorWarning(label,
+color, val, n)` next to `computeBgColor()`; mirrors the per-line warn_active
+conditions). One `spr_warn` pushSprite per half-cycle; the OFF phase blacks the block
+and invalidates the sensor rows so they repaint. **Everything else (speed, laps, RPM
+bar, GPS, TIME, buttons) stays live** and the block runs independently of the shift
+band (both can flash at once). The sensor rows are skipped while `warn_block_on`.
+Why it changed: the old full-screen `fillScreen` twice a second was the same PSRAM-DMA
+tearing mechanism as the shift flash (see "THE SHAKE" below) and hid the speed/laps
+exactly when you least want to lose them.
+
+### Shift-alert FLASH BAND (v0.1.147; was full-screen)
+`computeBgColor()` now paints ONLY the top band `y 0..FLASH_BAND_H (130)`: the RPM bar
+(fill colour stays the gradient, empty part = alert colour), the RPM number (black text on
+a lit band) and the delta bar. On a colour flip, `drawDashPage()` fills just the band's
+background-only strips (~63 KB) and invalidates the three band elements; nothing below
+y=130 is repainted, so speed/laps/buttons never strobe. `flashBg` is the band colour;
+`bg` (always `TFT_BLACK`) is what every other element paints behind itself. The lap popup
+now starts at `FLASH_BAND_H` (the bar + delta bar stay visible under it).
+
+### Dash page v0.1.147 layout additions
+- **Delta bar** (`DBAR_*`, sprite 756×16 at y=113, bar 12 px): live gap vs session-best at
+  the same point on track, as a bar directly under the RPM number. White centre tick = even;
+  fill grows **RIGHT/RED when slower, LEFT/GREEN when faster**; `±DBAR_DEAD_MS` (100 ms)
+  dead-band shows no fill (grey ticks mark it); `±DBAR_FULL_MS` (2.0 s) = full deflection.
+  Empty dark trough until a ghost lap exists / when not recording. 10 Hz redraw cap.
+- **Middle column is PRED / LAP / BEST** — the DELTA text row became `BEST` (fastest lap this
+  session, green, `lapTimer.best_lap_ms`, `spr_best`). Delta lives in the bar now.
+- **Right column collapsed** FIX/SATS/GPS → ONE Font4 line `GPS 3D` (3D green / 2D yellow /
+  `--` red / `OFF` red / `STALE` orange; `spr_gps`; sats + raw status stay on the STATUS page)
+  + **`TIME H:MM:SS`** = session elapsed (`spr_sess_time`; runs while `recording`, freezes at
+  STOP; from `rec_start_ms`). Rows: `LAP n` y=346, GPS y=378, TIME y=406 (values at x=680).
+- REC badge moved to y=132 (under the delta bar). `spr_fix`/`spr_sats`/`spr_delta` and the
+  115 KB `spr_rpm_bar` are gone; `spr_delta_bar`, `spr_sess_time`, `spr_best`, `spr_warn`
+  (260×140) are new. All pre-allocated in `setupDashSprites()`.
+
+### THE SHAKE — RGB332 framebuffer + PSRAM-bandwidth discipline (v0.1.147) — DO NOT REGRESS
+Symptom (both Advance panels): the whole image jitters horizontally, worst toward the
+BOTTOM, whenever things update. Root cause: LovyanGFX `Bus_RGB` on this core (IDF 4.4.6)
+streams the **PSRAM framebuffer straight to the panel over GDMA with NO bounce buffer**,
+restarting at each VSYNC. Any PSRAM stall delays pixels; the error accumulates down the
+frame and snaps back at VSYNC. Stall sources: our own sprite pushes, WiFi, and the constant
+flash-cache misses of a 1.25 MB program on this core's **16 KB icache** (flash and PSRAM
+share the SPI bus on the S3). IDF 4.4 has no bounce-buffer support (that's IDF 5), so the
+fix is DEMAND reduction:
+1. **The framebuffer is 8-bit RGB332** (`DASH_FB_RGB332=1`, `Panel_RGB_Dash` subclass sets
+   `_write_depth/_read_depth = rgb332_1Byte`; LovyanGFX's `Bus_RGB` already carries the
+   rgb332 signal table and `lcd_2byte_en = pixel_bytes > 1`). Halves the LCD DMA's PSRAM
+   bandwidth (30 → 15 MB/s at 15 MHz), the framebuffer (768 → 384 KB) and every sprite
+   push. **This is what made the shake go away** (confirmed on the bench 7" Advance).
+   256 colours is fine for a flat-colour dash; sprites use `DASH_SPRITE_DEPTH` (8) so
+   pushSprite is a plain memcpy. Boot banner prints `framebuffer 8 bpp`.
+2. **Never re-push a big sprite per tick.** The RPM bar used to re-push its whole 756×76
+   sprite on EVERY rpm change (and the continuous gradient made it "change" every tick) =
+   ~6 MB/s of PSRAM. Now: solid `fillRect`s only (write-only; as scan-safe as a sprite push
+   because a solid fill is a single step) — delta band when the colour is unchanged, full fill
+   when the gradient step moves; gradient quantized to 24 steps (`rpmBarColor`).
+3. **Key redraws on the DISPLAYED value, not the raw one.** TEMP/PSI show integers; they were
+   keyed on ×10 (0.1° jitter = 18 KB repaint). Look for this pattern before adding a field.
+4. **Rate-cap cosmetic fast movers** (RPM number, PRED hundredths, delta bar px) to 10 Hz;
+   invalidation (`-1`/sentinel) always paints immediately so flash/entry repaints are instant.
+5. No stale force-repaints (the START button used to be re-pushed on every mph change from an
+   old "speed pad clips the button" layout that no longer overlaps).
+Remaining levers if it ever returns: `DASH_FREQ_WRITE` 15 → 13–14 MHz (panel PLL floor risk:
+12 MHz drifted on the 5"), then real bounce buffers = a GDMA-level fork of `Bus_RGB`.
 
 ## Dash UI architecture (RaceDash.ino)
 
 ### Pages
 | Page | Entered via | Purpose |
 | --- | --- | --- |
-| `PAGE_DASH` | swipe ←-direction from settings | RPM bar (top), HUGE Font7 speed (right side at x=600), HDG/LAT/LON left column, FIX/SATS/GPS right column, START/STOP button left of speed |
+| `PAGE_DASH` | swipe ←-direction from settings | RPM bar + RPM number + **delta bar** (top band, the only part the shift alert flashes), HUGE Font7 speed (right, x=580), START/TRACK buttons left, TEMP/PSI/VOLT(AFR) bottom-left (= the sensor-warning block), PRED/LAP/**BEST** middle, `LAP n` / **`GPS 3D`** / **`TIME`** right (v0.1.147 layout) |
 | `PAGE_SETTINGS` | swipe →-direction from dash | Scrollable list of settings rows |
 | `PAGE_NUM_KB` | tap on cloud port value | Numeric keypad (3 cols × 4 rows + DONE/CANCEL) |
 | `PAGE_TEXT_KB` | tap on cloud host / auth user / auth pass | Full lowercase keyboard (10 × 4 letters/digits + .-_/ + BACK/SPACE/DONE/CANCEL) |
@@ -883,6 +956,24 @@ Transitions force a full repaint via `pageJustEntered`.
 | `PAGE_SENSOR` | tap the **Sensor data source** settings row | Dedicated picker: Direct / MegaSquirt / **Bluetooth** buttons (like the GPS page). In Bluetooth mode shows the paired OBD-II dongle + live BLE status + a SCAN button. DONE saves, CANCEL reverts. |
 | `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). Drag-scrollable. RESCAN / BACK. |
 | `PAGE_PID_SCAN` | tap COOLANT PID on PAGE_SENSOR | Mode-01 PID scan (needs connected dongle + ignition); tap a row to map it as COOLANT (`btpid`). Drag-scrollable. RESCAN / BACK. |
+| `PAGE_TEST_SRC` | Tools → **Start test mode** (when idle) | **"TEST DATA SOURCE"** (v0.1.147): **TEENSY** = existing `TESTSTART` (Teensy synthesizes + RECORDS a real SD session; exercises SD + upload) / **SCREEN** = dash-local simulator, **no Teensy needed** / CANCEL. Tap-only modal, returns to Tools. |
+
+### Screen-side telemetry simulator (v0.1.147) — test the UI with no Teensy
+`simStart()/simTick()/simStop()` (next to `uartLinkTick()`): the dash synthesizes the EXACT
+wire lines the Teensy would send (`GPS,` `ENG,` `ECU,` `IMU,` at 25 Hz; `TIME,` `HLTH,` `CLD,`
++ `SD,REC,1,…` while `recording` at 1 Hz; `VER,teensy,<fw>` + `SD,READY` once) and feeds them
+through the REAL parser (`simInject` → `parseLine`, credits `uart_last_ok_ms`), so the GPS
+sanity gates, lap timer + S/F gate, delta bar, PRED/BEST, shift flash, sensor-warning block
+and REC handshake all run the on-track code. The car drives a **250 m circle through the
+selected track's real S/F line** (perpendicular at the midpoint; circle centre biased toward
+the track centre so it stays inside `radius_km`; falls back to the first non-aux track with an
+S/F) — ~50 s laps varying ±2 % so BEST/delta move. RPM = 5-gear sawtooth vs speed (hits the
+shift alert every gear). Demo schedule: coolant 180→228 °F over 90 s (warn default 220), oil
+dips to 8 psi for 6 s every 75 s, battery 11.8 V for 8 s every 120 s (VOLT shows in MS3/BT
+modes only). **While the sim runs, `pumpUart()` drains and IGNORES a connected Teensy** (two
+sources would fight); outgoing commands still go out. `simStop()` also STOPs the dash session.
+All sim math is `float` (the S3 has no double FPU — the first cut cost 13 KB of soft-float).
+Tools button 3 reads "Stop test mode (SCREEN sim)" / "(TEENSY)" while either runs.
 
 ### Bluetooth OBD-II (ELM327 BLE) — `sensor_type == 2`
 `obd_ble.h` is a self-contained NimBLE client for a **BLE ELM327** dongle in the
@@ -1063,8 +1154,9 @@ Lap timing runs in `RaceDash.ino` (`updateLapTimer()`) — **only WHILE RECORDIN
 START resets `lapTimer` for a fresh session (rising-edge reset also avoids a stale `prev_gps_ms`
 distance jump on restart); STOP freezes it and PRED/DELTA draw as grey `--` (the LAP row keeps
 the last completed time as a static fact). Middle dash column shows `PRED` / `LAP`
-(time) / `DELTA`; a **LAP COUNTER** (`"LAP N"`, yellow Font4) is drawn near the
-speed, just above the FIX/SATS/GPS column (current lap; `LAP --` until the first
+(time) / `BEST` (v0.1.147 — was `DELTA`; the delta is now the BAR under the RPM bar, see
+"Dash page v0.1.147 layout additions"); a **LAP COUNTER** (`"LAP N"`, yellow Font4) is
+drawn near the speed, just above the GPS/TIME column (current lap; `LAP --` until the first
 crossing).
 - **Start/finish = LINE crossing (v0.1.82).** The S/F is a **2-point line**
   (endpoints A,B). `updateLapTimer()` keeps the previous GPS point and logs a lap
@@ -1124,6 +1216,11 @@ Keyboard pages use a tap-only model (CANCEL is the way out, no swipe-back).
 5. **Scroll redraw rate cap = 30 Hz max** during active drag (`now - lastDraw >= 33 ms`). At ~200 Hz the LCD never gets a clean scan window between renders and tearing accumulates. 30 Hz gives the LCD two full scan periods per render.
 
 The settings page uses a `settingsDirty` flag, picker uses `tp.dirty`. Drawing is skipped between mutations.
+
+6. **PSRAM bandwidth is the real budget (v0.1.147).** The LCD DMA reads the PSRAM framebuffer
+   with no bounce buffer; every byte we push to PSRAM competes with it and shows up as the
+   bottom-of-screen shake. See "THE SHAKE" above: 8-bit framebuffer, no per-tick big-sprite
+   pushes, redraw keys on displayed values, 10 Hz caps on cosmetic fast movers.
 
 **Scroll flicker is reduced but not zero.** If a perfect fix is needed, the next step is a sprite back-buffer for each scrollable body — render to PSRAM sprite first, `pushSprite` once. That's deferred for now (current behaviour was deemed acceptable).
 

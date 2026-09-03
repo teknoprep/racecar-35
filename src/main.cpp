@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.146"
+#define FIRMWARE_VERSION "0.1.147"
 
 #include <SPI.h>
 #include <Ethernet.h>
@@ -393,6 +393,8 @@ static char     current_tz[8]    = "UTC";
 static void formatSDCard();   // defined below, after SD section
 static void openSession();    // forward decl — defined in SD section
 static void closeSession();
+static void emitSessionStatus(bool active);   // SD,REC,<0|1>,... ack (used by the REC handler, v0.1.147)
+extern bool session_file_open;                // defined in the SD section (v0.1.147)
 static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float lat_deg, float lon_deg,
                                float mph, float hdg_deg,
@@ -467,6 +469,25 @@ static void handleDashCommand(const String& line) {
                 Serial.printf("[teensy] REC STOP — duration=%lums\n",
                               (unsigned long)dur);
             }
+        } else if (now) {
+            // v0.1.147: REPEATED REC,1 — the dash's handshake watchdog re-sends
+            // TRACK+REC,1 until our SD,REC,1 heartbeat reaches it. Idempotent:
+            //   - session not open (the first openSession() failed, e.g. card
+            //     not READY at that instant, or the original REC,1 arrived but
+            //     the open lost a race) -> retry the open, SAME start time so
+            //     the filename/session id stay stable;
+            //   - session open -> just re-ack (our SD,REC,1 may have been the
+            //     line that got lost).
+            if (!session_file_open) {
+                Serial.println(F("[teensy] REC,1 (retry) — session not open, retrying openSession"));
+                openSession();
+            } else {
+                emitSessionStatus(true);
+            }
+        } else {
+            // Repeated REC,0 while already stopped: re-ack so a dash whose
+            // sd_session_active is stale (lost SD,REC,0) clears its badge.
+            emitSessionStatus(false);
         }
     } else if (line.startsWith("TRACK,")) {
         const String name = line.substring(6);
@@ -2083,7 +2104,7 @@ static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf) 
 // whole session.
 // ---------------------------------------------------------------------------
 static File32  session_file;
-static bool    session_file_open = false;
+bool           session_file_open = false;   // (non-static: forward-referenced by handleDashCommand, v0.1.147)
 static uint32_t session_samples       = 0;   // (declared before the dbg block, which reads it)
 static uint32_t session_last_flush_ms = 0;
 
