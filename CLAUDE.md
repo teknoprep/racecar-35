@@ -62,18 +62,23 @@ $cli = "C:\Users\ChrisRawlings\AppData\Local\Programs\Arduino IDE\resources\app\
 & $cli upload  --fqbn $fqbn -p COM3 $sketch
 ```
 
-**Multi-board (one source tree, FOUR display panels).** `RaceDash.ino` is panel-agnostic; the
-only board-specific values (RGB pin map, panel timing + sync polarities, touch I2C pins,
-backlight method, LCD-reset method) live in `crowpanel-arduino/RaceDash/board_config.h`,
-selected at compile time by `-DDASH_BOARD`. **Each panel also needs its own FlashSize** in the
-FQBN:
+**Multi-board (one source tree, TWO live display panels — both CrowPanel *Advance*).**
+`RaceDash.ino` is panel-agnostic; the only board-specific values (RGB pin map, panel timing +
+sync polarities, touch I2C pins, backlight method, LCD-reset method) live in
+`crowpanel-arduino/RaceDash/board_config.h`, selected at compile time by `-DDASH_BOARD`:
 
 | `-DDASH_BOARD` | board id | panel | FlashSize | notes |
 | --- | --- | --- | --- | --- |
-| `7` (default) | `crowpanel7` | CrowPanel 7.0" V3.0 (Basic RGB) | `4M` | PCA9557 reset, touch 19/20, GPIO2 PWM backlight |
-| `5` | `crowpanel5` | CrowPanel 5.0" V3.0 (Basic RGB) | `4M` | same family as 7", different pin map/porches |
 | `51` | `crowpanel5adv` | CrowPanel **Advance** 5.0" (HMI IPS, N16R8) | `16M` | inverted sync polarity, touch 15/16, **I2C 0x30 coprocessor** backlight, NO PCA9557, GPIO 38 is an RGB data pin |
-| `71` | `crowpanel7adv` | CrowPanel **Advance** 7.0" (HMI IPS, N16R8) | `16M` | **electrically identical to the 5" Advance** (Elecrow ships ONE shared `..._4_3_5_0_7_0` LovyanGFX driver for 4.3/5/7) — same `board_config.h` block, only the board id differs (v0.1.145) |
+| `71` (default) | `crowpanel7adv` | CrowPanel **Advance** 7.0" (HMI IPS, N16R8) | `16M` | **electrically identical to the 5" Advance** (Elecrow ships ONE shared `..._4_3_5_0_7_0` LovyanGFX driver for 4.3/5/7) — same `board_config.h` block, only the board id differs (v0.1.145) |
+
+**⚠️ RETIRED after v0.1.146 — the CrowPanel *Basic* panels (`7` = `crowpanel7` 7.0" V3.0, `5` =
+`crowpanel5` 5.0" V3.0, both 4M).** That hardware was scrapped. They are **no longer built,
+published, or in the manifest**; their bins were deleted from the server; `board_config.h`
+makes `-DDASH_BOARD=7|5` a hard `#error` (override `-DDASH_ALLOW_RETIRED_BOARDS` for
+archaeology only); the build default is now `71`. Their pin maps stay in `board_config.h` for
+reference. **Don't spend effort on them.** (Everything below that still says "Basic"/"4M" is
+historical context for old incidents.)
 
 **⚠️ Advance 0x30 backlight coprocessor has TWO DIALECTS (v0.1.145, the "display does not boot"
 incident).** Same STC8H1K28 at I²C 0x30, incompatible firmwares by hardware revision (Elecrow
@@ -106,11 +111,10 @@ get swapped on the bench between commands — re-check each time, don't trust th
 # Hardware check via flash size:
 python3 ~/.arduino15/packages/esp32/tools/esptool_py/4.5.1/esptool.py --port /dev/ttyUSB0 flash_id | grep -iE "flash size|MAC"
 #   16 MB  -> a CrowPanel Advance (5" crowpanel5adv DASH_BOARD=51 OR 7" crowpanel7adv DASH_BOARD=71, both FlashSize=16M)
-#    4 MB  -> a Basic panel (7" crowpanel7 OR 5" crowpanel5, both FlashSize=4M)
+#    4 MB  -> a RETIRED Basic panel -> do NOT flash it (scrapped hardware, no current firmware exists)
 ```
-- Flash size distinguishes the **Advance (16M)** from the **Basic 4M** boards; it does NOT tell
-  7" from 5" within a family — for those, go by which panel is physically plugged in (and/or
-  the MAC). Known bench MACs: 5" Advance (linear rev) `1c:db:d4:4d:67:04`; 5" Advance V1.1
+- Flash size only confirms it's an **Advance (16M)**; it does NOT tell the 7" Advance from the
+  5" Advance — for those, go by which panel is physically plugged in (and/or the MAC). Known bench MACs: 5" Advance (linear rev) `1c:db:d4:4d:67:04`; 5" Advance V1.1
   (ladder rev) `98:88:e0:13:99:a0` (killed 2026-09-02 by 5 V on the HY2.0 3V3_OUT pin — see
   the Advance power note below); 7" Advance (linear rev) `1c:db:d4:4e:3e:e4`.
 - **After flashing, confirm the boot banner** over `/dev/ttyUSB0` @ 921600 prints the expected
@@ -160,14 +164,14 @@ This is the default release contract for this repo. When code is changed and the
 
 1. **Bump the version** in BOTH `FIRMWARE_VERSION` defines (`src/main.cpp` + `RaceDash.ino`) to
    the same new number. Every artifact ships at one identical version (lockstep).
-2. **Rebuild ALL FIVE artifacts** even if only one side changed: `teensy`, `crowpanel7`,
-   `crowpanel5`, `crowpanel5adv`, `crowpanel7adv` (v0.1.145+). The four dash bins are one
-   source built with different `-DDASH_BOARD` (the two Advance builds use `FlashSize=16M`, the
-   Basics `4M`).
-3. **Update the manifest** (`publish_firmware.sh` generates the server one; it now emits the
-   `crowpanel7adv` entry too): set every `version` to the new number, recompute every
-   `sha256` + `size`, keep each entry's `board` field, and keep the legacy `crowpanel` entry
-   mirroring `crowpanel7`. A stale sha aborts OTA on the device.
+2. **Rebuild ALL THREE artifacts** even if only one side changed: `teensy`, `crowpanel5adv`,
+   `crowpanel7adv`. The two dash bins are one source built with `-DDASH_BOARD=51` and `=71`,
+   both `FlashSize=16M`. (The Basic `crowpanel7`/`crowpanel5` bins were RETIRED after 0.1.146
+   — never build or publish them again.)
+3. **Update the manifest** (`publish_firmware.sh` generates the server one — three entries:
+   `teensy`, `crowpanel5adv`, `crowpanel7adv`; the legacy `crowpanel` alias is gone): set
+   every `version` to the new number, recompute every `sha256` + `size`, keep each entry's
+   `board` field. A stale sha aborts OTA on the device.
 4. **Check-then-flash, every time** — if a panel is connected on USB: FIRST run `esptool
    flash_id` to confirm which board it is (16M=Advance, 4M=Basic) and flash the MATCHING build,
    then read the boot banner over `/dev/ttyUSB0` @ 921600 (`crowpanel-…` line = board id +
@@ -189,9 +193,14 @@ As of **v0.1.73** the dash `OTA_MANIFEST_URL` points at
 `https://racecar.api.blueuc.com/firmware/manifest.json` (see `RaceDash.ino`).
 The FastAPI server (`server/app/main.py`) hosts the OTA feed:
 `GET /firmware/manifest.json` (served **`Cache-Control: no-store`** → instantly
-fresh, no CDN lag), `GET /firmware/{file}`, and `POST /firmware/upload?name=<f>`
-(gated by `X-API-Key` == the server's `RACECAR_API_KEY`). Files live in
-`RACECAR_DATA_DIR/firmware/`.
+fresh, no CDN lag), `GET /firmware/{file}`, `POST /firmware/upload?name=<f>`, and
+`DELETE /firmware/{file}` (retire an artifact; refuses `manifest.json` — replace that via
+upload so devices never 404). Upload + delete are gated by `X-API-Key` == the server's
+**`RACECAR_FIRMWARE_KEY`**. Files live in `RACECAR_DATA_DIR/firmware/`.
+
+**Firmware key location:** on the server box, `/docker/racecar.api.blueuc.com/server/.env`
+(`RACECAR_FIRMWARE_KEY=`) or `docker exec racecar35-cloud printenv RACECAR_FIRMWARE_KEY`. On
+this build host a copy lives at `/home/chris/racecar-tools/secrets/racecar_api_key.env`.
 
 **Why:** `raw.githubusercontent.com` is fronted by Fastly, which ignores
 query-string cache-busting AND client `no-cache` headers and serves ~5 min
@@ -1456,7 +1465,7 @@ On Teensy boot: DHCP → NTP query to `0.pool.ntp.org` → set the Teensy's RTC.
 src/main.cpp                              Teensy: GNSS + tach + REC/TRACK consumer + (TODO) W5500 cloud client
 platformio.ini                            Teensy build (do NOT add a CrowPanel env)
 crowpanel-arduino/RaceDash/RaceDash.ino   CrowPanel: dash UI + settings + keyboards + track picker + GT911 touch (LIVE, panel-agnostic)
-crowpanel-arduino/RaceDash/board_config.h Per-panel RGB pin map/timing/backlight/touch (DASH_BOARD 7|5); 7"=crowpanel7, 5"=crowpanel5
+crowpanel-arduino/RaceDash/board_config.h Per-panel RGB pin map/timing/backlight/touch. LIVE: DASH_BOARD 51=crowpanel5adv, 71=crowpanel7adv (default). 7|5 = RETIRED Basics (#error)
 crowpanel-arduino/RaceDash/obd_ble.h      BLE OBD-II (ELM327) client — NimBLE on a core-0 task; coolant/IAT/voltage for sensor_type==2 (NOT RPM)
 crowpanel-arduino/RaceDash_v0139_orig/    Pre-touch-rework backup of RaceDash (swap/revert screens easily)
 crowpanel-arduino/PanelTest/PanelTest.ino Bare panel bring-up sketch — display only, NO touch (not a touch baseline)

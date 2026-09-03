@@ -7,19 +7,21 @@
 // mechanism differ. Those board-specific values live here, selected at
 // COMPILE time via -DDASH_BOARD:
 //
-//   DASH_BOARD == 7   -> CrowPanel ESP32 7.0" V3.0 (Basic RGB)  -> "crowpanel7"
-//   DASH_BOARD == 5   -> CrowPanel ESP32 5.0" V3.0 (Basic RGB)  -> "crowpanel5"
 //   DASH_BOARD == 51  -> CrowPanel Advance 5.0" (HMI IPS, S3)    -> "crowpanel5adv"
 //   DASH_BOARD == 71  -> CrowPanel Advance 7.0" (HMI IPS, S3)    -> "crowpanel7adv"
+//
+//   RETIRED (hardware scrapped after v0.1.146 — no longer built/published):
+//   DASH_BOARD == 7   -> CrowPanel ESP32 7.0" V3.0 (Basic RGB)  -> "crowpanel7"
+//   DASH_BOARD == 5   -> CrowPanel ESP32 5.0" V3.0 (Basic RGB)  -> "crowpanel5"
+//   Their pin maps are kept below for reference only and are a HARD BUILD
+//   ERROR unless -DDASH_ALLOW_RETIRED_BOARDS is also given.
 //
 // IDENTITY IS BAKED AT THE FIRST USB FLASH. We never auto-detect the panel at
 // runtime (a wrong RGB-timing guess = an unrecoverable black screen). The
 // binary is built for exactly one panel, so OTA can — and does — only ever
 // consume the manifest entry keyed by this board's DASH_BOARD_ID.
 //
-// Build (note the Advance is a 16 MB module, so FlashSize=16M):
-//   7":       --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7"   FlashSize=4M
-//   5" Basic: --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5"   FlashSize=4M
+// Build (both Advance panels are 16 MB modules, so FlashSize=16M):
 //   5" Adv:   --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51"  FlashSize=16M
 //   7" Adv:   --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=71"  FlashSize=16M
 //
@@ -39,7 +41,13 @@
 #pragma once
 
 #ifndef DASH_BOARD
-#define DASH_BOARD 7   // default to the 7" if the build flag is absent
+#define DASH_BOARD 71  // default to the 7" ADVANCE if the build flag is absent
+#endif
+
+// The Basic panels are retired hardware. Refuse to build them by accident —
+// a Basic image flashed onto an Advance = dead touch + garbled RGB.
+#if (DASH_BOARD == 7 || DASH_BOARD == 5) && !defined(DASH_ALLOW_RETIRED_BOARDS)
+#error "DASH_BOARD 7/5 (CrowPanel Basic) are RETIRED. Build 51 (5\" Advance) or 71 (7\" Advance). Define DASH_ALLOW_RETIRED_BOARDS to override."
 #endif
 
 // Backlight is GPIO 2 PWM on the Basic V3.0 panels; the Advance drives it over

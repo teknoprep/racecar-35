@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Publish the four OTA artifacts + a server-pointed manifest to the racecar
-# cloud server's /firmware store. Run AFTER building (see ../BUILD.md), from the
+# Publish the THREE OTA artifacts (teensy + the two Advance panels) + a
+# server-pointed manifest to the racecar cloud server's /firmware store.
+# The Basic panels (crowpanel7 / crowpanel5) were RETIRED (scrapped hardware)
+# after v0.1.146 and are no longer built or published. Run AFTER building (see ../BUILD.md), from the
 # repo root's firmware/ dir being present.
 #
 # Usage:
@@ -32,16 +34,10 @@ if [ -z "${RACECAR_FW_DIR:-}" ]; then
   echo "         NEW release you almost certainly want a staging dir instead."
 fi
 
-declare -A BOARD=(
-  [teensy41-dash.hex]=teensy
-  [crowpanel7-dash.bin]=crowpanel7
-  [crowpanel5-dash.bin]=crowpanel5
-  [crowpanel5adv-dash.bin]=crowpanel5adv
-  [crowpanel7adv-dash.bin]=crowpanel7adv
-)
+ARTIFACTS=(teensy41-dash.hex crowpanel5adv-dash.bin crowpanel7adv-dash.bin)
 
 # 1. Upload each binary artifact.
-for f in teensy41-dash.hex crowpanel7-dash.bin crowpanel5-dash.bin crowpanel5adv-dash.bin crowpanel7adv-dash.bin; do
+for f in "${ARTIFACTS[@]}"; do
   [ -f "$FW/$f" ] || { echo "missing $FW/$f (build first)"; exit 1; }
   echo "-> uploading $f ($(stat -c%s "$FW/$f") bytes)"
   curl -fsS -X POST "$BASE/firmware/upload?name=$f" \
@@ -65,12 +61,9 @@ MAN="$(mktemp)"
 {
   echo "{"
   emit_entry teensy        teensy        teensy41-dash.hex;      echo ","
-  emit_entry crowpanel7    crowpanel7    crowpanel7-dash.bin;    echo ","
-  emit_entry crowpanel5    crowpanel5    crowpanel5-dash.bin;    echo ","
   emit_entry crowpanel5adv crowpanel5adv crowpanel5adv-dash.bin; echo ","
-  emit_entry crowpanel7adv crowpanel7adv crowpanel7adv-dash.bin; echo ","
-  # legacy alias: key "crowpanel" but board mirrors crowpanel7
-  emit_entry crowpanel     crowpanel7    crowpanel7-dash.bin
+  emit_entry crowpanel7adv crowpanel7adv crowpanel7adv-dash.bin
+  # (crowpanel7 / crowpanel5 / legacy "crowpanel" alias RETIRED after 0.1.146.)
   echo ""
   echo "}"
 } > "$MAN"

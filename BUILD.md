@@ -9,10 +9,15 @@ There are **two independent toolchains** — they are NOT interchangeable (see C
 | Artifact(s) | Toolchain | Source |
 | --- | --- | --- |
 | `teensy41-dash.hex` | **PlatformIO** (`platform = teensy`, `board = teensy41`) | `src/main.cpp`, `platformio.ini` |
-| `crowpanel7-dash.bin`, `crowpanel5-dash.bin`, `crowpanel5adv-dash.bin`, `crowpanel7adv-dash.bin` | **arduino-cli** + `esp32:esp32@2.0.14` | `crowpanel-arduino/RaceDash/` |
+| `crowpanel5adv-dash.bin`, `crowpanel7adv-dash.bin` | **arduino-cli** + `esp32:esp32@2.0.14` | `crowpanel-arduino/RaceDash/` |
 
-> The three CrowPanel bins are one source (`RaceDash.ino`) built three times with a different
-> `-DDASH_BOARD` and a per-board `FlashSize` (Advance = `16M`, both Basics = `4M`).
+> The two CrowPanel bins are one source (`RaceDash.ino`) built twice with a different
+> `-DDASH_BOARD` (51 = 5" Advance, 71 = 7" Advance); both are `FlashSize=16M`.
+>
+> **RETIRED after v0.1.146: the Basic panels (`crowpanel7` / `crowpanel5`, 4M).** That
+> hardware was scrapped. They are no longer built, published, or in the manifest, and
+> `board_config.h` makes `-DDASH_BOARD=7|5` a hard `#error` (override with
+> `-DDASH_ALLOW_RETIRED_BOARDS` only for archaeology).
 
 ---
 
@@ -122,10 +127,7 @@ base="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DF
 # Must go to BOTH c and cpp flags (the NimBLE host core is C).
 trim="-DCONFIG_BT_NIMBLE_ROLE_PERIPHERAL_DISABLED -DCONFIG_BT_NIMBLE_ROLE_BROADCASTER_DISABLED -DCONFIG_BT_NIMBLE_MAX_CONNECTIONS=1"
 
-# 7" Basic (crowpanel7), 4M
-$CLI compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=7 $trim"  --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd7_build   --output-dir /tmp/rd7_out   crowpanel-arduino/RaceDash
-# 5" Basic (crowpanel5), 4M
-$CLI compile --fqbn "${base},FlashSize=4M"  --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=5 $trim"  --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd5_build   --output-dir /tmp/rd5_out   crowpanel-arduino/RaceDash
+# (7"/5" Basic builds REMOVED — retired hardware, see the note at the top.)
 # 5" Advance (crowpanel5adv), 16M
 $CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51 $trim" --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
 # 7" Advance (crowpanel7adv), 16M  (v0.1.145+; same electrical config as the 5" Advance)
@@ -184,18 +186,15 @@ board — see CLAUDE.md).
 ```bash
 cd <repo root>
 cp .pio/build/teensy41/firmware.hex firmware/teensy41-dash.hex
-cp /tmp/rd7_out/RaceDash.ino.bin    firmware/crowpanel7-dash.bin
-cp /tmp/rd5_out/RaceDash.ino.bin    firmware/crowpanel5-dash.bin
 cp /tmp/rdadv_out/RaceDash.ino.bin  firmware/crowpanel5adv-dash.bin
 cp /tmp/rd7adv_out/RaceDash.ino.bin firmware/crowpanel7adv-dash.bin
 
-sha256sum firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin firmware/crowpanel5adv-dash.bin firmware/crowpanel7adv-dash.bin
-stat -c'%n %s' firmware/teensy41-dash.hex firmware/crowpanel7-dash.bin firmware/crowpanel5-dash.bin firmware/crowpanel5adv-dash.bin firmware/crowpanel7adv-dash.bin
+sha256sum firmware/teensy41-dash.hex firmware/crowpanel5adv-dash.bin firmware/crowpanel7adv-dash.bin
+stat -c'%n %s' firmware/teensy41-dash.hex firmware/crowpanel5adv-dash.bin firmware/crowpanel7adv-dash.bin
 ```
 Then hand-edit `firmware/manifest.json`: set **every** `version` to the new number, paste the
-recomputed `sha256` + `size` into each entry, keep each `board` field, and keep the legacy
-`crowpanel` entry mirroring `crowpanel7` (same sha/size/version). A stale sha aborts OTA on the
-device.
+recomputed `sha256` + `size` into each entry, keep each `board` field. (The legacy `crowpanel`
+alias and the Basic entries are gone since 0.1.146.) A stale sha aborts OTA on the device.
 
 **Version bump (do FIRST, before building):** both defines must match:
 ```bash
@@ -209,9 +208,10 @@ sed -i "s/#define FIRMWARE_VERSION .*/#define FIRMWARE_VERSION \"$NEW\"/" crowpa
 ## 4. Flashing (optional — OTA is the normal path)
 
 - **CrowPanel over USB**: disconnect the Teensy↔CrowPanel UART jumpers first (shared with the
-  CH340). ALWAYS `esptool flash_id` to confirm 16M=Advance vs 4M=Basic and flash the matching
-  bin, then read the boot banner @ 921600 to confirm the `crowpanel-…` board id + version. See
-  CLAUDE.md "ALWAYS verify which board is connected".
+  CH340). ALWAYS `esptool flash_id` first: **16M = an Advance** (the only live panels); a 4M
+  reading is a retired Basic — do NOT flash it. Flash-size can't tell the 5" Advance from the
+  7" Advance (both 16M) — go by the glass in front of you, then read the boot banner @ 921600 to
+  confirm the `crowpanel-…-adv` board id + version. See CLAUDE.md "ALWAYS verify which board".
 - **Teensy over USB**: `pio run -t upload` (HalfKay; press the button if "Error opening USB
   device").
 - **OTA**: bump + rebuild all four + publish `manifest.json` (below); devices self-update.
@@ -253,8 +253,8 @@ CDN lag). See [server/README.md](server/README.md) for the endpoint reference.
 export RACECAR_API_KEY=$(grep -oE '[0-9a-f]{64}' /home/chris/racecar-tools/secrets/racecar_api_key.env)
 ./server/publish_firmware.sh 0.1.NN https://racecar.api.blueuc.com
 ```
-`publish_firmware.sh` uploads the four binaries then a server-pointed manifest (artifact URLs =
-`<base>/firmware/<file>`, every `version`=the arg, legacy `crowpanel` alias = `crowpanel7`) and
+`publish_firmware.sh` uploads the THREE binaries (teensy, crowpanel5adv, crowpanel7adv) then a
+server-pointed manifest (artifact URLs = `<base>/firmware/<file>`, every `version`=the arg) and
 prints the live manifest to verify. The script sends `X-API-Key: $RACECAR_API_KEY` — that env
 var is the FIRMWARE key here, matching the server's `RACECAR_FIRMWARE_KEY` (naming is a bit
 confusing: the script variable is `RACECAR_API_KEY` but it must hold the firmware key).

@@ -2690,6 +2690,25 @@ async def firmware_get(file: str) -> FileResponse:
                         filename=p.name, headers=_FW_NO_STORE)
 
 
+@app.delete("/firmware/{file}")
+async def firmware_delete(file: str, request: Request,
+                          x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    """Remove a retired artifact from the OTA store (e.g. the Basic-panel bins
+    after those boards were scrapped). Gated by the FIRMWARE key, same as
+    upload. Refuses to delete the manifest itself — re-upload a new one via
+    POST /firmware/upload?name=manifest.json instead, so devices never see a
+    404 on the manifest."""
+    if FIRMWARE_KEY and x_api_key != FIRMWARE_KEY:
+        raise HTTPException(status_code=401, detail="invalid firmware key")
+    if file == "manifest.json":
+        raise HTTPException(status_code=400, detail="replace the manifest via upload, never delete it")
+    p = _resolve_firmware(file)
+    p.unlink()
+    log.info("firmware delete %s -> %s",
+             request.client.host if request.client else "?", p.name)
+    return JSONResponse({"ok": True, "deleted": p.name})
+
+
 # Every upload attempt (success OR failure) appends one JSON line here so we can
 # diagnose the dash's flaky uploads from the RECEIVING end — crucial because when
 # an upload fails the device can't send us its own debug log either. Pullable via
