@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.147"
+#define FIRMWARE_VERSION "0.1.150"
 
 #include <Preferences.h>
 #include <time.h>
@@ -37,6 +37,7 @@
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
 #include "board_config.h"   // per-panel RGB pin map + timing (DASH_BOARD 7|5|51|71)
+#include "aem_afr.h"
 #include "obd_ble.h"       // Bluetooth-LE OBD-II (ELM327) client for sensor_type==2
 #include "zdeflate.h"      // tiny raw-DEFLATE for compressed uploads (v0.1.127 zblocks)
 
@@ -48,12 +49,9 @@
 struct SfGate;   // S/F crossing gate (v0.1.130) — used by buildSfGate/sfGateCross
 
 enum SettingId : uint8_t {
-    // Internet block at the very top — picks whether all internet-bound
-    // operations route via Teensy/W5500 (Ethernet) or CrowPanel/ESP32-S3 WiFi.
-    // SSID/pass/status rows are hidden when Mode=Ethernet.
+    // WiFi on this panel is the only network path (v0.1.148).
     ST_BRIGHTNESS = 0,            // LCD backlight slider — top of the settings list
     ST_PANEL_REV,                 // Advance only: 0x30 backlight coprocessor dialect (v0.1.145)
-    ST_INET_MODE,
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
     ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_RPM_SPIKE, ST_GPS_FILTER, ST_LAP_OVERLAY, ST_ALERTS,
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
@@ -67,10 +65,11 @@ enum SettingId : uint8_t {
     // — that's normal, not a failing alternator).
     ST_SHOW_VOLT, ST_VOLT_WARN, ST_VOLT_WARN_COL,
     ST_COACH_SHOW,                // show the AI coach checklist button on the dash
-    // Sensor data source (Direct / MegaSquirt) + AFR display (MS3 mode only).
+    // Engine source plus independent AEM-gauge AFR (legacy fallback: MS3 mode).
     // AFR has both a "too rich" (low) and "too lean" (high) warn threshold;
     // either fires the same colour.
     ST_SENSOR_TYPE,
+    ST_AEM_AFR, ST_AEM_STATUS,  // independent AEM 30-0300 analog input (opt-in)
     ST_SHOW_AFR, ST_AFR_WARN_LO, ST_AFR_WARN_HI, ST_AFR_WARN_COL,
     ST_REC_SD, ST_REC_CLOUD,
     ST_CL_HOST, ST_CL_PORT, ST_CL_PROTO,
@@ -82,6 +81,8 @@ enum SettingId : uint8_t {
     ST_GPS_STATUS,  // INFO: Teensy's GPSBAUD report (locked baud + OK/NO DATA)
     ST_DEBUG_LOG,   // TOGGLE: write on-SD .dbg diagnostic logs (CFG,dbg_on)
     ST_SET_TIME,    // action: open time-set page
+    ST_VIDEO_EN,    // TOGGLE: Pi 5 video box on Teensy Serial1 (CFG,viden)
+    ST_VIDEO_STATUS,// INFO: last VID,... from the box
     ST_COUNT,
     // Tool-page actions — NOT in the scrollable settings list. They live on
     // PAGE_TOOLS (swipe right from STATUS). Their SettingId values are still
@@ -280,7 +281,7 @@ namespace {
     LGFX_Sprite spr_speed(&tft);       // huge centred MPH digits
     LGFX_Sprite spr_temp(&tft);        // "TEMP: ..." line
     LGFX_Sprite spr_psi(&tft);         // "PSI:  ..." line
-    LGFX_Sprite spr_afr(&tft);         // "AFR:  ..." line (MS3 mode only)
+    LGFX_Sprite spr_afr(&tft);         // selected AFR line (AEM or legacy MS3)
     LGFX_Sprite spr_rec_badge(&tft);   // REC ● N  /  queue: N  /  REC ? no ack
     LGFX_Sprite spr_gps(&tft);         // GPS fix quality "3D" (right column, Font4) (v0.1.147)
     LGFX_Sprite spr_sess_time(&tft);   // session elapsed H:MM:SS (right column) (v0.1.147)
@@ -378,6 +379,9 @@ struct EcuState {
     uint32_t last_ms       = 0;
 };
 static EcuState ecu;
+static aemafr::Reading aem_reading;
+static uint32_t aem_last_ms = 0;
+static bool aem_seen = false;
 
 struct ImuState {
     float    ax = 0, ay = 0, az = 0;   // g  (±2g range)
@@ -386,7 +390,6 @@ struct ImuState {
 };
 static ImuState imu;
 
-static char     active_ip[24]    = "NOT CONNECTED";  // updated by ETH, line from Teensy
 static uint32_t rec_start_ms     = 0;                // millis() when recording last started
 
 // SD card state — updated from SD,<status>[,<total_mb>[,<free_mb>]] lines.
@@ -541,6 +544,8 @@ static uint32_t sd_format_arm_ms = 0;
 static bool settingsDirty = true;
 static char gps_status_buf[48] = "";   // Teensy GPSBAUD report (settings INFO row);
                                        // declared early: parseLine() writes it.
+static char video_status_buf[48] = "no box";  // last VID,... forwarded by Teensy
+static uint32_t video_last_ms = 0;
 
 // RTC epoch received from the Teensy's TIME, line (0 = not yet received).
 static uint32_t rtc_epoch = 0;
@@ -698,10 +703,7 @@ struct Settings {
     char     cloud_auth_user[64] = "";   // user email (X-User-Email)
     char     cloud_auth_pass[96] = "";   // API key (X-API-Key); masked on display
 
-    // Internet routing. 0=Ethernet (Teensy/W5500), 1=WiFi (CrowPanel ESP32-S3).
-    // Phase 1: controls NTP path + (future) firmware update path. Cloud upload
-    // routing still flows through Teensy/Ethernet regardless until Phase 3.
-    uint8_t  internet_mode    = 0;       // default Ethernet
+    // WiFi only. The retired NVS 'inet' value never gates networking.
     char     wifi_ssid[33]    = "";      // 802.11 max 32 + NUL
     char     wifi_pass[64]    = "";      // WPA2 PSK max 63 + NUL
 
@@ -732,7 +734,7 @@ struct Settings {
     //                    readings (coolant/IAT/voltage). RPM still comes from
     //                    the Teensy opto tach (BT is too slow for the RPM bar).
     // Oil PSI stays direct regardless (MS3 typically doesn't have an oil
-    // pressure input wired). AFR is only available in MegaSquirt mode.
+    // pressure input wired). AEM gauge AFR is selected independently below.
     uint8_t  sensor_type        = 0;       // default Direct
 
     // Bluetooth OBD-II (ELM327 BLE) dongle — the paired device we reconnect to
@@ -765,9 +767,10 @@ struct Settings {
     uint8_t  gps_filter         = 2;    // GPS drift filter, same levels (CFG,gpsflt, NVS gpsflt)
     uint8_t  lap_overlay_s      = 3;    // finish-line lap-time popup duration, 0-9 s (0 = off)
 
-    // AFR (Air/Fuel Ratio) — only meaningful in MegaSquirt sensor mode.
+    // AFR — independent AEM gauge input, otherwise the legacy MegaSquirt value.
     // Two-sided warn band: too rich (< afr_warn_lo) and too lean (> afr_warn_hi)
     // both flip the value to the warn colour. Values are AFR × 10 (so 145 = 14.5).
+    bool     aem_afr            = false;    // protected A6 input, never auto-enable old hardware
     bool     show_afr           = true;
     uint16_t afr_warn_lo_x10    = 115;     // 11.5 AFR — below this is dangerously rich
     uint16_t afr_warn_hi_x10    = 160;     // 16.0 AFR — above this is dangerously lean
@@ -811,6 +814,10 @@ struct Settings {
     // DEFAULT OFF since v0.1.103 (GPS saga solved — the JST connector): debug
     // logging is a diagnostic tool now, turned on from Settings when needed.
     bool     debug_enabled    = false;
+
+    // Separate Pi 5 video box on Teensy Serial1. Default OFF so a missing box
+    // never blocks START. NVS viden, CFG,viden,0|1.
+    bool     video_en         = false;
 };
 static Settings s;
 
@@ -838,8 +845,6 @@ static int rpmPprIndex() {
     for (int i = 0; i < N_RPM_PPR; ++i) if (RPM_PPR_X10[i] == s.rpm_ppr_x10) return i;
     return 2;  // default to "2"
 }
-const char* const INET_MODE_NAMES[]   = { "Ethernet", "WiFi" };
-constexpr int N_INET_MODE   = 2;
 // GPS UART baud choices. Higher = more headroom for 25 Hz PVT (25 kbit/s);
 // 38400 is only ~65% util (chronic backlog after loop stalls -> GPS STALE).
 // Sent to the Teensy as CFG,gpsbaud,<value>; it switches the module + reports
@@ -1512,7 +1517,7 @@ static void loadSettings() {
     s.auto_start_mph     = prefs.getUShort("astmph",   s.auto_start_mph);
     s.auto_start_sec     = prefs.getUShort("astsec",   s.auto_start_sec);
     s.timezone_idx       = prefs.getUChar ("tz",       s.timezone_idx);
-    s.internet_mode      = prefs.getUChar ("inet",     s.internet_mode);
+    // Ignore retired 'inet', including old installations saved as Ethernet.
     prefs.getString      ("wssid",    s.wifi_ssid, sizeof(s.wifi_ssid));
     prefs.getString      ("wpass",    s.wifi_pass, sizeof(s.wifi_pass));
     s.show_coolant       = prefs.getBool  ("s_temp",   s.show_coolant);
@@ -1530,6 +1535,7 @@ static void loadSettings() {
     // onto already-deployed units (old key had ON persisted; keys are
     // append-only — the orphaned dbg_on is ignored, never repurposed).
     s.debug_enabled      = prefs.getBool  ("dbg2",     s.debug_enabled);
+    s.video_en           = prefs.getBool  ("viden",    s.video_en);
     prefs.getString      ("bt_addr",  s.bt_addr, sizeof(s.bt_addr));
     s.bt_atype           = prefs.getUChar ("bt_atype", s.bt_atype);
     s.bt_pid_clt         = prefs.getUChar ("btpid",    s.bt_pid_clt);
@@ -1546,6 +1552,7 @@ static void loadSettings() {
     s.gps_filter         = prefs.getUChar ("gpsflt",   s.gps_filter) % N_SPIKE_FILTER;
     s.lap_overlay_s      = prefs.getUChar ("lapov",    s.lap_overlay_s);
     if (s.lap_overlay_s > 9) s.lap_overlay_s = 9;
+    s.aem_afr            = prefs.getBool  ("afraem",   s.aem_afr);
     s.show_afr           = prefs.getBool  ("s_afr",    s.show_afr);
     s.afr_warn_lo_x10    = prefs.getUShort("afr_lo",   s.afr_warn_lo_x10);
     s.afr_warn_hi_x10    = prefs.getUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -1609,7 +1616,7 @@ static void saveSettings() {
     // (sendCfgToTeensy() is called at end of this function so any save also
     // re-syncs the cloud config to the Teensy.)
     prefs.putUChar ("tz",       s.timezone_idx);
-    prefs.putUChar ("inet",     s.internet_mode);
+    prefs.putUChar ("inet",     1);  // same legacy meaning: WiFi; safe on rollback
     prefs.putString("wssid",    s.wifi_ssid);
     prefs.putString("wpass",    s.wifi_pass);
     prefs.putBool  ("s_temp",   s.show_coolant);
@@ -1624,6 +1631,7 @@ static void saveSettings() {
     prefs.putUChar ("v_col",    s.volt_warn_col);
     prefs.putUChar ("srctyp",   s.sensor_type);
     prefs.putBool  ("dbg2",     s.debug_enabled);
+    prefs.putBool  ("viden",    s.video_en);
     prefs.putString("bt_addr",  s.bt_addr);
     prefs.putUChar ("bt_atype", s.bt_atype);
     prefs.putUChar ("btpid",    s.bt_pid_clt);
@@ -1635,6 +1643,7 @@ static void saveSettings() {
     prefs.putUChar ("rpmspk",   s.rpm_spike);
     prefs.putUChar ("gpsflt",   s.gps_filter);
     prefs.putUChar ("lapov",    s.lap_overlay_s);
+    prefs.putBool  ("afraem",   s.aem_afr);
     prefs.putBool  ("s_afr",    s.show_afr);
     prefs.putUShort("afr_lo",   s.afr_warn_lo_x10);
     prefs.putUShort("afr_hi",   s.afr_warn_hi_x10);
@@ -1697,8 +1706,9 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,cl_key,%s\n",    s.cloud_auth_pass);
     Serial.printf("CFG,rec_sd,%d\n",    (int)s.record_sd);
     Serial.printf("CFG,rec_cl,%d\n",    (int)s.record_cloud);
-    Serial.printf("CFG,inet,%u\n",      (unsigned)s.internet_mode);
+    Serial.println("CFG,inet,1");  // compatibility: force WiFi on older Teensy firmware
     Serial.printf("CFG,srctyp,%u\n",    (unsigned)s.sensor_type);
+    Serial.printf("CFG,afraem,%d\n",    (int)s.aem_afr);
     Serial.printf("CFG,rpmppr,%u\n",    (unsigned)s.rpm_ppr_x10);
     Serial.printf("CFG,gpsbaud,%lu\n",  (unsigned long)s.gps_baud);
     Serial.printf("CFG,gpshz,%u\n",     (unsigned)s.gps_nav_hz);
@@ -1706,6 +1716,7 @@ static void sendCfgToTeensy() {
     Serial.printf("CFG,rpmspk,%u\n",    (unsigned)s.rpm_spike);
     Serial.printf("CFG,gpsflt,%u\n",    (unsigned)s.gps_filter);
     Serial.printf("CFG,dbg_on,%d\n",    (int)s.debug_enabled);
+    Serial.printf("CFG,viden,%d\n",     (int)s.video_en);
     sendSfToTeensy(last_track_idx);     // active track's S/F line for lap stamping
 }
 
@@ -2171,8 +2182,17 @@ static int32_t predictiveDeltaMs() {
 // frames are decoded. Until that lands, no ECU lines arrive and the dash
 // leaves ecu.* at -1, which the renderer treats as "---".
 //
-// All sensor fields are x10 fixed-point integers (e.g. 1450 = 14.5 AFR);
+// All sensor fields are x10 fixed-point integers (e.g. 145 = 14.5 AFR);
 // -1 in any slot means "this field not available from MS3 right now".
+static bool parseAemAfrLine(const String& line) {
+    aemafr::Reading next;
+    if (!aemafr::parseFrame(line.c_str(), next)) return false;
+    aem_reading = next;
+    aem_last_ms = millis();
+    aem_seen = true;
+    return true;
+}
+
 static bool parseEcuLine(const String& line) {
     int idx[9], n = 0;
     for (int i = 0; i < (int)line.length() && n < 9; ++i)
@@ -2211,16 +2231,6 @@ static bool parseImuLine(const String& line) {
     imu.gy = field(4).toFloat();
     imu.gz = field(5).toFloat();
     imu.last_ms = millis();
-    return true;
-}
-
-static bool parseEthLine(const String& line) {
-    // ETH,<ip>  — sent by Teensy once DHCP assigns an address
-    const int comma = line.indexOf(',');
-    if (comma < 0) return false;
-    const String ip = line.substring(comma + 1);
-    strncpy(active_ip, ip.c_str(), sizeof(active_ip) - 1);
-    active_ip[sizeof(active_ip) - 1] = '\0';
     return true;
 }
 
@@ -2665,7 +2675,7 @@ static void resumeQueryTask(void*) {
 static void resumeQueryKick() {
     uf.skip_lines   = 0;
     uf.resume_bytes = 0;
-    if (s.internet_mode != 1 || !wifiConnectedNow()) { uf.rq_state = 2; return; }
+    if (!wifiConnectedNow()) { uf.rq_state = 2; return; }
     uf.rq_state = 1;
     // 16 KB stack — TLS handshake (the coachTask 8 KB lesson, v0.1.138).
     if (xTaskCreatePinnedToCore(resumeQueryTask, "ufresume", 16384, nullptr, 1,
@@ -2806,7 +2816,7 @@ static void zbFree() {
 // connection leaves -1 so the next attempt re-probes.
 static void zbProbeCaps() {
     if (srv_zblocks != -1) return;
-    if (s.internet_mode != 1 || !wifiConnectedNow()) return;
+    if (!wifiConnectedNow()) return;
     WiFiClient* c = nullptr;
     if (s.cloud_protocol == 1) {
         WiFiClientSecure* sec = new WiFiClientSecure();
@@ -2872,7 +2882,7 @@ static bool ufOpenStream(uint32_t content_length, const char* path) {
         snprintf(uf.last_err, sizeof(uf.last_err), "cloud host/port unset");
         return false;
     }
-    if (s.internet_mode != 1 || !wifiConnectedNow()) {
+    if (!wifiConnectedNow()) {
         snprintf(uf.last_err, sizeof(uf.last_err), "WiFi not connected");
         return false;
     }
@@ -3094,7 +3104,7 @@ static void coachTask(void*) {
 static void coachKick(const char* tick_id) {
     if (coach_busy) return;
     if (!s.coach_show) return;
-    if (s.internet_mode != 1 || !wifiConnectedNow()) return;
+    if (!wifiConnectedNow()) return;
     if (s.cloud_auth_user[0] == '\0') return;
     // ⚠️ NEVER while the uploader or the sessions list owns the link (v0.1.138).
     // This crashed and rebooted the board in 0.1.137: an upload already holds a
@@ -3151,7 +3161,7 @@ static void ufDiagTask(void*) {
 
 static void ufDiagReport(const char* why) {
     if (ufdiag_busy) return;                                    // one in flight
-    if (s.internet_mode != 1 || !wifiConnectedNow()) return;
+    if (!wifiConnectedNow()) return;
     snprintf(ufdiag_note, sizeof(ufdiag_note),
              "ufdiag %s st=%u net=%u rh=%lu rt=%lu lr=%lu ih=%u er=%.40s f=%.28s",
              why, (unsigned)uf.state, (unsigned)uf.net_state,
@@ -4139,8 +4149,9 @@ static bool parseLine(const String& line) {
     }
     if (line.startsWith("ENG,")) return parseEngLine(line);
     if (line.startsWith("ECU,")) return parseEcuLine(line);
+    if (line.startsWith("AFR,")) return parseAemAfrLine(line);
     if (line.startsWith("IMU,")) return parseImuLine(line);
-    if (line.startsWith("ETH,"))  return parseEthLine(line);
+    if (line.startsWith("ETH,"))  return true;  // ignore retired status from an older Teensy
     if (line.startsWith("SD,"))   return parseSdLine(line);
     if (line.startsWith("CANSNIFF,")) return parseCanSniffLine(line);
     if (line.startsWith("CANDIAG,"))  return parseCanDiagLine(line);
@@ -4201,6 +4212,14 @@ static bool parseLine(const String& line) {
         health_last_hlth_ms = millis();
         return true;
     }
+    if (line.startsWith("VID,")) {
+        // Teensy forwards Pi 5 video-box status: VID,HELLO / READY / REC / ERR
+        strncpy(video_status_buf, line.c_str() + 4, sizeof(video_status_buf) - 1);
+        video_status_buf[sizeof(video_status_buf) - 1] = 0;
+        video_last_ms = millis();
+        settingsDirty = true;
+        return true;
+    }
     if (line.startsWith("RST,teensy,")) {
         // Teensy's last reset cause (POR/brownout/watchdog/lockup/overtemp/swrst)
         // — shown on the STATUS HEALTH bar for the comms-death diagnosis.
@@ -4229,7 +4248,8 @@ static uint16_t uart_reinits    = 0;
 static bool uartLineIsTelemetry(const String& s) {
     return s.startsWith("GPS,")  || s.startsWith("ENG,")  || s.startsWith("ECU,")
         || s.startsWith("IMU,")  || s.startsWith("TIME,") || s.startsWith("HLTH,")
-        || s.startsWith("SD,")   || s.startsWith("CLD,")  || s.startsWith("ETH,")
+        || s.startsWith("AFR,")
+        || s.startsWith("SD,")   || s.startsWith("CLD,")
         || s.startsWith("VER,")  || s.startsWith("RST,");
 }
 
@@ -4458,6 +4478,10 @@ static void simTick() {
     snprintf(l, sizeof(l), "GPS,3,14,%.6f,%.6f,%.1f,%.1f,2", lat, lon, sim_mph, hdg);  simInject(l);
     snprintf(l, sizeof(l), "ENG,%u,%d,%d", rpm, psi_x10, clt_x10);                              simInject(l);
     snprintf(l, sizeof(l), "ECU,%u,%d,%d,%d,%d,%d,%d", rpm, clt_x10, map_x10, tps_x10, afr_x10, iat_x10, bat_x10); simInject(l);
+    const aemafr::Reading ar = s.aem_afr
+        ? aemafr::fromMillivolts(3000 + (int)(400.0f * sinf(t / 7.0f))) : aemafr::Reading{};
+    snprintf(l, sizeof(l), "AFR,%u,%d,%d,%d", (unsigned)ar.status,
+             ar.afr_x100, ar.lambda_x10000, ar.mv); simInject(l);
     snprintf(l, sizeof(l), "IMU,%.2f,%.2f,1.00f,0.0f,0.0f,%.1f", ax_g, ay_g, (v_mps / SIM_R_M) * 180.0f / (float)M_PI); simInject(l);
     sim_samples++;
 
@@ -5018,6 +5042,34 @@ static uint16_t rpmBarColor(uint16_t rpm) {
 // the alternator isn't spinning meaningfully and 12.x V is normal, not a fault.
 static constexpr uint16_t ENGINE_RUNNING_RPM = 500;
 
+static bool afrIsVisible() {
+    return s.show_afr && (s.aem_afr || s.sensor_type == 1);
+}
+
+static int16_t selectedAfrX10() {
+    const uint32_t now = millis();
+    if (s.aem_afr) {
+        if (!aem_seen || now - aem_last_ms > 2000 || aem_reading.status != aemafr::VALID)
+            return -1;  // selected AEM fault must NOT fall back to CAN
+        return (int16_t)((aem_reading.afr_x100 + 5) / 10);
+    }
+    return (s.sensor_type == 1 && ecu.last_ms != 0 && now - ecu.last_ms <= 2000)
+        ? ecu.afr_x10 : -1;
+}
+
+static void formatAemStatus(char* buf, size_t cap) {
+    if (!s.aem_afr) snprintf(buf, cap, "off");
+    else if (!aem_seen || millis() - aem_last_ms > 2000) snprintf(buf, cap, "NO AFR LINK");
+    else if (aem_reading.status == aemafr::VALID)
+        snprintf(buf, cap, "%d.%03dV  L%d.%04d", aem_reading.mv / 1000,
+                 aem_reading.mv % 1000, aem_reading.lambda_x10000 / 10000,
+                 aem_reading.lambda_x10000 % 10000);
+    else if (aem_reading.mv >= 0)
+        snprintf(buf, cap, "%d.%03dV %s", aem_reading.mv / 1000,
+                 aem_reading.mv % 1000, aemafr::statusName(aem_reading.status));
+    else snprintf(buf, cap, "%s", aemafr::statusName(aem_reading.status));
+}
+
 // Highest-priority ACTIVE sensor warning — drives the full-screen warning
 // flash with the warning NAME (v0.1.110). Priority: OIL (engine-killing) >
 // TEMP > VOLT > AFR. Mirrors the per-line warn_active conditions in
@@ -5062,12 +5114,12 @@ static bool activeSensorWarning(const char** label, uint16_t* color,
             put("%d.%dV", v); return true;
         }
     }
-    // AFR — out of band (MS3 mode only)
-    if (s.show_afr && fromMs3 && !ecuStale && ecu.afr_x10 >= 0
-        && (ecu.afr_x10 < (int)s.afr_warn_lo_x10
-            || ecu.afr_x10 > (int)s.afr_warn_hi_x10)) {
+    // AFR — selected AEM gauge, or the legacy MS3 source. No warning on fault/stale.
+    const int16_t afr = selectedAfrX10();
+    if (afrIsVisible() && afr >= 0
+        && (afr < (int)s.afr_warn_lo_x10 || afr > (int)s.afr_warn_hi_x10)) {
         *label = "AFR"; *color = PALETTE[s.afr_warn_col];
-        put("%d.%d", ecu.afr_x10); return true;
+        put("%d.%d", afr); return true;
     }
     return false;
 }
@@ -5936,20 +5988,21 @@ static void drawDashPage() {
     }
 
     // ---- AFR line ----
-    // Visible only in MegaSquirt sensor mode (no direct AFR source exists).
+    // AEM analog input is independent of engine source; otherwise legacy MS3.
     // Two-sided warn band: too rich (< afr_warn_lo) and too lean (> afr_warn_hi)
     // both flip the value to s.afr_warn_col.
     {
-        const bool    visible   = s.show_afr && (s.sensor_type == 1);
-        const bool    fault     = !visible || (ecu.afr_x10 < 0) || ecuStale;
+        const int16_t afr       = selectedAfrX10();
+        const bool    visible   = afrIsVisible();
+        const bool    fault     = !visible || (afr < 0);
         const bool    warn_active = visible && !fault
-                                    && (ecu.afr_x10 < (int)s.afr_warn_lo_x10
-                                        || ecu.afr_x10 > (int)s.afr_warn_hi_x10);
+                                    && (afr < (int)s.afr_warn_lo_x10
+                                        || afr > (int)s.afr_warn_hi_x10);
         const uint32_t tag = ((uint32_t)visible << 24)
                            | ((uint32_t)s.afr_warn_col << 16)
                            | ((uint32_t)fault << 8)
                            | ((uint32_t)warn_active);
-        const int32_t  val = visible ? (int32_t)ecu.afr_x10 : INT32_MIN + 1;
+        const int32_t  val = visible ? (int32_t)afr : INT32_MIN + 1;
         if (val != ld.afr_x10 || tag != ld.afr_col_tag) {
             char buf[24] = "";
             uint16_t col = TFT_WHITE;
@@ -5957,7 +6010,7 @@ static void drawDashPage() {
                 if (fault) { snprintf(buf, sizeof(buf), "AFR: ---"); col = TFT_DARKGREY; }
                 else {
                     snprintf(buf, sizeof(buf), "AFR: %d.%d",
-                             ecu.afr_x10 / 10, ecu.afr_x10 % 10);
+                             afr / 10, afr % 10);
                     col = warn_active ? PALETTE[s.afr_warn_col] : TFT_WHITE;
                 }
             }
@@ -5987,10 +6040,10 @@ static void drawDashPage() {
 
     // ---- Voltage line (v0.1.110) ----
     // Shares the AFR row (no free row below it). Renders only when the AFR
-    // line isn't visible (AFR is MS3-only; voltage matters most in BT mode),
+    // line isn't visible (AEM AFR can also own the row in Direct/BT mode),
     // the engine is RUNNING, and a live source exists (BT ATRV / MS3 CAN bat).
     {
-        const bool afrVisible = s.show_afr && (s.sensor_type == 1);
+        const bool afrVisible = afrIsVisible();
         int16_t v = -1;
         if (s.sensor_type == 2 && obd::dataFresh() && obd::voltX10() > 0) v = obd::voltX10();
         else if (s.sensor_type == 1 && !ecuStale && ecu.bat_x10 > 0)      v = ecu.bat_x10;
@@ -6276,7 +6329,6 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_BRIGHTNESS,   "Brightness",            SettingRow::SLIDER  },
     { ST_PANEL_REV,    "Panel revision",        SettingRow::ENUM    },
     { ST_LAP_OVERLAY,  "Lap time popup (sec)",  SettingRow::NUMERIC },
-    { ST_INET_MODE,    "Internet",              SettingRow::ENUM    },
     { ST_WIFI_SSID,    "WiFi network (SSID)",   SettingRow::TEXT    },
     { ST_WIFI_PASS,    "WiFi password",         SettingRow::TEXT    },
     { ST_WIFI_STATUS,  "WiFi status",           SettingRow::INFO    },
@@ -6304,12 +6356,16 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_VOLT_WARN,    "Voltage low-warn (x10)",   SettingRow::NUMERIC },
     { ST_VOLT_WARN_COL,"Voltage warn color",       SettingRow::COLOR   },
     { ST_SENSOR_TYPE,  "Sensor data source",    SettingRow::ENUM    },
-    { ST_SHOW_AFR,     "Show AFR (MS3 only)",   SettingRow::TOGGLE  },
+    { ST_AEM_AFR,      "AEM 30-0300 AFR input", SettingRow::TOGGLE  },
+    { ST_AEM_STATUS,   "AEM voltage / lambda", SettingRow::INFO    },
+    { ST_SHOW_AFR,     "Show AFR",              SettingRow::TOGGLE  },
     { ST_AFR_WARN_LO,  "AFR rich-warn (x10)",   SettingRow::NUMERIC },
     { ST_AFR_WARN_HI,  "AFR lean-warn (x10)",   SettingRow::NUMERIC },
     { ST_AFR_WARN_COL, "AFR warn color",        SettingRow::COLOR   },
     { ST_REC_SD,        "Record to SD card",    SettingRow::TOGGLE  },
     { ST_REC_CLOUD,     "Record to cloud",      SettingRow::TOGGLE  },
+    { ST_VIDEO_EN,      "Video interconnect",   SettingRow::TOGGLE  },
+    { ST_VIDEO_STATUS,  "Video box",            SettingRow::INFO    },
     { ST_AUTO_TRACK,    "Auto select by GPS",   SettingRow::TOGGLE  },
     { ST_DEBUG_LOG,     "Debug logging (SD)",   SettingRow::TOGGLE  },
     { ST_AUTO_START,    "Auto start recording", SettingRow::TOGGLE  },
@@ -6474,7 +6530,9 @@ static const char* boolValueOnRow(SettingId id) {
         case ST_SHOW_VOLT:   return s.show_volt         ? "ON" : "OFF";
         case ST_COACH_SHOW:  return s.coach_show        ? "ON" : "OFF";
         case ST_SHOW_PSI:    return s.show_oil_psi      ? "ON" : "OFF";
+        case ST_AEM_AFR:     return s.aem_afr           ? "ON" : "OFF";
         case ST_SHOW_AFR:    return s.show_afr          ? "ON" : "OFF";
+        case ST_VIDEO_EN:    return s.video_en          ? "ON" : "OFF";
         default:             return "?";
     }
 }
@@ -6490,14 +6548,16 @@ static bool boolValueOnState(SettingId id) {
         case ST_SHOW_VOLT:   return s.show_volt;
         case ST_COACH_SHOW:  return s.coach_show;
         case ST_SHOW_PSI:    return s.show_oil_psi;
+        case ST_AEM_AFR:     return s.aem_afr;
         case ST_SHOW_AFR:    return s.show_afr;
+        case ST_VIDEO_EN:    return s.video_en;
         default:             return false;
     }
 }
 // ---------------------------------------------------------------------------
-// WiFi state machine — entire lifecycle of the ESP32-S3 radio. Driven by
-// the Internet=WiFi setting. Periodic tick from loop() at 1 Hz; only stays
-// up when mode==WiFi and an SSID is set. NTP runs once after successful
+// WiFi state machine — entire lifecycle of the ESP32-S3 radio. Periodic
+// tick from loop() at 1 Hz; stays up only when an SSID is set and the radio
+// arbiter permits WiFi. NTP runs after successful
 // connect and pushes SETTIME,<epoch> to the Teensy (which sets its RTC).
 // (WifiState enum is forward-declared up top — see auto-prototyper note.)
 // ---------------------------------------------------------------------------
@@ -6539,7 +6599,7 @@ static int wupDoCloudPost(int* http_status_out, char* err_out, size_t err_sz) {
         snprintf(err_out, err_sz, "empty buffer");
         return 0;
     }
-    if (s.internet_mode != 1 || wifi_state != WS_CONNECTED) {
+    if (wifi_state != WS_CONNECTED) {
         snprintf(err_out, err_sz, "wifi not connected");
         return 0;
     }
@@ -6604,9 +6664,8 @@ static bool parseWupLine(const String& line) {
         // Diagnostic: report receipt + dash-side state. Routed to Teensy USB
         // via our DBG relay so the developer can see exactly what's happening
         // when an upload kicks off.
-        Serial.printf("DBG,wup_recv tail_len=%u inet=%u wifi=%u rxBufLen=%u\n",
+        Serial.printf("DBG,wup_recv tail_len=%u wifi=%u rxBufLen=%u\n",
                       (unsigned)tail.length(),
-                      (unsigned)s.internet_mode,
                       (unsigned)wifi_state,
                       (unsigned)rxBuf.length());
         wupFree();
@@ -6623,9 +6682,6 @@ static bool parseWupLine(const String& line) {
         const uint32_t sz = (uint32_t)s2.substring(p1 + 1, p2).toInt();
         const uint32_t sid= (uint32_t)s2.substring(p2 + 1, p3).toInt();
         const String trk  = s2.substring(p3 + 1);
-        if (s.internet_mode != 1) {
-            Serial.println("WUP,NACK,not_wifi_mode"); Serial.flush(); return true;
-        }
         if (wifi_state != WS_CONNECTED) {
             Serial.println("WUP,NACK,no_wifi"); Serial.flush(); return true;
         }
@@ -6713,7 +6769,7 @@ static char      wifi_status_buf[64] = "";       // display string for INFO row
 static void formatWifiStatus() {
     switch (wifi_state) {
         case WS_OFF:        snprintf(wifi_status_buf, sizeof(wifi_status_buf),
-                                  s.internet_mode == 1 ? "idle (no SSID)" : "disabled");
+                                  "idle (no SSID or radio paused)");
                               break;
         case WS_CONNECTING: snprintf(wifi_status_buf, sizeof(wifi_status_buf),
                                   "connecting to %s...", s.wifi_ssid);
@@ -6769,17 +6825,6 @@ static void wifiTick() {
         if (wifi_state != WS_OFF) {
             WiFi.disconnect(true, true);
             WiFi.mode(WIFI_OFF);
-            wifi_ip[0]    = '\0';
-            wifi_ntp_done = false;
-            setWifiState(WS_OFF);
-        }
-        return;
-    }
-
-    if (s.internet_mode != 1) {
-        if (wifi_state != WS_OFF) {
-            WiFi.disconnect(true, true);
-            WiFi.mode(WIFI_OFF);   // ESP32 wifi_mode_t (radio off), NOT our WS_OFF state
             wifi_ip[0]    = '\0';
             wifi_ntp_done = false;
             setWifiState(WS_OFF);
@@ -7549,7 +7594,6 @@ static void handleBtScanTap(int x, int y) {
 
 static const char* enumValue(SettingId id) {
     switch (id) {
-        case ST_INET_MODE:   return INET_MODE_NAMES[s.internet_mode % N_INET_MODE];
         case ST_CL_PROTO:    return PROTOCOL_NAMES[s.cloud_protocol % N_PROTOCOL];
         case ST_TIMEZONE:    return TIMEZONES[s.timezone_idx % N_TIMEZONES].name;
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
@@ -7582,10 +7626,10 @@ static bool rowShouldShow(SettingId id) {
         case ST_PANEL_REV: return DASH_IS_ADVANCE;      // 0x30 coprocessor dialect: Advance only
         // (ST_SD_FORMAT row never appears in the settings list anymore —
         //  the maintenance action moved to PAGE_TOOLS.)
-        // WiFi credential + status rows only meaningful when mode=WiFi.
+        // WiFi is the only network route; credentials/status are always visible.
         case ST_WIFI_SSID:
         case ST_WIFI_PASS:
-        case ST_WIFI_STATUS: return s.internet_mode == 1;
+        case ST_WIFI_STATUS: return true;
 
         // Tach pulses/rev divider only applies to the Direct opto tach; in
         // MegaSquirt mode RPM comes straight from CAN.
@@ -7609,12 +7653,12 @@ static bool rowShouldShow(SettingId id) {
         case ST_PSI_WARN_PSI:
         case ST_PSI_WARN_COL:  return s.show_oil_psi;
 
-        // AFR is a MegaSquirt-only reading: hide the whole AFR block in Direct
-        // mode, and hide the warn sub-settings unless AFR display is on.
-        case ST_SHOW_AFR:  return s.sensor_type == 1;
+        // AEM toggle is always available. Display setting never gates logging.
+        case ST_AEM_STATUS: return s.aem_afr;
+        case ST_SHOW_AFR:  return s.aem_afr || s.sensor_type == 1;
         case ST_AFR_WARN_LO:
         case ST_AFR_WARN_HI:
-        case ST_AFR_WARN_COL:  return s.sensor_type == 1 && s.show_afr;
+        case ST_AFR_WARN_COL:  return (s.aem_afr || s.sensor_type == 1) && s.show_afr;
 
         // Cloud endpoint/credentials only matter when recording to cloud.
         case ST_CL_HOST:
@@ -7635,7 +7679,6 @@ enum SettingsGroup : int { SG_DISPLAY, SG_NET, SG_RPM, SG_SENSORS, SG_RECORDING,
 static int rowGroup(SettingId id) {
     switch (id) {
         case ST_BRIGHTNESS: case ST_PANEL_REV: case ST_LAP_OVERLAY: return SG_DISPLAY;
-        case ST_INET_MODE:
         case ST_WIFI_SSID: case ST_WIFI_PASS: case ST_WIFI_STATUS: return SG_NET;
         case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_RPM_SPIKE:
         case ST_GPS_FILTER: case ST_ALERTS:
@@ -7644,12 +7687,14 @@ static int rowGroup(SettingId id) {
         case ST_SENSOR_TYPE:
         case ST_SHOW_TEMP: case ST_TEMP_WARN_F: case ST_TEMP_WARN_COL:
         case ST_SHOW_PSI:  case ST_PSI_WARN_PSI: case ST_PSI_WARN_COL:
+        case ST_AEM_AFR: case ST_AEM_STATUS:
         case ST_SHOW_AFR:  case ST_AFR_WARN_LO: case ST_AFR_WARN_HI: case ST_AFR_WARN_COL:
         case ST_SHOW_VOLT: case ST_VOLT_WARN: case ST_VOLT_WARN_COL: return SG_SENSORS;
         case ST_COACH_SHOW: return SG_RECORDING;
         case ST_REC_SD: case ST_REC_CLOUD: case ST_AUTO_TRACK:
         case ST_AUTO_START: case ST_AUTO_START_MPH:
-        case ST_AUTO_START_SEC: return SG_RECORDING;
+        case ST_AUTO_START_SEC:
+        case ST_VIDEO_EN: case ST_VIDEO_STATUS: return SG_RECORDING;
         case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO:
         case ST_CL_AUTH_USER: case ST_CL_AUTH_PASS: return SG_CLOUD;
         case ST_TIMEZONE: case ST_GPS_BAUD: case ST_GPS_STATUS:
@@ -7884,9 +7929,16 @@ static void drawSettingsPage() {
             tft.fillRect(INFO_X, y, INFO_W, SETTINGS_ROW_HEIGHT, TFT_BLACK);
             tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
             tft.setTextDatum(textdatum_t::middle_left);
+            char aemStatus[48];
             const char* shown = "";
+            if (r.id == ST_AEM_STATUS) { formatAemStatus(aemStatus, sizeof(aemStatus)); shown = aemStatus; }
             if (r.id == ST_WIFI_STATUS) shown = wifi_status_buf[0] ? wifi_status_buf : "-";
             if (r.id == ST_GPS_STATUS)  shown = gps_status_buf[0]  ? gps_status_buf  : "-";
+            if (r.id == ST_VIDEO_STATUS) {
+                if (!s.video_en) shown = "disabled";
+                else if (video_last_ms == 0 || millis() - video_last_ms > 5000) shown = "no box";
+                else shown = video_status_buf[0] ? video_status_buf : "-";
+            }
             tft.drawString(shown, INFO_X + 10, y + SETTINGS_ROW_HEIGHT / 2);
             tft.setTextDatum(textdatum_t::top_left);
         } else { // TEXT — tap-to-edit field. Used for cloud_host (string,
@@ -8006,7 +8058,12 @@ static void handleSettingsTap(int x, int y) {
                     case ST_SHOW_VOLT:  s.show_volt         = !s.show_volt;         break;
                     case ST_COACH_SHOW: s.coach_show        = !s.coach_show;        break;
                     case ST_SHOW_PSI:   s.show_oil_psi      = !s.show_oil_psi;      break;
+                    case ST_AEM_AFR:    s.aem_afr = !s.aem_afr;
+                                        aem_reading = aemafr::Reading{}; aem_seen = false;
+                                        Serial.printf("CFG,afraem,%d\n", (int)s.aem_afr); break;
                     case ST_SHOW_AFR:   s.show_afr          = !s.show_afr;          break;
+                    case ST_VIDEO_EN:   s.video_en = !s.video_en;
+                                        Serial.printf("CFG,viden,%d\n", (int)s.video_en); break;
                     default: break;
                 }
                 settingsDirty = true;
@@ -8042,10 +8099,6 @@ static void handleSettingsTap(int x, int y) {
                     // (SD filenames, cloud metadata). Display still uses UTC
                     // from the Teensy and we apply the offset locally.
                     Serial.printf("TZ,%s\n", TIMEZONES[s.timezone_idx].id);
-                } else if (r.id == ST_INET_MODE) {
-                    s.internet_mode = (s.internet_mode + 1) % N_INET_MODE;
-                    wifiForceReconfigure();
-                    Serial.printf("CFG,inet,%u\n", (unsigned)s.internet_mode);
                 } else if (r.id == ST_GPS_BAUD) {
                     // Don't cycle-on-tap (rapid module switches freak the GPS
                     // out) — open the dedicated GPS page for deliberate selection.
@@ -9291,11 +9344,7 @@ static bool queryTeensyVersionBlocking(uint32_t timeout_ms) {
 }
 
 static void otaStart() {
-    if (s.internet_mode != 1) {
-        snprintf(ota_err_msg, sizeof(ota_err_msg),
-                 "OTA needs WiFi mode (Ethernet OTA coming soon)");
-        ota_state = OTA_S_FAILED;
-    } else if (wifi_state != WS_CONNECTED) {
+    if (wifi_state != WS_CONNECTED) {
         snprintf(ota_err_msg, sizeof(ota_err_msg), "WiFi not connected");
         ota_state = OTA_S_FAILED;
     } else {
@@ -10585,7 +10634,7 @@ static void drawToolsPage() {
     }
 
     // ---- Button 1: Check for updates ----
-    const bool ota_ready = (s.internet_mode == 1 && wifi_state == WS_CONNECTED);
+    const bool ota_ready = (wifi_state == WS_CONNECTED);
     const uint16_t b1_fill = ota_ready ? TFT_NAVY : TFT_DARKGREY;
     tft.fillRect(TOOLS_BTN_X, TOOLS_BTN1_Y, TOOLS_BTN_W, TOOLS_BTN_H, b1_fill);
     tft.drawRect(TOOLS_BTN_X, TOOLS_BTN1_Y, TOOLS_BTN_W, TOOLS_BTN_H, TFT_WHITE);
@@ -10599,10 +10648,7 @@ static void drawToolsPage() {
     tft.setTextColor(TFT_LIGHTGREY, b1_fill);
     char b1sub[80];
     if (!ota_ready) {
-        snprintf(b1sub, sizeof(b1sub),
-                 "requires WiFi mode (currently %s, %s)",
-                 s.internet_mode == 1 ? "WiFi"     : "Ethernet",
-                 wifi_state == WS_CONNECTED ? "connected" : "not connected");
+        snprintf(b1sub, sizeof(b1sub), "requires WiFi connected");
     } else {
         snprintf(b1sub, sizeof(b1sub), "current v%s", FIRMWARE_VERSION);
     }
@@ -10637,8 +10683,7 @@ static void drawToolsPage() {
     // ---- Button 3: Test mode ----
     // Generates synthetic GPS/RPM/IMU on the Teensy and writes a real SD
     // session, exercising the SD-write + cloud-upload pipeline without
-    // needing real sensors. STOP closes the session, which triggers upload
-    // via either Ethernet (when W5500 lands) or WiFi-via-dash.
+    // needing real sensors. STOP closes the session for later upload via WiFi.
     // v0.1.147: two flavours — TEENSY (existing: Teensy generates + records a
     // real SD session) or SCREEN (dash-local simulator, no Teensy needed).
     // Idle tap opens PAGE_TEST_SRC to choose; active tap stops whichever runs.
@@ -10691,7 +10736,7 @@ static void drawToolsPage() {
 
     // ---- Button 5: WiFi speed test (v0.1.116) ----
     {
-        const bool wifi_ok = (s.internet_mode == 1 && wifi_state == WS_CONNECTED);
+        const bool wifi_ok = (wifi_state == WS_CONNECTED);
         const bool running = (nettest_state == 1);
         const uint16_t b5_fill = running ? TFT_DARKGREY : (wifi_ok ? TFT_NAVY : TFT_DARKGREY);
         tft.fillRect(TOOLS_BTN_X, TOOLS_BTN5_Y, TOOLS_BTN_W, TOOLS_BTN_H, b5_fill);
@@ -10821,7 +10866,7 @@ static void handleToolsTap(int x, int y) {
     if (x >= TOOLS_BTN_X && x <= TOOLS_BTN_X + TOOLS_BTN_W &&
         y >= TOOLS_BTN5_Y && y <= TOOLS_BTN5_Y + TOOLS_BTN_H) {
         if (nettest_state == 1) return;                       // already running
-        if (s.internet_mode != 1 || wifi_state != WS_CONNECTED) return;
+        if (wifi_state != WS_CONNECTED) return;
         if (uf.state != UF_IDLE) return;                      // don't fight an upload
         nettest_state = 1;
         nettest_result[0] = '\0';
@@ -11505,6 +11550,7 @@ static void drawStatusPage() {
         tft.drawString("GZ",    410, 212);
         tft.drawString("SD",    410, 256);
         tft.drawString("CLOUD", 410, 276);
+        tft.drawString("VIDEO", 410, 292);
         tft.drawString("CLOCK", 410, 310);
         tft.setTextColor(LBL, BG);
         tft.drawString("TIME",  415, 326);
@@ -11545,9 +11591,9 @@ static void drawStatusPage() {
             // number (v0.1.115; > -70 fine, < -80 = uploads will crawl).
             char ipbuf[40];
             if (wifiConnectedNow())
-                snprintf(ipbuf, sizeof(ipbuf), "%s  %ddBm", active_ip, (int)WiFi.RSSI());
+                snprintf(ipbuf, sizeof(ipbuf), "%s  %ddBm", wifi_ip, (int)WiFi.RSSI());
             else
-                snprintf(ipbuf, sizeof(ipbuf), "%s", active_ip);
+                snprintf(ipbuf, sizeof(ipbuf), "NOT CONNECTED");
             tft.drawString(ipbuf, LV, 81);
         }
     }
@@ -11705,10 +11751,22 @@ static void drawStatusPage() {
         tft.drawString(buf, RV, 256);
     }
     {
-        const bool hasIp   = (strcmp(active_ip, "NOT CONNECTED") != 0);
-        const bool cloudOn = hasIp && s.record_cloud;
+        const bool cloudOn = wifiConnectedNow() && s.record_cloud;
         tft.setTextColor(cloudOn ? TFT_GREEN : TFT_DARKGREY, BG);
         tft.drawString(cloudOn ? "CONNECTED" : "NOT CONNECTED", RV, 276);
+    }
+    {
+        char buf[40]; uint16_t col;
+        if (!s.video_en) {
+            strncpy(buf, "OFF", sizeof(buf)); col = TFT_DARKGREY;
+        } else if (video_last_ms == 0 || nowMs - video_last_ms > 5000) {
+            strncpy(buf, "no box", sizeof(buf)); col = TFT_YELLOW;
+        } else {
+            strncpy(buf, video_status_buf, sizeof(buf) - 1); buf[sizeof(buf)-1] = 0;
+            col = TFT_GREEN;
+        }
+        tft.setTextColor(col, BG);
+        tft.drawString(buf, RV, 292);
     }
     // CLOCK — display in active timezone with DST applied. Source-of-truth
     // is rtc_epoch (UTC unix epoch), see TIME, line from Teensy.
@@ -12135,6 +12193,24 @@ void setup() {
     Serial.println("dash UI ready — listening on UART0");
 }
 
+// 5 Hz lap overlay for the Pi 5 video box. Teensy merges this into HUD on Serial1.
+// Never inject during an upload / Q,* exchange (same rule as CFG resend).
+static void videoHudTick() {
+    if (!s.video_en || !recording) return;
+    if (uf.state != UF_IDLE) return;
+    if (q_activity_ms != 0 && millis() - q_activity_ms < 10000) return;
+    static uint32_t last = 0;
+    const uint32_t now = millis();
+    if (now - last < 200) return;
+    last = now;
+    const uint32_t pred = predictiveLapMs();
+    Serial.printf("HUDLAP,%d,%lu,%ld,%lu\n",
+                  lapTimer.lap_number,
+                  (unsigned long)lapTimer.last_lap_ms,
+                  pred ? (long)pred : -1L,
+                  (unsigned long)lapTimer.best_lap_ms);
+}
+
 // 1 Hz: read our ESP32-S3 die temp and report it to the Teensy (DTEMP) so both
 // MCUs' temps land in the same health line / .dbg log for heat diagnosis.
 static uint32_t dash_health_ms = 0;
@@ -12172,6 +12248,7 @@ void loop() {
     uartLinkTick();   // hard-reinit UART0 if the Teensy link goes silent (v0.1.122)
     handleTouch();
     dashHealthTick();  // 1 Hz ESP32 temp -> Teensy (heat diagnostics)
+    videoHudTick();    // 5 Hz lap overlay to Pi 5 via Teensy Serial1
     netOwnerTick();   // WiFi<->BLE radio time-share arbiter (must run before wifiTick)
     wifiTick();   // WiFi state machine + one-shot NTP push to Teensy (1 Hz tick)
     uploadTick(); // Dash-initiated upload state machine (UF_*)
@@ -12264,6 +12341,10 @@ void loop() {
         // like an oil-pressure warning flash) smooth.
         if (now - lastDraw >= 20) { lastDraw = now; drawDashPage(); }
     } else if (currentPage == PAGE_SETTINGS) {
+        static uint32_t lastAemInfo = 0;
+        if (s.aem_afr && now - lastAemInfo >= 1000) {
+            lastAemInfo = now; settingsDirty = true; // live input/fault diagnostics, NOT 25 Hz
+        }
         // Cap scroll redraws to ~30 Hz so the LCD has time to scan a full
         // clean frame between renders. Without this cap we re-render on
         // every loop iteration during a drag (~200 Hz), and each render's

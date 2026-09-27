@@ -1,0 +1,976 @@
+[
+  {
+    "ref": "U1",
+    "value": "Teensy 4.1 (socketed)",
+    "footprint": "Racecar:Teensy41_Socket",
+    "pins": {
+      "48": null,
+      "47": null,
+      "46": null,
+      "45": null,
+      "44": null,
+      "43": null,
+      "42": null,
+      "41": null,
+      "40": null,
+      "39": "GND",
+      "38": "ETH_SCK",
+      "37": "DASH_TX_MCU",
+      "36": "DASH_RX_MCU",
+      "35": null,
+      "34": null,
+      "33": "IMU_SDA",
+      "32": "IMU_SCL",
+      "31": null,
+      "30": null,
+      "29": "CAN_TX",
+      "28": "CAN_RX",
+      "27": "+3V3_MCU",
+      "26": "GND",
+      "25": "TEENSY_VIN",
+      "24": null,
+      "23": null,
+      "22": null,
+      "21": null,
+      "20": null,
+      "19": null,
+      "18": null,
+      "17": null,
+      "16": null,
+      "15": "+3V3_MCU",
+      "14": "ETH_MISO",
+      "13": "ETH_MOSI",
+      "12": "ETH_CS",
+      "11": "TACH_MCU",
+      "10": "GPS_TX_MCU",
+      "9": "GPS_RX_MCU",
+      "8": "ETH_RST",
+      "7": "ETH_INT",
+      "6": null,
+      "5": null,
+      "4": null,
+      "3": null,
+      "2": null,
+      "1": "GND"
+    },
+    "mpn": "TEENSY41",
+    "maker": "PJRC",
+    "notes": "CUT VUSB-VIN bridge before connecting USB with carrier power. 2x24 female sockets supplied separately.",
+    "x": 50,
+    "y": 28,
+    "angle": 0
+  },
+  {
+    "ref": "U2",
+    "value": "D36V50F5 / 5V 5A budget",
+    "footprint": "Racecar:Pololu_D36V50F5",
+    "pins": {
+      "12": null,
+      "11": null,
+      "10": "VIN_PROTECTED",
+      "9": "VIN_PROTECTED",
+      "8": "VIN_FUSED",
+      "7": "VIN_FUSED",
+      "6": "GND",
+      "5": "GND",
+      "4": "GND",
+      "3": "GND",
+      "2": "+5V_MAIN",
+      "1": "+5V_MAIN"
+    },
+    "mpn": "4091 / D36V50F5",
+    "maker": "Pololu",
+    "notes": "Solder BOTH rows of header pins. Reverse protection built in. EN and PG unconnected. Support above board with insulating spacer.",
+    "x": 68,
+    "y": 99,
+    "angle": 0
+  },
+  {
+    "ref": "U3",
+    "value": "TSR 1-2433 / AUX 3V3",
+    "footprint": "Racecar:Converter_DCDC_TRACO_TSR-1_THT",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND",
+      "3": "+3V3_AUX"
+    },
+    "mpn": "TSR 1-2433",
+    "maker": "Traco Power",
+    "notes": "Powered from reverse-protected 10-20V, NOT the marginal 5V minimum. 1A nominal; budget 500mA peripherals for Rev A.",
+    "x": 100,
+    "y": 76,
+    "angle": 0
+  },
+  {
+    "ref": "J1",
+    "value": "10-20V INPUT",
+    "footprint": "Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",
+    "pins": {
+      "1": "VIN_RAW",
+      "2": "GND"
+    },
+    "mpn": "1729018",
+    "maker": "Phoenix Contact",
+    "notes": "MKDS 1,5/2-5,08. Add external 5A fuse close to battery.",
+    "x": 30,
+    "y": 111,
+    "angle": 0
+  },
+  {
+    "ref": "J2",
+    "value": "CROWPANEL J10 ONLY",
+    "footprint": "Racecar:TerminalBlock_Phoenix_MKDS-1,5-4-5.08_1x04_P5.08mm_Horizontal",
+    "pins": {
+      "1": "GND",
+      "2": "+5V_SCREEN",
+      "3": "DASH_RX_CABLE",
+      "4": "DASH_TX_CABLE"
+    },
+    "mpn": "1729034",
+    "maker": "Phoenix Contact",
+    "notes": "1 GND, 2 +5V OUT, 3 FROM screen TXD0_H, 4 TO screen RXD0_H. Never J2/HY2.0 3V3_OUT on screen.",
+    "x": 110,
+    "y": 111,
+    "angle": 0
+  },
+  {
+    "ref": "J3",
+    "value": "EXTERNAL OPTO OUTPUT",
+    "footprint": "Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",
+    "pins": {
+      "1": "GND",
+      "2": "TACH_CABLE"
+    },
+    "mpn": "1729018",
+    "maker": "Phoenix Contact",
+    "notes": "Open collector or 0-3.3/5V logic ONLY. NO raw coil, ignition or 12V tach.",
+    "x": 32,
+    "y": 54,
+    "angle": 270
+  },
+  {
+    "ref": "J4",
+    "value": "GPS UART 3V3",
+    "footprint": "Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND",
+      "3": "GPS_TX_CABLE",
+      "4": "GPS_RX_CABLE"
+    },
+    "mpn": "B4B-XH-A(LF)(SN)",
+    "maker": "JST",
+    "notes": "1 3V3 OUT, 2 GND, 3 to GPS RX, 4 from GPS TX. Not a universal GPS cable pinout.",
+    "x": 99,
+    "y": 28,
+    "angle": 0
+  },
+  {
+    "ref": "J5",
+    "value": "MPU6050 I2C 3V3",
+    "footprint": "Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND",
+      "3": "IMU_SDA",
+      "4": "IMU_SCL"
+    },
+    "mpn": "B4B-XH-A(LF)(SN)",
+    "maker": "JST",
+    "notes": "1 3V3, 2 GND, 3 SDA(18), 4 SCL(19). AD0 on sensor to GND.",
+    "x": 123,
+    "y": 28,
+    "angle": 0
+  },
+  {
+    "ref": "J6",
+    "value": "CAN MODULE LOGIC",
+    "footprint": "Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND",
+      "3": "CAN_TX",
+      "4": "CAN_RX"
+    },
+    "mpn": "B4B-XH-A(LF)(SN)",
+    "maker": "JST",
+    "notes": "External SN65HVD230 module: CTX/D to pin3, CRX/R to pin4. NOT CANH/CANL.",
+    "x": 99,
+    "y": 47,
+    "angle": 0
+  },
+  {
+    "ref": "J7",
+    "value": "W5500 BREAKOUT",
+    "footprint": "Racecar:PinHeader_2x04_P2.54mm_Vertical",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND",
+      "3": "ETH_CS",
+      "4": "ETH_MOSI",
+      "5": "ETH_MISO",
+      "6": "ETH_SCK",
+      "7": "ETH_RST",
+      "8": "ETH_INT"
+    },
+    "mpn": "TSW-104-07-G-D",
+    "maker": "Samtec",
+    "notes": "Custom cable map, NOT a standard W5500 module footprint. Only a 3.3V-powered, 3.3V-logic module.",
+    "x": 125,
+    "y": 47,
+    "angle": 0
+  },
+  {
+    "ref": "JP1",
+    "value": "MCU POWER ENABLE",
+    "footprint": "Racecar:PinHeader_1x02_P2.54mm_Vertical",
+    "pins": {
+      "1": "+5V_MCU_DIODE",
+      "2": "TEENSY_VIN"
+    },
+    "mpn": "TSW-102-07-G-S",
+    "maker": "Samtec",
+    "notes": "Fit shunt AFTER unloaded power checks. Does NOT replace cutting Teensy VUSB/VIN bridge.",
+    "x": 82,
+    "y": 30,
+    "angle": 0
+  },
+  {
+    "ref": "D2",
+    "value": "SS14 USB backfeed barrier",
+    "footprint": "Racecar:D_SMA",
+    "pins": {
+      "1": "+5V_MCU_DIODE",
+      "2": "+5V_MAIN"
+    },
+    "mpn": "SS14",
+    "maker": "Diodes Inc.",
+    "notes": "K(1) toward JP1; A(2) toward +5V_MAIN. Still MUST cut Teensy VUSB/VIN bridge.",
+    "x": 91,
+    "y": 35,
+    "angle": 0
+  },
+  {
+    "ref": "F1",
+    "value": "5A INPUT FUSE",
+    "footprint": "Racecar:Fuse_Littelfuse-NANO2-451_453",
+    "pins": {
+      "1": "VIN_RAW",
+      "2": "VIN_FUSED"
+    },
+    "mpn": "0451005.MRL",
+    "maker": "Littelfuse",
+    "notes": "NANO2 451 5A fast, 125V. Does not replace harness fuse at battery.",
+    "x": 41,
+    "y": 101,
+    "angle": 0
+  },
+  {
+    "ref": "F2",
+    "value": "4A SCREEN FUSE",
+    "footprint": "Racecar:Fuse_Littelfuse-NANO2-451_453",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "+5V_SCREEN"
+    },
+    "mpn": "0451004.MRL",
+    "maker": "Littelfuse",
+    "notes": "4A screen branch; 5A total main output budget.",
+    "x": 108,
+    "y": 98,
+    "angle": 270
+  },
+  {
+    "ref": "D1",
+    "value": "SMBJ20CA INPUT TVS",
+    "footprint": "Racecar:D_SMB",
+    "pins": {
+      "1": "VIN_FUSED",
+      "2": "GND"
+    },
+    "mpn": "SMBJ20CA",
+    "maker": "Littelfuse",
+    "notes": "BIDIRECTIONAL 20V standoff / 32.4V nominal rated-current clamp. Transient help, NOT load-dump certification.",
+    "x": 53,
+    "y": 100,
+    "angle": 90
+  },
+  {
+    "ref": "C1",
+    "value": "100uF 50V",
+    "footprint": "Racecar:CP_Radial_D8.0mm_P3.50mm",
+    "pins": {
+      "1": "VIN_FUSED",
+      "2": "GND"
+    },
+    "mpn": "EEU-FR1H101",
+    "maker": "Panasonic",
+    "notes": "Observe + terminal; 105C low ESR.",
+    "x": 55,
+    "y": 116,
+    "angle": 180
+  },
+  {
+    "ref": "C2",
+    "value": "470uF 10V",
+    "footprint": "Racecar:CP_Radial_D8.0mm_P3.50mm",
+    "pins": {
+      "1": "+5V_SCREEN",
+      "2": "GND"
+    },
+    "mpn": "EEU-FR1A471B",
+    "maker": "Panasonic",
+    "notes": "Observe + terminal; 105C low ESR.",
+    "x": 98,
+    "y": 112,
+    "angle": 0
+  },
+  {
+    "ref": "C3",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 97,
+    "y": 69,
+    "angle": 0
+  },
+  {
+    "ref": "C4",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 108,
+    "y": 81,
+    "angle": 0
+  },
+  {
+    "ref": "C5",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 72,
+    "y": 33,
+    "angle": 0
+  },
+  {
+    "ref": "U4",
+    "value": "SN74LVC1T45",
+    "footprint": "Racecar:SOT-23-6_Handsoldering",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND",
+      "3": "DASH_TX_MCU",
+      "4": "DASH_TX_5V",
+      "5": "+3V3_MCU",
+      "6": "+5V_SCREEN"
+    },
+    "mpn": "SN74LVC1T45DBVR",
+    "maker": "Texas Instruments",
+    "notes": "Fixed DIR: U4 A->B TX; U5 B->A RX. VCC isolation + Ioff; both rails decoupled.",
+    "x": 130,
+    "y": 91,
+    "angle": 0
+  },
+  {
+    "ref": "U5",
+    "value": "SN74LVC1T45",
+    "footprint": "Racecar:SOT-23-6_Handsoldering",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND",
+      "3": "DASH_RX_MCU",
+      "4": "DASH_RX_5V",
+      "5": "GND",
+      "6": "+5V_SCREEN"
+    },
+    "mpn": "SN74LVC1T45DBVR",
+    "maker": "Texas Instruments",
+    "notes": "Fixed DIR: U4 A->B TX; U5 B->A RX. VCC isolation + Ioff; both rails decoupled.",
+    "x": 141,
+    "y": 91,
+    "angle": 0
+  },
+  {
+    "ref": "C6",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 126,
+    "y": 87,
+    "angle": 0
+  },
+  {
+    "ref": "C7",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+5V_SCREEN",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 133,
+    "y": 87,
+    "angle": 0
+  },
+  {
+    "ref": "C8",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 138,
+    "y": 87,
+    "angle": 0
+  },
+  {
+    "ref": "C9",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+5V_SCREEN",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 145,
+    "y": 87,
+    "angle": 0
+  },
+  {
+    "ref": "R1",
+    "value": "100",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "DASH_TX_5V",
+      "2": "DASH_TX_CABLE"
+    },
+    "mpn": "RC0805FR-07100RL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 129,
+    "y": 101,
+    "angle": 90
+  },
+  {
+    "ref": "R2",
+    "value": "100",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "DASH_RX_CABLE",
+      "2": "DASH_RX_5V"
+    },
+    "mpn": "RC0805FR-07100RL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 140,
+    "y": 101,
+    "angle": 90
+  },
+  {
+    "ref": "R3",
+    "value": "47k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "DASH_TX_MCU"
+    },
+    "mpn": "RC0805FR-0747KL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 126,
+    "y": 81,
+    "angle": 0
+  },
+  {
+    "ref": "R4",
+    "value": "47k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "+5V_SCREEN",
+      "2": "DASH_RX_CABLE"
+    },
+    "mpn": "RC0805FR-0747KL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 138,
+    "y": 107,
+    "angle": 0
+  },
+  {
+    "ref": "D3",
+    "value": "PESD5V0S1BA",
+    "footprint": "Racecar:D_SOD-323",
+    "pins": {
+      "1": "DASH_TX_CABLE",
+      "2": "GND"
+    },
+    "mpn": "PESD5V0S1BA,115",
+    "maker": "Nexperia",
+    "notes": "Bidirectional signal ESD TVS. NOT protection against 12V miswiring.",
+    "x": 130,
+    "y": 117,
+    "angle": 90
+  },
+  {
+    "ref": "D4",
+    "value": "PESD5V0S1BA",
+    "footprint": "Racecar:D_SOD-323",
+    "pins": {
+      "1": "DASH_RX_CABLE",
+      "2": "GND"
+    },
+    "mpn": "PESD5V0S1BA,115",
+    "maker": "Nexperia",
+    "notes": "Bidirectional signal ESD TVS. NOT protection against 12V miswiring.",
+    "x": 140,
+    "y": 117,
+    "angle": 90
+  },
+  {
+    "ref": "U6",
+    "value": "SN74LVC2G17",
+    "footprint": "Racecar:SOT-23-6_Handsoldering",
+    "pins": {
+      "1": "TACH_FILTER",
+      "2": "GND",
+      "3": "GPS_RX_FILTER",
+      "4": "GPS_RX_MCU",
+      "5": "+3V3_MCU",
+      "6": "TACH_MCU"
+    },
+    "mpn": "SN74LVC2G17DBVR",
+    "maker": "Texas Instruments",
+    "notes": "3.3V Schmitt buffers; 5.5V-tolerant inputs; Ioff. Channel 1 tach, channel 2 GPS RX.",
+    "x": 40,
+    "y": 67,
+    "angle": 0
+  },
+  {
+    "ref": "C10",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 44,
+    "y": 63,
+    "angle": 0
+  },
+  {
+    "ref": "C11",
+    "value": "1nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "TACH_FILTER",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H102KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 35,
+    "y": 66,
+    "angle": 90
+  },
+  {
+    "ref": "R5",
+    "value": "1k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "TACH_CABLE",
+      "2": "TACH_FILTER"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 40,
+    "y": 59,
+    "angle": 0
+  },
+  {
+    "ref": "R6",
+    "value": "4.7k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "TACH_CABLE"
+    },
+    "mpn": "RC0805FR-074K7L",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 35,
+    "y": 74,
+    "angle": 90
+  },
+  {
+    "ref": "D5",
+    "value": "PESD5V0S1BA",
+    "footprint": "Racecar:D_SOD-323",
+    "pins": {
+      "1": "TACH_CABLE",
+      "2": "GND"
+    },
+    "mpn": "PESD5V0S1BA,115",
+    "maker": "Nexperia",
+    "notes": "Logic-level ESD only",
+    "x": 29,
+    "y": 67,
+    "angle": 90
+  },
+  {
+    "ref": "R7",
+    "value": "100",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "GPS_RX_CABLE",
+      "2": "GPS_RX_FILTER"
+    },
+    "mpn": "RC0805FR-07100RL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 109,
+    "y": 35,
+    "angle": 0
+  },
+  {
+    "ref": "R8",
+    "value": "100",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "GPS_TX_MCU",
+      "2": "GPS_TX_CABLE"
+    },
+    "mpn": "RC0805FR-07100RL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 101,
+    "y": 35,
+    "angle": 0
+  },
+  {
+    "ref": "R9",
+    "value": "47k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GPS_RX_FILTER"
+    },
+    "mpn": "RC0805FR-0747KL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 110,
+    "y": 42,
+    "angle": 0
+  },
+  {
+    "ref": "R10",
+    "value": "10k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "ETH_CS"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 139,
+    "y": 57,
+    "angle": 0
+  },
+  {
+    "ref": "R11",
+    "value": "10k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "ETH_RST"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 138,
+    "y": 64,
+    "angle": 0
+  },
+  {
+    "ref": "R12",
+    "value": "4.7k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "IMU_SDA"
+    },
+    "mpn": "RC0805FR-074K7L",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 125,
+    "y": 36,
+    "angle": 0
+  },
+  {
+    "ref": "R13",
+    "value": "4.7k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "IMU_SCL"
+    },
+    "mpn": "RC0805FR-074K7L",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 135,
+    "y": 36,
+    "angle": 0
+  },
+  {
+    "ref": "D6",
+    "value": "GREEN 5V",
+    "footprint": "Racecar:LED_0805_2012Metric",
+    "pins": {
+      "1": "LED_K",
+      "2": "+5V_MAIN"
+    },
+    "mpn": "LTST-C170KGKT",
+    "maker": "Lite-On",
+    "notes": "LED cathode is pad 1",
+    "x": 116,
+    "y": 82,
+    "angle": 0
+  },
+  {
+    "ref": "R14",
+    "value": "4.7k",
+    "footprint": "Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder",
+    "pins": {
+      "1": "LED_K",
+      "2": "GND"
+    },
+    "mpn": "RC0805FR-074K7L",
+    "maker": "Yageo",
+    "notes": "",
+    "x": 116,
+    "y": 77,
+    "angle": 90
+  },
+  {
+    "ref": "C12",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 115,
+    "y": 25,
+    "angle": 0
+  },
+  {
+    "ref": "C13",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 141,
+    "y": 28,
+    "angle": 0
+  },
+  {
+    "ref": "C14",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 114,
+    "y": 48,
+    "angle": 0
+  },
+  {
+    "ref": "C15",
+    "value": "100nF",
+    "footprint": "Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "notes": "50V X7R",
+    "x": 137,
+    "y": 47,
+    "angle": 0
+  },
+  {
+    "ref": "TP1",
+    "value": "GND",
+    "footprint": "Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "GND"
+    },
+    "mpn": "test pad",
+    "maker": "PCB",
+    "notes": "Probe with meter before fitting modules.",
+    "x": 42,
+    "y": 119,
+    "angle": 0
+  },
+  {
+    "ref": "TP2",
+    "value": "VIN_FUSED",
+    "footprint": "Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "VIN_FUSED"
+    },
+    "mpn": "test pad",
+    "maker": "PCB",
+    "notes": "Probe with meter before fitting modules.",
+    "x": 47,
+    "y": 119,
+    "angle": 0
+  },
+  {
+    "ref": "TP3",
+    "value": "+5V_MAIN",
+    "footprint": "Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "+5V_MAIN"
+    },
+    "mpn": "test pad",
+    "maker": "PCB",
+    "notes": "Probe with meter before fitting modules.",
+    "x": 115,
+    "y": 92,
+    "angle": 0
+  },
+  {
+    "ref": "TP4",
+    "value": "+3V3_AUX",
+    "footprint": "Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "+3V3_AUX"
+    },
+    "mpn": "test pad",
+    "maker": "PCB",
+    "notes": "Probe with meter before fitting modules.",
+    "x": 114,
+    "y": 70,
+    "angle": 0
+  },
+  {
+    "ref": "TP5",
+    "value": "+3V3_MCU",
+    "footprint": "Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "+3V3_MCU"
+    },
+    "mpn": "test pad",
+    "maker": "PCB",
+    "notes": "Probe with meter before fitting modules.",
+    "x": 74,
+    "y": 43,
+    "angle": 0
+  },
+  {
+    "ref": "H1",
+    "value": "M3 MOUNT",
+    "footprint": "Racecar:MountingHole_3.2mm_M3",
+    "pins": {
+      "": null
+    },
+    "mpn": "M3 nylon standoff",
+    "maker": "Hardware",
+    "notes": "Use insulating standoffs; keep wiring away from screw heads.",
+    "x": 24,
+    "y": 24,
+    "angle": 0
+  },
+  {
+    "ref": "H2",
+    "value": "M3 MOUNT",
+    "footprint": "Racecar:MountingHole_3.2mm_M3",
+    "pins": {
+      "": null
+    },
+    "mpn": "M3 nylon standoff",
+    "maker": "Hardware",
+    "notes": "Use insulating standoffs; keep wiring away from screw heads.",
+    "x": 146,
+    "y": 24,
+    "angle": 0
+  },
+  {
+    "ref": "H3",
+    "value": "M3 MOUNT",
+    "footprint": "Racecar:MountingHole_3.2mm_M3",
+    "pins": {
+      "": null
+    },
+    "mpn": "M3 nylon standoff",
+    "maker": "Hardware",
+    "notes": "Use insulating standoffs; keep wiring away from screw heads.",
+    "x": 24,
+    "y": 126,
+    "angle": 0
+  },
+  {
+    "ref": "H4",
+    "value": "M3 MOUNT",
+    "footprint": "Racecar:MountingHole_3.2mm_M3",
+    "pins": {
+      "": null
+    },
+    "mpn": "M3 nylon standoff",
+    "maker": "Hardware",
+    "notes": "Use insulating standoffs; keep wiring away from screw heads.",
+    "x": 146,
+    "y": 126,
+    "angle": 0
+  }
+]

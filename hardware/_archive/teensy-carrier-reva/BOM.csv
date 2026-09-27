@@ -1,0 +1,61 @@
+Reference,Quantity,Value,Manufacturer,MPN,Footprint,Assembly_notes
+U1,1,Teensy 4.1 (socketed),PJRC,TEENSY41,Racecar:Teensy41_Socket,CUT VUSB-VIN bridge before connecting USB with carrier power. 2x24 female sockets supplied separately.
+U2,1,D36V50F5 / 5V 5A budget,Pololu,4091 / D36V50F5,Racecar:Pololu_D36V50F5,Solder BOTH rows of header pins. Reverse protection built in. EN and PG unconnected. Support above board with insulating spacer.
+U3,1,TSR 1-2433 / AUX 3V3,Traco Power,TSR 1-2433,Racecar:Converter_DCDC_TRACO_TSR-1_THT,"Powered from reverse-protected 10-20V, NOT the marginal 5V minimum. 1A nominal; budget 500mA peripherals for Rev A."
+J1,1,10-20V INPUT,Phoenix Contact,1729018,"Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal","MKDS 1,5/2-5,08. Add external 5A fuse close to battery."
+J2,1,CROWPANEL J10 ONLY,Phoenix Contact,1729034,"Racecar:TerminalBlock_Phoenix_MKDS-1,5-4-5.08_1x04_P5.08mm_Horizontal","1 GND, 2 +5V OUT, 3 FROM screen TXD0_H, 4 TO screen RXD0_H. Never J2/HY2.0 3V3_OUT on screen."
+J3,1,EXTERNAL OPTO OUTPUT,Phoenix Contact,1729018,"Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal","Open collector or 0-3.3/5V logic ONLY. NO raw coil, ignition or 12V tach."
+J4,1,GPS UART 3V3,JST,B4B-XH-A(LF)(SN),Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical,"1 3V3 OUT, 2 GND, 3 to GPS RX, 4 from GPS TX. Not a universal GPS cable pinout."
+J5,1,MPU6050 I2C 3V3,JST,B4B-XH-A(LF)(SN),Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical,"1 3V3, 2 GND, 3 SDA(18), 4 SCL(19). AD0 on sensor to GND."
+J6,1,CAN MODULE LOGIC,JST,B4B-XH-A(LF)(SN),Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical,"External SN65HVD230 module: CTX/D to pin3, CRX/R to pin4. NOT CANH/CANL."
+J7,1,W5500 BREAKOUT,Samtec,TSW-104-07-G-D,Racecar:PinHeader_2x04_P2.54mm_Vertical,"Custom cable map, NOT a standard W5500 module footprint. Only a 3.3V-powered, 3.3V-logic module."
+JP1,1,MCU POWER ENABLE,Samtec,TSW-102-07-G-S,Racecar:PinHeader_1x02_P2.54mm_Vertical,Fit shunt AFTER unloaded power checks. Does NOT replace cutting Teensy VUSB/VIN bridge.
+D2,1,SS14 USB backfeed barrier,Diodes Inc.,SS14,Racecar:D_SMA,K(1) toward JP1; A(2) toward +5V_MAIN. Still MUST cut Teensy VUSB/VIN bridge.
+F1,1,5A INPUT FUSE,Littelfuse,0451005.MRL,Racecar:Fuse_Littelfuse-NANO2-451_453,"NANO2 451 5A fast, 125V. Does not replace harness fuse at battery."
+F2,1,4A SCREEN FUSE,Littelfuse,0451004.MRL,Racecar:Fuse_Littelfuse-NANO2-451_453,4A screen branch; 5A total main output budget.
+D1,1,SMBJ20CA INPUT TVS,Littelfuse,SMBJ20CA,Racecar:D_SMB,"BIDIRECTIONAL 20V standoff / 32.4V nominal rated-current clamp. Transient help, NOT load-dump certification."
+C1,1,100uF 50V,Panasonic,EEU-FR1H101,Racecar:CP_Radial_D8.0mm_P3.50mm,Observe + terminal; 105C low ESR.
+C2,1,470uF 10V,Panasonic,EEU-FR1A471B,Racecar:CP_Radial_D8.0mm_P3.50mm,Observe + terminal; 105C low ESR.
+C3,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C4,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C5,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+U4,1,SN74LVC1T45,Texas Instruments,SN74LVC1T45DBVR,Racecar:SOT-23-6_Handsoldering,Fixed DIR: U4 A->B TX; U5 B->A RX. VCC isolation + Ioff; both rails decoupled.
+U5,1,SN74LVC1T45,Texas Instruments,SN74LVC1T45DBVR,Racecar:SOT-23-6_Handsoldering,Fixed DIR: U4 A->B TX; U5 B->A RX. VCC isolation + Ioff; both rails decoupled.
+C6,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C7,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C8,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C9,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+R1,1,100,Yageo,RC0805FR-07100RL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R2,1,100,Yageo,RC0805FR-07100RL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R3,1,47k,Yageo,RC0805FR-0747KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R4,1,47k,Yageo,RC0805FR-0747KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+D3,1,PESD5V0S1BA,Nexperia,"PESD5V0S1BA,115",Racecar:D_SOD-323,Bidirectional signal ESD TVS. NOT protection against 12V miswiring.
+D4,1,PESD5V0S1BA,Nexperia,"PESD5V0S1BA,115",Racecar:D_SOD-323,Bidirectional signal ESD TVS. NOT protection against 12V miswiring.
+U6,1,SN74LVC2G17,Texas Instruments,SN74LVC2G17DBVR,Racecar:SOT-23-6_Handsoldering,"3.3V Schmitt buffers; 5.5V-tolerant inputs; Ioff. Channel 1 tach, channel 2 GPS RX."
+C10,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C11,1,1nF,Murata,GRM21BR71H102KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+R5,1,1k,Yageo,RC0805FR-071KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R6,1,4.7k,Yageo,RC0805FR-074K7L,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+D5,1,PESD5V0S1BA,Nexperia,"PESD5V0S1BA,115",Racecar:D_SOD-323,Logic-level ESD only
+R7,1,100,Yageo,RC0805FR-07100RL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R8,1,100,Yageo,RC0805FR-07100RL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R9,1,47k,Yageo,RC0805FR-0747KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R10,1,10k,Yageo,RC0805FR-0710KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R11,1,10k,Yageo,RC0805FR-0710KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R12,1,4.7k,Yageo,RC0805FR-074K7L,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+R13,1,4.7k,Yageo,RC0805FR-074K7L,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+D6,1,GREEN 5V,Lite-On,LTST-C170KGKT,Racecar:LED_0805_2012Metric,LED cathode is pad 1
+R14,1,4.7k,Yageo,RC0805FR-074K7L,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+C12,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C13,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C14,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+C15,1,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,50V X7R
+TP1,1,GND,PCB,test pad,Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm,Probe with meter before fitting modules.
+TP2,1,VIN_FUSED,PCB,test pad,Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm,Probe with meter before fitting modules.
+TP3,1,+5V_MAIN,PCB,test pad,Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm,Probe with meter before fitting modules.
+TP4,1,+3V3_AUX,PCB,test pad,Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm,Probe with meter before fitting modules.
+TP5,1,+3V3_MCU,PCB,test pad,Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm,Probe with meter before fitting modules.
+H1,1,M3 MOUNT,Hardware,M3 nylon standoff,Racecar:MountingHole_3.2mm_M3,Use insulating standoffs; keep wiring away from screw heads.
+H2,1,M3 MOUNT,Hardware,M3 nylon standoff,Racecar:MountingHole_3.2mm_M3,Use insulating standoffs; keep wiring away from screw heads.
+H3,1,M3 MOUNT,Hardware,M3 nylon standoff,Racecar:MountingHole_3.2mm_M3,Use insulating standoffs; keep wiring away from screw heads.
+H4,1,M3 MOUNT,Hardware,M3 nylon standoff,Racecar:MountingHole_3.2mm_M3,Use insulating standoffs; keep wiring away from screw heads.

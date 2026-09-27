@@ -4,20 +4,115 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-`racecar-35` is a two-MCU dash for a track car, with the **driver-facing display in the cabin** and **all sensing + connectivity in the trunk** so we run only one UART wire end-to-end.
+`racecar-35` is a two-MCU dash: sensing/logging in the trunk, with the driver-facing
+CrowPanel display **and WiFi** in the cabin, joined by a bidirectional UART link.
+
+### Latest Rev C hardware requirement: TWO WiFi endpoints + RTC battery
+The user wants **on-board Teensy-side WiFi AND the screen's existing WiFi**.
+The previous screen-only hardware plan is superseded; **Ethernet stays removed**.
+Proposed trunk module: **ESP32-S3-WROOM-1-N8R2** (8 MB flash / 2 MB PSRAM,
+INTERNAL PCB antenna, listed -40..85 C). The user rejected external WiFi antennas;
+no 1U module/pigtail/WiFi jack. GPS SMA/external antenna is unchanged. A short **SPI0 link, Teensy master** supplies
+SD chunks to the module for direct HTTPS uploads, avoiding the long UART/screen.
+The screen keeps WiFi for **UNCHANGED OTA downloads** (screen self-update + UART
+Teensy update) and optional upload fallback. Both can associate with an AP, but
+one owner per file; do not reintroduce blocking/live upload work during recording.
+The screen's own WiFi/BLE arbiter remains mandatory; the separate module is independent.
+
+- Reserve Teensy **10 CS / 11 MOSI / 12 MISO / 13 SCK**, **5 READY / 6 NET reset**.
+  ESP proposed SPI pins are GPIO10/11/13/12 respectively, READY GPIO14; separate
+  chips, so do not confuse them with the screen/GPS Teensy pin allocations.
+  **Current code still blinks pin 13. Disable that before using SPI.**
+- Electrical Rev C uses a dedicated **TRACO TSR 1-2433 NET supply from Pololu
+  protected input (VRP)**, separate from the AUX TSR; never the Teensy 3.3 V output.
+  This replaces the earlier proposed 5 V-fed NET regulator. Recalculate the TOTAL 5 A/thermal budget, power-off backfeeding,
+  boot/reset and decoupling. Built-in WiFi antenna at carrier edge with all-layer
+  keepout/overhang; plastic enclosure or RF window, not a closed metal shield.
+- **3 V CR2032 primary cell, + to Teensy VBAT / - to GND**, replaceable retained
+  holder. RTC only, no charger/whole-system backup; finite service life, not forever.
+  Existing outer-row socket footprint DOES NOT expose VBAT. Electrical Rev C uses
+  **J9 and a removable two-wire lead to the actual Teensy VBAT/GND auxiliary pads**;
+  this is a required assembly operation, not an inferred new socket contact. Firmware already reads the RTC and sets it on SETTIME; new time-validity,
+  corrupted-command protection and fresh-SNTP resync handling remain to be implemented.
+  Current source has NO GPS UTC -> RTC setter, despite some older comments.
+- **New network-module firmware/transport/ownership and service/update support are
+  NOT implemented.** Do not add an OTA artifact or claim fast uploads from a render.
+  Current v0.1.149 code still uses screen WiFi; its existing OTA path stays intact.
+- Active revision **C**: all six screw terminals (tach/oil/coolant/AEM/power/screen)
+  face ONE LEFT edge, labelled: **J3 TACH, J4 OIL, J5 NTC, J6 AEM, J1 POWER,
+  J2 SCREEN**. Envelope **130 x 140 mm**. Real electrical CAD and engineering Gerbers
+  now exist under `hardware/teensy-integrated-revc/`: **136 PCB parts, 76 nets,
+  392 connected pads, 427 pin/geometry/calculation assertions; full ERC/DRC and
+  unconnected counts zero**. See its README and `design/` documents. The explicit
+  `fabrication/export.py --engineering-prototype` mode creates an **UNAPPROVED,
+  UNBUILT first-build package**, not an invented independent-review approval.
+  Default reviewed-release mode still requires a genuine hash-pinned named review.
+  The earlier `preview/` remains netless and must never supply Gerbers. A/B are retired:
+  archived A source under `hardware/_archive/` still supplies rendering assets;
+  a tar snapshot preserves B; old Downloads packages moved to `.retired-racecar-ab`.
+  Full contract, sources and acceptance gates:
+  `hardware/teensy-integrated-revc/WIFI_RTC_ARCHITECTURE.md`.
+
+**Current IMPLEMENTATION: WiFi ONLY since v0.1.148, via the screen.** Ethernet/W5500 is permanently removed from
+Teensy firmware, the PlatformIO dependencies, dash settings and the Rev C concept.
+Uploads/OTA/NTP use the CrowPanel. Legacy NVS `inet` is ignored on load, saved as
+`1` (unchanged meaning: WiFi) for rollback, and `CFG,inet,1` is still sent to support
+older Teensy firmware; new Teensy firmware ignores that retired key. Old `ETH,`
+lines are ignored without changing WiFi IP or crediting UART telemetry health.
+WiFi rows are always visible; the WiFi/BLE radio time-share MUST remain intact.
+Older Ethernet descriptions below are historical, not a supported option.
+
+### AEM AFR/lambda (v0.1.149 source) — GAUGE OUTPUT ONLY
+The user selected the **external AEM X-Series 30-0300 gauge**, NOT a bare sensor.
+**No direct-sensor connector, onboard heater/controller or source jumper.** The
+AEM Power/IO harness has solid WHITE (pin 9) analogue positive and BROWN (pin 10)
+reference; use BOTH. These are NOT Teensy pin numbers. No gauge/heater power is
+provided by the recorder. Official manual: https://documents.holley.com/30-0300.pdf
+(10-0300, 2017-07-12, Gauge Connections / 0-5V Analog Output).
+
+- Target input **Teensy A6/pin 20**, reviewed/protected **0.500 gain** front end
+  (20k/20k 0.1% starting divider, 1k/100nF filter; protection and power-off isolation
+  are now implemented with LM4040 3.0 V shunts, negative Schottky clamps and
+  TMUX1511 powered-off isolation; independent review/physical tests remain). Never
+  connect raw 5 V to the MCU. ADC
+  uses INPUT with NO internal pull; external divider provides the pulldown.
+- Shared, host-tested `RaceDash/aem_afr.h`: 12-bit ADC, nominal 3.300 V reference;
+  gauge V before divider → **AFR = 2.3750*V + 7.3125**, **lambda = 0.1621*V + 0.4990**.
+  Gasoline-equivalent AFR (AEM's 14.65 convention), not AFR/14.7. Valid range
+  **0.50–4.50 V**; below = not_ready (also open/unpowered), above = error. Invalid
+  values never become plausible AFR. Analogue range is 8.50–18.00 AFR, narrower
+  than the gauge display. Calibrate actual reference/gain against known voltages.
+- Settings **AEM 30-0300 AFR input** (`afraem` bool, default OFF), synced as
+  `CFG,afraem,0|1`. OFF preserves old hardware and MS3 display behaviour. When ON,
+  AEM wins regardless of Direct/MS3/Bluetooth engine source, without fallback to
+  CAN on a bad reading. **Show AFR** controls display only, not logging. Settings
+  **AEM voltage / lambda** INFO refreshes at 1 Hz. AFR shares its row with VOLT.
+- `AFR,<status>,<afr_x100>,<lambda_x10000>,<gauge_mV>`: status 0 off / 1 valid /
+  2 not_ready / 3 error; invalid ratios = -1. Strict bounded parser validates
+  tuple consistency; no commit on damage; dash readings stale after 2 s.
+- SD logs `afr`, `lambda`, `afr_v`, `afr_status`, `afr_source:"aem30-0300"` on
+  each sample when enabled; invalid ratios are JSON null. Same snapshot as UART.
+  Both simulators synthesize these frames when enabled. Server uploads/data retain
+  fields unchanged; no new web chart. Legacy raw/WUP line buffers grew to 640 B
+  with a compile-time RX-window bound, and SD formatting now bounds every append.
+- Full electrical limits/assembly checks: `hardware/teensy-integrated-revc/AFR_INTERFACE.md`.
+  Electrical Rev C is now routed; software/CAD checks are not physical validation.
+  **Rev C oil gain changed to 0.500 and coolant to 4.096 V / 2.49k excitation with
+  half-gain sensing and 40k parallel loading. Current firmware does NOT implement
+  those new oil/NTC conversions.** Do not trust legacy readings on this PCB.
 
 ```
-Cabin (driver)                   Trunk (data + connectivity)
+Cabin (driver + WiFi)            Trunk (sensing + logging)
 +-------------------+           +-----------------------------+
 |  CrowPanel ESP32  | ---UART-> |  Teensy 4.1                 |
 |  - dash UI        |           |  - GPS (NEO-M9N) @ 25 Hz    |
 |  - settings page  |           |  - tach in (opto, pin 9)    |
 |  - track picker   |           |  - MS3Pro CAN (CAN1, 22/23) |
-|  - touch (GT911)  |           |  - W5500 ethernet (SPI0)    |
-|  - keyboards      |           |  - SD card (built-in slot)  |
+|  - touch (GT911)  |           |  - WiFi ESP32-S3 (PLANNED)  |
+|  - WiFi / NTP     |           |  - SD card (built-in slot)  |
 |  - REC commands ──+--UART---->|  - IMU (MPU-6050, Wire)     |
 +-------------------+           |  - cloud uploader + queue   |
-                                |  - NTP from 0.pool.ntp.org  |
+                                |  - RTC / VBAT cell (NEW)   |
                                 +-----------------------------+
 ```
 
@@ -25,11 +120,11 @@ UART is **bidirectional**:
 - Teensy → CrowPanel: `GPS,...`, `ENG,...`, `ECU,...`, `IMU,...`, `SD,...`, `CLD,...`, `CANSNIFF,...` lines (telemetry + status, 25 Hz with 1 Hz heartbeat)
 - CrowPanel → Teensy: `REC,<0|1>`, `TRACK,<name>`, `CFG,<k>,<v>`, `CANSNIFF,<0|1>`, etc. (control)
 
-> Most of the once-"planned" trunk features (W5500, SD logging, cloud queue, IMU, NTP) are
-> **implemented now**. The newest additions (this work cycle) are the **MS3Pro CAN bus**
-> (RPM/coolant/AFR) and a **CAN sniffer** for reverse-engineering the ECU broadcast layout.
+> SD logging, cloud queue, IMU, MS3Pro CAN and CAN sniffing are implemented.
+> WiFi/NTP and all internet access belong to the CrowPanel; no Ethernet remains.
 
-[README.md](README.md) has the original wiring table — **architecture has expanded since**: there's now a planned W5500 ethernet module on the Teensy SPI0, and the dash sends control commands back to the Teensy.
+[README.md](README.md) contains historical overview material; this file and
+[WIRING.md](WIRING.md) describe the current allocations.
 
 ## Critical: two MCUs, two build systems — and they are NOT interchangeable
 
@@ -525,9 +620,11 @@ lockstep** — keep all four (+ the legacy alias) equal.
   - **CAN1** (TX 22, RX 23): **MS3Pro MegaSquirt CAN bus** via SN65HVD230 transceiver. See "MS3Pro CAN" section.
   - **Wire / I²C** (SDA 18, SCL 19): MPU-6050 IMU (AD0→GND ⇒ addr 0x68)
   - **A2** (pin 16): oil-pressure transducer (0.5–4.5 V via 10k/20k divider). **A3** (pin 17): coolant NTC thermistor (150 Ω pull-up). Used in Direct sensor mode.
-  - **SPI0** (CS 10, MOSI 11, MISO 12, SCK 13): **W5500 ethernet** (when installed)
-  - **Pin 5**: W5500 `/INT` (planned)
-  - **Pin 6**: W5500 `/RESET` (planned)
+  - **Pins 0 / 1**: Serial1 to the Pi 5 video box (RX1 / TX1, 115200, 3.3 V). v0.1.150.
+  - **Pins 5, 6, 10–13**: RESERVED for the proposed trunk-WiFi SPI link (see above),
+    NOT active in v0.1.150. Current pin **13** heartbeat must be disabled for SPI.
+    No Ethernet driver returns. RTC backup needs **VBAT**, not a spare GPIO.
+  - **A6/pin 20**: opt-in AEM 30-0300 gauge-output ADC (v0.1.149); protected 0.500 gain input required.
   - **SDIO (built-in)**: SD card (pins are dedicated, not on the header)
 - **FlasherX OTA staging vs Teensy 4.1 EEPROM emulation (v0.1.99).** PJRC's EEPROM emulation
   lives in flash `0x607C0000..0x607FF000` (63 sectors) and we write it nearly every boot (IMU
@@ -553,6 +650,7 @@ GPS,<fix>,<sats>,<lat_deg>,<lon_deg>,<speed_mph>,<heading_deg>,<gps_status>
 ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>
 ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>
 IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
+AFR,<status>,<afr_x100>,<lambda_x10000>,<gauge_mV>  (v0.1.149, AEM gauge input)
 SD,REC,<0|1>,<file>,<samples>   (+ SD,READY/FMT/NONE/ERR/ACTIVE status forms)
 CLD,<live_ok>,<queue_depth>
 CANSNIFF,<0|1>,<file>,<frames>  (CAN sniffer status / live frame count)
@@ -560,6 +658,7 @@ TIME,<unix_epoch>               (RTC, 1 Hz)
 HLTH,<t_die_x10>,<t_mpu_x10>,<t_esp_x10>,<batt_x10>  (1 Hz device health; batt falls back to the BT dongle's ATRV when no MS3 CAN)
 RST,teensy,<reason>             (once at boot: Teensy reset cause)
 VER,teensy,<semver>
+VID,<HELLO|READY|REC|ERR>,...   (v0.1.150, Pi 5 video box status, forwarded from Serial1)
 ```
 - **`RST,teensy,<reason>`** (once at boot): the Teensy's own reset cause, decoded from `SRC_SRSR`
   (`captureResetReason()`): `POR(power)` / `watchdog` / `lockup/swrst` / `OVERTEMP` / `reset-pin`
@@ -773,6 +872,8 @@ CFG,<key>,<value>  # push settings (incl. srctyp, cloud, inet, and sf = active
                    #   stamps "lap":N into NDJSON via line-crossing).
                    #   NOTE: cl_strm REMOVED in v0.1.66 (live "stream to cloud"
                    #   deleted). Teensy ignores cl_strm if an old dash sends it.
+CFG,viden,<0|1>    # (v0.1.150) Pi 5 video interconnect. Teensy Serial1 pins 0/1.
+HUDLAP,<lap>,<last_ms>,<pred_ms>,<best_ms>  # dash -> Teensy, merged into HUD for overlay
 CFG,dbg_on,<0|1>   # (part of CFG) debug logging master switch. 0 = Teensy writes
                    #   NO .dbg health log for a session. NVS key dbg2 on the dash
                    #   (renamed from dbg_on in v0.1.103 to force the new OFF default;
@@ -852,7 +953,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `cl_email` / `cl_key` | string | Cloud user email (X-User-Email) + API key (X-API-Key, masked). Migrated from legacy `cl_user`/`cl_pass`. |
 | `autost` / `astmph` / `astsec` | bool/uint16/uint16 | **Auto-start recording** (v0.1.131): enable / speed threshold (mph) / **seconds the speed must be HELD continuously** (default 4, range 1-30). The dwell is the fix for spurious starts — the pre-0.1.131 code fired on the FIRST sample above the threshold, so one GPS speed spike or a squirt across the paddock opened a session. ANY dip below the threshold restarts the dwell. The START button turns amber and counts down (`AUTO 3`) while arming. |
 | `auto_trk` | bool | Auto-select closest track on START (skip picker if a clear match exists) |
-| `inet` | uint8 | Internet routing: 0=Ethernet (Teensy/W5500), 1=WiFi (CrowPanel) |
+| `inet` | uint8, retired | **WiFi-only since v0.1.148.** Ignored on load (old 0 cannot disable WiFi), saved as 1 for rollback. `CFG,inet,1` remains for old Teensy compatibility; new Teensy ignores the key. Never repurpose it. |
 | `wssid` / `wpass` | string | WiFi SSID / PSK |
 | `s_temp` / `t_warn` / `t_col` | bool/uint16/uint8 | Coolant show / warn-°F / warn-colour |
 | `s_psi` / `p_warn` / `p_col` | bool/uint16/uint8 | Oil-PSI show / warn-PSI / warn-colour |
@@ -863,11 +964,13 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `rpmspk` | uint8 | **RPM spike filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2). Sent as `CFG,rpmspk,<v>`; Teensy slew-gates tach pulses (see "RPM spike filter" note above). |
 | `gpsflt` | uint8 | **GPS drift filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2, v0.1.119). Sent as `CFG,gpsflt,<v>`. Teensy `applyGpsDriftFilter()` at the emit choke point (dash display + lap timing + NDJSON all filtered): parked GPS wander is LATCHED — below the freeze speed (0.8/1.2/2.0 mph, ~0.5 s) position/heading hold and speed clamps to 0; thaws instantly above the hysteresis speed (1.8/2.5/3.5 mph) OR when the raw fix escapes 8/12/20 m from the latch point (catches speed-less creep). |
-| `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour (MS3 mode only) |
+| `afraem` | bool | External AEM 30-0300 analogue input, default OFF. `CFG,afraem,0|1`; independent of engine source. Requires protected/scaled A6 input. Logs even when Show AFR is off. |
+| `s_afr` / `afr_lo` / `afr_hi` / `afr_col` | bool/uint16/uint16/uint8 | AFR show / rich-warn×10 / lean-warn×10 / colour. AEM when enabled, otherwise MS3 mode only. |
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
 | `lapov` | uint8 | **Finish-line lap-time popup duration** in seconds, 0–9 (default 3, 0 = off). Dash-only (no CFG). Settings → "Lap time popup (sec)". |
 | `advrev` | uint8 | **Advance 0x30 backlight-coprocessor dialect** (v0.1.145): 0=Auto (send both, ladder last), 1=Old rev/ladder (5" V1.1, 7" V1.2), 2=New rev/linear (5" V1.2+, 7" V1.3+). Dash-only (no CFG); row hidden on Basic panels. Settings → "Panel revision". See the Advance dialect note in the build section. |
 | `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
+| `viden` | bool | **Video interconnect** (v0.1.150, default OFF). Settings → "Video interconnect". `CFG,viden,0\|1`. When ON, Teensy Serial1 (pins 0/1, 115200) talks to a **separate Raspberry Pi 5** video box: forwards `REC`/`TRACK`/`HUD` for 1080p front + rear PIP + overlay. Does not block START if the Pi is missing. See `hardware/video-recorder/` and `hardware/breadboard/`. |
 | `sf_unk` | blob | **UNKNOWN-track S/F** (one `SfOverride`, v0.1.129) — the ONLY on-car S/F capture left. SET S/F (STATUS page / dash TRACK button while recording) works ONLY when `lapTrackIdx() < 0`; lap timing + Teensy `CFG,sf` stamping run against it at unmapped tracks. DELETE S/F clears it. |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **⚠️ IGNORED since v0.1.129 for KNOWN tracks** — the baked S/F (web-managed via `/tools/sfpicker`) is the ONLY source; a stale on-device capture used to silently beat a freshly baked line and kill lap timing (the Summit Point incident). Blob still loaded/saved for back-compat, never consulted. On-car capture now exists ONLY for UNKNOWN tracks (`sf_unk` above). The dash LAP row shows a CYAN `SF <dist>` countdown (pre-arm, while recording) so a misplaced S/F is visible on lap 1. Historical: struct size changed in 0.1.82 (pre-0.1.82 blobs ignored once).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. **v0.1.112: a capture below 5 mph stores a POINT (radius method) — GPS heading is garbage at rest, so the old parked capture built a line pointing anywhere and silently killed lap detection for the whole track (the Thompson incident). Rolling capture (≥5 mph) builds the perpendicular line. The STATUS button label now shows live distance to the effective S/F (`custom`/`default`, meters); a maroon **CLR S/F** sub-button (only when an override exists) wipes a bad override trackside; `updateLapTimer()` emits a 20 s `DBG,lap trk=… ovr=… d_sf=…m armed=… laps=…` breadcrumb.** Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
 
@@ -1480,9 +1583,10 @@ In RaceDash.ino: `enum SettingId`, `struct NumBounds`, and `struct KbKey` are fo
 
 `I2C_NUM_1` requires `#include <driver/i2c.h>` even though Wire.h transitively pulls it in some paths but not others.
 
-## Planned: cloud upload pipeline (W5500 incoming)
+## Historical: Ethernet cloud plan (REMOVED in v0.1.148)
 
-When the W5500 module arrives, the **Teensy** side gets:
+The following is retained as history only. Do NOT implement or wire this plan;
+all internet access now uses WiFi on the CrowPanel. The former plan was:
 
 - **`NativeEthernet` lib** (paulstoffregen) for the W5500 — stable on Teensy 4.1
 - **`OPEnSLab-OSU/SSLClient`** for HTTPS — wraps mbedtls, works with NativeEthernet
@@ -1555,6 +1659,55 @@ This means the car can have zero connectivity at the track and still get all dat
 
 ### NTP sync
 On Teensy boot: DHCP → NTP query to `0.pool.ntp.org` → set the Teensy's RTC. GPS time is the secondary source (UTC from PVT). When neither NTP nor GPS-fix is available, fall back to `millis()`-relative timestamps until one becomes available.
+
+## Prototype carrier PCB — hardware/_archive/teensy-carrier-reva (UNBUILT)
+
+**Scope correction:** the user subsequently requested an INTEGRATED board: soldered GPS
+and IMU, direct oil/coolant senders and onboard tach conditioning. Rev A does NOT provide
+that. See `hardware/teensy-integrated-revc/REQUIREMENTS.md` for verified Amazon sender
+candidates and firmware-calibration implications. **Tach scope is now fixed by the user:
+conditioned ECU / instrument-cluster tach ONLY, initially 1990–2005 Spec Miata; NEVER coil
+negative, spark or injector drive.** Rev C must include the optocoupler and a high-impedance
+front end on the main PCB so it does not load down the factory tach line. A future ignition
+pickup needs a SEPARATE conditioner producing a compatible low-voltage output. See
+`hardware/teensy-integrated-revc/TACH_INTERFACE.md`; input levels/pull-ups and PPR still need
+year-specific verification, not a guessed universal Miata wire colour.
+**Rev C now has actual routed electrical CAD and an engineering Gerber/drill ZIP**;
+see `hardware/teensy-integrated-revc/README.md` and its `design/` documents. Do not
+substitute Rev A or the older netless `preview/` files. Current deliverables are
+`Racecar-RevC-GERBERS-ENGINEERING-PROTOTYPE.zip` and
+`REV-C-ASSEMBLED-ENGINEERING-PROTOTYPE.png`, also copied to Downloads. They are
+unbuilt/unapproved prototypes; no independent reviewer, physical rating or working
+new WiFi firmware is claimed. The old concept RFQ and preview are historical only.
+
+`hardware/_archive/teensy-carrier-reva/` contains a **Rev A prototype, not a validated automotive
+board**: KiCad 9 sources, routed 130×110 mm two-layer PCB (2 oz BOTH sides), Gerbers/drills,
+BOM, schematic PDF, fabrication/bring-up instructions and verification scripts. It uses a
+socketed Teensy 4.1, an on-carrier **Pololu D36V50F5 / 4091** module for 10–20 V → 5 V
+(5 A total design budget; screen branch fused 4 A), and a **Traco TSR 1-2433** fed from
+Pololu **VRP** for separate auxiliary 3.3 V. GPS/IMU/CAN/W5500 are EXTERNAL modules;
+there is no integrated GPS/SMA, CAN transceiver, raw-coil input or ADC conditioning.
+
+Carrier **J2** is GND / +5V OUT / RX-from-screen / TX-to-screen, level-shifted to 5 V
+UART. It connects ONLY to the screen's verified **J10 +5V_IN/TXD0_H/RXD0_H** interface,
+NEVER the screen's small J2/HY2.0 3V3_OUT. Clones require physical pinout verification.
+The **Teensy VUSB–VIN bridge must be cut** before simultaneous USB/carrier power; the
+carrier diode/jumper does not replace that step. Tach is external open collector through
+filter/Schmitt buffer to pin 9. Read `BRINGUP.md`; no finger-temperature testing.
+
+`export.sh` fails hard on PCB DRC/unconnected pads and compares all connected PCB pads
+with the exported schematic netlist. Schematic symbols are **passive connectivity blocks**,
+so a clean ERC is NOT a full electrical check. Independent review, footprint fit, actual
+5 A/thermal/startup tests, clone-header validation, automotive-transient qualification and
+long-cable 921600-baud UART testing remain open. Do not claim this is production-ready.
+`generate.py` overwrites the routed PCB; use `export.sh` only to re-export the final board.
+The initial carrier work made no firmware changes. The subsequent v0.1.148
+source changes remove Ethernet and make the system WiFi-only; the requested
+AEM 30-0300 gauge-output support is implemented in v0.1.149 source; physical
+input protection/isolation and the full Rev C circuit still require review.
+Trunk-WiFi + RTC-cell circuitry is now in electrical Rev C, but network transport
+and robust time-resynchronization firmware still need implementation. No new uplink
+was flashed/published and the current screen-led OTA path was not revised.
 
 ## Layout
 

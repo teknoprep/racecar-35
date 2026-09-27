@@ -1,0 +1,1 @@
+(fp_lib_table (version 7) (lib (name "Racecar")(type "KiCad")(uri "${KIPRJMOD}/Racecar.pretty")(options "")(descr "Project-local verified stock and module footprints")))

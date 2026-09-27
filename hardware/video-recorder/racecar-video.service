@@ -1,0 +1,15 @@
+[Unit]
+Description=RaceDash dual-camera recorder (UART from Teensy)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/racecar-video
+ExecStart=/usr/bin/python3 /home/pi/racecar-video/recorder.py
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

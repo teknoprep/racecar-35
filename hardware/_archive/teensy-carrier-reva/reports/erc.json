@@ -1,0 +1,38 @@
+{
+    "$schema": "https://schemas.kicad.org/erc.v1.json",
+    "coordinate_units": "mm",
+    "date": "2026-09-09T08:36:46-0400",
+    "included_severities": [
+        "error",
+        "warning"
+    ],
+    "kicad_version": "9.0.8",
+    "sheets": [
+        {
+            "path": "/Power: 10-20V input / 5V / separate 3V3/",
+            "uuid_path": "/9601c2a6-72d9-5ad7-a1b5-53016fc72acf/8184643d-4fc9-50c6-b4e4-439233b99d50",
+            "violations": []
+        },
+        {
+            "path": "/Teensy 4.1 / expansion connectors/",
+            "uuid_path": "/9601c2a6-72d9-5ad7-a1b5-53016fc72acf/699a99a4-b37e-5e44-a862-c1fa2fbe1581",
+            "violations": []
+        },
+        {
+            "path": "/CrowPanel Advance J10: 5V power and translated UART/",
+            "uuid_path": "/9601c2a6-72d9-5ad7-a1b5-53016fc72acf/5b8fd27e-b513-53d8-a9fa-1f7eef1da362",
+            "violations": []
+        },
+        {
+            "path": "/External optocoupler and GPS input buffers/",
+            "uuid_path": "/9601c2a6-72d9-5ad7-a1b5-53016fc72acf/e9dfd3ac-6223-5281-81b8-4deb4aa88019",
+            "violations": []
+        },
+        {
+            "path": "/",
+            "uuid_path": "/9601c2a6-72d9-5ad7-a1b5-53016fc72acf",
+            "violations": []
+        }
+    ],
+    "source": "racecar-carrier-reva.kicad_sch"
+}

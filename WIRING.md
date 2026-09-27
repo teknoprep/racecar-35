@@ -1,8 +1,20 @@
 # racecar-35 — Wiring Reference
 
-Complete pin-by-pin wiring for both MCUs. Use this when rebuilding on a new
-board. The architecture lives in [CLAUDE.md](CLAUDE.md) — this file is just
-the connections.
+Wiring reference for the existing two-MCU system. **WiFi-only on the CrowPanel
+since v0.1.148: no Ethernet module or Internet-route setting.**
+The current **solder-it-yourself** build is a protoboard, not Rev C:
+[hardware/breadboard/](hardware/breadboard/) (terminals on the LEFT edge,
+Teensy on the right, Pi 5 video box on Serial1). Rev C Gerbers stay parked. v0.1.149 firmware supports ONLY an external AEM 30-0300 gauge's
+WHITE/BROWN analogue output through a reviewed scaled/protected input. No direct
+oxygen sensor, onboard heater/controller or source-selection jumper.
+See [CLAUDE.md](CLAUDE.md) and
+[AFR_INTERFACE.md](hardware/teensy-integrated-revc/AFR_INTERFACE.md).
+
+**New Rev C reservations (NOT wired or driven by current firmware):** on-board
+ESP32-S3 WiFi over SPI0 (10/11/12/13 + IRQ5/reset6) and CR2032 backup to dedicated
+Teensy VBAT/GND. Screen WiFi/OTA stays. See
+[WIFI_RTC_ARCHITECTURE.md](hardware/teensy-integrated-revc/WIFI_RTC_ARCHITECTURE.md).
+Never attach a cell to a generic GPIO; add the missing auxiliary VBAT contact.
 
 ```
 Cabin (driver)                         Trunk (data + connectivity)
@@ -11,7 +23,7 @@ Cabin (driver)                         Trunk (data + connectivity)
 |  (cabin display)  |                 |  GPS (NEO-M9N)              |
 |                   |                 |  Tach input (opto)          |
 |                   |                 |  IMU (MPU-6050)             |
-|                   |                 |  W5500 ethernet             |
+|  WiFi / NTP      |                 |  No network hardware        |
 |                   |                 |  SD card (built-in slot)    |
 +-------------------+                 +-----------------------------+
 ```
@@ -22,31 +34,27 @@ Cabin (driver)                         Trunk (data + connectivity)
 
 | Teensy 4.1 pin | Function                          | Notes |
 |---------------:|-----------------------------------|-------|
-| **3.3V**       | Power out — to GPS, IMU, W5500, tach pull-up | Internal regulator, ~250 mA budget |
+| **3.3V**       | Legacy GPS/IMU and logic pull-ups | Respect the MCU current budget; proposed carrier has a separate auxiliary rail |
 | **GND**        | Common ground for everything      | Multiple GND pins on the header — any will do |
 | **VIN / 5V**   | Power in (5 V, USB or ext)        | Or use USB-C |
 | **5V**         | Output — feed downstream 5 V devices if needed | Same rail as VIN |
-| Pin 5          | W5500 `/INT`                      | Open-drain interrupt from W5500 |
-| Pin 6          | W5500 `/RST`                      | Active-low reset to W5500 |
+| Pin 0          | Serial1 RX1 — **from Pi 5 TX**    | Video box UART, 3.3 V, 115200. See [hardware/breadboard](hardware/breadboard/) |
+| Pin 1          | Serial1 TX1 — **to Pi 5 RX**      | Crossed with pin 0; common GND; NEVER 5 V |
+| Pins 5 / 6     | Proposed NET READY / reset        | Reserved for new WiFi coprocessor; not implemented |
 | Pin 7          | Serial2 RX2 — **GPS TX**          | u-blox NEO-M9N TX → here |
 | Pin 8          | Serial2 TX2 — **GPS RX**          | Optional (config); often unused |
-| Pin 9          | **Tach input** (FreqMeasure)      | Only pin FreqMeasure works on for T4.x |
-| Pin 10         | W5500 `CS` / `SCS`                | SPI chip-select (CS_PIN) |
-| Pin 11         | W5500 `MOSI`                      | SPI0 MOSI |
-| Pin 12         | W5500 `MISO`                      | SPI0 MISO |
-| Pin 13         | W5500 `SCK` / `SCLK`              | SPI0 SCK — *also* the on-board LED |
+| Pin 9          | **Tach input via FreqMeasureMulti** | Conditioned opto output only; plain FreqMeasure uses pin 22 and is WRONG here |
+| Pins 10–12     | Proposed NET CS / MOSI / MISO      | Reserved for local WiFi SPI; not yet driven |
+| Pin 13         | Current heartbeat / proposed SCK  | MUST disable heartbeat GPIO writes before SPI |
 | Pin 14         | Serial3 TX3 — to CrowPanel `RX`   | Dash telemetry out |
 | Pin 15         | Serial3 RX3 — from CrowPanel `TX` | Dash commands in (REC, TRACK, TZ, SDFORMAT) |
 | Pin 16 / A2    | **Oil pressure ADC**              | 0.5–4.5 V transducer via 10 kΩ / 20 kΩ divider |
 | Pin 17 / A3    | **Coolant temp ADC**              | NTC thermistor with 150 Ω pullup to 3.3 V |
 | Pin 18         | Wire SDA — **IMU SDA**            | I²C data |
 | Pin 19         | Wire SCL — **IMU SCL**            | I²C clock |
+| Pin 20 / A6    | AEM 30-0300 gauge-output ADC       | Opt-in `afraem`; requires protected 0.500 gain front end; NEVER raw 5 V |
+| Pins 22 / 23   | CAN1 TX / RX                      | Used by MS3Pro; requires a CAN transceiver |
 | (built-in SDIO)| **SD card slot**                  | Dedicated socket on the board, no header pins |
-
-> **Warning — pin 13 LED:** since pin 13 is also `SCK`, the on-board LED won't
-> blink as a heartbeat once the W5500 is wired. The Teensy is still alive —
-> watch the USB serial output instead. (If you really want a blink LED, wire
-> an external one to any free pin.)
 
 ---
 
@@ -205,38 +213,17 @@ Then:
 
 ---
 
-## 7. W5500 Ethernet module
+## 7. Networking — WiFi only (v0.1.148)
 
-8 wires. Note that **pin 13 doubles as SCK and the Teensy on-board LED** —
-once SPI is active, the LED won't blink as a heartbeat anymore.
+No Ethernet/W5500 module is used or probed. Set WiFi SSID/password on the
+CrowPanel; those settings are always visible. Uploads and OTA use that WiFi link.
+NTP runs on the screen and relays `SETTIME` over UART. Current source does NOT
+set the RTC from GPS UTC (older documentation overstated that behaviour).
+The WiFi/BLE arbiter still turns WiFi off while Bluetooth owns the radio.
 
-| W5500 module pin* | Teensy 4.1 pin | Notes |
-|------------------:|:---------------|-------|
-| `VCC` (3V3)       | **3.3V**       | WIZnet modules need 3.3 V; some Chinese clones have a 5 V regulator and accept 5 V |
-| `GND`             | **GND**        | |
-| `SCS` / `CS` / `NSS` | **Pin 10**  | SPI chip-select |
-| `MOSI` / `SI`     | **Pin 11**     | SPI MOSI |
-| `MISO` / `SO`     | **Pin 12**     | SPI MISO |
-| `SCK` / `SCLK`    | **Pin 13**     | SPI clock |
-| `INT` / `IRQ`     | **Pin 5**      | Open-drain interrupt; pulled up by Teensy internally |
-| `RST` / `RESET`   | **Pin 6**      | Active-low reset; held low briefly at boot |
-
-\* Different W5500 modules use different silkscreen labels — common
-aliases shown. Consult your specific module's pinout if unsure.
-
-### Diagnostics at boot
-
-The Teensy's USB-serial output prints diagnostics:
-
-```
-[eth] miso pin test: CSlo:U=0,D=0  CShi:U=1,D=0     ← chip is driving MISO ✓
-[eth] raw VERSIONR=0x04 (3 reads: 0x04,0x04,0x04)   ← W5500 signature, stable bus ✓
-[eth] DHCP... OK  IP: 192.168.1.42  (chip=W5500, link=UP)
-[ntp] querying 0.pool.ntp.org ...
-[ntp] OK  unix=1746715847
-```
-
-If anything fails, see the `[eth-dbg]` line printed every 3 s for live state.
+Old saved `inet=0` selections are ignored. The new dash sends `CFG,inet,1` only
+for compatibility with old Teensy firmware. Retired `ETH,` lines cannot overwrite
+the screen's WiFi address/status.
 
 ---
 
@@ -258,7 +245,7 @@ on `SDFORMAT` command.
 | 12 V battery  | DC-DC step-down to 5 V (~2 A)                     |
 | 5 V (regulated) | Teensy `VIN` (or USB-C if bench testing)        |
 | 5 V (regulated) | CrowPanel USB-C input (or 5 V pin)              |
-| Teensy `3.3V` | GPS, IMU, W5500, tach pull-up                     |
+| Teensy `3.3V` | Legacy GPS, IMU and tach pull-up within the rail budget |
 | **Common GND**| **All grounds tied together** — engine, Teensy, CrowPanel, every module |
 
 > **Star-ground rule of thumb:** run separate ground wires from each module
@@ -279,7 +266,7 @@ When rebuilding:
 - [ ] Oil PSI: 5V, GND, signal via 10 kΩ/20 kΩ divider → T16 (A2)
 - [ ] Coolant temp: 150 Ω pullup from 3.3 V → T17 (A3); dedicated body ground
 - [ ] IMU: 4 wires (VCC, GND, SCL→T19, SDA→T18)
-- [ ] W5500: 8 wires (VCC, GND, CS→T10, MOSI→T11, MISO→T12, SCK→T13, INT→T5, RST→T6)
+- [ ] WiFi SSID/password configured on the CrowPanel; no Ethernet module
 - [ ] SD card inserted in Teensy 4.1 built-in socket
 - [ ] **Disconnect the UART jumpers before flashing the CrowPanel**
 
@@ -308,19 +295,19 @@ currently uses**.
 ```
                               +-------[USB-C]-------+
                          GND -|                     |- 5V (VIN)
-            Serial1 RX     0 -|                     |- GND
-            Serial1 TX     1 -|                     |- 3.3V
-                           2 -|                     |- 23   A9
-                           3 -|                     |- 22   A8
+     [Video Pi] RX1    0 -|                     |- GND
+     [Video Pi] TX1    1 -|                     |- 3.3V
+                           2 -|                     |- 23   A9          [CAN1 RX]
+                           3 -|                     |- 22   A8          [CAN1 TX]
                            4 -|                     |- 21   A7 / RX5
- [W5500 /INT]              5 -|                     |- 20   A6 / TX5
- [W5500 /RST]              6 -|                     |- 19   A5 / SCL    [IMU SCL]
+                           5 -|                     |- 20   A6 / TX5    [AEM AFR via scaled/protected input]
+                           6 -|                     |- 19   A5 / SCL    [IMU SCL]
        [GPS] RX2           7 -|                     |- 18   A4 / SDA    [IMU SDA]
        [GPS] TX2           8 -|     T E E N S Y     |- 17   A3 / TX4    [Coolant temp ADC]
      [Tach in]             9 -|        4 . 1        |- 16   A2 / RX4    [Oil PSI ADC]
-   [W5500 CS]             10 -|                     |- 15   A1 / RX3    [Dash RX  <- CrowPanel TX]
- [W5500 MOSI]             11 -|                     |- 14   A0 / TX3    [Dash TX  -> CrowPanel RX]
- [W5500 MISO]             12 -|                     |- 13   SCK / LED   (SPI0 SCK; on-board LED)
+                          10 -|                     |- 15   A1 / RX3    [Dash RX  <- CrowPanel TX]
+                          11 -|                     |- 14   A0 / TX3    [Dash TX  -> CrowPanel RX]
+                          12 -|                     |- 13   SCK / LED   [Heartbeat LED]
                         3.3V -|                     |- GND
                           24 -|                     |- 41   A17
       Serial6 TX          25 -|                     |- 40   A16
@@ -345,11 +332,13 @@ currently uses**.
 
 | Status | Pins | Notes |
 |--------|------|-------|
-| **In use** | 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, SDIO | See the project annotations in the diagram above |
-| **Free** | 0, 1, 2, 3, 4, 20, 21, 22, 23, 24-32, 33-41 | All available for future expansion |
+| **In use** | 7, 8, 9, 13, 14, 15, 16, 17, 18, 19, 22, 23, SDIO | CAN1 uses 22/23; network module removed |
+| **Opt-in AFR** | 20 / A6 | AEM gauge output through reviewed 0.500 gain front end; no internal pull |
+| **Reserved for new WiFi** | 5, 6, 10–13 | Local SPI/READY/reset proposal; no new driver yet |
+| **No firmware assignment** | 0–4, 21, 24–41 | Review carrier/peripheral wiring before reuse |
 | **Caveat** | Pins 16/17 used as analog (A2/A3) | Serial4 (RX4/TX4) is no longer available |
-| **Caveat** | Pin 13 doubles as SPI0 SCK and the on-board LED | LED won't blink as a heartbeat once W5500 is wired |
-| **FreqMeasure only** | Pin 9 | The *only* pin FreqMeasure works on for T4.x — don't reassign |
+| **Caveat** | Pin 13 doubles as SPI0 SCK and the on-board LED | Stop heartbeat GPIO writes before enabling new WiFi SPI |
+| **FreqMeasureMulti** | Pin 9 | The configured tach pin; plain FreqMeasure incorrectly uses CAN TX pin 22 |
 
 ### Common alt-functions for currently-unused pins
 
@@ -358,10 +347,10 @@ If you need to add something, these are the natural pin choices:
 | Function | Best free pin | Alt |
 |----------|---------------|-----|
 | Another UART | Serial6 (pins 24=TX, 25=RX) | Serial7 (28=RX, 29=TX) |
-| Another I²C bus | Wire1 (pins 16=SDA1, 17=SCL1)... but those are in use as ADCs now | Wire2 (24=SCL2, 25=SDA2) |
+| Another I²C bus | Wire1 (SDA 17 / SCL 16) is already occupied by the ADC inputs | Wire2 (SDA 25 / SCL 24); verify any other allocations first |
 | Another SPI bus | SPI1 (pins 26=MOSI1, 27=SCK1, 39=MISO1) | — |
-| More ADC inputs | A6 (pin 20), A7 (21), A8 (22), A9 (23) | A14–A17 (pins 38–41) |
-| CAN bus | CAN1 (pin 22=TX1, 23=RX1), CAN2 (pin 0=RX2, 1=TX2), CAN3 (pin 30=TX3, 31=RX3) | T4.1 has FlexCAN on multiple pins |
+| More ADC inputs | A7 (21) | A6 (20) reserved for AEM AFR; 22/23 already used by CAN1 |
+| CAN bus | CAN1 (TX 22 / RX 23) is ALREADY IN USE | Verify PJRC pin mapping before assigning another controller |
 | PWM output | Most pins support FlexPWM; 2, 3, 4, 33 are clean | See PJRC PWM table |
 
 Full reference: [Teensy 4.1 pinout card](https://www.pjrc.com/store/teensy41.html).

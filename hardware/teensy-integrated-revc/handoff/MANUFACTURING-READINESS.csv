@@ -1,0 +1,22 @@
+Deliverable,Status,Required_before
+System requirements and tach-source scope,AVAILABLE IN THIS PACKAGE,Engineering review
+Assembled appearance and functional drawing,CONCEPT ONLY,Placement discussion; not fabrication
+Electrical schematic and netlist,MISSING,Electrical review and layout
+Exact manufacturer BOM and approved alternates,MISSING,Procurement and assembly
+Protection and analogue circuit values,MISSING,Electrical review and layout
+AFR model and analogue scaling,DEFINED,AEM 30-0300 gauge WHITE/BROWN only; see AFR_INTERFACE.md
+AFR protection and power-off isolation,DESIGN REVIEW REQUIRED,Validate complete front end and 0.500 gain before connecting Teensy
+Trunk WiFi transport and module firmware,MISSING,Direct uploads and module deployment
+WiFi supply/RF/SPI/power-off design,DESIGN REVIEW REQUIRED,New module wiring and fabrication
+RTC VBAT contact and battery circuit,DESIGN REVIEW REQUIRED,Backup retention tests and fabrication
+RTC validity and fresh-time resync policy,FIRMWARE WORK REQUIRED,Reliable offline/online time behaviour
+Final GNSS RF design and stackup,MISSING,Fabrication
+Verified component land patterns and orientations,MISSING,Fabrication and assembly
+Routed electrically connected PCB,MISSING,Fabrication
+Rev C Gerber or ODB++ and drill files,MISSING,Fabrication
+Pick-and-place or CPL,MISSING,Assembly
+Final assembly drawings and connector labels,MISSING,Assembly and wiring
+Approved programming image and procedure,MISSING,Programming
+Approved fixture and test limits,MISSING,First-article acceptance
+Independent engineering review,MISSING,Prototype manufacturing approval
+Written customer fabrication authorization,NOT PROVIDED,Any manufacturing start

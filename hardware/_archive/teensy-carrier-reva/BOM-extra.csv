@@ -1,0 +1,14 @@
+Item,Quantity,Requirement
+Teensy sockets,2,"Samtec SSQ-124-03-G-S or equivalent 1x24, 2.54mm pitch; 15.24mm row separation"
+Teensy male headers,2,"1x24 2.54mm 0.64mm square pins, solder to Teensy"
+Regulator header,1,"Samtec TSW-106-07-G-D, 2x6 2.54mm, at least 3A/contact. Solder both rows, no low-current socket"
+JP1 shunt,1,2.54mm 2-pin shorting shunt
+JST housing,3,"XHP-4 plus SXH-001T-P0.6 crimp contacts, explicitly wire per pin map"
+Harness fuse,1,"Inline automotive blade fuse holder, 5A fuse, fitted close to power source"
+Screen cable,1,"18AWG or heavier power pair, short twisted TX/RX+ground arrangement; see cable drop limits"
+Standoffs,4,M3 nylon screws and standoffs
+Regulator support,1,Nonconductive spacer beneath Pololu module; no metal contact with underside components
+GPS,1,External verified u-blox UART breakout + SMA active antenna; NEO-M9N is current firmware target
+IMU,1,"Optional 3.3V-compatible GY-521/MPU6050, AD0 grounded"
+CAN module,1,Optional SN65HVD230 3.3V module; termination belongs at bus ends
+Ethernet module,1,"Optional W5500 3.3V-powered module; map custom J7 cable, no assumed module pin order"

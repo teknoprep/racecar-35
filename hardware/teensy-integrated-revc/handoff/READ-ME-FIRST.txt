@@ -1,0 +1,45 @@
+RACECAR-35 / INTEGRATED REV C
+DESIGN COMPLETION + REVIEW / QUOTE PACKAGE
+NOT FOR FABRICATION OR ASSEMBLY
+
+The included PNG is an illustrated placement concept, NOT a completed PCB.
+This package is intended for a hardware design engineer or a supplier offering
+PCB design services. An assembly-only supplier cannot manufacture Rev C from it.
+
+DO NOT START FABRICATION OR BUY/ASSEMBLE COMPONENTS FROM THIS PACKAGE.
+No production or prototype manufacturing order is authorized by these files.
+
+WHAT IS INCLUDED
+- Rev C assembled-board concept: ALL screw terminals on one labelled LEFT edge.
+- INTERNAL WiFi PCB antenna; external GPS antenna unchanged.
+- Functional connection drawing in SVG and PDF (NOT a circuit schematic).
+- Agreed system requirements and ECU/cluster-only tach input contract.
+- Two WiFi endpoints (new trunk coprocessor + screen); unchanged screen-led OTA.
+- RTC CR2032/VBAT backup, finite-life service requirements and time-sync work.
+- AEM 30-0300 gauge-output-only AFR input requirements.
+- Candidate major parts/senders, clearly marked NOT a BOM.
+- Assembly, silkscreen-label and commissioning requirements.
+- Firmware pin/interface constraints and known compatibility gaps.
+- Vendor request and a list of manufacturing deliverables still missing.
+- Package manifest with SHA-256 hashes for integrity checking.
+
+WHAT DOES NOT EXIST YET FOR THE INTEGRATED REV C
+- Completed, reviewed electrical schematic and netlist.
+- Final component selection, resistor/capacitor/protection values and exact BOM.
+- Electrically routed PCB with verified land patterns and fabrication stackup.
+- Gerbers/ODB++ and drill files for the integrated board.
+- Pick-and-place/CPL, final assembly drawings and connector pinout.
+- Approved Rev C programming image, test procedure/fixture and test limits.
+- Prototype electrical, RF, sensor-calibration, thermal and vehicle validation.
+
+The source project contains an older REV A CARRIER, but that board requires
+external GPS/IMU/opto and does NOT meet the revised integrated-board request.
+Its Gerbers, BOM, assembly files and firmware images are intentionally NOT included.
+Do not substitute that older board or generate fabrication files from the pictured
+placement. The render-only layout has no electrical nets or routing.
+
+NEXT STEP
+Quote completion/review of the electrical design and layout first. After the
+customer approves a frozen manufacturing package, quote fabrication, component
+sourcing, fully populated assembly, labels, programming and functional testing.
+The intended product is an unvalidated prototype, not an automotive-qualified unit.

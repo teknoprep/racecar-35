@@ -1,0 +1,5 @@
+*.kicad_prl
+*.kicad_pcb.lck
+*.lck
+*-backups/
+checked-netlist.xml

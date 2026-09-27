@@ -1,0 +1,11 @@
+Item,Quantity,Manufacturer,Part,Notes
+Teensy female socket,2,Samtec,SSW-124-01-G-S,Check actual mating height and module clearance before order
+Teensy male strip,2,Samtec,TSW-124-07-G-S,Fit to Teensy outer rows and verify full seating
+JP1 shunt,1,Harwin,M7566-05,2.54mm shunt; fit only after unloaded rail tests
+RTC cell,1,Panasonic,CR2032,Primary 3V; fit after soldering and cleaning; do not charge
+RTC lead housing,1,JST,XHP-2,Mates with J9; pin1 VBAT pin2 GND
+RTC lead contacts,2,JST,SXH-001T-P0.6,Use specified wire/crimp tool; verify retention
+RTC lead,2,Assembly,Insulated flexible hook-up wire,Short strain-relieved lead to actual Teensy VBAT/GND pads
+Pololu mating header,1,Assembly,2x6 2.54mm through-hole male header,Verify pitch/height against module footprint and vendor drawing; both columns fitted
+Mounting hardware,4,Assembly,M3 insulated standoffs and screws,No exposed lead or antenna contact; verify enclosure clearance
+GPS antenna,1,Assembly,3.3V active GNSS antenna with SMA male,Current must work with 50mA minimum bias limit; validate GNSS band/gain/noise

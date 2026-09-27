@@ -1,0 +1,29 @@
+References,Quantity,Value,Manufacturer,MPN,Footprint
+U1,1,Teensy 4.1 (socketed),PJRC,TEENSY41,Racecar:Teensy41_Socket
+U2,1,D36V50F5 / 5V 5A budget,Pololu,4091 / D36V50F5,Racecar:Pololu_D36V50F5
+U3,1,TSR 1-2433 / AUX 3V3,Traco Power,TSR 1-2433,Racecar:Converter_DCDC_TRACO_TSR-1_THT
+J1,1,10-20V INPUT,Phoenix Contact,1729018,"Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal"
+J2,1,CROWPANEL J10 ONLY,Phoenix Contact,1729034,"Racecar:TerminalBlock_Phoenix_MKDS-1,5-4-5.08_1x04_P5.08mm_Horizontal"
+J3,1,EXTERNAL OPTO OUTPUT,Phoenix Contact,1729018,"Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal"
+J4,1,GPS UART 3V3,JST,B4B-XH-A(LF)(SN),Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical
+J5,1,MPU6050 I2C 3V3,JST,B4B-XH-A(LF)(SN),Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical
+J6,1,CAN MODULE LOGIC,JST,B4B-XH-A(LF)(SN),Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical
+J7,1,W5500 BREAKOUT,Samtec,TSW-104-07-G-D,Racecar:PinHeader_2x04_P2.54mm_Vertical
+JP1,1,MCU POWER ENABLE,Samtec,TSW-102-07-G-S,Racecar:PinHeader_1x02_P2.54mm_Vertical
+D2,1,SS14 USB backfeed barrier,Diodes Inc.,SS14,Racecar:D_SMA
+F1,1,5A INPUT FUSE,Littelfuse,0451005.MRL,Racecar:Fuse_Littelfuse-NANO2-451_453
+F2,1,4A SCREEN FUSE,Littelfuse,0451004.MRL,Racecar:Fuse_Littelfuse-NANO2-451_453
+D1,1,SMBJ20CA INPUT TVS,Littelfuse,SMBJ20CA,Racecar:D_SMB
+C1,1,100uF 50V,Panasonic,EEU-FR1H101,Racecar:CP_Radial_D8.0mm_P3.50mm
+C2,1,470uF 10V,Panasonic,EEU-FR1A471B,Racecar:CP_Radial_D8.0mm_P3.50mm
+"C3, C4, C5, C6, C7, C8, C9, C10, C12, C13, C14, C15",12,100nF,Murata,GRM21BR71H104KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder
+"U4, U5",2,SN74LVC1T45,Texas Instruments,SN74LVC1T45DBVR,Racecar:SOT-23-6_Handsoldering
+"R1, R2, R7, R8",4,100,Yageo,RC0805FR-07100RL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder
+"R3, R4, R9",3,47k,Yageo,RC0805FR-0747KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder
+"D3, D4, D5",3,PESD5V0S1BA,Nexperia,"PESD5V0S1BA,115",Racecar:D_SOD-323
+U6,1,SN74LVC2G17,Texas Instruments,SN74LVC2G17DBVR,Racecar:SOT-23-6_Handsoldering
+C11,1,1nF,Murata,GRM21BR71H102KA01L,Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder
+R5,1,1k,Yageo,RC0805FR-071KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder
+"R6, R12, R13, R14",4,4.7k,Yageo,RC0805FR-074K7L,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder
+"R10, R11",2,10k,Yageo,RC0805FR-0710KL,Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder
+D6,1,GREEN 5V,Lite-On,LTST-C170KGKT,Racecar:LED_0805_2012Metric

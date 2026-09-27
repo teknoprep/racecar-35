@@ -1,0 +1,7 @@
+__pycache__/
+*.log
+angle-raw.png
+top-raw.png
+PLACEMENT-ONLY-NOT-FOR-FAB.kicad_pcb
+PLACEMENT-ONLY-NOT-FOR-FAB.kicad_pro
+PLACEMENT-ONLY-NOT-FOR-FAB.kicad_prl

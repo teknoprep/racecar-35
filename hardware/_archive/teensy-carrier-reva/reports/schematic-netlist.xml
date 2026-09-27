@@ -1,0 +1,2017 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<export version="E">
+  <design>
+    <source>/home/chris/coding/racecar-35/hardware/teensy-carrier-reva/design/racecar-carrier-reva.kicad_sch</source>
+    <date>2026-09-09T08:36:46-0400</date>
+    <tool>Eeschema 9.0.8+dfsg-1</tool>
+    <sheet number="1" name="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/">
+      <title_block>
+        <title/>
+        <company/>
+        <rev/>
+        <date/>
+        <source>01-power.kicad_sch</source>
+        <comment number="1" value=""/>
+        <comment number="2" value=""/>
+        <comment number="3" value=""/>
+        <comment number="4" value=""/>
+        <comment number="5" value=""/>
+        <comment number="6" value=""/>
+        <comment number="7" value=""/>
+        <comment number="8" value=""/>
+        <comment number="9" value=""/>
+      </title_block>
+    </sheet>
+    <sheet number="2" name="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/">
+      <title_block>
+        <title/>
+        <company/>
+        <rev/>
+        <date/>
+        <source>02-mcu.kicad_sch</source>
+        <comment number="1" value=""/>
+        <comment number="2" value=""/>
+        <comment number="3" value=""/>
+        <comment number="4" value=""/>
+        <comment number="5" value=""/>
+        <comment number="6" value=""/>
+        <comment number="7" value=""/>
+        <comment number="8" value=""/>
+        <comment number="9" value=""/>
+      </title_block>
+    </sheet>
+    <sheet number="3" name="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/">
+      <title_block>
+        <title/>
+        <company/>
+        <rev/>
+        <date/>
+        <source>03-screen.kicad_sch</source>
+        <comment number="1" value=""/>
+        <comment number="2" value=""/>
+        <comment number="3" value=""/>
+        <comment number="4" value=""/>
+        <comment number="5" value=""/>
+        <comment number="6" value=""/>
+        <comment number="7" value=""/>
+        <comment number="8" value=""/>
+        <comment number="9" value=""/>
+      </title_block>
+    </sheet>
+    <sheet number="4" name="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/">
+      <title_block>
+        <title/>
+        <company/>
+        <rev/>
+        <date/>
+        <source>04-inputs.kicad_sch</source>
+        <comment number="1" value=""/>
+        <comment number="2" value=""/>
+        <comment number="3" value=""/>
+        <comment number="4" value=""/>
+        <comment number="5" value=""/>
+        <comment number="6" value=""/>
+        <comment number="7" value=""/>
+        <comment number="8" value=""/>
+        <comment number="9" value=""/>
+      </title_block>
+    </sheet>
+    <sheet number="5" name="/" tstamps="/">
+      <title_block>
+        <title/>
+        <company/>
+        <rev/>
+        <date/>
+        <source>racecar-carrier-reva.kicad_sch</source>
+        <comment number="1" value=""/>
+        <comment number="2" value=""/>
+        <comment number="3" value=""/>
+        <comment number="4" value=""/>
+        <comment number="5" value=""/>
+        <comment number="6" value=""/>
+        <comment number="7" value=""/>
+        <comment number="8" value=""/>
+        <comment number="9" value=""/>
+      </title_block>
+    </sheet>
+  </design>
+  <components>
+    <comp ref="C1">
+      <value>100uF 50V</value>
+      <footprint>Racecar:CP_Radial_D8.0mm_P3.50mm</footprint>
+      <fields>
+        <field name="Footprint">Racecar:CP_Radial_D8.0mm_P3.50mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C1" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>600c29c6-cbed-5699-be37-ff331eea9ea9</tstamps>
+    </comp>
+    <comp ref="C2">
+      <value>470uF 10V</value>
+      <footprint>Racecar:CP_Radial_D8.0mm_P3.50mm</footprint>
+      <fields>
+        <field name="Footprint">Racecar:CP_Radial_D8.0mm_P3.50mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C2" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>e63735b4-98c6-51e0-acdc-0718f434bfa5</tstamps>
+    </comp>
+    <comp ref="C3">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C3" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>7db0e7fc-7671-54bb-8646-58722b480db1</tstamps>
+    </comp>
+    <comp ref="C4">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C4" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>4ead872e-d806-5c78-8b66-59e3560a01ab</tstamps>
+    </comp>
+    <comp ref="D1">
+      <value>SMBJ20CA INPUT TVS</value>
+      <footprint>Racecar:D_SMB</footprint>
+      <fields>
+        <field name="Footprint">Racecar:D_SMB</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="D1" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>5696efe1-58ae-5dfd-9228-e6cb95df194c</tstamps>
+    </comp>
+    <comp ref="D2">
+      <value>SS14 USB backfeed barrier</value>
+      <footprint>Racecar:D_SMA</footprint>
+      <fields>
+        <field name="Footprint">Racecar:D_SMA</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="D2" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>ab8a667a-c411-5062-af68-a76bee2ca974</tstamps>
+    </comp>
+    <comp ref="D6">
+      <value>GREEN 5V</value>
+      <footprint>Racecar:LED_0805_2012Metric</footprint>
+      <fields>
+        <field name="Footprint">Racecar:LED_0805_2012Metric</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="D6" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>88935cbd-55f8-5d02-93fd-ccc219bc77e2</tstamps>
+    </comp>
+    <comp ref="F1">
+      <value>5A INPUT FUSE</value>
+      <footprint>Racecar:Fuse_Littelfuse-NANO2-451_453</footprint>
+      <fields>
+        <field name="Footprint">Racecar:Fuse_Littelfuse-NANO2-451_453</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="F1" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>282ac733-6a1e-550e-81ed-b1bb9f6115a4</tstamps>
+    </comp>
+    <comp ref="F2">
+      <value>4A SCREEN FUSE</value>
+      <footprint>Racecar:Fuse_Littelfuse-NANO2-451_453</footprint>
+      <fields>
+        <field name="Footprint">Racecar:Fuse_Littelfuse-NANO2-451_453</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="F2" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>e2ef76f5-a9b0-53c3-8da9-8465afa8d2ba</tstamps>
+    </comp>
+    <comp ref="J1">
+      <value>10-20V INPUT</value>
+      <footprint>Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal</footprint>
+      <fields>
+        <field name="Footprint">Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="J1" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>481dd3d5-0ee6-564e-90da-9e756c5fb82a</tstamps>
+    </comp>
+    <comp ref="JP1">
+      <value>MCU POWER ENABLE</value>
+      <footprint>Racecar:PinHeader_1x02_P2.54mm_Vertical</footprint>
+      <fields>
+        <field name="Footprint">Racecar:PinHeader_1x02_P2.54mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="JP1" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>b3a7a1e6-07b9-5b98-92d9-3c67287bea06</tstamps>
+    </comp>
+    <comp ref="R14">
+      <value>4.7k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R14" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>d1aaeae3-607b-57f5-990d-354004767e5b</tstamps>
+    </comp>
+    <comp ref="TP1">
+      <value>GND</value>
+      <footprint>Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</footprint>
+      <fields>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="TP1" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>0b82cf55-3c03-5325-95ae-b5464b9b835d</tstamps>
+    </comp>
+    <comp ref="TP2">
+      <value>VIN_FUSED</value>
+      <footprint>Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</footprint>
+      <fields>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="TP2" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>4ef9fc30-1365-5d8d-8186-b22fa17a7f78</tstamps>
+    </comp>
+    <comp ref="TP3">
+      <value>+5V_MAIN</value>
+      <footprint>Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</footprint>
+      <fields>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="TP3" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>e4023f5f-c6f9-593d-af9c-174e900495ab</tstamps>
+    </comp>
+    <comp ref="TP4">
+      <value>+3V3_AUX</value>
+      <footprint>Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</footprint>
+      <fields>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="TP4" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>9d288180-4533-5db6-800e-b12beca69ea2</tstamps>
+    </comp>
+    <comp ref="U2">
+      <value>D36V50F5 / 5V 5A budget</value>
+      <footprint>Racecar:Pololu_D36V50F5</footprint>
+      <fields>
+        <field name="Footprint">Racecar:Pololu_D36V50F5</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="U2" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>560463d5-a967-589b-aefa-8ea6847c733b</tstamps>
+    </comp>
+    <comp ref="U3">
+      <value>TSR 1-2433 / AUX 3V3</value>
+      <footprint>Racecar:Converter_DCDC_TRACO_TSR-1_THT</footprint>
+      <fields>
+        <field name="Footprint">Racecar:Converter_DCDC_TRACO_TSR-1_THT</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="U3" description=""/>
+      <property name="Sheetname" value="Power: 10-20V input / 5V / separate 3V3"/>
+      <property name="Sheetfile" value="01-power.kicad_sch"/>
+      <sheetpath names="/Power: 10-20V input / 5V / separate 3V3/" tstamps="/8184643d-4fc9-50c6-b4e4-439233b99d50/"/>
+      <tstamps>37f6ac05-1db9-5f33-85ec-f4cd1c3a46ee</tstamps>
+    </comp>
+    <comp ref="C5">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C5" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>0a4f62d5-7196-5cc3-8d8c-9ce61f175868</tstamps>
+    </comp>
+    <comp ref="C12">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C12" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>9893c472-078d-506d-9af6-a57d06698cbb</tstamps>
+    </comp>
+    <comp ref="C13">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C13" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>baaf0f19-8094-53e7-8ebe-8a9e84c4b034</tstamps>
+    </comp>
+    <comp ref="C14">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C14" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>77fd87a7-fcb3-5718-855c-42405419b35c</tstamps>
+    </comp>
+    <comp ref="C15">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C15" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>95d070c6-6035-503a-a644-2bf4391c7ec3</tstamps>
+    </comp>
+    <comp ref="J4">
+      <value>GPS UART 3V3</value>
+      <footprint>Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</footprint>
+      <fields>
+        <field name="Footprint">Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="J4" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>470ce22f-73a2-5a78-8ec5-a8923a9fea71</tstamps>
+    </comp>
+    <comp ref="J5">
+      <value>MPU6050 I2C 3V3</value>
+      <footprint>Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</footprint>
+      <fields>
+        <field name="Footprint">Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="J5" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>abc1fd08-e030-55bd-817f-6a9dac3057b7</tstamps>
+    </comp>
+    <comp ref="J6">
+      <value>CAN MODULE LOGIC</value>
+      <footprint>Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</footprint>
+      <fields>
+        <field name="Footprint">Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="J6" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>e3f74ca5-8a3d-5f25-a01a-f21bd5853fd0</tstamps>
+    </comp>
+    <comp ref="J7">
+      <value>W5500 BREAKOUT</value>
+      <footprint>Racecar:PinHeader_2x04_P2.54mm_Vertical</footprint>
+      <fields>
+        <field name="Footprint">Racecar:PinHeader_2x04_P2.54mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="J7" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>bc99847c-8719-590c-97d3-3c1a4a525fb4</tstamps>
+    </comp>
+    <comp ref="R10">
+      <value>10k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R10" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>7f0071ef-3d2d-5b61-9b7f-1e7fec1e987d</tstamps>
+    </comp>
+    <comp ref="R11">
+      <value>10k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R11" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>ce039909-9b44-545e-8add-d82b97a9d11e</tstamps>
+    </comp>
+    <comp ref="R12">
+      <value>4.7k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R12" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>4516366f-bfde-5da7-aeb6-aa683cc1b4d1</tstamps>
+    </comp>
+    <comp ref="R13">
+      <value>4.7k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R13" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>18d34808-25bf-5858-b745-391c3402f7cf</tstamps>
+    </comp>
+    <comp ref="TP5">
+      <value>+3V3_MCU</value>
+      <footprint>Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</footprint>
+      <fields>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="TP5" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>3de7d4e6-ffc7-504c-9073-f5fa0060e251</tstamps>
+    </comp>
+    <comp ref="U1">
+      <value>Teensy 4.1 (socketed)</value>
+      <footprint>Racecar:Teensy41_Socket</footprint>
+      <fields>
+        <field name="Footprint">Racecar:Teensy41_Socket</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="U1" description=""/>
+      <property name="Sheetname" value="Teensy 4.1 / expansion connectors"/>
+      <property name="Sheetfile" value="02-mcu.kicad_sch"/>
+      <sheetpath names="/Teensy 4.1 / expansion connectors/" tstamps="/699a99a4-b37e-5e44-a862-c1fa2fbe1581/"/>
+      <tstamps>8f628667-487b-565e-bfe3-9516d2b9dd33</tstamps>
+    </comp>
+    <comp ref="C6">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C6" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>3ccd3916-c334-5d66-b13b-b335f00089a0</tstamps>
+    </comp>
+    <comp ref="C7">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C7" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>e189d84f-5bf5-513e-b622-dade84df854f</tstamps>
+    </comp>
+    <comp ref="C8">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C8" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>8b1b5c58-9d85-5230-8c53-4332f086cafc</tstamps>
+    </comp>
+    <comp ref="C9">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C9" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>f2c2c00d-ca70-5ff7-8b14-9033167d1c18</tstamps>
+    </comp>
+    <comp ref="D3">
+      <value>PESD5V0S1BA</value>
+      <footprint>Racecar:D_SOD-323</footprint>
+      <fields>
+        <field name="Footprint">Racecar:D_SOD-323</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="D3" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>7d161e15-e258-59fe-ba35-403e92d86fa2</tstamps>
+    </comp>
+    <comp ref="D4">
+      <value>PESD5V0S1BA</value>
+      <footprint>Racecar:D_SOD-323</footprint>
+      <fields>
+        <field name="Footprint">Racecar:D_SOD-323</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="D4" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>9c77e4b9-905b-5b9d-b51f-fb1c6302e451</tstamps>
+    </comp>
+    <comp ref="J2">
+      <value>CROWPANEL J10 ONLY</value>
+      <footprint>Racecar:TerminalBlock_Phoenix_MKDS-1,5-4-5.08_1x04_P5.08mm_Horizontal</footprint>
+      <fields>
+        <field name="Footprint">Racecar:TerminalBlock_Phoenix_MKDS-1,5-4-5.08_1x04_P5.08mm_Horizontal</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="J2" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>1d28cb0f-8daa-52b9-a930-a053abc56ebd</tstamps>
+    </comp>
+    <comp ref="R1">
+      <value>100</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R1" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>2cf805de-6448-5f2e-bf75-3c1f92dc083c</tstamps>
+    </comp>
+    <comp ref="R2">
+      <value>100</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R2" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>e5fb99d9-5f87-5dfc-b711-0a11bf756100</tstamps>
+    </comp>
+    <comp ref="R3">
+      <value>47k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R3" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>3b399444-17fb-5440-9638-cc8272df0e40</tstamps>
+    </comp>
+    <comp ref="R4">
+      <value>47k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R4" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>4986c511-d659-597e-8c62-48b0c4958878</tstamps>
+    </comp>
+    <comp ref="U4">
+      <value>SN74LVC1T45</value>
+      <footprint>Racecar:SOT-23-6_Handsoldering</footprint>
+      <fields>
+        <field name="Footprint">Racecar:SOT-23-6_Handsoldering</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="U4" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>20aa4703-1ca3-5e91-95a4-b5d8f5e5d703</tstamps>
+    </comp>
+    <comp ref="U5">
+      <value>SN74LVC1T45</value>
+      <footprint>Racecar:SOT-23-6_Handsoldering</footprint>
+      <fields>
+        <field name="Footprint">Racecar:SOT-23-6_Handsoldering</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="U5" description=""/>
+      <property name="Sheetname" value="CrowPanel Advance J10: 5V power and translated UART"/>
+      <property name="Sheetfile" value="03-screen.kicad_sch"/>
+      <sheetpath names="/CrowPanel Advance J10: 5V power and translated UART/" tstamps="/5b8fd27e-b513-53d8-a9fa-1f7eef1da362/"/>
+      <tstamps>97e12aab-4536-5856-923b-264fc3647c2b</tstamps>
+    </comp>
+    <comp ref="C10">
+      <value>100nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C10" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>31700476-5ef3-5976-98a0-8a7c81358ff6</tstamps>
+    </comp>
+    <comp ref="C11">
+      <value>1nF</value>
+      <footprint>Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="C11" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>fa758e46-ca49-57fd-8c1b-b2c8b813c4b0</tstamps>
+    </comp>
+    <comp ref="D5">
+      <value>PESD5V0S1BA</value>
+      <footprint>Racecar:D_SOD-323</footprint>
+      <fields>
+        <field name="Footprint">Racecar:D_SOD-323</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="D5" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>888826f0-eaba-5bae-bfb0-894af4e4f334</tstamps>
+    </comp>
+    <comp ref="J3">
+      <value>EXTERNAL OPTO OUTPUT</value>
+      <footprint>Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal</footprint>
+      <fields>
+        <field name="Footprint">Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="J3" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>745c8967-8ce5-56ef-b222-cc52de638f63</tstamps>
+    </comp>
+    <comp ref="R5">
+      <value>1k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R5" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>06fd752b-7f77-5ef1-b5ad-d8eb2b861c43</tstamps>
+    </comp>
+    <comp ref="R6">
+      <value>4.7k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R6" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>8a58d1d0-b014-5636-b594-ce3bf4cc8cb8</tstamps>
+    </comp>
+    <comp ref="R7">
+      <value>100</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R7" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>d2ded154-24a9-584f-9af3-087432f1c393</tstamps>
+    </comp>
+    <comp ref="R8">
+      <value>100</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R8" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>25c8b55d-b087-502d-8a47-b5363af1450a</tstamps>
+    </comp>
+    <comp ref="R9">
+      <value>47k</value>
+      <footprint>Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</footprint>
+      <fields>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="R9" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>13b5eaf8-e871-5be4-a541-547fc1cc0bf9</tstamps>
+    </comp>
+    <comp ref="U6">
+      <value>SN74LVC2G17</value>
+      <footprint>Racecar:SOT-23-6_Handsoldering</footprint>
+      <fields>
+        <field name="Footprint">Racecar:SOT-23-6_Handsoldering</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="Carrier" part="U6" description=""/>
+      <property name="Sheetname" value="External optocoupler and GPS input buffers"/>
+      <property name="Sheetfile" value="04-inputs.kicad_sch"/>
+      <sheetpath names="/External optocoupler and GPS input buffers/" tstamps="/e9dfd3ac-6223-5281-81b8-4deb4aa88019/"/>
+      <tstamps>3812e702-0a88-56cc-a24f-bdeb570a9f14</tstamps>
+    </comp>
+  </components>
+  <libparts>
+    <libpart lib="Carrier" part="C1">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100uF 50V</field>
+        <field name="Footprint">Racecar:CP_Radial_D8.0mm_P3.50mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="+" type="passive"/>
+        <pin num="2" name="-" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C10">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C11">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">1nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C12">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C13">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C14">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C15">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C2">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">470uF 10V</field>
+        <field name="Footprint">Racecar:CP_Radial_D8.0mm_P3.50mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="+" type="passive"/>
+        <pin num="2" name="-" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C3">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C4">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C5">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C6">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C7">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C8">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="C9">
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">100nF</field>
+        <field name="Footprint">Racecar:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="D1">
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">SMBJ20CA INPUT TVS</field>
+        <field name="Footprint">Racecar:D_SMB</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="D2">
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">SS14 USB backfeed barrier</field>
+        <field name="Footprint">Racecar:D_SMA</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="K" type="passive"/>
+        <pin num="2" name="A" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="D3">
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">PESD5V0S1BA</field>
+        <field name="Footprint">Racecar:D_SOD-323</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="D4">
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">PESD5V0S1BA</field>
+        <field name="Footprint">Racecar:D_SOD-323</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="D5">
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">PESD5V0S1BA</field>
+        <field name="Footprint">Racecar:D_SOD-323</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="D6">
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">GREEN 5V</field>
+        <field name="Footprint">Racecar:LED_0805_2012Metric</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="K" type="passive"/>
+        <pin num="2" name="A" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="F1">
+      <fields>
+        <field name="Reference">F</field>
+        <field name="Value">5A INPUT FUSE</field>
+        <field name="Footprint">Racecar:Fuse_Littelfuse-NANO2-451_453</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="F2">
+      <fields>
+        <field name="Reference">F</field>
+        <field name="Value">4A SCREEN FUSE</field>
+        <field name="Footprint">Racecar:Fuse_Littelfuse-NANO2-451_453</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="J1">
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">10-20V INPUT</field>
+        <field name="Footprint">Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="+10-20V_IN" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="J2">
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">CROWPANEL J10 ONLY</field>
+        <field name="Footprint">Racecar:TerminalBlock_Phoenix_MKDS-1,5-4-5.08_1x04_P5.08mm_Horizontal</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="GND" type="passive"/>
+        <pin num="2" name="+5V_OUT" type="passive"/>
+        <pin num="3" name="RX_from_panel" type="passive"/>
+        <pin num="4" name="TX_to_panel" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="J3">
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">EXTERNAL OPTO OUTPUT</field>
+        <field name="Footprint">Racecar:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="GND" type="passive"/>
+        <pin num="2" name="OPTO_OUT" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="J4">
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">GPS UART 3V3</field>
+        <field name="Footprint">Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="3V3_OUT" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+        <pin num="3" name="to_GPS_RX" type="passive"/>
+        <pin num="4" name="from_GPS_TX" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="J5">
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">MPU6050 I2C 3V3</field>
+        <field name="Footprint">Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="3V3_OUT" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+        <pin num="3" name="SDA" type="passive"/>
+        <pin num="4" name="SCL" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="J6">
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">CAN MODULE LOGIC</field>
+        <field name="Footprint">Racecar:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="3V3_OUT" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+        <pin num="3" name="to_CTX/D" type="passive"/>
+        <pin num="4" name="from_CRX/R" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="J7">
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">W5500 BREAKOUT</field>
+        <field name="Footprint">Racecar:PinHeader_2x04_P2.54mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="3V3_OUT" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+        <pin num="3" name="CS" type="passive"/>
+        <pin num="4" name="MOSI" type="passive"/>
+        <pin num="5" name="MISO" type="passive"/>
+        <pin num="6" name="SCK" type="passive"/>
+        <pin num="7" name="RESET" type="passive"/>
+        <pin num="8" name="INT" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="JP1">
+      <fields>
+        <field name="Reference">JP</field>
+        <field name="Value">MCU POWER ENABLE</field>
+        <field name="Footprint">Racecar:PinHeader_1x02_P2.54mm_Vertical</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R1">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">100</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R10">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">10k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R11">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">10k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R12">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">4.7k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R13">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">4.7k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R14">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">4.7k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R2">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">100</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R3">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">47k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R4">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">47k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R5">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">1k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R6">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">4.7k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R7">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">100</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R8">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">100</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="R9">
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">47k</field>
+        <field name="Footprint">Racecar:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+        <pin num="2" name="2" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="TP1">
+      <fields>
+        <field name="Reference">TP</field>
+        <field name="Value">GND</field>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="TP2">
+      <fields>
+        <field name="Reference">TP</field>
+        <field name="Value">VIN_FUSED</field>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="TP3">
+      <fields>
+        <field name="Reference">TP</field>
+        <field name="Value">+5V_MAIN</field>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="TP4">
+      <fields>
+        <field name="Reference">TP</field>
+        <field name="Value">+3V3_AUX</field>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="TP5">
+      <fields>
+        <field name="Reference">TP</field>
+        <field name="Value">+3V3_MCU</field>
+        <field name="Footprint">Racecar:TestPoint_THTPad_D2.0mm_Drill1.0mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="U1">
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">Teensy 4.1 (socketed)</field>
+        <field name="Footprint">Racecar:Teensy41_Socket</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="GND" type="passive"/>
+        <pin num="2" name="GPIO_0" type="passive"/>
+        <pin num="3" name="GPIO_1" type="passive"/>
+        <pin num="4" name="GPIO_2" type="passive"/>
+        <pin num="5" name="GPIO_3" type="passive"/>
+        <pin num="6" name="GPIO_4" type="passive"/>
+        <pin num="7" name="GPIO_5" type="passive"/>
+        <pin num="8" name="GPIO_6" type="passive"/>
+        <pin num="9" name="GPIO_7" type="passive"/>
+        <pin num="10" name="GPIO_8" type="passive"/>
+        <pin num="11" name="GPIO_9" type="passive"/>
+        <pin num="12" name="GPIO_10" type="passive"/>
+        <pin num="13" name="GPIO_11" type="passive"/>
+        <pin num="14" name="GPIO_12" type="passive"/>
+        <pin num="15" name="3V3_OUT" type="passive"/>
+        <pin num="16" name="GPIO_24" type="passive"/>
+        <pin num="17" name="GPIO_25" type="passive"/>
+        <pin num="18" name="GPIO_26" type="passive"/>
+        <pin num="19" name="GPIO_27" type="passive"/>
+        <pin num="20" name="GPIO_28" type="passive"/>
+        <pin num="21" name="GPIO_29" type="passive"/>
+        <pin num="22" name="GPIO_30" type="passive"/>
+        <pin num="23" name="GPIO_31" type="passive"/>
+        <pin num="24" name="GPIO_32" type="passive"/>
+        <pin num="25" name="VIN" type="passive"/>
+        <pin num="26" name="GND" type="passive"/>
+        <pin num="27" name="3V3_OUT" type="passive"/>
+        <pin num="28" name="GPIO_23" type="passive"/>
+        <pin num="29" name="GPIO_22" type="passive"/>
+        <pin num="30" name="GPIO_21" type="passive"/>
+        <pin num="31" name="GPIO_20" type="passive"/>
+        <pin num="32" name="GPIO_19" type="passive"/>
+        <pin num="33" name="GPIO_18" type="passive"/>
+        <pin num="34" name="GPIO_17" type="passive"/>
+        <pin num="35" name="GPIO_16" type="passive"/>
+        <pin num="36" name="GPIO_15" type="passive"/>
+        <pin num="37" name="GPIO_14" type="passive"/>
+        <pin num="38" name="GPIO_13" type="passive"/>
+        <pin num="39" name="GND" type="passive"/>
+        <pin num="40" name="GPIO_41" type="passive"/>
+        <pin num="41" name="GPIO_40" type="passive"/>
+        <pin num="42" name="GPIO_39" type="passive"/>
+        <pin num="43" name="GPIO_38" type="passive"/>
+        <pin num="44" name="GPIO_37" type="passive"/>
+        <pin num="45" name="GPIO_36" type="passive"/>
+        <pin num="46" name="GPIO_35" type="passive"/>
+        <pin num="47" name="GPIO_34" type="passive"/>
+        <pin num="48" name="GPIO_33" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="U2">
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">D36V50F5 / 5V 5A budget</field>
+        <field name="Footprint">Racecar:Pololu_D36V50F5</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="VOUT" type="passive"/>
+        <pin num="2" name="VOUT" type="passive"/>
+        <pin num="3" name="GND" type="passive"/>
+        <pin num="4" name="GND" type="passive"/>
+        <pin num="5" name="GND" type="passive"/>
+        <pin num="6" name="GND" type="passive"/>
+        <pin num="7" name="VIN" type="passive"/>
+        <pin num="8" name="VIN" type="passive"/>
+        <pin num="9" name="VRP" type="passive"/>
+        <pin num="10" name="VRP" type="passive"/>
+        <pin num="11" name="EN" type="passive"/>
+        <pin num="12" name="PG" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="U3">
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">TSR 1-2433 / AUX 3V3</field>
+        <field name="Footprint">Racecar:Converter_DCDC_TRACO_TSR-1_THT</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="VIN" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+        <pin num="3" name="3V3_OUT" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="U4">
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">SN74LVC1T45</field>
+        <field name="Footprint">Racecar:SOT-23-6_Handsoldering</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="VCCA" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+        <pin num="3" name="A_(TX_in)" type="passive"/>
+        <pin num="4" name="B_(TX_out)" type="passive"/>
+        <pin num="5" name="DIR_HIGH" type="passive"/>
+        <pin num="6" name="VCCB" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="U5">
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">SN74LVC1T45</field>
+        <field name="Footprint">Racecar:SOT-23-6_Handsoldering</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="VCCA" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+        <pin num="3" name="A_(RX_out)" type="passive"/>
+        <pin num="4" name="B_(RX_in)" type="passive"/>
+        <pin num="5" name="DIR_LOW" type="passive"/>
+        <pin num="6" name="VCCB" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Carrier" part="U6">
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">SN74LVC2G17</field>
+        <field name="Footprint">Racecar:SOT-23-6_Handsoldering</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="1A_TACH" type="passive"/>
+        <pin num="2" name="GND" type="passive"/>
+        <pin num="3" name="2A_GPS_RX" type="passive"/>
+        <pin num="4" name="2Y_GPS_RX" type="passive"/>
+        <pin num="5" name="VCC" type="passive"/>
+        <pin num="6" name="1Y_TACH" type="passive"/>
+      </pins>
+    </libpart>
+  </libparts>
+  <libraries>
+    <library logical="Carrier">
+      <uri>/home/chris/coding/racecar-35/hardware/teensy-carrier-reva/design/Carrier.kicad_sym</uri>
+    </library>
+  </libraries>
+  <nets>
+    <net code="1" name="+3V3_AUX" class="Default">
+      <node ref="C12" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="C13" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="C14" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="C15" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="C4" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="J4" pin="1" pinfunction="3V3_OUT" pintype="passive"/>
+      <node ref="J5" pin="1" pinfunction="3V3_OUT" pintype="passive"/>
+      <node ref="J6" pin="1" pinfunction="3V3_OUT" pintype="passive"/>
+      <node ref="J7" pin="1" pinfunction="3V3_OUT" pintype="passive"/>
+      <node ref="R11" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R12" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R13" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="TP4" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U3" pin="3" pinfunction="3V3_OUT" pintype="passive"/>
+    </net>
+    <net code="2" name="+3V3_MCU" class="Default">
+      <node ref="C10" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="C5" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="C6" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="C8" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R10" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R3" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R6" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R9" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="TP5" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U1" pin="15" pinfunction="3V3_OUT" pintype="passive"/>
+      <node ref="U1" pin="27" pinfunction="3V3_OUT" pintype="passive"/>
+      <node ref="U4" pin="1" pinfunction="VCCA" pintype="passive"/>
+      <node ref="U4" pin="5" pinfunction="DIR_HIGH" pintype="passive"/>
+      <node ref="U5" pin="1" pinfunction="VCCA" pintype="passive"/>
+      <node ref="U6" pin="5" pinfunction="VCC" pintype="passive"/>
+    </net>
+    <net code="3" name="+5V_MAIN" class="Default">
+      <node ref="D2" pin="2" pinfunction="A" pintype="passive"/>
+      <node ref="D6" pin="2" pinfunction="A" pintype="passive"/>
+      <node ref="F2" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="TP3" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U2" pin="1" pinfunction="VOUT" pintype="passive"/>
+      <node ref="U2" pin="2" pinfunction="VOUT" pintype="passive"/>
+    </net>
+    <net code="4" name="+5V_MCU_DIODE" class="Default">
+      <node ref="D2" pin="1" pinfunction="K" pintype="passive"/>
+      <node ref="JP1" pin="1" pinfunction="1" pintype="passive"/>
+    </net>
+    <net code="5" name="+5V_SCREEN" class="Default">
+      <node ref="C2" pin="1" pinfunction="+" pintype="passive"/>
+      <node ref="C7" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="C9" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="F2" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="J2" pin="2" pinfunction="+5V_OUT" pintype="passive"/>
+      <node ref="R4" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U4" pin="6" pinfunction="VCCB" pintype="passive"/>
+      <node ref="U5" pin="6" pinfunction="VCCB" pintype="passive"/>
+    </net>
+    <net code="6" name="CAN_RX" class="Default">
+      <node ref="J6" pin="4" pinfunction="from_CRX/R" pintype="passive"/>
+      <node ref="U1" pin="28" pinfunction="GPIO_23" pintype="passive"/>
+    </net>
+    <net code="7" name="CAN_TX" class="Default">
+      <node ref="J6" pin="3" pinfunction="to_CTX/D" pintype="passive"/>
+      <node ref="U1" pin="29" pinfunction="GPIO_22" pintype="passive"/>
+    </net>
+    <net code="8" name="DASH_RX_5V" class="Default">
+      <node ref="R2" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U5" pin="4" pinfunction="B_(RX_in)" pintype="passive"/>
+    </net>
+    <net code="9" name="DASH_RX_CABLE" class="Default">
+      <node ref="D4" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="J2" pin="3" pinfunction="RX_from_panel" pintype="passive"/>
+      <node ref="R2" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R4" pin="2" pinfunction="2" pintype="passive"/>
+    </net>
+    <net code="10" name="DASH_RX_MCU" class="Default">
+      <node ref="U1" pin="36" pinfunction="GPIO_15" pintype="passive"/>
+      <node ref="U5" pin="3" pinfunction="A_(RX_out)" pintype="passive"/>
+    </net>
+    <net code="11" name="DASH_TX_5V" class="Default">
+      <node ref="R1" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U4" pin="4" pinfunction="B_(TX_out)" pintype="passive"/>
+    </net>
+    <net code="12" name="DASH_TX_CABLE" class="Default">
+      <node ref="D3" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="J2" pin="4" pinfunction="TX_to_panel" pintype="passive"/>
+      <node ref="R1" pin="2" pinfunction="2" pintype="passive"/>
+    </net>
+    <net code="13" name="DASH_TX_MCU" class="Default">
+      <node ref="R3" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U1" pin="37" pinfunction="GPIO_14" pintype="passive"/>
+      <node ref="U4" pin="3" pinfunction="A_(TX_in)" pintype="passive"/>
+    </net>
+    <net code="14" name="ETH_CS" class="Default">
+      <node ref="J7" pin="3" pinfunction="CS" pintype="passive"/>
+      <node ref="R10" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U1" pin="12" pinfunction="GPIO_10" pintype="passive"/>
+    </net>
+    <net code="15" name="ETH_INT" class="Default">
+      <node ref="J7" pin="8" pinfunction="INT" pintype="passive"/>
+      <node ref="U1" pin="7" pinfunction="GPIO_5" pintype="passive"/>
+    </net>
+    <net code="16" name="ETH_MISO" class="Default">
+      <node ref="J7" pin="5" pinfunction="MISO" pintype="passive"/>
+      <node ref="U1" pin="14" pinfunction="GPIO_12" pintype="passive"/>
+    </net>
+    <net code="17" name="ETH_MOSI" class="Default">
+      <node ref="J7" pin="4" pinfunction="MOSI" pintype="passive"/>
+      <node ref="U1" pin="13" pinfunction="GPIO_11" pintype="passive"/>
+    </net>
+    <net code="18" name="ETH_RST" class="Default">
+      <node ref="J7" pin="7" pinfunction="RESET" pintype="passive"/>
+      <node ref="R11" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U1" pin="8" pinfunction="GPIO_6" pintype="passive"/>
+    </net>
+    <net code="19" name="ETH_SCK" class="Default">
+      <node ref="J7" pin="6" pinfunction="SCK" pintype="passive"/>
+      <node ref="U1" pin="38" pinfunction="GPIO_13" pintype="passive"/>
+    </net>
+    <net code="20" name="GND" class="Default">
+      <node ref="C1" pin="2" pinfunction="-" pintype="passive"/>
+      <node ref="C10" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C11" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C12" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C13" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C14" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C15" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C2" pin="2" pinfunction="-" pintype="passive"/>
+      <node ref="C3" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C4" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C5" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C6" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C7" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C8" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="C9" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="D1" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="D3" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="D4" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="D5" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="J1" pin="2" pinfunction="GND" pintype="passive"/>
+      <node ref="J2" pin="1" pinfunction="GND" pintype="passive"/>
+      <node ref="J3" pin="1" pinfunction="GND" pintype="passive"/>
+      <node ref="J4" pin="2" pinfunction="GND" pintype="passive"/>
+      <node ref="J5" pin="2" pinfunction="GND" pintype="passive"/>
+      <node ref="J6" pin="2" pinfunction="GND" pintype="passive"/>
+      <node ref="J7" pin="2" pinfunction="GND" pintype="passive"/>
+      <node ref="R14" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="TP1" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U1" pin="1" pinfunction="GND" pintype="passive"/>
+      <node ref="U1" pin="26" pinfunction="GND" pintype="passive"/>
+      <node ref="U1" pin="39" pinfunction="GND" pintype="passive"/>
+      <node ref="U2" pin="3" pinfunction="GND" pintype="passive"/>
+      <node ref="U2" pin="4" pinfunction="GND" pintype="passive"/>
+      <node ref="U2" pin="5" pinfunction="GND" pintype="passive"/>
+      <node ref="U2" pin="6" pinfunction="GND" pintype="passive"/>
+      <node ref="U3" pin="2" pinfunction="GND" pintype="passive"/>
+      <node ref="U4" pin="2" pinfunction="GND" pintype="passive"/>
+      <node ref="U5" pin="2" pinfunction="GND" pintype="passive"/>
+      <node ref="U5" pin="5" pinfunction="DIR_LOW" pintype="passive"/>
+      <node ref="U6" pin="2" pinfunction="GND" pintype="passive"/>
+    </net>
+    <net code="21" name="GPS_RX_CABLE" class="Default">
+      <node ref="J4" pin="4" pinfunction="from_GPS_TX" pintype="passive"/>
+      <node ref="R7" pin="1" pinfunction="1" pintype="passive"/>
+    </net>
+    <net code="22" name="GPS_RX_FILTER" class="Default">
+      <node ref="R7" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="R9" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U6" pin="3" pinfunction="2A_GPS_RX" pintype="passive"/>
+    </net>
+    <net code="23" name="GPS_RX_MCU" class="Default">
+      <node ref="U1" pin="9" pinfunction="GPIO_7" pintype="passive"/>
+      <node ref="U6" pin="4" pinfunction="2Y_GPS_RX" pintype="passive"/>
+    </net>
+    <net code="24" name="GPS_TX_CABLE" class="Default">
+      <node ref="J4" pin="3" pinfunction="to_GPS_RX" pintype="passive"/>
+      <node ref="R8" pin="2" pinfunction="2" pintype="passive"/>
+    </net>
+    <net code="25" name="GPS_TX_MCU" class="Default">
+      <node ref="R8" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U1" pin="10" pinfunction="GPIO_8" pintype="passive"/>
+    </net>
+    <net code="26" name="IMU_SCL" class="Default">
+      <node ref="J5" pin="4" pinfunction="SCL" pintype="passive"/>
+      <node ref="R13" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U1" pin="32" pinfunction="GPIO_19" pintype="passive"/>
+    </net>
+    <net code="27" name="IMU_SDA" class="Default">
+      <node ref="J5" pin="3" pinfunction="SDA" pintype="passive"/>
+      <node ref="R12" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U1" pin="33" pinfunction="GPIO_18" pintype="passive"/>
+    </net>
+    <net code="28" name="LED_K" class="Default">
+      <node ref="D6" pin="1" pinfunction="K" pintype="passive"/>
+      <node ref="R14" pin="1" pinfunction="1" pintype="passive"/>
+    </net>
+    <net code="29" name="TACH_CABLE" class="Default">
+      <node ref="D5" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="J3" pin="2" pinfunction="OPTO_OUT" pintype="passive"/>
+      <node ref="R5" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R6" pin="2" pinfunction="2" pintype="passive"/>
+    </net>
+    <net code="30" name="TACH_FILTER" class="Default">
+      <node ref="C11" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="R5" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U6" pin="1" pinfunction="1A_TACH" pintype="passive"/>
+    </net>
+    <net code="31" name="TACH_MCU" class="Default">
+      <node ref="U1" pin="11" pinfunction="GPIO_9" pintype="passive"/>
+      <node ref="U6" pin="6" pinfunction="1Y_TACH" pintype="passive"/>
+    </net>
+    <net code="32" name="TEENSY_VIN" class="Default">
+      <node ref="JP1" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="U1" pin="25" pinfunction="VIN" pintype="passive"/>
+    </net>
+    <net code="33" name="VIN_FUSED" class="Default">
+      <node ref="C1" pin="1" pinfunction="+" pintype="passive"/>
+      <node ref="D1" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="F1" pin="2" pinfunction="2" pintype="passive"/>
+      <node ref="TP2" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U2" pin="7" pinfunction="VIN" pintype="passive"/>
+      <node ref="U2" pin="8" pinfunction="VIN" pintype="passive"/>
+    </net>
+    <net code="34" name="VIN_PROTECTED" class="Default">
+      <node ref="C3" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="U2" pin="10" pinfunction="VRP" pintype="passive"/>
+      <node ref="U2" pin="9" pinfunction="VRP" pintype="passive"/>
+      <node ref="U3" pin="1" pinfunction="VIN" pintype="passive"/>
+    </net>
+    <net code="35" name="VIN_RAW" class="Default">
+      <node ref="F1" pin="1" pinfunction="1" pintype="passive"/>
+      <node ref="J1" pin="1" pinfunction="+10-20V_IN" pintype="passive"/>
+    </net>
+    <net code="36" name="unconnected-(U1-GPIO_0-Pad2)" class="Default">
+      <node ref="U1" pin="2" pinfunction="GPIO_0" pintype="passive+no_connect"/>
+    </net>
+    <net code="37" name="unconnected-(U1-GPIO_1-Pad3)" class="Default">
+      <node ref="U1" pin="3" pinfunction="GPIO_1" pintype="passive+no_connect"/>
+    </net>
+    <net code="38" name="unconnected-(U1-GPIO_2-Pad4)" class="Default">
+      <node ref="U1" pin="4" pinfunction="GPIO_2" pintype="passive+no_connect"/>
+    </net>
+    <net code="39" name="unconnected-(U1-GPIO_3-Pad5)" class="Default">
+      <node ref="U1" pin="5" pinfunction="GPIO_3" pintype="passive+no_connect"/>
+    </net>
+    <net code="40" name="unconnected-(U1-GPIO_4-Pad6)" class="Default">
+      <node ref="U1" pin="6" pinfunction="GPIO_4" pintype="passive+no_connect"/>
+    </net>
+    <net code="41" name="unconnected-(U1-GPIO_16-Pad35)" class="Default">
+      <node ref="U1" pin="35" pinfunction="GPIO_16" pintype="passive+no_connect"/>
+    </net>
+    <net code="42" name="unconnected-(U1-GPIO_17-Pad34)" class="Default">
+      <node ref="U1" pin="34" pinfunction="GPIO_17" pintype="passive+no_connect"/>
+    </net>
+    <net code="43" name="unconnected-(U1-GPIO_20-Pad31)" class="Default">
+      <node ref="U1" pin="31" pinfunction="GPIO_20" pintype="passive+no_connect"/>
+    </net>
+    <net code="44" name="unconnected-(U1-GPIO_21-Pad30)" class="Default">
+      <node ref="U1" pin="30" pinfunction="GPIO_21" pintype="passive+no_connect"/>
+    </net>
+    <net code="45" name="unconnected-(U1-GPIO_24-Pad16)" class="Default">
+      <node ref="U1" pin="16" pinfunction="GPIO_24" pintype="passive+no_connect"/>
+    </net>
+    <net code="46" name="unconnected-(U1-GPIO_25-Pad17)" class="Default">
+      <node ref="U1" pin="17" pinfunction="GPIO_25" pintype="passive+no_connect"/>
+    </net>
+    <net code="47" name="unconnected-(U1-GPIO_26-Pad18)" class="Default">
+      <node ref="U1" pin="18" pinfunction="GPIO_26" pintype="passive+no_connect"/>
+    </net>
+    <net code="48" name="unconnected-(U1-GPIO_27-Pad19)" class="Default">
+      <node ref="U1" pin="19" pinfunction="GPIO_27" pintype="passive+no_connect"/>
+    </net>
+    <net code="49" name="unconnected-(U1-GPIO_28-Pad20)" class="Default">
+      <node ref="U1" pin="20" pinfunction="GPIO_28" pintype="passive+no_connect"/>
+    </net>
+    <net code="50" name="unconnected-(U1-GPIO_29-Pad21)" class="Default">
+      <node ref="U1" pin="21" pinfunction="GPIO_29" pintype="passive+no_connect"/>
+    </net>
+    <net code="51" name="unconnected-(U1-GPIO_30-Pad22)" class="Default">
+      <node ref="U1" pin="22" pinfunction="GPIO_30" pintype="passive+no_connect"/>
+    </net>
+    <net code="52" name="unconnected-(U1-GPIO_31-Pad23)" class="Default">
+      <node ref="U1" pin="23" pinfunction="GPIO_31" pintype="passive+no_connect"/>
+    </net>
+    <net code="53" name="unconnected-(U1-GPIO_32-Pad24)" class="Default">
+      <node ref="U1" pin="24" pinfunction="GPIO_32" pintype="passive+no_connect"/>
+    </net>
+    <net code="54" name="unconnected-(U1-GPIO_33-Pad48)" class="Default">
+      <node ref="U1" pin="48" pinfunction="GPIO_33" pintype="passive+no_connect"/>
+    </net>
+    <net code="55" name="unconnected-(U1-GPIO_34-Pad47)" class="Default">
+      <node ref="U1" pin="47" pinfunction="GPIO_34" pintype="passive+no_connect"/>
+    </net>
+    <net code="56" name="unconnected-(U1-GPIO_35-Pad46)" class="Default">
+      <node ref="U1" pin="46" pinfunction="GPIO_35" pintype="passive+no_connect"/>
+    </net>
+    <net code="57" name="unconnected-(U1-GPIO_36-Pad45)" class="Default">
+      <node ref="U1" pin="45" pinfunction="GPIO_36" pintype="passive+no_connect"/>
+    </net>
+    <net code="58" name="unconnected-(U1-GPIO_37-Pad44)" class="Default">
+      <node ref="U1" pin="44" pinfunction="GPIO_37" pintype="passive+no_connect"/>
+    </net>
+    <net code="59" name="unconnected-(U1-GPIO_38-Pad43)" class="Default">
+      <node ref="U1" pin="43" pinfunction="GPIO_38" pintype="passive+no_connect"/>
+    </net>
+    <net code="60" name="unconnected-(U1-GPIO_39-Pad42)" class="Default">
+      <node ref="U1" pin="42" pinfunction="GPIO_39" pintype="passive+no_connect"/>
+    </net>
+    <net code="61" name="unconnected-(U1-GPIO_40-Pad41)" class="Default">
+      <node ref="U1" pin="41" pinfunction="GPIO_40" pintype="passive+no_connect"/>
+    </net>
+    <net code="62" name="unconnected-(U1-GPIO_41-Pad40)" class="Default">
+      <node ref="U1" pin="40" pinfunction="GPIO_41" pintype="passive+no_connect"/>
+    </net>
+    <net code="63" name="unconnected-(U2-EN-Pad11)" class="Default">
+      <node ref="U2" pin="11" pinfunction="EN" pintype="passive+no_connect"/>
+    </net>
+    <net code="64" name="unconnected-(U2-PG-Pad12)" class="Default">
+      <node ref="U2" pin="12" pinfunction="PG" pintype="passive+no_connect"/>
+    </net>
+  </nets>
+</export>

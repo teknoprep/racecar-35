@@ -1,0 +1,159 @@
+Reference,Function,Value,Manufacturer,MPN,Footprint,Notes
+U2,U2,Pololu D36V50F5,Pololu,4091 / D36V50F5,RacecarC:Pololu_D36V50F5,2x6 header; raised module; both output/ground columns fitted. EN/PG unused.
+U3,U3,TSR 1-2433,TRACO Power,TSR 1-2433,RacecarC:Converter_DCDC_TRACO_TSR-1_THT,"Separate 1A module fed by Pololu VRP (10-20V protected), NOT marginal 5V input."
+C3,C_U3I,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C4,C_U3O,10u,Murata,GRM21BR61E106KA73L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+U6,U_NET_PWR,TSR 1-2433,TRACO Power,TSR 1-2433,RacecarC:Converter_DCDC_TRACO_TSR-1_THT,"Separate 1A module fed by Pololu VRP (10-20V protected), NOT marginal 5V input."
+C5,C_U_NET_PWRI,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C6,C_U_NET_PWRO,10u,Murata,GRM21BR61E106KA73L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+J1,J1,POWER IN,Phoenix Contact,1729018,"RacecarC:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",
+F1,F1,5A fuse,Littelfuse,0451005.MRL,RacecarC:Fuse_Littelfuse-NANO2-451_453,
+F2,F2,3A fuse,Littelfuse,0451003.MRL,RacecarC:Fuse_Littelfuse-NANO2-451_453,
+D1,D1,SMBJ20CA,Littelfuse,SMBJ20CA,RacecarC:D_SMB,Bidirectional TVS; NOT automotive load-dump qualification
+C1,C1,100uF 50V,Panasonic,EEU-FR1H101,RacecarC:CP_Radial_D8.0mm_P3.50mm,
+C2,C2,470uF 10V,Panasonic,EEU-FR1A471B,RacecarC:CP_Radial_D8.0mm_P3.50mm,
+D2,D2,SS14,Diodes Incorporated,SS14,RacecarC:D_SMA,
+JP1,JP1,MCU POWER,Samtec,TSW-102-07-G-S,RacecarC:PinHeader_1x02_P2.54mm_Vertical,Fit shunt after unloaded rail tests; cut Teensy VUSB-VIN before dual-power use
+U1,U1,Teensy 4.1 SOCKETED,PJRC,TEENSY41,RacecarC:Teensy41_Socket,CUT VUSB-VIN. Two 24-pin sockets. VBAT via separate removable 2-wire service lead to labelled Teensy VBAT/GND pads.
+C7,C_MCU,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+BT1,BT1,CR2032 HOLDER,Keystone,1058,RacecarC:BatteryHolder_Keystone_1058_1x2032,Fit Panasonic CR2032 AFTER reflow/cleaning. Primary cell: NO charging.
+J9,J_BAT,TO TEENSY VBAT/GND,JST,B2B-XH-A(LF)(SN),RacecarC:JST_XH_B2B-XH-A_1x02_P2.50mm_Vertical,"Short removable lead: 1 to Teensy VBAT auxiliary pad, 2 GND. NEVER 3V3/ONOFF. Required assembly operation."
+J7,J6,CAN MODULE LOGIC,JST,B4B-XH-A(LF)(SN),RacecarC:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical,"External SN65HVD230 module only, powered from this header. Not CANH/L. No independent module power."
+C8,C_CAN,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+J13,J_VID,PI 5 VIDEO 3V3 UART,JST,B4B-XH-A(LF)(SN),RacecarC:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical,"Pi 5 UART 115200 8N1, 3.3V only. NO 5V/12V here. Cameras and USB storage stay on the Pi and are NOT powered by this board."
+R1,R_VIDTX,1k 1%,Yageo,RC0805FR-071KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R2,R_VIDRX,1k 1%,Yageo,RC0805FR-071KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+D3,D_VIDTX,UART ESD,Nexperia,"PESD5V0S1BA,115",RacecarC:D_SOD-323,
+D4,D_VIDRX,UART ESD,Nexperia,"PESD5V0S1BA,115",RacecarC:D_SOD-323,
+U7,U_IMU,ICM-42670-P,TDK InvenSense,ICM-42670-P,RacecarC:InvenSense_LGA-14_2.5x3.0mm_P0.50mm,Address 0x68 (AP_AD0=GND); AP_CS=VDDIO selects I2C. Polling only; INT1/INT2 unconnected. RESV pads grounded per DS-000451.
+C9,C_IMUV,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C10,C_IMUL,10n,Murata,GRM21BR71H103KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C11,C_IMUR,2.2u,Murata,GRM21BR71H225KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R3,R_SDA,10k 1%,Yageo,RC0805FR-0710KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R4,R_SCL,10k 1%,Yageo,RC0805FR-0710KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+U8,U_GPS,NEO-M9N-00B,u-blox,NEO-M9N-00B,RacecarC:ublox_NEO,"USB disabled: V_USB GND, D+/- open. No GPS coin-cell load: V_BCKP=VCC. VCC_RF unused; antenna bias from protected AUX rail."
+C12,C_GPS1,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C13,C_GPS2,10u,Murata,GRM21BR61E106KA73L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+J8,J_ANT,GPS SMA FEMALE,Amphenol RF,901-143,RacecarC:SMA_Amphenol_901-143_Horizontal,"Active GPS antenna 3.3V bias, never WiFi. Supplier drawing/board-edge fit must be inspected."
+C14,C_RF,100pF C0G,Murata,GRM1555C1H101JA01D,RacecarC:C_0402_1005Metric,
+L1,L_RF,27nH RF choke,Murata,LQG15HS27NJ02D,RacecarC:L_0402_1005Metric,
+D5,D_RF,RF ESD,Nexperia,"PESD3V3U1UL,315",RacecarC:D_SOD-882,RF-rated low-capacitance ESD. Verify capacitance/S-parameter budget at GNSS bands.
+U9,U_ANT,TPS2553,Texas Instruments,TPS2553DBVR,RacecarC:SOT-23-6,"ILIM tied to IN: 50/75/100mA min/typ/max limit per datasheet. Antenna fed from AUX, not GPS VCC_RF."
+R5,R_ANT_FILTER,10R 1%,Yageo,RC0805FR-0710RL,RacecarC:R_0805_2012Metric,
+C15,C_ANT_IN,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C16,C_ANT_OUT,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+U10,U_GTX,SN74LVC1G125,Texas Instruments,SN74LVC1G125DBVR,RacecarC:SOT-23-5,
+C17,C_GTX,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+J3,J_TACH,TACH INPUT,Phoenix Contact,1729018,"RacecarC:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",ECU/cluster conditioned 3.3/5/battery-level waveform ONLY. NEVER coil or injector.
+R6,R_TTOP,180k 1%,Yageo,RC0805FR-07180KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R7,R_TBOT,22k 1%,Yageo,RC0805FR-0722KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+C18,C_TFILTER,1n,Murata,GRM21BR71H102KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+D6,D_TPOS,LM4040 2.5,Texas Instruments,LM4040AIM3-2.5/NOPB,RacecarC:SOT-23,
+D7,D_TNEG,PMEG2010ER,Nexperia,"PMEG2010ER,115",RacecarC:Nexperia_CFP3_SOD-123W,
+U11,U_CMP,LM2903B,Texas Instruments,LM2903BIDR,RacecarC:SOIC-8_3.9x4.9mm_P1.27mm,
+R8,R_TREFH,240k 1%,Yageo,RC0805FR-07240KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R9,R_TREFL,10k 1%,Yageo,RC0805FR-0710KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+C19,C_TREF,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C20,C_CMP,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R10,R_THYST,2.2M 1%,Yageo,RC0805FR-072M2L,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R11,R_TPULL,4.7k 1%,Yageo,RC0805FR-074K7L,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R12,R_TBASE,10k 1%,Yageo,RC0805FR-0710KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R13,R_TBE,100k 1%,Yageo,RC0805FR-07100KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+Q1,Q_TLED,MMBT3904,Nexperia,"MMBT3904,215",RacecarC:SOT-23,
+R14,R_TLED,680 1%,Yageo,RC0805FR-07680RL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+U12,U_OPTO,VO617A-3,Vishay,VO617A-3X017T,RacecarC:SMDIP-4_W9.53mm,"100-200% CTR grade; ground shared, not whole-system galvanic isolation."
+R15,R_TOPULL,4.7k 1%,Yageo,RC0805FR-074K7L,RacecarC:R_0805_2012Metric,0805; >=0.125W
+U13,U_INPUT,SN74LVC2G17,Texas Instruments,SN74LVC2G17DBVR,RacecarC:SOT-23-6,"Inputs tolerate 5.5V, Ioff isolation; GPS AUX cannot back-power MCU through this buffer."
+C21,C_INPUT,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+J4,J_OIL,OIL 0.5-4.5V,Phoenix Contact,1729021,"RacecarC:TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal",
+F3,F_SENSOR,100mA PTC,Littelfuse,1206L010/30YR,RacecarC:Fuse_1206_3216Metric,
+J11,J_TPS,THROTTLE 0.5-4.5V,Phoenix Contact,1729021,"RacecarC:TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal",
+F4,F_TPS,100mA PTC,Littelfuse,1206L010/30YR,RacecarC:Fuse_1206_3216Metric,
+J12,J_BRAKE,BRAKE 0.5-4.5V,Phoenix Contact,1729021,"RacecarC:TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal",
+F5,F_BRK,100mA PTC,Littelfuse,1206L010/30YR,RacecarC:Fuse_1206_3216Metric,
+J5,J_COOL,COOLANT NTC,Phoenix Contact,1729018,"RacecarC:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",
+J6,J_AFR,AEM 30-0300 ONLY,Phoenix Contact,1729018,"RacecarC:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",External AEM gauge only. Gauge supply/heater NOT powered here.
+R16,R_OILH,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+R17,R_OILL,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+D8,D_OILP,LM4040 3.0,Texas Instruments,LM4040AIM3-3.0/NOPB,RacecarC:SOT-23,
+D9,D_OILN,PMEG2010ER,Nexperia,"PMEG2010ER,115",RacecarC:Nexperia_CFP3_SOD-123W,
+R18,R_OILF,1k 1%,Yageo,RC0805FR-071KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+C22,C_OILF,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R19,R_AFRH,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+R20,R_AFRL,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+D10,D_AFRP,LM4040 3.0,Texas Instruments,LM4040AIM3-3.0/NOPB,RacecarC:SOT-23,
+D11,D_AFRN,PMEG2010ER,Nexperia,"PMEG2010ER,115",RacecarC:Nexperia_CFP3_SOD-123W,
+R21,R_AFRF,1k 1%,Yageo,RC0805FR-071KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+C23,C_AFRF,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R22,R_NTCH,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+R23,R_NTCL,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+D12,D_NTCP,LM4040 3.0,Texas Instruments,LM4040AIM3-3.0/NOPB,RacecarC:SOT-23,
+D13,D_NTCN,PMEG2010ER,Nexperia,"PMEG2010ER,115",RacecarC:Nexperia_CFP3_SOD-123W,
+R24,R_NTCF,1k 1%,Yageo,RC0805FR-071KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+C24,C_NTCF,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R25,R_TPSH,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+R26,R_TPSL,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+D14,D_TPSP,LM4040 3.0,Texas Instruments,LM4040AIM3-3.0/NOPB,RacecarC:SOT-23,
+D15,D_TPSN,PMEG2010ER,Nexperia,"PMEG2010ER,115",RacecarC:Nexperia_CFP3_SOD-123W,
+R27,R_TPSF,1k 1%,Yageo,RC0805FR-071KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+C25,C_TPSF,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R28,R_BRKH,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+R29,R_BRKL,20k 0.1%,Yageo,RT0805BRD0720KL,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+D16,D_BRKP,LM4040 3.0,Texas Instruments,LM4040AIM3-3.0/NOPB,RacecarC:SOT-23,
+D17,D_BRKN,PMEG2010ER,Nexperia,"PMEG2010ER,115",RacecarC:Nexperia_CFP3_SOD-123W,
+R30,R_BRKF,1k 1%,Yageo,RC0805FR-071KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+C26,C_BRKF,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+D18,D_NTC_SUP,PMEG2010ER,Nexperia,"PMEG2010ER,115",RacecarC:Nexperia_CFP3_SOD-123W,
+R31,R_NTC_BIAS,150 1%,Yageo,RC0805FR-07150RL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+U14,U_NTC_REF,LM4040 4.1,Texas Instruments,LM4040AIM3-4.1/NOPB,RacecarC:SOT-23,
+C27,C_NTC_EXC,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R32,R_NTC_PU,2.49k 0.1%,Yageo,RT0805BRD072K49L,RacecarC:R_0805_2012Metric,Thin-film 0.1%
+U15,U_ADC,TMUX1511,Texas Instruments,TMUX1511PWR,RacecarC:TSSOP-14_4.4x5mm_P0.65mm,Power-off protection ONLY to 3.6V: independent shunts limit S1-S3 below 3.6V. Channel 4 disabled.
+C28,C_ADC,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+U16,U_ADC2,TMUX1511,Texas Instruments,TMUX1511PWR,RacecarC:TSSOP-14_4.4x5mm_P0.65mm,Channels 1-2 = throttle/brake. Channels 3-4 unused. Powered-off isolation only to 3.6V; shunts are the protection.
+C29,C_ADC2,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+J2,J2,SCREEN J10 ONLY,Phoenix Contact,1729034,"RacecarC:TerminalBlock_Phoenix_MKDS-1,5-4-5.08_1x04_P5.08mm_Horizontal",
+U4,U4,SN74LVC1T45,Texas Instruments,SN74LVC1T45DBVR,RacecarC:SOT-23-6,
+C30,C_U4A,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C31,C_U4B,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+U5,U5,SN74LVC1T45,Texas Instruments,SN74LVC1T45DBVR,RacecarC:SOT-23-6,
+C32,C_U5A,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C33,C_U5B,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R33,R_DTX,100 1%,Yageo,RC0805FR-07100RL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R34,R_DRX,100 1%,Yageo,RC0805FR-07100RL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R35,R_DTIDLE,47k 1%,Yageo,RC0805FR-0747KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R36,R_DRIDLE,47k 1%,Yageo,RC0805FR-0747KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+D19,D_DTX,UART ESD,Nexperia,"PESD5V0S1BA,115",RacecarC:D_SOD-323,
+D20,D_DRX,UART ESD,Nexperia,"PESD5V0S1BA,115",RacecarC:D_SOD-323,
+U17,U_NET,ESP32-S3-WROOM-1-N8R2,Espressif,ESP32-S3-WROOM-1-N8R2,RacecarC:ESP32-S3-WROOM-1,PCB antenna over carrier notch; ALL-LAYER keepout. New coprocessor firmware required. No WiFi external antenna.
+C34,C_NETB,10u,Murata,GRM21BR61E106KA73L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+C35,C_NETD,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R37,R_NETEN,10k 1%,Yageo,RC0805FR-0710KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+C36,C_NETEN,1u,Murata,GRM21BR71H105KA12L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R38,R_NETBOOT,10k 1%,Yageo,RC0805FR-0710KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+Q2,Q_NETRESET,MMBT3904,Nexperia,"MMBT3904,215",RacecarC:SOT-23,
+R39,R_NETRB,10k 1%,Yageo,RC0805FR-0710KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R40,R_NETRPD,100k 1%,Yageo,RC0805FR-07100KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+U18,U_SPI_TX,SN74LVC125A,Texas Instruments,SN74LVC125APWR,RacecarC:TSSOP-14_4.4x5mm_P0.65mm,
+C37,C_SPITX,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R41,R_NETCS,33 1%,Yageo,RC0805FR-0733RL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R42,R_NETMOSI,33 1%,Yageo,RC0805FR-0733RL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R43,R_NETSCK,33 1%,Yageo,RC0805FR-0733RL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R44,R_CS_IDLE,10k 1%,Yageo,RC0805FR-0710KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R45,R_SCK_IDLE,47k 1%,Yageo,RC0805FR-0747KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+U19,U_SPI_RX,SN74LVC2G125,Texas Instruments,SN74LVC2G125DCUR,RacecarC:VSSOP-8_2.3x2mm_P0.5mm,
+C38,C_SPIRX,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+R46,R_IRQ_IDLE,47k 1%,Yageo,RC0805FR-0747KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+R47,R_MISO_IDLE,47k 1%,Yageo,RC0805FR-0747KL,RacecarC:R_0805_2012Metric,0805; >=0.125W
+J10,J_NET_SERVICE,NET 3V3 UART SERVICE,Samtec,TSW-103-07-G-D,RacecarC:PinHeader_2x03_P2.54mm_Vertical,1GND 2 3V3 REFERENCE OUT 3TX fromNET 4RX toNET 5BOOT0 6EN. 5/6 open-drain or ground ONLY. Do NOT power via pin2.
+U20,U_NETUART,SN74LVC1G125,Texas Instruments,SN74LVC1G125DBVR,RacecarC:SOT-23-5,Prevents powered USB-UART TX backfeeding an unpowered NET rail
+C39,C_NETUART,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
+H1,H1,M3 MOUNT,Assembly,M3 insulated hardware,RacecarC:MountingHole_3.2mm_M3,
+H2,H2,M3 MOUNT,Assembly,M3 insulated hardware,RacecarC:MountingHole_3.2mm_M3,
+H3,H3,M3 MOUNT,Assembly,M3 insulated hardware,RacecarC:MountingHole_3.2mm_M3,
+H4,H4,M3 MOUNT,Assembly,M3 insulated hardware,RacecarC:MountingHole_3.2mm_M3,
+TP1,TP1,GND,PCB,PCB test pad,RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm,
+TP2,TP2,+5V_MAIN,PCB,PCB test pad,RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm,
+TP3,TP3,+3V3_AUX,PCB,PCB test pad,RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm,
+TP4,TP4,+3V3_NET,PCB,PCB test pad,RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm,
+TP5,TP5,+3V3_MCU,PCB,PCB test pad,RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm,

@@ -1,0 +1,245 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1700" height="2480" viewBox="0 0 1700 2480">
+<rect width="1700" height="2480" fill="#f3efe6"/>
+<style>
+  text{font-family:DejaVu Sans,Liberation Sans,sans-serif;fill:#1b2420}
+  .t{font-size:32px;font-weight:700}
+  .h{font-size:20px;font-weight:700}
+  .s{font-size:15px}
+  .xs{font-size:12px}
+  .w{fill:#f7f4ee}
+  .pin{font-size:11px;font-family:DejaVu Sans Mono,monospace}
+</style>
+
+<text x="48" y="48" class="t">Solderable breadboard — Teensy 4.1</text>
+<text x="48" y="78" class="s">All screw terminals on the LEFT edge. Teensy USB on the RIGHT. Not the Rev C PCB. Values are firmware contracts — do not “simplify” the AEM divider.</text>
+<rect x="48" y="92" width="1604" height="36" rx="6" fill="#f4d2c4" stroke="#a33" stroke-width="1.5"/>
+<text x="62" y="116" class="s">NEVER put 12 V on J1. NEVER put AEM WHITE on pin 20. NEVER use CrowPanel J2 (HY2.0). NEVER put 5 V on J3 / Pi GPIO. Cut Teensy VUSB–VIN if USB and J1 5V are both connected.</text>
+
+<!-- ===================== BOARD LAYOUT ===================== -->
+<text x="48" y="160" class="h">1. Physical layout — protoboard, terminals LEFT, Teensy RIGHT</text>
+<rect x="48" y="172" width="1604" height="520" rx="12" fill="#d9cbb6" stroke="#6b5a45" stroke-width="3"/>
+<text x="62" y="198" class="xs">PROTOBOARD  (plated holes, ≥100×150 mm). Star-GND the rail along the bottom of this board.</text>
+
+<!-- terminal column -->
+<g font-size="13">
+  <rect x="64" y="214" width="210" height="54" rx="6" fill="#222" stroke="#c9a227" stroke-width="2"/>
+  <text x="74" y="236" fill="#f5e6a8" font-weight="700">J1 POWER</text>
+  <text x="74" y="256" fill="#eee">5V     GND</text>
+  <text x="284" y="236" class="s">from 5 V buck only</text>
+  <text x="284" y="256" class="xs">feeds Teensy VIN + J2 5V</text>
+
+  <rect x="64" y="276" width="210" height="54" rx="6" fill="#222" stroke="#c9a227" stroke-width="2"/>
+  <text x="74" y="298" fill="#7ec8ff" font-weight="700">J2 SCREEN</text>
+  <text x="74" y="318" fill="#eee">GND  5V  TX  RX</text>
+  <text x="284" y="298" class="s">→ CrowPanel J10 (XH2.54)</text>
+  <text x="284" y="318" class="xs">TX=pin14  RX=pin15  921600</text>
+
+  <rect x="64" y="338" width="210" height="54" rx="6" fill="#222" stroke="#c9a227" stroke-width="2"/>
+  <text x="74" y="360" fill="#b5e07a" font-weight="700">J3 VIDEO</text>
+  <text x="74" y="380" fill="#eee">GND  TX  RX</text>
+  <text x="284" y="360" class="s">→ Pi 5 hdr 6 / 10 / 8</text>
+  <text x="284" y="380" class="xs">TX=pin1  RX=pin0  115200  3.3V</text>
+
+  <rect x="64" y="400" width="210" height="54" rx="6" fill="#222" stroke="#c9a227" stroke-width="2"/>
+  <text x="74" y="422" fill="#ffb070" font-weight="700">J4 TACH</text>
+  <text x="74" y="442" fill="#eee">SIG     GND</text>
+  <text x="284" y="422" class="s">ECU / cluster tach only</text>
+  <text x="284" y="442" class="xs">PC817 + 1k + 4.7k  → pin 9</text>
+
+  <rect x="64" y="462" width="210" height="54" rx="6" fill="#222" stroke="#c9a227" stroke-width="2"/>
+  <text x="74" y="484" fill="#e090e0" font-weight="700">J5 OIL</text>
+  <text x="74" y="504" fill="#eee">5V   SIG   GND</text>
+  <text x="284" y="484" class="s">0.5–4.5 V transducer</text>
+  <text x="284" y="504" class="xs">10k / 20k  → pin 16 (A2)</text>
+
+  <rect x="64" y="524" width="210" height="54" rx="6" fill="#222" stroke="#c9a227" stroke-width="2"/>
+  <text x="74" y="546" fill="#70d0d0" font-weight="700">J6 NTC</text>
+  <text x="74" y="566" fill="#eee">SIG     GND</text>
+  <text x="284" y="546" class="s">two-wire coolant sender</text>
+  <text x="284" y="566" class="xs">150 Ω to 3.3V  → pin 17 (A3)</text>
+
+  <rect x="64" y="586" width="210" height="54" rx="6" fill="#222" stroke="#c9a227" stroke-width="2"/>
+  <text x="74" y="608" fill="#ff8080" font-weight="700">J7 AEM</text>
+  <text x="74" y="628" fill="#eee">WHT    BRN</text>
+  <text x="284" y="608" class="s">30-0300 pin9 WHITE / pin10 BROWN</text>
+  <text x="284" y="628" class="xs">20k/20k + 1k/100nF  → pin 20 (A6)</text>
+</g>
+
+<!-- parts island -->
+<rect x="560" y="220" width="300" height="420" rx="10" fill="#efe6d6" stroke="#8a7355" stroke-width="1.5"/>
+<text x="576" y="244" class="h">Solder these here</text>
+<text x="576" y="270" class="s">PC817  (tach)</text>
+<text x="576" y="292" class="s">1 kΩ + 4.7 kΩ</text>
+<text x="576" y="314" class="s">10 kΩ + 20 kΩ  (oil)</text>
+<text x="576" y="336" class="s">150 Ω  (coolant)</text>
+<text x="576" y="358" class="s">2× 20 kΩ 0.1% + 1 kΩ</text>
+<text x="576" y="380" class="s">100 nF  (AEM)</text>
+<text x="576" y="402" class="s">2× 1 kΩ  (video UART)</text>
+<text x="576" y="436" class="s">Optional modules:</text>
+<text x="576" y="458" class="s">GPS  3.3V  pins 7 / 8</text>
+<text x="576" y="480" class="s">IMU  3.3V  pins 18 / 19</text>
+<text x="576" y="502" class="s">CAN xcvr  pins 22 / 23</text>
+<text x="576" y="536" class="xs">Keep analog parts close to</text>
+<text x="576" y="552" class="xs">the Teensy analog pins.</text>
+<text x="576" y="616" class="xs">GND RAIL along this edge →</text>
+
+<!-- Teensy -->
+<rect x="900" y="214" width="720" height="430" rx="10" fill="#1e3a32" stroke="#7fb39a" stroke-width="2"/>
+<text x="920" y="240" fill="#d4efe4" class="h">TEENSY 4.1  — USB-C this end (RIGHT / outboard)</text>
+<text x="920" y="262" fill="#9cc9b8" class="xs">USB-C at the TOP of the chip in this drawing. Outer-row pins shown. Do not use pins 5/6/10–13 (reserved).</text>
+
+<!-- teensy body -->
+<rect x="1108" y="278" width="304" height="330" rx="8" fill="#16312b" stroke="#c9a227" stroke-width="2"/>
+<text x="1260" y="430" fill="#c9a227" font-size="18" text-anchor="middle" font-weight="700">TEENSY 4.1</text>
+<text x="1260" y="454" fill="#9cc9b8" font-size="12" text-anchor="middle">USB-C ↑</text>
+<text x="1260" y="560" fill="#9cc9b8" font-size="11" text-anchor="middle">SD slot on back</text>
+
+<!-- left pin labels (0-12, 3v3, 24+) we care about -->
+<g fill="#d4efe4" class="pin">
+  <text x="1098" y="300" text-anchor="end">0 RX1  VIDEO ← Pi TX</text>
+  <text x="1098" y="318" text-anchor="end">1 TX1  VIDEO → Pi RX</text>
+  <text x="1098" y="354" text-anchor="end">7 RX2  GPS TX</text>
+  <text x="1098" y="372" text-anchor="end">8 TX2  GPS RX</text>
+  <text x="1098" y="390" text-anchor="end">9 TACH  from PC817</text>
+  <text x="1098" y="430" text-anchor="end" fill="#888">10–13 reserved</text>
+  <text x="1098" y="470" text-anchor="end">3.3V  pull-ups / IMU / GPS</text>
+  <text x="1098" y="488" text-anchor="end">GND   star to J1 GND</text>
+</g>
+<g fill="#d4efe4" class="pin">
+  <text x="1422" y="300">VIN  ← J1 5V</text>
+  <text x="1422" y="318">GND</text>
+  <text x="1422" y="336">23  CAN RX  (opt)</text>
+  <text x="1422" y="354">22  CAN TX  (opt)</text>
+  <text x="1422" y="372">20 A6  AEM (divided)</text>
+  <text x="1422" y="390">19 SCL IMU</text>
+  <text x="1422" y="408">18 SDA IMU</text>
+  <text x="1422" y="426">17 A3  coolant</text>
+  <text x="1422" y="444">16 A2  oil</text>
+  <text x="1422" y="462">15 RX3  J2 RX</text>
+  <text x="1422" y="480">14 TX3  J2 TX</text>
+  <text x="1422" y="498">13 LED  (leave)</text>
+  <text x="1422" y="534">5V out  J5 5V ok</text>
+</g>
+
+<!-- ===================== CIRCUITS ===================== -->
+<text x="48" y="730" class="h">2. Circuits — solder exactly these values</text>
+
+<!-- TACH -->
+<rect x="48" y="746" width="800" height="280" rx="10" fill="#fff" stroke="#c47a3a" stroke-width="2"/>
+<text x="64" y="772" class="h">TACH  J4 → pin 9</text>
+<text x="64" y="794" class="xs">PC817 DIP-4, notch up, pin 1 top-left. ECU/cluster tach only — not coil negative.</text>
+<!-- simple schematic -->
+<text x="80" y="830" class="s">J4 SIG</text>
+<line x1="150" y1="824" x2="230" y2="824" stroke="#333" stroke-width="2"/>
+<rect x="230" y="810" width="70" height="28" fill="#f3efe6" stroke="#333"/>
+<text x="265" y="830" text-anchor="middle" class="xs">1 kΩ</text>
+<line x1="300" y1="824" x2="360" y2="824" stroke="#333" stroke-width="2"/>
+<rect x="360" y="792" width="120" height="90" rx="4" fill="#1e3a32" stroke="#333"/>
+<text x="420" y="818" text-anchor="middle" fill="#d4efe4" class="xs">PC817</text>
+<text x="372" y="838" fill="#d4efe4" class="xs">1  A</text>
+<text x="372" y="854" fill="#d4efe4" class="xs">2  K</text>
+<text x="430" y="838" fill="#d4efe4" class="xs">4  C</text>
+<text x="430" y="854" fill="#d4efe4" class="xs">3  E</text>
+<line x1="150" y1="880" x2="360" y2="880" stroke="#333" stroke-width="2"/>
+<text x="80" y="886" class="s">J4 GND</text>
+<line x1="360" y1="854" x2="360" y2="880" stroke="#333" stroke-width="2"/>
+<line x1="480" y1="854" x2="480" y2="900" stroke="#333" stroke-width="2"/>
+<line x1="420" y1="900" x2="560" y2="900" stroke="#333" stroke-width="2"/>
+<text x="500" y="918" class="xs">GND</text>
+<line x1="480" y1="824" x2="560" y2="824" stroke="#333" stroke-width="2"/>
+<line x1="560" y1="824" x2="560" y2="790" stroke="#333" stroke-width="2"/>
+<rect x="520" y="762" width="80" height="28" fill="#f3efe6" stroke="#333"/>
+<text x="560" y="782" text-anchor="middle" class="xs">4.7 kΩ</text>
+<line x1="560" y1="762" x2="560" y2="748" stroke="#333" stroke-width="2"/>
+<text x="572" y="752" class="xs">3.3 V</text>
+<line x1="560" y1="824" x2="700" y2="824" stroke="#c47a3a" stroke-width="2.5"/>
+<text x="640" y="816" class="s">Teensy pin 9</text>
+<text x="64" y="1000" class="xs">Pin 9 must swing 0–3.3 V. LOW &lt; 0.8 V. Optional 100 nF pin 9 to GND at the Teensy pin.</text>
+
+<!-- OIL -->
+<rect x="864" y="746" width="788" height="280" rx="10" fill="#fff" stroke="#8a4a8a" stroke-width="2"/>
+<text x="880" y="772" class="h">OIL  J5 → pin 16 (A2)</text>
+<text x="880" y="794" class="xs">5 V sender. Divider is mandatory — Teensy ADC is not 5 V tolerant.</text>
+<text x="880" y="830" class="s">J5 5V  ──────────── Teensy 5V / J1 5V</text>
+<text x="880" y="858" class="s">J5 GND ──────────── GND</text>
+<text x="880" y="900" class="s">J5 SIG ── 10 kΩ ──●── Teensy pin 16 (A2)</text>
+<text x="1008" y="928" class="s">│</text>
+<text x="1008" y="952" class="s">20 kΩ</text>
+<text x="1008" y="976" class="s">│</text>
+<text x="1008" y="1000" class="s">GND     (optional 10 nF at A2)</text>
+<text x="1280" y="900" class="xs">0.5 V at 0 PSI → A2 ≈ 0.33 V</text>
+<text x="1280" y="920" class="xs">4.5 V full scale → A2 ≈ 3.00 V</text>
+<text x="1280" y="940" class="xs">Firmware: Vadc = Vsensor × 2/3</text>
+
+<!-- NTC -->
+<rect x="48" y="1042" width="800" height="220" rx="10" fill="#fff" stroke="#2a8a8a" stroke-width="2"/>
+<text x="64" y="1068" class="h">COOLANT  J6 → pin 17 (A3)</text>
+<text x="64" y="1090" class="xs">VDO 1600–22 Ω curve. Dedicated GND wire — not the engine block.</text>
+<text x="64" y="1130" class="s">3.3 V ── 150 Ω ──●── Teensy pin 17 (A3)</text>
+<text x="196" y="1154" class="s">│</text>
+<text x="64" y="1178" class="s">J6 SIG ──────────┘</text>
+<text x="64" y="1208" class="s">J6 GND ──────────── GND</text>
+<text x="480" y="1130" class="xs">Different sender = different pull-up.</text>
+<text x="480" y="1150" class="xs">GM ~3.3 kΩ @ 100 F → use ~2.2 kΩ.</text>
+<text x="480" y="1170" class="xs">Calibrate Steinhart-Hart in src/main.cpp.</text>
+
+<!-- AEM -->
+<rect x="864" y="1042" width="788" height="220" rx="10" fill="#fff" stroke="#c33" stroke-width="2"/>
+<text x="880" y="1068" class="h">AEM 30-0300  J7 → pin 20 (A6)   DO NOT SKIP THE DIVIDER</text>
+<text x="880" y="1090" class="xs">WHITE = analogue + (harness pin 9). BROWN = analogue return (pin 10). Gauge 12 V is NOT on this board.</text>
+<text x="880" y="1128" class="s">J7 WHT ── 20 kΩ 0.1% ──●── 20 kΩ 0.1% ── J7 BRN ── GND</text>
+<text x="1088" y="1152" class="s">│</text>
+<text x="1088" y="1176" class="s">1 kΩ</text>
+<text x="1088" y="1200" class="s">│</text>
+<text x="880" y="1236" class="s">Teensy pin 20 (A6) ── 100 nF ── GND     Meter 5.00 V in → 2.50 V at pin 20 before enabling afraem.</text>
+
+<!-- ===================== UART ===================== -->
+<text x="48" y="1300" class="h">3. Two UART cables — crossed TX/RX, different voltages, different baud</text>
+
+<rect x="48" y="1316" width="800" height="250" rx="10" fill="#fff" stroke="#3a7ec4" stroke-width="2"/>
+<text x="64" y="1342" class="h">J2 SCREEN  →  CrowPanel J10 only</text>
+<text x="64" y="1366" class="xs">Large XH2.54 header. 5 V in is OK here. Small HY2.0 J2 on the screen is 3V3_OUT — 5 V there kills the panel.</text>
+<text x="64" y="1400" class="s">J2 GND  ────────────  J10 GND</text>
+<text x="64" y="1424" class="s">J2 5V   ────────────  J10 +5V_IN     (or power the screen from USB-C)</text>
+<text x="64" y="1448" class="s">J2 TX   ─ pin 14 ──→  J10 RXD0_H</text>
+<text x="64" y="1472" class="s">J2 RX   ─ pin 15 ──←  J10 TXD0_H</text>
+<text x="64" y="1504" class="xs">921600 8N1. Unplug J2 TX/RX before USB-flashing the CrowPanel.</text>
+
+<rect x="864" y="1316" width="788" height="250" rx="10" fill="#fff" stroke="#4a8a3a" stroke-width="2"/>
+<text x="880" y="1342" class="h">J3 VIDEO  →  Raspberry Pi 5  40-pin  (3.3 V)</text>
+<text x="880" y="1366" class="xs">Pi has its own 5 V 5 A USB-C. Do not feed the Pi from J1. 1 kΩ series on both data lines on this board.</text>
+<text x="880" y="1400" class="s">J3 GND  ────────────  Pi header pin 6  GND</text>
+<text x="880" y="1424" class="s">J3 TX   ─ 1 kΩ ─ pin 1 ──→  header pin 10  GPIO15 RXD</text>
+<text x="880" y="1448" class="s">J3 RX   ─ 1 kΩ ─ pin 0 ──←  header pin 8   GPIO14 TXD</text>
+<text x="880" y="1480" class="xs">115200 8N1. Settings → Video interconnect ON after this cable works.</text>
+<text x="880" y="1504" class="xs">Pi config: dtparam=uart0=on  and  usb_max_current_enable=1</text>
+
+<!-- ===================== POWER / NOTES ===================== -->
+<rect x="48" y="1584" width="1604" height="200" rx="10" fill="#fff" stroke="#6b5a45" stroke-width="2"/>
+<text x="64" y="1610" class="h">4. Power and grounding</text>
+<text x="64" y="1638" class="s">Car 12 V  →  5 V ≥ 3 A buck  →  J1 5V / GND. Same 5 V may feed CrowPanel J10. Raspberry Pi 5 uses a second 5 V 5 A USB-C buck — isolated except for the J3 GND.</text>
+<text x="64" y="1664" class="s">Star GND: J1 GND is the hub. J2–J7 GND, Teensy GND, GPS GND, IMU GND all go to that hub. Do not chain sensor grounds through each other.</text>
+<text x="64" y="1690" class="s">If you plug USB into the Teensy while J1 5V is live, cut the Teensy VUSB–VIN jumper pad (between USB and VIN on the back). Otherwise two 5 V sources fight.</text>
+<text x="64" y="1716" class="s">Bench bring-up: USB-only is fine (leave J1 open). Add J1 last. Enable AEM and Video interconnect in Settings only after those circuits meter correctly.</text>
+<text x="64" y="1742" class="s">Firmware v0.1.150. Full notes: hardware/breadboard/README.md   ·   cameras/stick: hardware/video-recorder/README.md</text>
+
+<rect x="48" y="1804" width="1604" height="150" rx="10" fill="#1e3a32"/>
+<text x="64" y="1836" fill="#d4efe4" class="h">Quick continuity after soldering (power OFF)</text>
+<text x="64" y="1864" fill="#d4efe4" class="s">J7 WHT to pin 20  =  ~21 kΩ     J7 BRN to pin 20  =  ~21 kΩ     J7 WHT to pin 20 short  =  you skipped the divider, stop.</text>
+<text x="64" y="1888" fill="#d4efe4" class="s">J5 SIG to pin 16  =  10 kΩ      pin 16 to GND  =  20 kΩ      J4 SIG to pin 9  =  open (opto — no DC path).</text>
+<text x="64" y="1912" fill="#d4efe4" class="s">J3 TX to pin 1  =  1 kΩ         J2 TX to pin 14  =  0 Ω      J1 5V to pin 20  =  open.</text>
+<text x="64" y="1936" fill="#d4efe4" class="s">J6 SIG to 3.3 V  =  150 Ω      J6 SIG to pin 17  =  0 Ω.</text>
+
+<text x="48" y="1988" class="h">5. Off-board (not soldered here)</text>
+<rect x="48" y="2000" width="1604" height="430" rx="10" fill="#fff" stroke="#6b5a45" stroke-width="2"/>
+<text x="64" y="2030" class="s">CrowPanel Advance — cabin. UART on J10 only. Own WiFi. START/STOP on this screen still starts Teensy SD and, if Video interconnect is ON, the Pi 5 recorder.</text>
+<text x="64" y="2058" class="s">Raspberry Pi 5 — separate box, official cooler, 5 V 5 A USB-C of its own. USB2: front ELP. USB2: rear ELP. USB3: stick. GPIO 14/15: J3.</text>
+<text x="64" y="2086" class="s">AEM 30-0300 gauge — 12 V via AEM’s 5 A fuse. We only steal WHITE/BROWN analogue. BLUE is RS-232. WHITE/BLACK is CAN. Do not grab those.</text>
+<text x="64" y="2114" class="s">Oil sender — 5 V / SIG / GND three-wire. Coolant — two-wire NTC. Tach — conditioned 12-ish V pulse from ECU or cluster, through the 1 kΩ into the opto LED.</text>
+<text x="64" y="2142" class="s">GPS NEO-M9N and GY-521 can sit on this protoboard on 3.3 V. They do not need screw terminals if the modules are onboard.</text>
+<text x="64" y="2182" class="h">Enable in Settings only after the matching circuit exists</text>
+<text x="64" y="2210" class="s">AEM 30-0300 AFR input  →  J7 soldered and pin 20 meters 2.5 V at 5 V in.</text>
+<text x="64" y="2234" class="s">Video interconnect     →  J3 soldered, Pi 5 booted with uart0 + usb_max_current_enable, recorder.py running.</text>
+<text x="64" y="2258" class="s">Sensor data source = Direct  →  tach + oil + coolant on J4/J5/J6. MegaSquirt additionally needs the CAN transceiver on 22/23.</text>
+<text x="64" y="2294" class="xs">This drawing is a wiring / soldering guide for a protoboard. It is not a fab Gerber, not a safety-certified automotive design, and not the abandoned Rev C PCB.</text>
+</svg>

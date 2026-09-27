@@ -1,0 +1,18 @@
+Item,Status,Manufacturer,Part_or_family,Reference_URL,Limitation
+Controller,Target module,PJRC,Teensy 4.1,https://www.pjrc.com/store/teensy41.html,Include headers and sockets plus required VUSB-VIN modification; not a completed board BOM
+Trunk WiFi module,PROPOSED; firmware and hardware review pending,Espressif,ESP32-S3-WROOM-1-N8R2,https://www.espressif.com/sites/default/files/documentation/esp32-s3-wroom-1_wroom-1u_datasheet_en.pdf,Soldered SPI network coprocessor; 8MB flash/2MB PSRAM; INTERNAL PCB 2.4GHz antenna; third MCU needs firmware/recovery
+NET supply,NOT SELECTED,TBD,3.3V 1A-class buck from regulated 5V,,Not Teensy 3.3V; recalculate peak/thermal system budget; power-off isolation required
+RTC backup cell,REQUIRED; exact temperature/lifetime spec pending,TBD,Primary 3V CR2032,https://www.pjrc.com/store/teensy41.html,VBAT and GND only; finite life; install after reflow; DO NOT CHARGE
+RTC holder,ILLUSTRATIVE CANDIDATE; fit/retention review required,Keystone,1058,,Include serviceable vibration retention and extra Teensy VBAT socket/contact
+GPS,Confirmed receiver family; exact ordering code and footprint pending,u-blox,NEO-M9N,,Solder to main PCB; final RF and active-antenna circuitry required
+IMU,NOT SELECTED,TBD,TBD,,Bare six-axis IC; illustrative QFN is not a selected part; driver compatibility required
+Tach optocoupler,NOT SELECTED,TBD,TBD,,Onboard required; illustrated DIP is not a selected part or verified footprint
+Tach front end,NOT DESIGNED,TBD,TBD,,High-impedance protected sensing and local LED drive; exact ICs and passives pending
+Main supply,Proposed module; review required,Pololu,D36V50F5 / 4091,https://www.pololu.com/product/4091,5 V 5 A TOTAL system target still requires load/thermal/protection validation
+Auxiliary supply,Proposed module; review required,TRACO Power,TSR 1-2433,,Proposed separate auxiliary 3.3 V rail; final topology and load budget pending
+Oil sender,Electrical target; installation and calibration validation required,AUTEX,Amazon ASIN B00NIK98O8,https://www.amazon.com/dp/B00NIK98O8,External sender; listed 5 V supply and 0.5-4.5 V over 150 PSI; 1/8-27 NPT; listed max 125 C
+Coolant sender,Proposed; curve and fitment pending,Delphi,TS10075 / Amazon ASIN B000CGM9O2,https://www.amazon.com/dp/B000CGM9O2,External two-wire sender; needs matching pull-up and new firmware calibration
+Connectors and labels,NOT FINALIZED,TBD,TBD,,Fully installed; final pinout and silkscreen must match reviewed netlist
+AFR gauge (EXTERNAL),USER SELECTED,AEM,30-0300,https://documents.holley.com/30-0300.pdf,Use existing powered gauge WHITE/BROWN output only; NOT installed on PCB; no sensor controller or jumper
+AFR input protection and terminal,DESIGN REVIEW PENDING,TBD,TBD,,Two-position SIG+/RETURN; 20k/20k 0.1 percent scaling and 1k/100nF filter starting values; power-off isolation and clamps still require selection
+Protection and passives,NOT FINALIZED,TBD,TBD,,Do not procure parts or infer counts from the rendering

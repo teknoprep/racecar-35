@@ -34,3 +34,6 @@ desktop.ini
 *~
 *.swp
 *.bak
+
+# transient run logs (freeerouting/render stderr etc.)
+logs/

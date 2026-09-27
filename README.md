@@ -2,6 +2,31 @@
 
 Two-MCU dash for a track car.
 
+**Latest Rev C target:** add a third MCU—an on-board ESP32-S3 WiFi coprocessor—to
+upload directly from Teensy SD over local SPI, while the screen keeps WiFi for
+unchanged OTA and optional upload fallback. Add a replaceable CR2032 on Teensy VBAT
+for RTC retention. This is an architecture update, **not an implemented new uplink**;
+see [WiFi/RTC requirements](hardware/teensy-integrated-revc/WIFI_RTC_ARCHITECTURE.md).
+Rev C has an **internal WiFi PCB antenna** and **all screw terminals on the LEFT
+edge**, labelled by function/pin. **Actual 130 × 140 mm routed electrical CAD,
+Gerber/drill ZIP, BOM, assembly documents and an assembled view now exist:**
+[Rev C engineering prototype](hardware/teensy-integrated-revc/README.md).
+It passes ERC/DRC/netlist checks but is unbuilt and not independently approved;
+new WiFi firmware, oil/coolant conversions and bench validation remain.
+A/B are retired under `hardware/_archive/`, not alternative orderable designs.
+
+**WiFi-only on the CrowPanel since v0.1.148.** Ethernet/W5500 support
+and the Internet-route setting have been removed. WiFi credentials/status are
+always visible; old saved Ethernet selections are ignored. NTP/OTA/uploads run
+through the screen. See [CLAUDE.md](CLAUDE.md) and [BUILD.md](BUILD.md) for current
+architecture/toolchains; much of the original overview below is historical.
+The integrated Rev C board is an unbuilt electrical prototype. **v0.1.149 source adds
+opt-in AFR/lambda logging from the external AEM 30-0300 gauge output** (WHITE signal
+and BROWN reference), not a direct oxygen sensor. A protected/scaled ADC input
+is implemented in Rev C with clamps and powered-off isolation, but requires
+independent review and physical validation. See
+[AFR_INTERFACE.md](hardware/teensy-integrated-revc/AFR_INTERFACE.md).
+
 ```
 +--------------+   Serial2 (UART)   +--------------+   Serial3 (UART)   +--------------+
 |              |  pin 7 RX2 / 8 TX2 |              | pin 14 TX3 / 15 RX |              |

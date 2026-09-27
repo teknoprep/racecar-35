@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1540" viewBox="0 0 1800 1540">
+<rect width="1800" height="1540" fill="#f1f5f7"/>
+<style>text{font-family:DejaVu Sans,sans-serif;fill:#173f4b}.title{font-size:35px;font-weight:bold}.h{font-size:24px;font-weight:bold}.s{font-size:20px}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#578575"/></marker></defs>
+<text x="60" y="65" class="title">REV C / INTEGRATED SYSTEM CONNECTIONS</text>
+<text x="60" y="105" class="s">Functional drawing only — proposed interfaces, not a circuit schematic or wiring pinout</text>
+<rect x="520" y="145" width="1220" height="1190" rx="20" fill="#e2eee8" stroke="#83ad98" stroke-width="3"/>
+<text x="550" y="187" class="h">MAIN PCB — ALL SENSOR INTERFACE ELECTRONICS HERE</text>
+<rect x="60" y="220" width="380" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="80" y="256" class="h">SMA antenna</text>
+<text x="80" y="292" class="s">External antenna only</text>
+<rect x="560" y="220" width="540" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="580" y="256" class="h">Soldered NEO-M9N</text>
+<text x="580" y="292" class="s">RF bias / protection / filtering</text>
+<text x="580" y="320" class="s">UART to Teensy RX7 / TX8</text>
+<path d="M442,283 H552" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<path d="M1103,283 H1250" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<rect x="60" y="378" width="380" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="80" y="414" class="h">Oil-pressure sender</text>
+<text x="80" y="450" class="s">AUTEX 150 PSI candidate</text>
+<text x="80" y="478" class="s">5 V / signal / return</text>
+<rect x="560" y="378" width="540" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="580" y="414" class="h">Oil input circuit</text>
+<text x="580" y="450" class="s">Regulated supply, scaling, filtering</text>
+<text x="580" y="478" class="s">Protected analogue input → A2 / 16</text>
+<path d="M442,441 H552" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<path d="M1103,441 H1250" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<rect x="60" y="536" width="380" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="80" y="572" class="h">Coolant sender</text>
+<text x="80" y="608" class="s">Delphi TS10075 candidate</text>
+<text x="80" y="636" class="s">Dedicated two-wire connection</text>
+<rect x="560" y="536" width="540" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="580" y="572" class="h">Coolant input circuit</text>
+<text x="580" y="608" class="s">Matched pull-up, filter, protection</text>
+<text x="580" y="636" class="s">Calibration required → A3 / 17</text>
+<path d="M442,599 H552" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<path d="M1103,599 H1250" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<rect x="60" y="694" width="380" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="80" y="730" class="h">ECU / cluster tach</text>
+<text x="80" y="766" class="s">Conditioned signal + return</text>
+<text x="80" y="794" class="s">NEVER coil / spark / injector</text>
+<rect x="560" y="694" width="540" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="580" y="730" class="h">Onboard tach circuit + OPTO</text>
+<text x="580" y="766" class="s">High-impedance front end + driver</text>
+<text x="580" y="794" class="s">Clean 3.3 V pulses → pin 9</text>
+<path d="M442,757 H552" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<path d="M1103,757 H1250" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<rect x="60" y="852" width="380" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="80" y="888" class="h">AEM 30-0300 GAUGE</text>
+<text x="80" y="924" class="s">WHITE signal / BROWN return</text>
+<text x="80" y="952" class="s">Gauge stays powered externally</text>
+<rect x="560" y="852" width="540" height="128" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="580" y="888" class="h">AFR scale / filter / protect</text>
+<text x="580" y="924" class="s">0.500 gain target → A6 / pin 20</text>
+<text x="580" y="952" class="s">No sensor / heater / source jumper</text>
+<path d="M442,915 H552" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<path d="M1103,915 H1250" stroke="#578575" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+<rect x="1260" y="220" width="420" height="760" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="1280" y="256" class="h">SOCKETED TEENSY 4.1</text>
+<text x="1280" y="292" class="s">Main controller + built-in micro-SD</text>
+<text x="1280" y="320" class="s"></text>
+<text x="1280" y="348" class="s">Soldered IMU on the same PCB</text>
+<text x="1280" y="376" class="s">I²C on SDA18 / SCL19</text>
+<text x="1280" y="404" class="s"></text>
+<text x="1280" y="432" class="s">10–20 V input / 5 V supply target</text>
+<text x="1280" y="460" class="s">Separate auxiliary 3.3 V rail</text>
+<text x="1280" y="488" class="s"></text>
+<text x="1280" y="516" class="s">Powered display UART → Serial3</text>
+<text x="1280" y="544" class="s">CrowPanel verified J10 only</text>
+<text x="1280" y="572" class="s"></text>
+<text x="1280" y="600" class="s">SPI → TRUNK WiFi coprocessor</text>
+<text x="1280" y="628" class="s">VBAT ← 3V CR2032 + GND</text>
+<rect x="560" y="1010" width="540" height="145" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="580" y="1046" class="h">TRUNK WIFI / ESP32-S3 (NEW)</text>
+<text x="580" y="1082" class="s">Short SPI link, own 3.3V supply</text>
+<text x="580" y="1110" class="s">INTERNAL PCB antenna; direct upload</text>
+<text x="580" y="1138" class="s">Coprocessor firmware still required</text>
+<rect x="1140" y="1010" width="540" height="145" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="1160" y="1046" class="h">RTC BACKUP / CR2032 (NEW)</text>
+<text x="1160" y="1082" class="s">Positive → Teensy VBAT; negative → GND</text>
+<text x="1160" y="1110" class="s">RTC only, finite life; DO NOT CHARGE</text>
+<text x="1160" y="1138" class="s">Auxiliary VBAT contact must be added</text>
+<rect x="560" y="1180" width="1120" height="115" rx="14" fill="#fff" stroke="#9fb7b2" stroke-width="2"/>
+<text x="580" y="1216" class="h">SCREEN WIFI STAYS — OTA DOWNLOAD PATH UNCHANGED</text>
+<text x="580" y="1252" class="s">Screen self-update + UART Teensy update. Optional screen-upload fallback.</text>
+<rect x="60" y="1370" width="1680" height="100" rx="14" fill="#fff0dd" stroke="#9fb7b2" stroke-width="2"/>
+<text x="80" y="1406" class="h">ARCHITECTURE ONLY — NO NEW WORKING UPLINK OR FABRICATION FILES</text>
+<text x="80" y="1442" class="s">Review power, SPI ownership/software, RF/EMC, RTC retention and actual-Internet resynchronization.</text>
+</svg>

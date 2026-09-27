@@ -1,0 +1,66 @@
+Subject: Design completion and turnkey prototype quote - integrated Miata data logger
+
+Please review the attached Racecar-35 integrated Rev C concept package.
+THIS IS A DESIGN-COMPLETION RFQ, NOT AN ORDER TO FABRICATE THE ATTACHED DRAWING.
+
+We need a fully assembled, labelled prototype controller board for a 1990-2005
+Mazda Miata / Spec Miata dashboard. All GPS/IMU/input-interface electronics must
+be on the main PCB; the antenna and car senders connect externally.
+
+Required features:
+- Socketed Teensy 4.1, including installed headers/sockets and built-in micro-SD access.
+- Soldered NEO-M9N GPS receiver, SMA antenna connector and complete RF/power support.
+- Soldered six-axis IMU with all required supporting components.
+- Direct three-wire 5 V oil-pressure sender input and two-wire coolant NTC input.
+- Onboard high-impedance ECU/cluster tach front end AND optocoupler to Teensy pin 9.
+  NEVER coil negative, spark lead or injector drive. No raw-ignition input mode.
+- 10-20 V input and 5 V / 5 A total main supply design target.
+- Four-wire powered UART to the verified CrowPanel Advance J10 interface.
+- ALL screw terminals in one LEFT-edge bank with outward wire access and readable
+  function/pin labels. Final deliverable MUST include real routed Gerbers/drills;
+  the review ZIP and render do not meet that requirement.
+- TWO WiFi endpoints, no Ethernet: proposed ESP32-S3-WROOM-1-N8R2 on this PCB,
+  local SPI to Teensy for primary uploads; screen WiFi remains for unchanged OTA
+  downloads and optional upload fallback. Include dedicated NET 3.3 V supply,
+  built-in PCB antenna clearance and programming/recovery access. No WiFi external
+  antenna/pigtail/jack; GPS SMA remains. Plastic/RF-window enclosure. New module
+  firmware is needed.
+- Replaceable CR2032 RTC backup to Teensy VBAT/GND, including the missing auxiliary
+  socket/contact; no charging, no whole-system battery power, no forever-life claim.
+- New illustrated envelope is 130 x 140 mm; final placement/enclosure still open.
+- AFR/lambda from external AEM 30-0300 GAUGE OUTPUT ONLY: solid WHITE signal,
+  BROWN reference. Two-position input with 0.500 scaling, filtering, protection
+  and power-off isolation to Teensy A6/pin 20. No direct sensor, heater controller
+  or source jumper. Firmware support exists; physical circuit still needs review.
+- Readable white silkscreen labels for every connector, polarity and signal function.
+
+The 130 x 110 mm drawing is a proposed envelope/placement only. Circuit design,
+exact BOM, RF layout, protective component values and PCB routing are incomplete.
+Please tell us whether you offer design engineering as well as assembly. If not,
+please identify the finalized files you require and any recommended design partner.
+
+Please quote these as SEPARATE phases:
+1. Complete and independently review the schematic, part selection, circuit
+   calculations and PCB layout; deliver editable CAD and the manufacturing package.
+2. After written design approval: bare PCB fabrication, authentic component
+   sourcing, mixed SMT/through-hole assembly, connector/module installation and labels.
+3. Approved firmware programming, first-article power/sensor/RF tests and reports.
+   Identify any fixture engineering, test-software and recurring test charges.
+
+For budgeting only, provide prototype quantity options of 1, 3 and 5 assembled
+boards. Final quantity and authorization will be agreed separately. State setup,
+engineering, sourcing, module installation, testing, shipping and tax charges.
+
+Confirm whether you can source/install the Teensy and proposed Pololu/Traco supply
+modules, or whether any must be customer-consigned. Include all module headers,
+sockets, supports and required manual operations. Do not assume 'SMT assembly'
+alone produces a fully assembled unit.
+
+The Teensy's VUSB-VIN bridge modification is required before simultaneous USB and
+carrier power; include that operation and an unpowered verification per PJRC.
+The screen's HY2.0 3V3_OUT must NEVER receive 5 V. Actual clone connector pinout
+verification and year-specific Miata tach verification are still required.
+
+Please list exclusions, unresolved engineering questions, substitutions requiring
+approval, expected lead time and the acceptance tests proposed for the prototypes.
+Do not describe the result as automotive-qualified without the corresponding work.

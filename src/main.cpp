@@ -67,13 +67,13 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.147"
+#define FIRMWARE_VERSION "0.1.150"
 
-#include <SPI.h>
-#include <Ethernet.h>
-#include <EthernetUdp.h>
+// Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
 #include "zdeflate_teensy.h"   // compress session blocks BEFORE the UART bottleneck
+#include "../crowpanel-arduino/RaceDash/aem_afr.h"
+#include <stdarg.h>
 #include <TimeLib.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 #include <FreqMeasureMulti.h>
@@ -82,6 +82,7 @@ extern "C" {
 namespace {
   HardwareSerial& GPS_SERIAL  = Serial2;            // pins 7 (RX2), 8 (TX2)
   HardwareSerial& DASH_SERIAL = Serial3;            // pin 14 (TX3) -> CrowPanel UART0 RX
+  HardwareSerial& VID_SERIAL  = Serial1;            // pin 0 RX1 / pin 1 TX1 -> Pi 5 video box
   constexpr uint32_t GPS_BAUD_TARGET   = 230400;    // RAISED (v0.1.83): 25 Hz UBX-NAV-PVT
                                                     // is ~25 kbit/s; at 38400 that's ~65%
                                                     // util (no headroom -> chronic backlog
@@ -94,6 +95,8 @@ namespace {
                                                   // telemetry + file uploads. Both sides
                                                   // must agree; if you mix old + new
                                                   // firmware versions you'll see garbage.
+  constexpr uint32_t VID_BAUD          = 115200;  // Pi 5 video box. Slow on purpose: overlay
+                                                  // stats are tiny; do NOT share 921600 dash.
   // NEO-M9N supports 25 Hz max nav rate. We push that hard for high-rate
   // logging and live telemetry. M8-class modules cap at 18 Hz — drop this
   // to 18 if you ever swap chips.
@@ -109,10 +112,10 @@ namespace {
   constexpr uint8_t  RPM_TACH_PIN       = 9;
   // PULSES_PER_REV depends on where the tap is taken — calibrate by reading
   // the dash at a known idle (e.g. 800 RPM should display ~800). Common
-  // values for a 4-cyl 4-stroke:
-  //   2.0  = wasted-spark coil-negative, distributor coil-neg, most ECU tach
-  //   1.0  = single COP coil trigger
-  //   0.5  = once-per-2-revs cam-position pulse
+  // values for a conditioned 4-cyl ECU/cluster tach signal:
+  //   2.0 = common starting point; verify against the actual ECU/cluster.
+  // NEVER connect coil negative, spark or injector drive to this board.
+  // Ignition-derived signals require a separate low-voltage conditioner.
   // This is only the COMPILE-TIME DEFAULT now — the live value is set from the
   // dash (Settings -> "Tach pulses/rev") via `CFG,rpmppr,<value_x10>` and held
   // in g_cfg.rpm_ppr_x10. Think of it as the divider: a tach reading 2x too
@@ -136,6 +139,8 @@ namespace {
   // ---- Oil pressure: generic 5V 0.5-4.5V transducer, 150 PSI full scale ----
   // Wired through a 10k / 20k voltage divider so the 0.5-4.5V sensor output
   // arrives at the ADC pin as 0.33-3.00V (safe for the not-5V-tolerant Teensy).
+  constexpr int   AEM_AFR_ADC_PIN    = A6;          // pin 20; protected 1:2 input, NOT raw 5V
+  constexpr size_t SESSION_LINE_CAP  = 640;         // serializer AND legacy upload line buffers
   constexpr int   OIL_ADC_PIN        = A2;          // physical pin 16
   constexpr float OIL_DIVIDER_RATIO  = 2.0f / 3.0f; // V_adc = V_sensor * R2/(R1+R2)
   constexpr float OIL_V_AT_ZERO_PSI  = 0.5f;        // sensor V at 0 PSI
@@ -191,8 +196,8 @@ static struct {
     char     api_key[64] = "";
     bool     rec_sd     = true;
     bool     rec_cl     = false;
-    uint8_t  inet        = 0;     // 0=Ethernet, 1=WiFi (mirror of dash setting)
     uint8_t  sensor_type = 0;     // 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN)
+    bool     aem_afr = false;    // opt-in; old hardware must not sample a floating A6
     uint16_t rpm_ppr_x10 = 20;    // tach pulses/rev x10 (20 = 2.0). Divides the
                                   // opto-tach frequency into RPM in Direct mode.
     int8_t   rpm_smooth  = 0;     // RPM display smoothing trim from the dash slider
@@ -203,7 +208,9 @@ static struct {
                                   // diagnostic tool, enabled from Settings when
                                   // needed. When false, NO on-SD .dbg
                                   // health log is written for a session.
+    bool     video_en = false;    // dash CFG,viden. Pi 5 video box on Serial1.
 } g_cfg;
+static aemafr::Reading aem_reading;   // one snapshot shared by UART and SD per emit
 
 // ESP32-S3 dash temp, reported by the dash via the DTEMP line (heat diagnostics).
 // Declared here (before handleDashCommand) so the command parser can set it.
@@ -349,7 +356,7 @@ static void updateTeensyLap(uint8_t fix, float lat, float lon) {
 // Set when the dash sends UPLOAD,CANCEL. Volatile across reboot — deliberately
 // in-RAM only so a reboot is the only way to re-enable uploads.
 static volatile bool uploads_disabled = false;
-// Set true while httpPost() is actively pushing a file; checked from
+// Set true while legacy WiFi forwarding is actively pushing a file; checked from
 // pumpDashCommands -> handleDashCommand so a CANCEL during the loop aborts
 // the current connection on the next chunk boundary.
 static volatile bool upload_in_progress = false;
@@ -377,14 +384,11 @@ static uint32_t test_mode_start_ms = 0;
 // drain attempt fails (to avoid hammering a dead server).
 static volatile bool drain_queue_now = false;
 
-// Most recent upload failure reason, set by the wupForwardFile / httpPost
-// paths and surfaced to the dash via UPLOAD,DONE,FAIL,<reason>. Empty when
+// Most recent legacy WiFi-forwarding failure, surfaced to the dash via
+// UPLOAD,DONE,FAIL,<reason>. Empty when
 // the upload succeeded or wasn't attempted.
 static char last_upload_err[96] = "";
 
-// True when the active path is 'WiFi via dash': dash owns the WiFi link and we
-// forward session files to it over UART for cloud upload. Mirrors g_cfg.inet.
-static bool wifiInetActive() { return g_cfg.inet == 1; }
 // Active timezone id sent by the dash (e.g. "ET", "PT", "UTC"). Used today
 // only for logging; future SD-filename / cloud-metadata code can consult it.
 // The Teensy's RTC and the wire-format TIME line are always UTC.
@@ -402,6 +406,11 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float ax, float ay, float az,
                                float gx, float gy, float gz, int lap);
 static void handleCfgLine(const String& line);   // cloud section below
+static void videoNotifyRec(bool on);
+static void videoHudTick();
+static void videoCapture(uint16_t rpm, float mph, int16_t oil_x10, int16_t clt_x10,
+                         int16_t afr_x10, float lat, float lon);
+static void pumpVidCommands();
 static bool sdReady();                            // SD status helper, defined below
 static void detectSD(bool quick = false, bool force = false);   // SD detect, defined below
 static void emitSdStatus();                       // SD wire emit, defined below
@@ -446,6 +455,90 @@ static void runFirmwareUpdate(Stream& io, const char* tag) {
     io.println(F("FW,ERR,update_failed"));
 }
 
+// ---------------------------------------------------------------------------
+// Video box (Raspberry Pi 5) on Serial1 — pin 0 RX1 / pin 1 TX1, 115200.
+// Separate from the dash UART. Gated by CFG,viden. Fire-and-forget REC/HUD;
+// Pi status lines (VID,...) are forwarded to the dash unchanged.
+// ---------------------------------------------------------------------------
+static bool     vid_rec_sent = false;
+static int32_t  vid_lap = -1, vid_last_ms = -1, vid_pred_ms = -1, vid_best_ms = -1;
+static uint32_t vid_hudlap_ms = 0;
+static uint16_t vid_rpm = 0;
+static int16_t  vid_mph_x10 = 0, vid_oil_x10 = -1, vid_clt_x10 = -1, vid_afr_x10 = -1;
+static float    vid_lat = 0, vid_lon = 0;
+
+static void videoSend(const char* fmt, ...) {
+    char buf[220];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    VID_SERIAL.write((const uint8_t*)buf, (size_t)n);
+    if (buf[n - 1] != '\n') VID_SERIAL.write('\n');
+}
+
+static void videoNotifyRec(bool on) {
+    if (!g_cfg.video_en) {
+        if (vid_rec_sent) { videoSend("REC,0"); vid_rec_sent = false; }
+        return;
+    }
+    if (on) {
+        videoSend("TRACK,%s", current_track);
+        videoSend("REC,1");
+        vid_rec_sent = true;
+    } else if (vid_rec_sent) {
+        videoSend("REC,0");
+        vid_rec_sent = false;
+    }
+}
+
+static void videoCapture(uint16_t rpm, float mph, int16_t oil_x10, int16_t clt_x10,
+                         int16_t afr_x10, float lat, float lon) {
+    vid_rpm = rpm;
+    vid_mph_x10 = (int16_t)lroundf(mph * 10.0f);
+    vid_oil_x10 = oil_x10;
+    vid_clt_x10 = clt_x10;
+    vid_afr_x10 = afr_x10;
+    vid_lat = lat;
+    vid_lon = lon;
+}
+
+static void videoHudTick() {
+    if (!g_cfg.video_en || !recording_active) return;
+    static uint32_t last_ms = 0;
+    const uint32_t now = millis();
+    if (now - last_ms < 100) return;
+    last_ms = now;
+    const bool lap_fresh = (vid_hudlap_ms != 0) && (now - vid_hudlap_ms < 2000);
+    const int32_t lap = lap_fresh ? vid_lap : (sf_lap.has_line ? (int32_t)sf_lap.lap : -1);
+    const int32_t last = lap_fresh ? vid_last_ms : -1;
+    const int32_t pred = lap_fresh ? vid_pred_ms : -1;
+    const int32_t best = lap_fresh ? vid_best_ms : -1;
+    videoSend("HUD,%u,%d,%ld,%ld,%ld,%ld,%d,%d,%d,%.6f,%.6f",
+              (unsigned)vid_rpm, (int)vid_mph_x10,
+              (long)lap, (long)last, (long)pred, (long)best,
+              (int)vid_oil_x10, (int)vid_clt_x10, (int)vid_afr_x10,
+              vid_lat, vid_lon);
+}
+
+static void handleVidLine(const String& line) {
+    if (!line.startsWith("VID,")) return;
+    DASH_SERIAL.println(line);
+}
+
+static void pumpVidCommands() {
+    static String buf;
+    while (VID_SERIAL.available()) {
+        const char c = (char)VID_SERIAL.read();
+        if (c == '\r') continue;
+        if (c == '\n') { handleVidLine(buf); buf = ""; }
+        else if (buf.length() < 192) buf += c;
+        else buf = "";
+    }
+}
+
 static void handleDashCommand(const String& line) {
     if (line.startsWith("REC,")) {
         const int v = line.substring(4).toInt();
@@ -459,9 +552,11 @@ static void handleDashCommand(const String& line) {
                               current_track, (unsigned long)session_start_ms,
                               (unsigned long)session_start_unix);
                 openSession();
+                videoNotifyRec(true);
             } else {
                 const uint32_t dur = millis() - session_start_ms;
                 closeSession();
+                videoNotifyRec(false);
                 if (test_mode_active) {
                     test_mode_active = false;
                     DASH_SERIAL.println(F("TEST,0"));
@@ -494,6 +589,19 @@ static void handleDashCommand(const String& line) {
         strncpy(current_track, name.c_str(), sizeof(current_track) - 1);
         current_track[sizeof(current_track) - 1] = '\0';
         Serial.printf("[teensy] track set to \"%s\"\n", current_track);
+        if (g_cfg.video_en) videoSend("TRACK,%s", current_track);
+    } else if (line.startsWith("HUDLAP,")) {
+        // Dash lap overlay: HUDLAP,<lap>,<last_ms>,<pred_ms>,<best_ms>
+        int p = 7, idx = 0; long v[4] = {-1,-1,-1,-1};
+        while (idx < 4) {
+            const int c = line.indexOf(',', p);
+            const String tok = (c < 0) ? line.substring(p) : line.substring(p, c);
+            v[idx++] = tok.toInt();
+            if (c < 0) break; p = c + 1;
+        }
+        vid_lap = (int32_t)v[0]; vid_last_ms = (int32_t)v[1];
+        vid_pred_ms = (int32_t)v[2]; vid_best_ms = (int32_t)v[3];
+        vid_hudlap_ms = millis();
     } else if (line == "SDFORMAT") {
         Serial.println(F("[teensy] SD format requested by dash"));
         formatSDCard();
@@ -520,7 +628,7 @@ static void handleDashCommand(const String& line) {
         // Begin a synthetic-data session. Track defaults to 'TEST' if the dash
         // didn't send a TRACK line first. We open a real /sessions/ file using
         // the same code path as a normal REC,1 so the closeSession() upload
-        // pipeline (Ethernet HTTP or WiFi-via-WUP) is exercised end-to-end.
+        // pipeline (SD plus WiFi-via-dash) is exercised end-to-end.
         if (!recording_active) {
             if (!sdReady()) {
                 Serial.println(F("[teensy] TESTSTART rejected: SD not ready"));
@@ -693,8 +801,8 @@ static uint32_t gnss_last_fresh_ms = 0;
 static uint32_t gnss_raw_bytes    = 0;
 
 // GPS stale auto-recovery watchdog. The root causes of mid-session GPS freeze
-// are gone (live per-sample cloud POST removed; Ethernet.maintain() no longer
-// runs in loop) and a 32 KB UART RX ring rides through SD-sync hiccups — so
+// are gone (no per-sample cloud POST or network work on the Teensy) and a
+// 32 KB UART RX ring rides through SD-sync hiccups — so
 // STALE should not occur during a session. This is a belt-and-suspenders net for
 // if it ever does:
 //   LIGHT  (>2.5 s stale): flush the RX ring so the UBX parser drops any
@@ -1493,263 +1601,6 @@ static void flushImu() {
 }
 
 // ---------------------------------------------------------------------------
-// Ethernet — W5500 on SPI0.
-//   CS=10  MOSI=11  MISO=12  SCK=13  /INT=5  /RST=6
-// DHCP at boot; lease maintained by Ethernet.maintain() in loop().
-// Emits ETH,<ip> to dash when the assigned address changes.
-// ---------------------------------------------------------------------------
-static constexpr int ETH_CS_PIN  = 10;
-static constexpr int ETH_RST_PIN =  6;
-// Locally-administered MAC (bit 1 of first byte = 1). Avoids any chance of
-// colliding with a real OUI; some routers / DHCP servers reject requests
-// from MACs in registered OUI blocks if the device isn't recognised.
-static const byte    ETH_MAC[]   = { 0x02, 0xE9, 0xE5, 0x00, 0x01, 0x35 };
-static char          eth_ip_str[16] = "0.0.0.0";
-static bool          eth_hw_present = false;   // true only if W5500 chip was detected at boot
-
-// Cached boot-time diagnostics so the periodic [eth] debug print (in loop)
-// can keep showing what happened at boot without re-running the SPI probes.
-static const char*   eth_chip_name   = "?";       // "NONE" | "W5500" | "W5200" | "W5100"
-static const char*   eth_link_boot   = "?";       // "UP" | "DOWN" | "(no chip)"
-static const char*   eth_dhcp_result = "skipped"; // "OK" | "failed" | "(no link)" | "(no chip)"
-
-// Raw SPI read of the W5500 VERSIONR register (0x0039 in common block).
-// Bypasses the Ethernet library to give us the unfiltered byte the chip
-// returned. Result is cached in eth_raw_versionr for the periodic [eth-dbg]
-// printout. Helps distinguish between "MISO disconnected" (0xFF), "MISO
-// shorted" (0x00), "wrong chip" (something else), and "W5500 OK" (0x04).
-static uint8_t eth_raw_versionr = 0xAA;   // sentinel "not yet probed"
-static char    eth_miso_test[40] = "(not run)";
-
-// Tests the MISO wire (Teensy pin 12) by toggling the internal pull and
-// reading. If the wire is properly connected to a driven W5500 output, the
-// pull won't dominate. If the wire is dangling, the pull will dominate and
-// we'll see the pull's value reflected in the read.
-//
-// Interpretation:
-//   "CSlo:U=1 D=0  CShi:U=1 D=0"  → MISO is FLOATING (pull dominates always)
-//                                    → MISO wire is broken, OR CS isn't
-//                                      reaching the W5500 (chip stays in high-Z)
-//   "CSlo:U=X D=X  CShi:U=1 D=0"  → MISO is driven when CS low (correct!)
-//                                    → if rawVERSIONR is still wrong, it's a
-//                                      clocking issue (SCK/MOSI)
-//   "CSlo:U=0 D=0  CShi:U=0 D=0"  → MISO shorted to GND
-//   "CSlo:U=1 D=1  CShi:U=1 D=1"  → MISO shorted to VCC
-static void misoPinDiagnostic() {
-    // Pin 12 is MISO on Teensy 4.1 SPI0.
-    constexpr int MISO_PIN = 12;
-    pinMode(ETH_CS_PIN, OUTPUT);
-
-    auto sample = [](int pin, int mode) {
-        pinMode(pin, mode);
-        delayMicroseconds(50);
-        return digitalRead(pin);
-    };
-
-    // CS HIGH (chip de-selected → MISO should be in high-Z, pull dominates)
-    digitalWrite(ETH_CS_PIN, HIGH);
-    delayMicroseconds(20);
-    int hiU = sample(MISO_PIN, INPUT_PULLUP);
-    int hiD = sample(MISO_PIN, INPUT_PULLDOWN);
-
-    // CS LOW (chip selected → MISO should be driven by chip)
-    digitalWrite(ETH_CS_PIN, LOW);
-    delayMicroseconds(20);
-    int loU = sample(MISO_PIN, INPUT_PULLUP);
-    int loD = sample(MISO_PIN, INPUT_PULLDOWN);
-
-    digitalWrite(ETH_CS_PIN, HIGH);
-    pinMode(MISO_PIN, INPUT);
-
-    snprintf(eth_miso_test, sizeof(eth_miso_test),
-             "CSlo:U=%d,D=%d  CShi:U=%d,D=%d", loU, loD, hiU, hiD);
-    Serial.printf("[eth] miso pin test: %s\n", eth_miso_test);
-}
-
-static void rawProbeW5500() {
-    SPI.begin();
-    pinMode(ETH_CS_PIN, OUTPUT);
-    digitalWrite(ETH_CS_PIN, HIGH);
-    delayMicroseconds(5);
-
-    // Drop to 1 MHz for the probe — slow enough to tolerate marginal
-    // breadboard connections / long jumpers. W5500 is happy at any speed
-    // up to ~80 MHz.
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(ETH_CS_PIN, LOW);
-    delayMicroseconds(1);
-    SPI.transfer(0x00);     // VERSIONR address high byte
-    SPI.transfer(0x39);     // VERSIONR address low byte
-    SPI.transfer(0x00);     // control: common block, read, VDM
-    eth_raw_versionr = SPI.transfer(0x00);   // <-- the byte we care about
-    digitalWrite(ETH_CS_PIN, HIGH);
-    SPI.endTransaction();
-
-    // Try 3 reads — if it's flaky we'll see varying values. All identical
-    // means the bus is stable; varying means there's a marginal connection.
-    uint8_t r2 = 0xAA, r3 = 0xAA;
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(ETH_CS_PIN, LOW);
-    delayMicroseconds(1);
-    SPI.transfer(0x00); SPI.transfer(0x39); SPI.transfer(0x00);
-    r2 = SPI.transfer(0x00);
-    digitalWrite(ETH_CS_PIN, HIGH);
-    SPI.endTransaction();
-    delayMicroseconds(50);
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(ETH_CS_PIN, LOW);
-    delayMicroseconds(1);
-    SPI.transfer(0x00); SPI.transfer(0x39); SPI.transfer(0x00);
-    r3 = SPI.transfer(0x00);
-    digitalWrite(ETH_CS_PIN, HIGH);
-    SPI.endTransaction();
-
-    Serial.printf("[eth] raw VERSIONR=0x%02X (3 reads: 0x%02X,0x%02X,0x%02X)  (W5500=0x04, none=0xFF/0x00)\n",
-                  eth_raw_versionr, eth_raw_versionr, r2, r3);
-}
-
-static void setupEthernet() {
-    pinMode(ETH_RST_PIN, OUTPUT);
-    digitalWrite(ETH_RST_PIN, LOW);   delay(25);
-    digitalWrite(ETH_RST_PIN, HIGH);  delay(200);  // W5500 PLL lock up to 150 ms after RST
-
-    // MISO pin diagnostic — checks whether MISO is being driven by the chip
-    // or just floating. Runs first because it's the most likely failure mode.
-    misoPinDiagnostic();
-
-    // Raw SPI probe BEFORE the Ethernet library probe — gives us a ground-truth
-    // read of MISO so we can tell wiring problems apart from chip problems.
-    rawProbeW5500();
-
-    Ethernet.init(ETH_CS_PIN);
-
-    // CRITICAL: Ethernet.hardwareStatus() returns NoHardware UNTIL Ethernet.begin()
-    // has run, because chip detection happens inside W5100.init() which is only
-    // called from begin(). So we have to call begin() first, then interpret the
-    // results. begin() also performs DHCP at the same time — no separate API.
-    //
-    // Timeout: 10 s lease + 4 s per-response. Most DHCP servers reply within
-    // 1-2 s, but some routers under load take 4-6 s. 10 s gives plenty of
-    // headroom while still keeping boot under ~12 s if DHCP fails entirely.
-    Serial.print(F("[eth] DHCP..."));
-    const int begin_result = Ethernet.begin(const_cast<byte*>(ETH_MAC), 10000, 4000);
-
-    const EthernetHardwareStatus hw = Ethernet.hardwareStatus();
-    eth_chip_name = (hw == EthernetW5500) ? "W5500" :
-                    (hw == EthernetW5200) ? "W5200" :
-                    (hw == EthernetW5100) ? "W5100" : "NONE";
-
-    if (hw == EthernetNoHardware) {
-        eth_link_boot   = "(no chip)";
-        eth_dhcp_result = "(no chip)";
-        Serial.println(F(" no chip detected"));
-        return;
-    }
-    eth_hw_present = true;
-
-    const EthernetLinkStatus lnk = Ethernet.linkStatus();
-    eth_link_boot = (lnk == LinkON)  ? "UP" :
-                    (lnk == LinkOFF) ? "DOWN" : "unknown";
-
-    if (begin_result == 0) {
-        eth_dhcp_result = (lnk == LinkOFF) ? "(no link)" : "failed";
-        Serial.printf(" failed  (chip=%s, link=%s)\n", eth_chip_name, eth_link_boot);
-    } else {
-        eth_dhcp_result = "OK";
-        IPAddress ip = Ethernet.localIP();
-        snprintf(eth_ip_str, sizeof(eth_ip_str), "%d.%d.%d.%d",
-                 ip[0], ip[1], ip[2], ip[3]);
-        Serial.printf(" OK  IP: %s  (chip=%s, link=%s)\n",
-                      eth_ip_str, eth_chip_name, eth_link_boot);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// NTP — query a public time server once at boot to set the Teensy 4.1 RTC.
-// Uses 0.pool.ntp.org by default. The RTC drifts only ~50 ppm and a track
-// session lasts a few hours at most, so a single boot sync is enough.
-// (For long-running deployments, we'd add a periodic non-blocking re-sync.)
-// ---------------------------------------------------------------------------
-constexpr const char* NTP_SERVER       = "0.pool.ntp.org";
-constexpr uint16_t    NTP_LOCAL_PORT   = 8888;
-constexpr uint16_t    NTP_PACKET_SIZE  = 48;
-constexpr uint32_t    NTP_TO_UNIX_SECS = 2208988800UL;  // 1900→1970 epoch delta
-
-static EthernetUDP ntpUdp;
-static const char* ntp_status = "(not run)";   // for the [eth-dbg] line
-
-static bool queryNtpOnce() {
-    uint8_t pkt[NTP_PACKET_SIZE] = {0};
-    pkt[0]  = 0xE3;   // LI=11 unsync, VN=4, Mode=3 client
-    pkt[1]  = 0;      // stratum
-    pkt[2]  = 6;      // poll interval
-    pkt[3]  = 0xEC;   // peer clock precision
-    pkt[12] = 49; pkt[13] = 0x4E; pkt[14] = 49; pkt[15] = 52;   // ref id "1N14"
-
-    if (!ntpUdp.beginPacket(NTP_SERVER, 123)) return false;   // includes DNS
-    ntpUdp.write(pkt, NTP_PACKET_SIZE);
-    if (!ntpUdp.endPacket()) return false;
-
-    const uint32_t deadline = millis() + 1500;
-    while ((int32_t)(deadline - millis()) > 0) {
-        if (ntpUdp.parsePacket() >= (int)NTP_PACKET_SIZE) {
-            ntpUdp.read(pkt, NTP_PACKET_SIZE);
-            // Bytes 40-43: transmit timestamp seconds (big-endian, since 1900).
-            const uint32_t ntpSecs = ((uint32_t)pkt[40] << 24) |
-                                     ((uint32_t)pkt[41] << 16) |
-                                     ((uint32_t)pkt[42] <<  8) |
-                                     ((uint32_t)pkt[43]);
-            if (ntpSecs < NTP_TO_UNIX_SECS) return false;   // bogus packet
-            const uint32_t unixSecs = ntpSecs - NTP_TO_UNIX_SECS;
-            Teensy3Clock.set((time_t)unixSecs);
-            setTime((time_t)unixSecs);
-            Serial.printf("[ntp] OK  unix=%lu\n", (unsigned long)unixSecs);
-            return true;
-        }
-        delay(5);
-    }
-    return false;
-}
-
-static void setupNtp() {
-    if (!eth_hw_present || strcmp(eth_ip_str, "0.0.0.0") == 0) {
-        Serial.println(F("[ntp] skipped (no IP)"));
-        ntp_status = "skipped";
-        return;
-    }
-    if (!ntpUdp.begin(NTP_LOCAL_PORT)) {
-        Serial.println(F("[ntp] UDP begin failed"));
-        ntp_status = "udp-fail";
-        return;
-    }
-    Serial.printf("[ntp] querying %s ...\n", NTP_SERVER);
-    for (int attempt = 1; attempt <= 3; ++attempt) {
-        if (queryNtpOnce()) {
-            ntp_status = "OK";
-            ntpUdp.stop();
-            return;
-        }
-        Serial.printf("[ntp] attempt %d timed out\n", attempt);
-        delay(300);
-    }
-    Serial.println(F("[ntp] giving up — RTC unchanged"));
-    ntp_status = "failed";
-    ntpUdp.stop();
-}
-
-// Returns true and updates eth_ip_str if the current IP differs from the
-// last-emitted value. Call after Ethernet.maintain() so lease renewals
-// trigger a fresh ETH line to the dash.
-static bool ethIpChanged() {
-    IPAddress ip = Ethernet.localIP();
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-    if (strcmp(buf, eth_ip_str) == 0) return false;
-    strncpy(eth_ip_str, buf, sizeof(eth_ip_str));
-    return true;
-}
-
-// ---------------------------------------------------------------------------
 // SD card — Teensy 4.1 built-in SDIO slot (BUILTIN_SDCARD constant).
 // Detects whether a card is present and whether it has a valid FAT filesystem.
 // Supports on-demand FAT32 format triggered by a dash SDFORMAT command.
@@ -2146,7 +1997,7 @@ static void dbgOpen(const char* sessionPath) {
     int n = snprintf(hdr, sizeof(hdr),
         "{\"ev\":\"open\",\"unix\":%lu,\"fw\":\"%s\",\"track\":\"%s\",\"rec_cl\":%d,\"inet\":%u,\"reset\":\"%s\"}\n",
         (unsigned long)session_start_unix, FIRMWARE_VERSION, current_track,
-        (int)g_cfg.rec_cl, (unsigned)g_cfg.inet, teensy_reset_reason);
+        (int)g_cfg.rec_cl, 1u, teensy_reset_reason);  // legacy log inet=1: WiFi only
     if (n > 0) { dbg_file.write((const uint8_t*)hdr, n); dbg_file.sync(); }
 }
 
@@ -2305,7 +2156,6 @@ static void openSession() {
 
 // Forward decl — cloud helpers live below this block but closeSession() uses them.
 static constexpr int HTTP_STATUS_CANCELLED = -1;
-static int  httpPost(const char* path, const uint8_t* body, size_t body_len, File32* file_body);
 static int  cloudUploadFile(const char* path, size_t body_len, File32* f);
 static bool moveToQueue(const char* src_path);
 static void scanQueue();
@@ -2328,7 +2178,7 @@ static void closeSession() {
     const bool have_file = (session_path[0] != '\0' && sdFat.exists(session_path));
     Serial.printf("[closeSession] path=%s have_file=%d rec_cl=%d inet=%u host=%s port=%u\n",
                   session_path, (int)have_file, (int)g_cfg.rec_cl,
-                  (unsigned)g_cfg.inet,
+                  1u,  // legacy diagnostic inet=1: WiFi only
                   g_cfg.host[0] ? g_cfg.host : "<unset>", (unsigned)g_cfg.port);
     if (have_file && g_cfg.rec_cl) {
         // The session is normally already in /queue/ (openSession writes there
@@ -2376,17 +2226,25 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
     // Hand-rolled NDJSON — avoids ArduinoJson dep, ~250 bytes/sample.
     // -1 sentinels for oil/coolant become JSON null so the server can
     // distinguish "sensor faulted" from a real zero.
-    char buf[384];   // ~305 B worst case with tps/spark — keep slack
+    char buf[SESSION_LINE_CAP];  // includes AFR/lambda + provenance/fault fields
     int n = 0;
+    auto append = [&](const char* fmt, ...) {
+        if (n < 0) return;
+        va_list args; va_start(args, fmt);
+        const int used = vsnprintf(buf + n, sizeof(buf) - n, fmt, args);
+        va_end(args);
+        if (used < 0 || (size_t)used >= sizeof(buf) - n) n = -1;
+        else n += used;
+    };
     if (session_start_unix > 0) {
-        n = snprintf(buf, sizeof(buf),
+        append(
             "{\"t\":%lu.%03lu,\"fix\":%u,\"sats\":%u,\"lat\":%.6f,\"lon\":%.6f,"
             "\"speed_mph\":%.1f,\"heading_deg\":%.1f,\"rpm\":%u,",
             (unsigned long)t_sec, (unsigned long)frac,
             fix, sats, lat_deg, lon_deg, mph, hdg_deg, rpm);
     } else {
         // No RTC: emit relative ms since session start as "t_ms" instead of "t".
-        n = snprintf(buf, sizeof(buf),
+        append(
             "{\"t_ms\":%lu,\"fix\":%u,\"sats\":%u,\"lat\":%.6f,\"lon\":%.6f,"
             "\"speed_mph\":%.1f,\"heading_deg\":%.1f,\"rpm\":%u,",
             (unsigned long)dt_ms,
@@ -2395,12 +2253,20 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
     if (n < 0 || n >= (int)sizeof(buf)) return;
 
     // Lap number (only when an S/F line is known, so the server can trust it).
-    if (lap >= 0) n += snprintf(buf+n, sizeof(buf)-n, "\"lap\":%d,", lap);
+    if (lap >= 0) append("\"lap\":%d,", lap);
 
-    if (oil_x10 < 0)  n += snprintf(buf+n, sizeof(buf)-n, "\"oil_psi\":null,");
-    else              n += snprintf(buf+n, sizeof(buf)-n, "\"oil_psi\":%.1f,",  oil_x10 * 0.1f);
-    if (cool_x10 < 0) n += snprintf(buf+n, sizeof(buf)-n, "\"coolant_f\":null,");
-    else              n += snprintf(buf+n, sizeof(buf)-n, "\"coolant_f\":%.1f,", cool_x10 * 0.1f);
+    if (oil_x10 < 0) append("\"oil_psi\":null,");
+    else            append("\"oil_psi\":%.1f,", oil_x10 * 0.1f);
+    if (cool_x10 < 0) append("\"coolant_f\":null,");
+    else             append("\"coolant_f\":%.1f,", cool_x10 * 0.1f);
+
+    // Display toggle never gates logging. AEM selected = log it even on fault;
+    // never silently substitute MS3 values or invent lambda from an unknown fuel.
+    if (g_cfg.aem_afr && n >= 0) {
+        const int used = aemafr::jsonFragment(buf + n, sizeof(buf) - n, aem_reading);
+        if (used < 0 || (size_t)used >= sizeof(buf) - n) return;
+        n += used;
+    }
 
     // Race-analysis channels (v0.1.109): throttle % + timing advance (°BTDC,
     // the knock-retard proxy). TPS comes from MS3 CAN when live, else from the
@@ -2414,12 +2280,12 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
         if (can_ok && can_ecu.tps_x10 >= 0) tps = can_ecu.tps_x10;
         else if (bt_ok && bt_tps_x10 >= 0)  tps = bt_tps_x10;
         if (tps >= 0)
-            n += snprintf(buf+n, sizeof(buf)-n, "\"tps_pct\":%.1f,", tps * 0.1f);
+            append("\"tps_pct\":%.1f,", tps * 0.1f);
         if (bt_ok && bt_spark_x10 > -1000)
-            n += snprintf(buf+n, sizeof(buf)-n, "\"spark_deg\":%.1f,", bt_spark_x10 * 0.1f);
+            append("\"spark_deg\":%.1f,", bt_spark_x10 * 0.1f);
     }
 
-    n += snprintf(buf+n, sizeof(buf)-n,
+    append(
         "\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"gx\":%.1f,\"gy\":%.1f,\"gz\":%.1f}\n",
         ax, ay, az, gx, gy, gz);
     if (n < 0 || n >= (int)sizeof(buf)) return;
@@ -2492,6 +2358,11 @@ static void handleCfgLine(const String& line) {
     else if (key == "cl_key")   { strncpy(g_cfg.api_key, val.c_str(), sizeof(g_cfg.api_key)-1); g_cfg.api_key[sizeof(g_cfg.api_key)-1]=0; }
     else if (key == "rec_sd")   { g_cfg.rec_sd = (val.toInt() != 0); }
     else if (key == "rec_cl")   { g_cfg.rec_cl = (val.toInt() != 0); }
+    else if (key == "afraem") {
+        if (val != "0" && val != "1") return;
+        g_cfg.aem_afr = (val == "1");
+        aem_reading = aemafr::Reading{};
+    }
     else if (key == "dbg_on")   { g_cfg.debug_enabled = (val.toInt() != 0);
         Serial.printf("[cfg] debug logging = %s\n", g_cfg.debug_enabled ? "ON" : "OFF"); }
     else if (key == "gpsbaud") {
@@ -2521,7 +2392,9 @@ static void handleCfgLine(const String& line) {
         Serial.printf("[cfg] S/F line %s\n", sf_lap.has_line ? "set" : "cleared");
     }
     else if (key == "inet") {
-        g_cfg.inet = (uint8_t)val.toInt();
+        // Retired setting: tolerate older dashes without allowing a route switch.
+        Serial.println(F("[cfg] inet ignored: WiFi via dash only"));
+        return;
     } else if (key == "srctyp") {
         // Sensor source: 0=Direct (opto tach + ADC sensors), 1=MegaSquirt (CAN),
         // 2=Bluetooth (dash-side BLE OBD-II for slow readings). 2 behaves like
@@ -2565,29 +2438,20 @@ static void handleCfgLine(const String& line) {
             Serial.printf("[cfg] gps drift filter = %u\n", (unsigned)v);
         }
     }
+    else if (key == "viden") {
+        if (val != "0" && val != "1") return;
+        const bool en = (val == "1");
+        g_cfg.video_en = en;
+        videoSend("VIDEN,%u", (unsigned)en);
+        if (en && recording_active) videoNotifyRec(true);
+        else if (!en) videoNotifyRec(false);
+        Serial.printf("[cfg] video interconnect = %s\n", en ? "ON" : "OFF");
+    }
     else {
         Serial.printf("[cfg] unknown key %s\n", key.c_str());
         return;
     }
     Serial.printf("[cfg] %s = %s\n", key.c_str(), val.c_str());
-}
-
-// URL-encode the small subset that actually shows up in track names. Anything
-// outside [A-Za-z0-9._~-] becomes %XX. Writes up to outsize-1 chars + NUL.
-static void urlEncode(const char* in, char* out, size_t outsize) {
-    // 'HEX' would collide with Teensy core Print.h's HEX macro — use a name
-    // unlikely to be a #define.
-    static const char HEX_DIGITS[] = "0123456789ABCDEF";
-    size_t o = 0;
-    for (size_t i = 0; in[i] && o + 4 < outsize; ++i) {
-        const unsigned char c = (unsigned char)in[i];
-        const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                          (c >= '0' && c <= '9') || c == '.' || c == '_' ||
-                          c == '~' || c == '-';
-        if (safe) { out[o++] = (char)c; }
-        else      { out[o++] = '%'; out[o++] = HEX_DIGITS[c >> 4]; out[o++] = HEX_DIGITS[c & 0xF]; }
-    }
-    out[o] = '\0';
 }
 
 // Emit upload progress to the dash. file_body==nullptr means live-stream
@@ -2609,113 +2473,8 @@ static void emitUploadDone(const char* status, const char* reason) {
     }
 }
 
-// Single POST primitive. body may be a contiguous buffer (live stream) or a
-// file streamed in fixed-size chunks (after-race / queue). For the file path
-// the caller passes body=nullptr + body_len=total + file=open File32. Returns
-// HTTP status code, HTTP_STATUS_CANCELLED on user cancel, or 0 on connect/
-// transport failure.
-static int httpPost(const char* path, const uint8_t* body, size_t body_len,
-                    File32* file_body) {
-    auto fail = [](const char* why) -> int {
-        snprintf(last_upload_err, sizeof(last_upload_err), "%s", why);
-        return 0;
-    };
-    if (uploads_disabled)                                   return fail("uploads disabled");
-    if (!eth_hw_present)                                    return fail("no W5500 detected");
-    if (Ethernet.linkStatus() != LinkON)                    return fail("Ethernet link down");
-    if (g_cfg.host[0] == '\0' || g_cfg.port == 0)           return fail("cloud host/port unset");
-    if (g_cfg.proto != 0) {
-        return fail("Teensy supports only HTTP (use WiFi for HTTPS)");
-    }
-
-    EthernetClient c;
-    c.setConnectionTimeout(800);
-    if (!c.connect(g_cfg.host, g_cfg.port)) {
-        Serial.printf("[cloud] connect %s:%u failed\n", g_cfg.host, g_cfg.port);
-        return fail("TCP connect failed");
-    }
-
-    // Build a single header blob and write in one go so the W5500 sends a
-    // single short TCP segment for the request line + headers.
-    char trackEsc[64]; urlEncode(current_track, trackEsc, sizeof(trackEsc));
-    char hdr[512];
-    int hn = snprintf(hdr, sizeof(hdr),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Content-Type: application/x-ndjson\r\n"
-        "X-API-Key: %s\r\n"
-        "X-User-Email: %s\r\n"
-        "X-Session-Id: %lu\r\n"
-        "X-Track-Name: %s\r\n"
-        "Content-Length: %u\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        path, g_cfg.host, g_cfg.api_key, g_cfg.email,
-        (unsigned long)session_start_unix, trackEsc, (unsigned)body_len);
-    if (hn < 0 || hn >= (int)sizeof(hdr)) { c.stop(); return 0; }
-    c.write((const uint8_t*)hdr, (size_t)hn);
-
-    if (file_body) {
-        // Stream the file in 1 KB chunks. Rewinds the file to the start first.
-        if (!file_body->seek(0)) { c.stop(); return 0; }
-
-        upload_in_progress    = true;
-        upload_cancel_pending = false;
-        uint8_t chunk[1024];
-        size_t  remaining     = body_len;
-        uint32_t done         = 0;
-        uint32_t last_prog_ms = 0;
-        emitUploadProg(0);
-        while (remaining > 0 && c.connected()) {
-            // Pump dash commands so an in-flight UPLOAD,CANCEL is observed
-            // without waiting for the post-POST loop tick.
-            pumpDashCommands();
-            if (upload_cancel_pending) {
-                c.stop();
-                upload_in_progress = false;
-                return HTTP_STATUS_CANCELLED;
-            }
-            size_t want = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
-            const int got = file_body->read(chunk, want);
-            if (got <= 0) break;
-            const int w   = c.write(chunk, (size_t)got);
-            if (w != got) { c.stop(); upload_in_progress = false; return 0; }
-            remaining -= (size_t)got;
-            done      += (size_t)got;
-            if (millis() - last_prog_ms >= 250) {
-                last_prog_ms = millis();
-                emitUploadProg(done);
-            }
-        }
-        emitUploadProg(done);
-        upload_in_progress = false;
-    } else if (body && body_len > 0) {
-        c.write(body, body_len);
-    }
-
-    // Read just enough of the response to grab the status code: "HTTP/1.1 NNN ..."
-    int status = 0;
-    const uint32_t deadline = millis() + 1500;
-    String line; line.reserve(64);
-    while (millis() < deadline && (c.connected() || c.available())) {
-        while (c.available() && (int32_t)(deadline - millis()) > 0) {
-            const char ch = (char)c.read();
-            if (ch == '\n') goto done_status;
-            if (ch != '\r' && line.length() < 60) line += ch;
-        }
-        delay(1);
-    }
-done_status:
-    if (line.length() >= 12 && line.startsWith("HTTP/")) {
-        status = line.substring(9, 12).toInt();
-    }
-    c.stop();
-    return status;
-}
-
 // --- WiFi-via-dash forwarder --------------------------------------------
-// When g_cfg.inet == 1 (WiFi), the dash owns the WiFi link. We can't HTTP
-// from the Teensy in that case. Instead we forward session files to the dash
+// The dash owns the only network link. We forward session files to the dash
 // over UART using a tiny line-oriented protocol; the dash performs the
 // actual HTTPS POST and reports back. NDJSON files are naturally line-based
 // so each sample (~250 B) becomes one WUP,L,<line> message.
@@ -2806,7 +2565,7 @@ static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
     upload_cancel_pending = false;
     emitUploadProg(0);
 
-    char     line[320];
+    char     line[SESSION_LINE_CAP];
     size_t   line_n      = 0;
     uint32_t lines       = 0;
     uint32_t bytes       = 0;
@@ -2892,16 +2651,11 @@ static int wupForwardFile(const char* path, const uint8_t* /*unused*/,
     return 0;
 }
 
-// Pick the right upload mechanism based on inet mode. Ethernet uses the local
-// httpPost(); WiFi-via-dash routes through wupForwardFile(). emitUploadStart
-// has already been called by the session-end / queue-walker code paths so the
-// dash modal is already up.
+// Legacy queue drain still uses WiFi-via-dash. Normal uploads use the newer
+// dash-initiated Q,* protocol. emitUploadStart has already opened the modal.
 static int cloudUploadFile(const char* path, size_t body_len, File32* f) {
     last_upload_err[0] = '\0';   // reset before each attempt
-    if (wifiInetActive()) {
-        return wupForwardFile(path, nullptr, body_len, f);
-    }
-    return httpPost("/upload", nullptr, body_len, f);
+    return wupForwardFile(path, nullptr, body_len, f);
 }
 
 // --- Cloud status emit ---------------------------------------------------
@@ -3358,9 +3112,11 @@ static void handleQGetLegacy(const char* args) {
     // ring) rides through the dash's UI-loop ack latency and pushes the hop
     // toward the wire's ~90 KB/s. RAM cost: 15 KB static (T4.1 has 1 MB).
     constexpr uint32_t QGET_WIN = 48;
-    static char     wtext[QGET_WIN][320];   // retransmit ring (static: ~15 KB, off the stack)
+    static_assert(QGET_WIN * (SESSION_LINE_CAP + 16) <= 32768 - 1024,
+                  "Legacy window must fit dash RX ring with header/slack");
+    static char     wtext[QGET_WIN][SESSION_LINE_CAP]; // ~30 KB; now includes AFR fields
     static uint16_t wlen[QGET_WIN];
-    char     line[320];
+    char     line[SESSION_LINE_CAP];
     size_t   line_n = 0;
     uint32_t seq = 0;
     long     last_acked = 0;
@@ -3584,13 +3340,8 @@ static void cloudTick() {
     }
     // Manual-only drain. Auto-drain has been disabled: the queue walker
     // only runs when the dash UPLOAD button sets drain_queue_now = true.
-    // Ethernet path also requires a real link before we let it try.
+    // The dash checks WiFi availability when accepting the legacy forwarder.
     if (!drain_queue_now) return;
-    if (!wifiInetActive() &&
-        (!eth_hw_present || Ethernet.linkStatus() != LinkON)) {
-        drain_queue_now = false;
-        return;
-    }
     if (queue_depth == 0) {
         drain_queue_now = false;
         return;
@@ -3616,6 +3367,13 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     Serial.begin(115200);
     DASH_SERIAL.begin(DASH_BAUD);
+    {
+        static uint8_t vidRxBuf[256];
+        static uint8_t vidTxBuf[512];
+        Serial1.addMemoryForRead(vidRxBuf, sizeof(vidRxBuf));
+        Serial1.addMemoryForWrite(vidTxBuf, sizeof(vidTxBuf));
+    }
+    VID_SERIAL.begin(VID_BAUD);
     // RX buffer sizing matters BIG TIME for Phase 2b firmware updates:
     // FlasherX's flash_write_block() does a 4 KB sector erase whenever the
     // staged image crosses a sector boundary, and that erase can stall the
@@ -3708,6 +3466,7 @@ void setup() {
     // calibration shift absorbed during sensor calibration.
     pinMode(OIL_ADC_PIN,     INPUT_PULLDOWN);
     pinMode(COOLANT_ADC_PIN, INPUT_PULLDOWN);
+    pinMode(AEM_AFR_ADC_PIN, INPUT); // NO internal pull: external 20k/20k defines gain
     Serial.println(F("Analog: oil PSI on A2, coolant degF on A3 (12-bit, x16 avg, pulldown)"));
 
     // IMU on Wire (SDA=18, SCL=19). Non-fatal if absent.
@@ -3716,12 +3475,8 @@ void setup() {
     // check; falls back to EEPROM offsets if the car is moving at boot.
     if (imu_present) calibrateIMU();
 
-    // W5500 Ethernet (SPI0: CS=10, RST=6). Non-fatal if unplugged.
-    setupEthernet();
-    DASH_SERIAL.printf("ETH,%s\n", eth_ip_str);   // emit immediately so dash picks up IP
-
-    // NTP — sets the Teensy RTC if Ethernet got an IP. Non-fatal otherwise.
-    setupNtp();
+    // WiFi/NTP live on the dash, which relays SETTIME. GPS also syncs this RTC.
+    // No Ethernet probes, DHCP waits or network pin configuration on the Teensy.
 
     // Built-in SDIO SD card. Non-fatal if absent.
     detectSD();
@@ -4042,6 +3797,16 @@ static void emitToDash() {
                            rpm, oil_psi_x10, cool_f_x10, ax, ay, az, gx, gy, gz);
     }
 
+    // Same per-sample snapshot feeds the dash and SD (independent of engine source).
+    aem_reading = aemafr::Reading{};
+    if (g_cfg.aem_afr) {
+        aem_reading = test_mode_active
+            ? aemafr::fromMillivolts(3000 + (int)(400.0f * sinf(millis() * 0.001f)))
+            : aemafr::fromAdc(analogRead(AEM_AFR_ADC_PIN));
+    }
+    DASH_SERIAL.printf("AFR,%u,%d,%d,%d\n", (unsigned)aem_reading.status,
+                       aem_reading.afr_x100, aem_reading.lambda_x10000, aem_reading.mv);
+
     DASH_SERIAL.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u\n",
                        fix, sats, lat_deg, lon_deg, mph, hdg_deg, status);
     Serial.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u  (raw_bytes=%lu)\n",
@@ -4080,9 +3845,13 @@ static void emitToDash() {
     }
 
     // Time of day from RTC — piggybacks on the 1 Hz GPS heartbeat so the dash
-    // gets a fresh TIME line every emit without a separate periodic block in
-    // loop() (which previously was causing UART stalls via Ethernet.maintain()).
+    // gets a fresh TIME line every emit without a separate periodic block.
     DASH_SERIAL.printf("TIME,%lu\n", (unsigned long)now());
+
+    int16_t afr_x10 = -1;
+    if (aem_reading.status == aemafr::VALID) afr_x10 = (int16_t)(aem_reading.afr_x100 / 10);
+    else if (can_ecu.afr_x10 > 0)            afr_x10 = can_ecu.afr_x10;
+    videoCapture(rpm, mph, oil_psi_x10, cool_f_x10, afr_x10, lat_deg, lon_deg);
 }
 
 void loop() {
@@ -4105,34 +3874,9 @@ void loop() {
     // Drain commands from the dash (REC, TRACK, SDFORMAT, …) and developer
     // commands from native USB (VER?, USBFWUPDATE).
     pumpDashCommands();
+    pumpVidCommands();
+    videoHudTick();
     pumpUsbCommands();
-
-    // NOTE: Ethernet maintenance and periodic SD/ETH status emission used to
-    // happen here in a 2 s block. That block was causing UART stalls — when
-    // the W5500 was wired and Ethernet.maintain() / Ethernet.localIP() were
-    // called, the SPI transactions delayed the loop past the dash's 2 s STALE
-    // threshold. We now emit ETH only at boot and TIME inside emitToDash()
-    // (1 Hz with the GPS heartbeat). DHCP lease renewal is also dropped — for
-    // a track session the lease will outlast it.
-
-    // Periodic ethernet diagnostic output to USB Serial only (NEVER touch
-    // DASH_SERIAL here — that's the dash UART). Boot info is cached so we
-    // can keep showing what happened without re-running blocking probes.
-    // We DO read linkStatus() each tick — it's a single SPI register read,
-    // a few hundred microseconds, fine for a 1 Hz GPS heartbeat budget.
-    static uint32_t lastEthDbgMs = 0;
-    if (millis() - lastEthDbgMs >= 3000) {
-        lastEthDbgMs = millis();
-        const char* live_link = "n/a";
-        if (eth_hw_present) {
-            const EthernetLinkStatus lnk = Ethernet.linkStatus();
-            live_link = (lnk == LinkON)  ? "UP" :
-                        (lnk == LinkOFF) ? "DOWN" : "?";
-        }
-        Serial.printf("[eth-dbg] chip=%s  link=now=%s  DHCP=%s  ip=%s  NTP=%s\n",
-                      eth_chip_name, live_link, eth_dhcp_result, eth_ip_str,
-                      ntp_status);
-    }
 
     // Drain both RPM sources every loop; emitToDash() picks the active one.
     pumpTach();

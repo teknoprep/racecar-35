@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.lck
+*.kicad_prl
+*-backups/
+logs/
+freerouting.json
