@@ -59,10 +59,13 @@ def r(ref,val,x,y,a,b,g,angle=0,precision=False):
     return part(ref,val+(' 0.1%' if precision else ' 1%'),RFP,x,y,{1:a,2:b},mpn,'Yageo',g,angle,
                 notes='Thin-film 0.1%' if precision else '0805; >=0.125W')
 def c(ref,val,x,y,a,b,g,angle=0):
-    mpn={'100n':'GRM21BR71H104KA01L','1n':'GRM21BR71H102KA01L','2.2n':'GRM21BR71H222KA01L',
-         '10n':'GRM21BR71H103KA01L','1u':'GRM21BR71H105KA12L','2.2u':'GRM21BR71H225KA01L',
-         '10u':'GRM21BR61E106KA73L'}[val]
-    return part(ref,val,CFP,x,y,{1:a,2:b},mpn,'Murata',g,angle,notes='X7R 50V; 10uF is X5R 25V')
+    # BOM-REV1: three Murata values have no LCSC stock; substituted with
+    # electrically identical X7R 50V parts (same 0805 footprint).
+    mpn,maker={'100n':('GRM21BR71H104KA01L','Murata'),'1n':('CC0805KRX7R9BB102','Yageo'),
+         '2.2n':('GRM21BR71H222KA01L','Murata'),'10n':('CL21B103KBANNNC','Samsung'),
+         '1u':('GRM21BR71H105KA12L','Murata'),'2.2u':('CC0805KKX7R9BB225','Yageo'),
+         '10u':('GRM21BR61E106KA73L','Murata')}[val]
+    return part(ref,val,CFP,x,y,{1:a,2:b},mpn,maker,g,angle,notes='X7R 50V; 10uF is X5R 25V')
 def clamp(ref,volts,x,y,a,g):
     # LM4040 SOT23: K1 / A2 / pin3 may tie to A (NOT universal TL431 pinout).
     return part(ref,'LM4040 '+volts,SOT3,x,y,{1:a,2:'GND',3:'GND'},
@@ -90,7 +93,7 @@ for ref,x,y,val,mpn,a,b,ang in [('F1',40,112,5,'0451005.MRL','VIN_RAW','VIN_FUSE
 part('D1','SMBJ20CA','Diode_SMD:D_SMB',46,107,{1:'VIN_FUSED',2:'GND'},'SMBJ20CA','Littelfuse','power',notes='Bidirectional TVS; NOT automotive load-dump qualification')
 part('C1','100uF 50V','Capacitor_THT:CP_Radial_D8.0mm_P3.50mm',55,116,{1:'VIN_PROTECTED',2:'GND'},'EEU-FR1H101','Panasonic','power',180)
 part('C2','470uF 10V','Capacitor_THT:CP_Radial_D8.0mm_P3.50mm',103,119,{1:'+5V_SCREEN',2:'GND'},'EEU-FR1A471B','Panasonic','power')
-part('D2','SS14','Diode_SMD:D_SMA',92,29,{1:'VIN_DIODE',2:'+5V_MAIN'},'SS14','Diodes Incorporated','power',names={1:'K',2:'A'})
+part('D2','SS14','Diode_SMD:D_SMA',92,29,{1:'VIN_DIODE',2:'+5V_MAIN'},'SS14','onsemi','power',names={1:'K',2:'A'},notes='BOM-REV1: onsemi is the orderable MPN (bare SS14 from Diodes Inc is not).')
 part('JP1','MCU POWER','Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical',84,29,{1:'VIN_DIODE',2:'TEENSY_VIN'},'TSW-102-07-G-S','Samtec','power',notes='Fit shunt after unloaded rail tests; cut Teensy VUSB-VIN before dual-power use')
 
 # 02: socketed Teensy. Pad numbering matches the proven outer-row footprint.
@@ -155,7 +158,7 @@ part('J_ANT','GPS SMA FEMALE','Connector_Coaxial:SMA_Amphenol_901-143_Horizontal
      '901-143','Amphenol RF','gps',notes='Active GPS antenna 3.3V bias, never WiFi. Supplier drawing/board-edge fit must be inspected.')
 part('C_RF','100pF C0G','Capacitor_SMD:C_0402_1005Metric',125,33,{1:'RF_ANT',2:'RF_GNSS'},'GRM1555C1H101JA01D','Murata','gps',270)
 part('L_RF','27nH RF choke','Inductor_SMD:L_0402_1005Metric',131,29,{1:'RF_ANT',2:'ANT_BIAS'},'LQG15HS27NJ02D','Murata','gps')
-part('D_RF','RF ESD','Diode_SMD:D_SOD-882',122,28,{1:'RF_ANT',2:'GND'},'PESD3V3U1UL,315','Nexperia','gps',notes='RF-rated low-capacitance ESD. Verify capacitance/S-parameter budget at GNSS bands.')
+part('D_RF','RF ESD','Diode_SMD:D_SOD-882',122,28,{1:'RF_ANT',2:'GND'},'PESD5V0F1BL,315','Nexperia','gps',notes='BOM-REV1: 5.5V standoff / 0.4pF bidirectional (PESD3V3U1UL was 3.3V/2.6pF and is out of stock). Same SOD-882/DFN1006-2 footprint; antenna bias is 3.3V so the higher standoff is also correct. Verify capacitance/S-parameter budget at GNSS bands.')
 part('U_ANT','TPS2553','Package_TO_SOT_SMD:SOT-23-6',140,34,
  {1:'+3V3_AUX',2:'GND',3:'+3V3_AUX',5:'+3V3_AUX',6:'ANT_SWITCH'},'TPS2553DBVR','Texas Instruments','gps',
  names={1:'IN',2:'GND',3:'EN',4:'FAULT_N',5:'ILIM',6:'OUT'},types={1:'power_in',6:'power_out'},
@@ -205,13 +208,13 @@ c('C_INPUT','100n',88,52,'+3V3_MCU','GND','tach')
 # sensor cannot take out the others.
 part('J_OIL','OIL 0.5-4.5V',TFP(3),30,46,{1:'+5V_SENSOR',2:'GND',3:'OIL_SIGNAL'},'1729021','Phoenix Contact','analog',270,
  names={1:'5V OUT',2:'RETURN',3:'SIGNAL'})
-part('F_SENSOR','100mA PTC','Fuse:Fuse_1206_3216Metric',40,60,{1:'+5V_MAIN',2:'+5V_SENSOR'},'1206L010/30YR','Littelfuse','analog')
+part('F_SENSOR','100mA PTC','Fuse:Fuse_1206_3216Metric',40,60,{1:'+5V_MAIN',2:'+5V_SENSOR'},'1206L010/60WR','Littelfuse','analog',notes='BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.')
 part('J_TPS','THROTTLE 0.5-4.5V',TFP(3),30,93,{1:'+5V_TPS',2:'GND',3:'TPS_SIGNAL'},'1729021','Phoenix Contact','analog',270,
  names={1:'5V OUT',2:'RETURN',3:'SIGNAL'})
-part('F_TPS','100mA PTC','Fuse:Fuse_1206_3216Metric',146,34,{1:'+5V_MAIN',2:'+5V_TPS'},'1206L010/30YR','Littelfuse','analog')
+part('F_TPS','100mA PTC','Fuse:Fuse_1206_3216Metric',146,34,{1:'+5V_MAIN',2:'+5V_TPS'},'1206L010/60WR','Littelfuse','analog',notes='BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.')
 part('J_BRAKE','BRAKE 0.5-4.5V',TFP(3),30,112,{1:'+5V_BRK',2:'GND',3:'BRK_SIGNAL'},'1729021','Phoenix Contact','analog',270,
  names={1:'5V OUT',2:'RETURN',3:'SIGNAL'})
-part('F_BRK','100mA PTC','Fuse:Fuse_1206_3216Metric',146,56,{1:'+5V_MAIN',2:'+5V_BRK'},'1206L010/30YR','Littelfuse','analog')
+part('F_BRK','100mA PTC','Fuse:Fuse_1206_3216Metric',146,56,{1:'+5V_MAIN',2:'+5V_BRK'},'1206L010/60WR','Littelfuse','analog',notes='BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.')
 part('J_COOL','COOLANT NTC',TFP(2),30,65,{1:'NTC_SIGNAL',2:'GND'},'1729018','Phoenix Contact','analog',270,names={1:'NTC',2:'RETURN'})
 part('J_AFR','AEM 30-0300 ONLY',TFP(2),30,79,{1:'AFR_SIGNAL',2:'GND'},'1729018','Phoenix Contact','analog',270,
  names={1:'WHITE SIG+',2:'BROWN RETURN'},notes='External AEM gauge only. Gauge supply/heater NOT powered here.')

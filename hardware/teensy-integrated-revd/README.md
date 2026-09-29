@@ -96,7 +96,33 @@ This is hardware only. Still required:
 - The ESP32-S3 network coprocessor firmware/transport is still unimplemented;
   **Teensy pin 13's heartbeat must stop before SPI is enabled.**
 
+## BOM revision 1 — procurement substitutions (2026-09-29)
+
+Applied after the PCBWay quote **T-2SJ3W1113248A** (5 units) came back with five
+out-of-stock lines. **No footprint, net, or routing change** — every substitution
+below is the same package, so the Gerbers are unchanged; the shipped fab package
+was re-exported so its `BOM.csv` matches. Details and sourcing:
+`pcbway/PARTS-AVAILABILITY-REVIEW.md`; the reply sent to PCBWay:
+`pcbway/PCBWAY-REPLY-2026-09-29.pdf`.
+
+| Ref | Was | Now | Why |
+|---|---|---|---|
+| F3 F4 F5 | `1206L010/30YR` | `1206L010/60WR` | the old part number does not exist in the Littelfuse 1206L series |
+| D5 | `PESD3V3U1UL,315` | `PESD5V0F1BL,315` | unobtainable; same SOD-882, 5.5 V standoff (antenna bias is 3.3 V) and 0.4 pF instead of 2.6 pF |
+| D2 | `SS14` (Diodes Inc) | `SS14` (**onsemi**) | the bare MPN is not orderable from Diodes Inc |
+| C10 | `GRM21BR71H103KA01L` | `CL21B103KBANNNC` (Samsung) | no stock; same 10 nF 50 V X7R 0805 |
+| C11 | `GRM21BR71H225KA01L` | `CC0805KKX7R9BB225` (Yageo) | no stock; X7R (PCBWay's proposed X5R part is only rated to 85 °C) |
+| C18 | `GRM21BR71H102KA01L` | `CC0805KRX7R9BB102` (Yageo) | no stock; same 1 nF 50 V X7R 0805 |
+
+**U1 (Teensy 4.1) and U2 (Pololu D36V50F5) are customer-fitted**, not assembled by
+PCBWay: they are socketed/headered modules, and Pololu's own store is rationed.
+The turnkey BOM file to send is `pcbway/Racecar-RevD-BOM-pcbway-assembly-REV1.csv`
+(the canonical full BOM stays in `pcbway/Racecar-RevD-BOM-pcbway-assembly.csv`).
+Two parts are **not in the BOM** and must be bought separately: the **2× 1×24
+2.54 mm female headers** for the Teensy socket, and the **CR2032 cell** itself.
+
 ## Reproducing
+
 
 ```sh
 python3 electrical/make_icm_footprint.py     # derived LAND pattern

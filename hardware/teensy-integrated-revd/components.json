@@ -377,12 +377,12 @@
       "2": "passive"
     },
     "mpn": "SS14",
-    "maker": "Diodes Incorporated",
+    "maker": "onsemi",
     "group": "power",
     "x": 92,
     "y": 29,
     "angle": 0,
-    "notes": "",
+    "notes": "BOM-REV1: onsemi is the orderable MPN (bare SS14 from Diodes Inc is not).",
     "alias": "D2"
   },
   {
@@ -937,8 +937,8 @@
       "1": "passive",
       "2": "passive"
     },
-    "mpn": "GRM21BR71H103KA01L",
-    "maker": "Murata",
+    "mpn": "CL21B103KBANNNC",
+    "maker": "Samsung",
     "group": "imu",
     "x": 91,
     "y": 45,
@@ -962,8 +962,8 @@
       "1": "passive",
       "2": "passive"
     },
-    "mpn": "GRM21BR71H225KA01L",
-    "maker": "Murata",
+    "mpn": "CC0805KKX7R9BB225",
+    "maker": "Yageo",
     "group": "imu",
     "x": 96,
     "y": 50,
@@ -1256,13 +1256,13 @@
       "1": "passive",
       "2": "passive"
     },
-    "mpn": "PESD3V3U1UL,315",
+    "mpn": "PESD5V0F1BL,315",
     "maker": "Nexperia",
     "group": "gps",
     "x": 125,
     "y": 29.8,
     "angle": 0,
-    "notes": "RF-rated low-capacitance ESD. Verify capacitance/S-parameter budget at GNSS bands.",
+    "notes": "BOM-REV1: 5.5V standoff / 0.4pF bidirectional (PESD3V3U1UL was 3.3V/2.6pF and is out of stock). Same SOD-882/DFN1006-2 footprint; antenna bias is 3.3V so the higher standoff is also correct. Verify capacitance/S-parameter budget at GNSS bands.",
     "alias": "D_RF"
   },
   {
@@ -1527,8 +1527,8 @@
       "1": "passive",
       "2": "passive"
     },
-    "mpn": "GRM21BR71H102KA01L",
-    "maker": "Murata",
+    "mpn": "CC0805KRX7R9BB102",
+    "maker": "Yageo",
     "group": "tach",
     "x": 47,
     "y": 28,
@@ -2047,13 +2047,13 @@
       "1": "passive",
       "2": "passive"
     },
-    "mpn": "1206L010/30YR",
+    "mpn": "1206L010/60WR",
     "maker": "Littelfuse",
     "group": "analog",
     "x": 40,
     "y": 60,
     "angle": 0,
-    "notes": "",
+    "notes": "BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.",
     "alias": "F_SENSOR"
   },
   {
@@ -2100,13 +2100,13 @@
       "1": "passive",
       "2": "passive"
     },
-    "mpn": "1206L010/30YR",
+    "mpn": "1206L010/60WR",
     "maker": "Littelfuse",
     "group": "analog",
     "x": 146,
     "y": 34,
     "angle": 0,
-    "notes": "",
+    "notes": "BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.",
     "alias": "F_TPS"
   },
   {
@@ -2153,13 +2153,13 @@
       "1": "passive",
       "2": "passive"
     },
-    "mpn": "1206L010/30YR",
+    "mpn": "1206L010/60WR",
     "maker": "Littelfuse",
     "group": "analog",
     "x": 146,
     "y": 56,
     "angle": 0,
-    "notes": "",
+    "notes": "BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.",
     "alias": "F_BRK"
   },
   {

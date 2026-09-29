@@ -15,6 +15,18 @@ Revision D · four-layer · 150.05 × 155.05 mm · 158 placements · 89 nets
 | `Racecar-RevD-BOM-pcbway-assembly.csv` | Turnkey-assembly BOM in PCBWay's column layout. |
 | `Racecar-RevD-BOM-purchasing.csv` | 68 unique parts aggregated by MPN with references — use this if you buy parts yourself. |
 | `Racecar-RevD-CPL.csv` | Pick-and-place, origin at board lower-left, Y positive up, 158 rows. |
+| `PARTS-AVAILABILITY-REVIEW.md` | **Read before replying to the PCBWay quote.** Six BOM lines must change, two capacitor subs need a counter-proposal, plus verified where-to-buy for the 12 consignment parts. |
+| `BOM-CHANGES.csv` | The same change list in machine-readable form. |
+
+> **⚠️ The BOM files in this folder are CORRECTED to BOM revision 1**
+> (`1206L010/30YR` → `1206L010/60WR`, `PESD3V3U1UL,315` → `PESD5V0F1BL,315`,
+> bare `SS14` → onsemi `SS14`, and three Murata caps with no stock → Yageo/Samsung
+> X7R equivalents). The file to send to PCBWay is
+> **`Racecar-RevD-BOM-pcbway-assembly-REV1.csv`** — it is the corrected BOM with
+> **U1 (Teensy 4.1) and U2 (Pololu 4091) removed**, because we fit those two
+> modules ourselves. The full BOM with both modules still listed (marked
+> "CUSTOMER SUPPLIED") is `Racecar-RevD-BOM-pcbway-assembly.csv`. Reply document:
+> **`PCBWAY-REPLY-2026-09-29.pdf`**. Background: `PARTS-AVAILABILITY-REVIEW.md`.
 
 The full engineering package (schematic PDF, editable CAD, reports, manifest) is
 the parent folder's `Racecar-RevD-GERBERS-ENGINEERING-PROTOTYPE.zip`.
