@@ -23,9 +23,11 @@ Revision D · four-layer · 150.05 × 155.05 mm · 158 placements · 89 nets
 > bare `SS14` → onsemi `SS14`, and three Murata caps with no stock → Yageo/Samsung
 > X7R equivalents). The file to send to PCBWay is
 > **`Racecar-RevD-BOM-pcbway-assembly-REV1.csv`** — it is the corrected BOM with
-> **U1 (Teensy 4.1) and U2 (Pololu 4091) removed**, because we fit those two
-> modules ourselves. The full BOM with both modules still listed (marked
-> "CUSTOMER SUPPLIED") is `Racecar-RevD-BOM-pcbway-assembly.csv`. Reply document:
+> **U1/U2 fitting instructions in its Comment column**: U2 (Pololu 4091) is for
+> PCBWay to source and fit (Digi-Key `2183-4091-ND`), U1 (Teensy 4.1) is customer
+> supplied with pins — PCBWay fits the two 1×24 sockets and we plug the Teensy in.
+> The canonical copy of the same BOM is
+> `Racecar-RevD-BOM-pcbway-assembly.csv`. Reply document:
 > **`PCBWAY-REPLY-2026-09-29.pdf`**. Background: `PARTS-AVAILABILITY-REVIEW.md`.
 
 The full engineering package (schematic PDF, editable CAD, reports, manifest) is

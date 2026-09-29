@@ -1,4 +1,5 @@
 No.,Quantity,Comment,Designator,Footprint,Manufacturer Part Number,Manufacturer,Supplier Part Number
+1,1,PLEASE SOURCE AND FIT (not an LCSC part): Digi-Key 2183-4091-ND / Pololu 4091 - see our reply letter para 3,U2,Pololu_D36V50F5,4091 / D36V50F5,Pololu,
 2,2,TSR 1-2433,U3 U6,Converter_DCDC_TRACO_TSR-1_THT,TSR 1-2433,TRACO Power,
 3,28,100n,C3 C5 C7 C8 C9 C12 C15 C16 C17 C19 C20 C21 C22 C23 C24 C25 C26 C27 C28 C29 C30 C31 C32 C33 C35 C37 C38 C39,C_0805_2012Metric,GRM21BR71H104KA01L,Murata,
 4,4,10u,C4 C6 C13 C34,C_0805_2012Metric,GRM21BR61E106KA73L,Murata,
@@ -10,6 +11,7 @@ No.,Quantity,Comment,Designator,Footprint,Manufacturer Part Number,Manufacturer,
 10,1,470uF 10V,C2,CP_Radial_D8.0mm_P3.50mm,EEU-FR1A471B,Panasonic,
 11,1,SS14,D2,D_SMA,SS14,onsemi,
 12,1,MCU POWER,JP1,PinHeader_1x02_P2.54mm_Vertical,TSW-102-07-G-S,Samtec,
+13,1,CUSTOMER SUPPLIED (Teensy 4.1 with pins). Please FIT 2x 1x24 2.54mm female sockets (Samtec SSW-124-01-G-S) - do NOT fit the Teensy,U1,Teensy41_Socket,TEENSY41,PJRC,
 14,1,CR2032 HOLDER,BT1,BatteryHolder_Keystone_1058_1x2032,1058,Keystone,
 15,1,TO TEENSY VBAT/GND,J9,JST_XH_B2B-XH-A_1x02_P2.50mm_Vertical,B2B-XH-A(LF)(SN),JST,
 16,1,CAN MODULE LOGIC,J7,JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical,B4B-XH-A(LF)(SN),JST,

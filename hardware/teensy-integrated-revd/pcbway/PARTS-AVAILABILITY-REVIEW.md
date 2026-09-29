@@ -1,14 +1,28 @@
 # Rev D — parts availability review (PCBWay quote T-2SJ3W1113248A, 5 units)
 
-> **STATUS: APPLIED (2026-09-29).** The six substitutions below are baked into
-> `../components.json`, `../electrical/generate.py`, `../design/BOM.csv` and both
-> `pcbway/*BOM*.csv`; the engineering fab ZIP was re-exported so its shipped
-> `BOM.csv` matches (ERC/DRC 0 violations, 531 assertions, 456 pads). The reply
-> to send is **`PCBWAY-REPLY-2026-09-29.pdf`** with
-> **`Racecar-RevD-BOM-pcbway-assembly-REV1.csv`** (that file has U1/U2 removed —
-> we fit those two modules ourselves). Decision: PCBWay sources and fits
-> everything else, including the GNSS/IMU/WiFi/SMA/TRACO/Keystone parts they
-> quoted; only U1 (Teensy 4.1) and U2 (Pololu 4091) are customer-fitted.
+> **STATUS: APPLIED (2026-09-29), with U1/U2 handled in the reply letter.** The six
+> substitutions below are baked into `../components.json`, `../electrical/generate.py`,
+> `../design/BOM.csv` and both `pcbway/*BOM*.csv`; the engineering fab ZIP was
+> re-exported so its shipped `BOM.csv` matches (ERC/DRC 0 violations, 531
+> assertions, 456 pads).
+>
+> **Decision on the two modules — nobody hand-solders anything:**
+> * **U2 (Pololu D36V50F5) — PCBWay sources and fits it.** It is not an LCSC part
+>   but it *is* in stock at Digi-Key (`2183-4091-ND`, 264 pcs, US$39.95) and at
+>   Pololu (item 4091). PCBWay already sourced our non-LCSC Amphenol `901-143` and
+>   Keystone `1058` in this same quote, so the letter asks them to buy it the same
+>   way and states we will pay the part plus a sourcing fee; the fallback (they
+>   cannot) is consignment, and they must tell us before the quote is finalised.
+> * **U1 (Teensy 4.1) — customer supplied**, bought *with pins* so the module needs
+>   no soldering; PCBWay fits the two 1×24 sockets, we plug the Teensy in.
+> * Left to us, all plug-in or hand steps: the CR2032 cell, the JP1 shunt (after
+>   bench tests), plugging in the Teensy, and the 2-wire J9 RTC lead.
+>
+> The reply to send is **`PCBWAY-REPLY-2026-09-29.pdf`** with
+> **`Racecar-RevD-BOM-pcbway-assembly-REV1.csv`** (identical content to the
+> canonical `Racecar-RevD-BOM-pcbway-assembly.csv`, under a distinct name so
+> PCBWay can tell it from the file they already have; the Comment column carries
+> the U1/U2 fitting instructions).
 
 Reviewed **2026-09-29** against the PCBWay Bom Quotation
 `Quotation for T-2SJ3W1113248A-5units-Racecar-RevD-BOM-pcbway-assembly(2026-09-29).xls`
@@ -90,15 +104,17 @@ right direction for GNSS. Pin 1 marking is irrelevant on a bidirectional part.
 
 ---
 
-## 4. Parts that must be supplied by us (consignment) or bought ourselves
+## 4. Parts that are not LCSC line items — who gets them
 
-These are not LCSC line items, which is why PCBWay cannot quote them. Stock
-verified 2026-09-29:
+Stock verified 2026-09-29. **U2 and U1 are the only two the quote's automatic
+sourcing failed on; the letter asks PCBWay to buy U2 from Digi-Key/Pololu and ship
+the sockets, and we supply the Teensy.** Everything else in this table PCBWay can
+quote directly (they already price most of it in the quote).
 
 | Ref | Part | Source (verified) | Stock | Price |
 |---|---|---|---|---|
 | U2 | Pololu 4091 / D36V50F5 | **Digi-Key 2183-4091-ND** | 264 | $39.95 (1) |
-| U1 | Teensy 4.1 | **Digi-Key** (SparkFun `DEV-16771`) | 1,169 | $31.50 |
+| U1 | Teensy 4.1 — **order the "with pins" version** | **Digi-Key** (SparkFun `DEV-16771`) or PJRC | 1,169 | $31.50 |
 | U8 | u-blox NEO-M9N-00B | **LCSC C5119087** | 516 | $16.31 |
 | U17 | ESP32-S3-WROOM-1-N8R2 | **LCSC C2913204** | 2,794 | $4.63 |
 | U7 | TDK ICM-42670-P | **LCSC C3288646** (alt Newark) | 10,525 (LCSC) / 2,298 (Newark) | $2.28 |
@@ -117,12 +133,16 @@ pcs, $5.46) but the brand is **YLPTEC**, not TRACO Power. Do not accept it as th
 TRACO part or as a PCBWay substitution. Buy the genuine part from Digi-Key /
 TME / Newark / Sager.
 
-**⚠️ Not in the BOM at all — buying gaps:**
-1. **2× 1×24 2.54 mm female headers** for the Teensy socket (plus matching male
-   pins on the Teensy). `U1` is a socket footprint; the headers are a separate
-   purchase (see `../design/ASSEMBLY.md` step 1).
-2. **1× CR2032 primary cell** per board (the holder is `BT1`, the cell is not).
-   Name-brand, no reflow, fitted last.
+**⚠️ Not in the BOM at all (assembly extras + hand-fit items).** `../design/ASSEMBLY-EXTRAS.csv`
+is the full list; the ones that matter for this order:
+
+| Qty/board | Part | Who | Stock / price |
+|---|---|---|---|
+| 2 | 1×24 2.54 mm female socket (Samtec `SSW-124-01-G-S`) — soldered into the U1 footprint | **PCBWay to fit** | Newark 427 @ $4.20 · Digi-Key 175 (we can consign the Samtec parts) |
+| 1 | Teensy 4.1 **with pins** (PJRC sells this variant) | us — plugs into the sockets, no soldering | Digi-Key / PJRC, $31.50 |
+| 1 | CR2032 primary cell — **never reflowed**, fitted after cleaning | us | any |
+| 1 | JP1 shunt (Harwin `M7566-05`) — **only after unloaded rail tests** | us | Digi-Key 5,393 · Newark 15,847, $0.30 |
+| 1 | RTC lead: JST `XHP-2` housing + 2× `SXH-001T-P0.6` contacts + hook-up wire (J9 → Teensy VBAT/GND pads) | us | Digi-Key 262,854 · 1,329,000 |
 
 ---
 
@@ -142,28 +162,20 @@ saves roughly **$19–24 per board** before shipping, i.e. ~$100 on the 5-unit r
 
 ---
 
-## 6. Suggested PCBWay "Customer Reply" text (paste into the quotation)
+## 6. The reply actually sent
 
-```
-Item 1  U2  Pololu 4091: WE WILL SUPPLY (consigned). Do not substitute.
-Item 11 D2  SS14: use onsemi SS14 (LCSC C83852) or Vishay SS14-E3/61T.
-Item 13 U1  Teensy 4.1: WE WILL SUPPLY (consigned). Do not substitute.
-Item 28 D5  use Nexperia PESD5V0F1BL,315 (LCSC C45961, SOD-882/DFN1006-2).
-            Alternative: PESD5V0U1UL,315 (LCSC C85401).
-Item 48 F3 F4 F5  1206L010/30YR does not exist in the Littelfuse 1206L
-            series. Use 1206L010/60WR (LCSC C2153714, 1206, 100 mA, 60 V).
-Item 21 C10 CL21B103KBANNNC: OK.
-Item 35 C18 CC0805KRX7R9BB102: OK.
-Item 22 C11: do NOT use CL21A225KBQNNNE (X5R 85C). Use CC0805KKX7R9BB225
-            (LCSC C125847) or CL21B225KBYNNNE (LCSC C2762602) X7R 50V 0805.
-Item 14 BT1: 1058 is correct - it is the Keystone SMD 20 mm coin-cell
-            holder; "CR2032" in the description is the cell (hand-fitted,
-            not a BOM part).
-Item 24 U8 NEO-M9N-00B: hold price - confirm final price before production,
-            we may supply it ourselves (LCSC C5119087).
-Also: quote TRACO TSR 1-2433 as genuine TRACO Power (LCSC C53183919 is a
-YLPTEC clone - not acceptable).
-```
+**`PCBWAY-REPLY-2026-09-29.pdf`** (source: `PCBWAY-REPLY-2026-09-29.md`) — a
+5-page letter answering every note in the quotation, plus
+**`Racecar-RevD-BOM-pcbway-assembly-REV1.csv`** as the corrected BOM to re-match
+from. Both are also copied to `~/Downloads/`. The letter's key asks:
+
+1. approve C10/C18, counter-propose X7R `CC0805KKX7R9BB225` for C11;
+2. use onsemi `SS14`, `PESD5V0F1BL,315`, `1206L010/60WR`;
+3. **purchase and fit U2** (Digi-Key `2183-4091-ND` / Pololu 4091) — we pay part +
+   sourcing fee, consignment only if they refuse;
+4. **fit the two 1×24 sockets for U1**; we supply the Teensy (with pins) and plug it in;
+5. do not fit the CR2032 cell, the JP1 shunt or the J9 lead;
+6. confirm the `NEO-M9N-00B` price before production; genuine TRACO only.
 
 ---
 
