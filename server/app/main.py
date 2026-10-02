@@ -6861,8 +6861,8 @@ _REVIEW_HTML = (
     el('v-glong').textContent = (gL == null) ? '\u2014' : gL.toFixed(2) + ' g';
     el('v-gvert').textContent = (gv == null) ? '\u2014' : gv.toFixed(2) + ' g';
     placeGDotVal(gl, gL);
-    placeDeltaCursor(i0);
-    updateCompReadouts(i0);
+    placeDeltaCursor(i0, i0 + f);
+    updateCompReadouts(i0, i0 + f);
   }
 
   // ---- play / pause ---------------------------------------------------
@@ -6983,21 +6983,42 @@ _REVIEW_HTML = (
              i0: ctxIdxAt(ctx, lap.t_start), i1: ctxIdxAt(ctx, lap.t_end),
              series: ctxSeries(ctx, lap) };
   }
-  function refIdxByTime(ref, tInto){
-    const tm=ref.series.tm, last=tm.length-1;
+  // (refIdxByTime / refIdxByDist lived here: integer-index lookups. They were the
+  //  reason the red comparison dot stepped between samples — replaced by
+  //  idxFrac/seriesAt/refPosAt below, which interpolate.)
+
+  // ---- sub-sample interpolation ---------------------------------------
+  // Playback renders at 60 fps but the sample stream is much coarser (a long
+  // session loads at only a few Hz), so ANYTHING driven by a raw integer index
+  // visibly steps — that was the jerky red comparison dot. idxFrac returns a
+  // FRACTIONAL index for a value in a monotonic array; seriesAt lerps a series
+  // value at that index; refPosAt lerps a ghost lap's lat/lon.
+  function idxFrac(arr, v){
+    const last=arr.length-1;
     if (last<0) return 0;
-    if (tInto<=tm[0]) return 0; if (tInto>=tm[last]) return last;
+    if (!(v>arr[0])) return 0;
+    if (v>=arr[last]) return last;
     let lo=0, hi=last;
-    while (lo<hi){ const m=(lo+hi)>>1; if (tm[m]<tInto) lo=m+1; else hi=m; }
-    return lo;
+    while (lo<hi){ const m=(lo+hi)>>1; if (arr[m]<v) lo=m+1; else hi=m; }
+    const i=Math.max(1,lo), a=arr[i-1], b=arr[i];
+    return (b>a) ? (i-1)+(v-a)/(b-a) : (i-1);
   }
-  function refIdxByDist(ref, dq){
-    const dist=ref.series.dist, last=dist.length-1;
-    if (last<0) return 0;
-    if (dq<=dist[0]) return 0; if (dq>=dist[last]) return last;
-    let lo=0, hi=last;
-    while (lo<hi){ const m=(lo+hi)>>1; if (dist[m]<dq) lo=m+1; else hi=m; }
-    return lo;
+  function seriesAt(series, fi, key){
+    const arr=series[key], n=arr.length-1;
+    if (n<0) return null;
+    const c=Math.max(0,Math.min(n,fi));
+    const k0=Math.floor(c), k1=Math.min(k0+1,n);
+    return lerpN(arr[k0], arr[k1], c-k0);
+  }
+  function refPosAt(ref, fi){
+    const n=ref.i1-ref.i0;
+    if (n<0) return null;
+    const c=Math.max(0,Math.min(n,fi)), k0=Math.floor(c);
+    const A=ref.ctx.S[ref.i0+k0], B=ref.ctx.S[ref.i0+Math.min(k0+1,n)] || A;
+    if (!A) return null;
+    const lat=lerpN(A.lat, B.lat, c-k0), lon=lerpN(A.lon, B.lon, c-k0);
+    if (typeof lat!=='number' || typeof lon!=='number' || !(lat||lon)) return null;
+    return [lat, lon];
   }
 
   // ---- map ghost lines + comparison dot ------------------------------
@@ -7064,15 +7085,17 @@ _REVIEW_HTML = (
                  primSeries:sa, refSeries:sb, maxD, lo, hi };
     placeDeltaCursor(Number(slider.value));
   }
-  function placeDeltaCursor(idx){
+  function placeDeltaCursor(idx, fidx){
     const cur=el('delta-cursor'); const live=el('delta-live');
     if (!cur) return;
     if (!deltaState || idx<deltaState.i0 || idx>deltaState.i1 || !(deltaState.maxD>0)){
       cur.style.display='none'; if (live) live.textContent=''; return;
     }
-    const k=idx-deltaState.i0;
-    const dq=deltaState.primSeries.dist[k];
-    const v=deltaState.primSeries.tm[k]-interpTime(deltaState.refSeries, dq);
+    const k=((typeof fidx==='number') ? fidx : idx)-deltaState.i0;
+    const dq=seriesAt(deltaState.primSeries, k, 'dist');
+    const tmK=seriesAt(deltaState.primSeries, k, 'tm');
+    if (dq==null || tmK==null){ cur.style.display='none'; return; }
+    const v=tmK-interpTime(deltaState.refSeries, dq);
     const W=dcanv.width, H=dcanv.height;
     const px=34+(W-44)*Math.min(1, dq/deltaState.maxD);
     const py=10+(H-28)*(1-(v-deltaState.lo)/(deltaState.hi-deltaState.lo));
@@ -7093,29 +7116,30 @@ _REVIEW_HTML = (
     set('c-rpm', (s.rpm!=null) ? ('vs '+fmtInt(s.rpm)) : '');
     set('c-hdg', (s.heading_deg!=null) ? ('vs '+fmt(s.heading_deg,0)+'\u00b0') : '');
   }
-  function updateCompReadouts(idx){
+  function updateCompReadouts(idx, fidx){
     const active = currentRef && primLap && lapWindow && deltaState
       && idx>=lapWindow.i0 && idx<=lapWindow.i1
       && !(currentRef.ctx===selfCtx && currentRef.lap.lap===primLap.lap);
     if (!active){ hideCompDot(); setCompTiles(null); return; }
-    const k=idx-lapWindow.i0;
-    const tInto=deltaState.primSeries.tm[k];
-    const dq=deltaState.primSeries.dist[k];
-    let rk;
+    // fidx = FRACTIONAL index into S[] while playing; idx is the sample index
+    // when scrubbing. Interpolating here is what keeps the red dot smooth.
+    const k = ((typeof fidx==='number') ? fidx : idx) - lapWindow.i0;
+    const tInto = seriesAt(deltaState.primSeries, k, 'tm');
+    const dq    = seriesAt(deltaState.primSeries, k, 'dist');
+    if (tInto==null || dq==null){ hideCompDot(); setCompTiles(null); return; }
+    let rkF;
     if (syncMode==='time'){
       // same elapsed time into the lap -> generally a DIFFERENT place; show
       // where the comparison car was at this instant with its own red dot.
-      rk=refIdxByTime(currentRef, tInto);
-      const gs=currentRef.ctx.S[currentRef.i0+rk];
-      if (gs && typeof gs.lat==='number' && typeof gs.lon==='number' && (gs.lat||gs.lon))
-        showCompDot([gs.lat, gs.lon]);
-      else hideCompDot();
+      rkF=idxFrac(currentRef.series.tm, tInto);
+      const pos=refPosAt(currentRef, rkF);
+      if (pos) showCompDot(pos); else hideCompDot();
     } else {
       // same place on track -> one dot; compare the telemetry at this spot.
-      rk=refIdxByDist(currentRef, dq);
+      rkF=idxFrac(currentRef.series.dist, dq);
       hideCompDot();
     }
-    setCompTiles(currentRef.ctx.S[currentRef.i0+rk]);
+    setCompTiles(currentRef.ctx.S[currentRef.i0+Math.round(rkF)]);
   }
 
   // ---- selection state ------------------------------------------------
