@@ -129,9 +129,11 @@ trim="-DCONFIG_BT_NIMBLE_ROLE_PERIPHERAL_DISABLED -DCONFIG_BT_NIMBLE_ROLE_BROADC
 
 # (7"/5" Basic builds REMOVED — retired hardware, see the note at the top.)
 # 5" Advance (crowpanel5adv), 16M
-$CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51 $trim" --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
+# v0.1.152: upload.maximum_size MUST match the 6 MB app slot from the sketch-local
+# partitions.csv, or the compile-time percentage is a lie (it would say 96 % not 20 %).
+$CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=51 $trim" --build-property "compiler.c.extra_flags=$trim" --build-property "upload.maximum_size=6291456" --build-path /tmp/rdadv_build --output-dir /tmp/rdadv_out crowpanel-arduino/RaceDash
 # 7" Advance (crowpanel7adv), 16M  (v0.1.145+; same electrical config as the 5" Advance)
-$CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=71 $trim" --build-property "compiler.c.extra_flags=$trim" --build-path /tmp/rd7adv_build --output-dir /tmp/rd7adv_out crowpanel-arduino/RaceDash
+$CLI compile --fqbn "${base},FlashSize=16M" --build-property "compiler.cpp.extra_flags=-DDASH_BOARD=71 $trim" --build-property "compiler.c.extra_flags=$trim" --build-property "upload.maximum_size=6291456" --build-path /tmp/rd7adv_build --output-dir /tmp/rd7adv_out crowpanel-arduino/RaceDash
 ```
 **A fresh `--build-path` compiles the whole ESP32 core (~10+ min).** Run first-time builds
 of a new variant in the background (`nohup … &`) or they'll blow past an agent's command
@@ -141,17 +143,16 @@ the required USB-mode flags), and a **distinct `--build-path` per board** so the
 define can't cross-contaminate the cache. The APP binary is `RaceDash.ino.bin` in each
 `--output-dir`.
 
-**Flash-size ceiling — what actually limits us.** The binding limit is the **A/B OTA app slot
-in the partition table** (PartitionScheme=default ⇒ 1,310,720 B per slot), NOT total flash and
-NOT the OTA transport. The partition table is written ONLY during a USB flash — OTA can never
-change it — so **1.31 MB stays the release ceiling until every deployed 4M panel has been
-bench-flashed**. The shipped `.bin` is partition-agnostic (ESP32 apps are MMU-mapped; the same
-binary runs from either slot on either table), so the release builds above keep
-`PartitionScheme=default` harmlessly. **Policy: any USB (bench) flash of a panel should use
-`PartitionScheme=min_spiffs`** — same A/B OTA layout but SPIFFS (which we never use; settings
-live in NVS) shrinks from 1.4 MB to 128 KB, growing each app slot to 1,966,080 B (+50%
-headroom). Units migrate opportunistically as they visit the bench; an oversized image sent to
-a not-yet-migrated unit fails cleanly (its `Update.begin()` checks its own table — no brick).
+**Flash-size ceiling (v0.1.152).** `crowpanel-arduino/RaceDash/partitions.csv` is picked up
+automatically by arduino-esp32's prebuild hook (a **sketch-local** `partitions.csv` wins over
+the platform tables), giving **two 6 MB A/B OTA slots** (`app0` 0x10000, `app1` 0x610000) plus
+a 3 MB reserved data partition, with `nvs`/`otadata` left at their stock offsets so deployed
+units keep their settings. That is why the builds above pass
+`--build-property "upload.maximum_size=6291456"`: it makes the compiler's size report truthful
+(`20 %` instead of `96 %`). **The partition table can only be written by a USB flash** — OTA
+writes the app slot only — so **every unit needs one bench flash** to adopt the 6 MB layout;
+until then its OTA is capped by its own table and an oversized image fails cleanly inside
+`Update.begin()` (no brick). Verify a unit with `esptool read_flash 0x8000 0x600`.
 
 ---
 

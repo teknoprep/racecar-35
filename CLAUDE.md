@@ -38,9 +38,33 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
 - **New network-module firmware/transport/ownership and service/update support are
   NOT implemented.** Do not add an OTA artifact or claim fast uploads from a render.
   Current v0.1.149 code still uses screen WiFi; its existing OTA path stays intact.
-- Active revision **C**: all six screw terminals (tach/oil/coolant/AEM/power/screen)
-  face ONE LEFT edge, labelled: **J3 TACH, J4 OIL, J5 NTC, J6 AEM, J1 POWER,
-  J2 SCREEN**. Envelope **130 x 140 mm**. Real electrical CAD and engineering Gerbers
+- **Active revision for new builds is now D** (`hardware/teensy-integrated-revd/`):
+  **4 copper layers** (F.Cu signals, **In1.Cu continuous GND plane with no routing**,
+  In2.Cu signals, B.Cu signals), **1 oz outer copper**, **150 x 155 mm**, 158
+  footprints, 88 nets, 456 connected pads, 110 vias, 531 assertions; ERC/DRC/
+  unconnected all zero. It adds the **Raspberry Pi 5 video UART (J13** -> Teensy
+  `Serial1` pins 0/1, 115200, 1 k series + ESD**)**, **THROTTLE (J11)** and
+  **BRAKE (J12)** protected 0.500-gain analogue inputs on **A7/pin 21** and
+  **A10/pin 24**, and replaces the IMU with a **TDK ICM-42670-P** (I2C 18/19 @0x68,
+  AP_CS=VDDIO, land pattern derived from DS-000451). All EIGHT screw terminals face
+  ONE LEFT edge in this order: **J3 TACH, J4 OIL, J5 NTC, J6 AEM, J11 THROTTLE,
+  J12 BRAKE, J1 POWER, J2 SCREEN**. The screen branch fuse is **3 A**
+  (`0451003.MRL`), which is what makes 1 oz outer copper adequate. **Firmware for the
+  ICM-42670-P, throttle/brake, the Pi video link and the ESP32 coprocessor does NOT
+  exist**, and the Rev D oil/coolant conversions (0.500 gain; coolant 4.096 V /
+  2.49 k excitation, 40 k parallel-loading compensation) are not implemented.
+  Toolchain pin 13 is NET_SCK - **stop the pin-13 heartbeat before SPI**. Warning:
+  **J4/J11/J12 supply +5 V to the sensor - never parallel them onto a transducer the
+  ECU already feeds.** Order day: send `pcbway/Racecar-RevD-PCBWAY-GERBERS.zip` (16
+  Gerber/drill files, no documents) plus `Racecar-RevD-BOM-pcbway-assembly-REV1.csv`
+  and `Racecar-RevD-CPL.csv`; take every order setting from
+  `pcbway/PCBWAY-ORDER-GUIDE.md`. Re-export with
+  `fabrication/export.py --engineering-prototype` (Gerbers unchanged by the BOM
+  revision-1 substitutions).
+- Revision **C** (superseded, retained for reference and its WIFI_RTC_ARCHITECTURE
+  contract): all six screw terminals (tach/oil/coolant/AEM/power/screen) face ONE
+  LEFT edge, labelled: **J3 TACH, J4 OIL, J5 NTC, J6 AEM, J1 POWER, J2 SCREEN**.
+  Envelope **130 x 140 mm**. Real electrical CAD and engineering Gerbers
   now exist under `hardware/teensy-integrated-revc/`: **136 PCB parts, 76 nets,
   392 connected pads, 427 pin/geometry/calculation assertions; full ERC/DRC and
   unconnected counts zero**. See its README and `design/` documents. The explicit
@@ -548,13 +572,17 @@ reads the bare `crowpanel` key) can still OTA forward; keep it pointing at the 7
 
 Full publish procedure (Linux host; `$HOME` is unset in this shell — prefix git ops with
 `HOME=/root` OR push to an explicit token URL):
-**⚠️ Size ceiling = the OTA app slot, not the hardware.** PartitionScheme=default gives two
-1,310,720 B A/B app slots + 1.4 MB SPIFFS we never use. OTA can never rewrite the partition
-table (USB flash only), so 1.31 MB is the release ceiling until deployed 4M panels get
-bench-flashed. The `.bin` is partition-agnostic — release builds keep PartitionScheme=default.
-**USB/bench flashes should use `PartitionScheme=min_spiffs`** (same A/B OTA, app slots grow to
-1,966,080 B); an oversized OTA to a not-yet-migrated unit fails cleanly, no brick. Full
-explanation in BUILD.md §1f.
+**⚠️ Size ceiling = the OTA app slot, and since v0.1.152 it is 6 MB (v0.1.152).** All remaining
+panels are 16 MB Advances, so `crowpanel-arduino/RaceDash/partitions.csv` (picked up
+automatically — arduino-esp32's prebuild hook copies a **sketch-local** `partitions.csv` ahead
+of the platform tables, so no FQBN change is needed) replaces the stock 4 MB `default` scheme
+with **two 6 MB A/B app slots** + a 3 MB reserved data partition. `nvs`/`otadata` keep their
+stock offsets so an existing unit's settings survive the migration. The build must also declare
+the real slot size or the compile warning lies again:
+`--build-property "upload.maximum_size=6291456"` → it now reports 20 %, not 96 %. **The
+partition table is written ONLY by a USB flash** — OTA cannot change it — so **each unit needs
+one bench flash** to move onto the 6 MB layout; before that its OTAs are capped at its own
+table (an oversized image fails cleanly in `Update.begin()`, no brick).
 
 **⚠️ Publishing now uses a STAGING dir** — `RACECAR_FW_DIR=/tmp/fwstage
 ./server/publish_firmware.sh <ver>` after copying fresh builds there. The repo
@@ -969,6 +997,8 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `tz` | uint8 | Timezone index into `TIMEZONES[]` |
 | `lapov` | uint8 | **Finish-line lap-time popup duration** in seconds, 0–9 (default 3, 0 = off). Dash-only (no CFG). Settings → "Lap time popup (sec)". |
 | `advrev` | uint8 | **Advance 0x30 backlight-coprocessor dialect** (v0.1.145): 0=Auto (send both, ladder last), 1=Old rev/ladder (5" V1.1, 7" V1.2), 2=New rev/linear (5" V1.2+, 7" V1.3+). Dash-only (no CFG); row hidden on Basic panels. Settings → "Panel revision". See the Advance dialect note in the build section. |
+| `atime` | bool | **Auto time** (v0.1.152, default **ON**). Settings → "Auto time". When ON: the panel RTC / NTP / the Teensy's GPS-derived `TIME,` may set the clock, and the panel writes NTP to its own coin-cell RTC and re-broadcasts `SETTIME` to the Teensy when they disagree. OFF freezes the clock — only Settings → "Set time" moves it. |
+| `atz` | bool | **Auto timezone** (v0.1.152, default **ON**). Settings → "Auto timezone". When ON the zone is derived from GPS at START: the venue's own `TRACKS[].tz` when the fix identifies the track, else a coordinate estimate (longitude → nearest whole-hour zone, DST-observing variant preferred). A manual pick in the timezone picker sets this OFF. |
 | `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
 | `viden` | bool | **Video interconnect** (v0.1.150, default OFF). Settings → "Video interconnect". `CFG,viden,0\|1`. When ON, Teensy Serial1 (pins 0/1, 115200) talks to a **separate Raspberry Pi 5** video box: forwards `REC`/`TRACK`/`HUD` for 1080p front + rear PIP + overlay. Does not block START if the Pi is missing. See `hardware/video-recorder/` and `hardware/breadboard/`. |
 | `sf_unk` | blob | **UNKNOWN-track S/F** (one `SfOverride`, v0.1.129) — the ONLY on-car S/F capture left. SET S/F (STATUS page / dash TRACK button while recording) works ONLY when `lapTrackIdx() < 0`; lap timing + Teensy `CFG,sf` stamping run against it at unmapped tracks. DELETE S/F clears it. |
@@ -999,6 +1029,24 @@ background-only strips (~63 KB) and invalidates the three band elements; nothing
 y=130 is repainted, so speed/laps/buttons never strobe. `flashBg` is the band colour;
 `bg` (always `TFT_BLACK`) is what every other element paints behind itself. The lap popup
 now starts at `FLASH_BAND_H` (the bar + delta bar stay visible under it).
+
+### v0.1.152 — panel RTC, automatic time/timezone, wall clock
+
+* **The panel has its own coin-cell RTC** — a **PCF8563-compatible chip at I²C `0x51`**, found by
+  probing the touch bus (SDA 15 / SCL 16, alongside 0x30 backlight and 0x5D GT911); its register
+  0x02 bit 7 is the **VL "voltage low / time invalid"** flag. `rtc_pcf8563.h` reads it in
+  `setup()` and, when VL is clear, restores the system clock **before WiFi/NTP** — so the dash
+  knows the time at the track with no network. Verified on hardware across a power cycle
+  (`[rtc] PCF8563 0x51: time RESTORED … - no NTP needed`).
+* **Time flows both ways with one-way trust:** NTP → writes the panel RTC **and** pushes
+  `SETTIME` to the Teensy; the Teensy's `TIME,` is adopted by the panel **only when the panel's
+  own time is invalid** (then stored in the coin cell); the panel re-sends `SETTIME` to the
+  Teensy every 30 s if they differ by >5 s — never mid-upload or mid-OTA. All of it is gated on
+  **Auto time**.
+* **Wall clock:** local `HH:MM` (no seconds) bottom-right of the dash page, grey when the clock
+  is real / orange `--:--` when nothing has set it; redrawn once a minute.
+* **The timezone is GPS-derived** (see `atz` above) — per-track zones for all 26 `TRACKS[]`
+  entries plus a coordinate fallback for venues we don't know, with the picker as the override.
 
 ### Dash page v0.1.147 layout additions
 - **Delta bar** (`DBAR_*`, sprite 756×16 at y=113, bar 12 px): live gap vs session-best at
@@ -1059,6 +1107,7 @@ Remaining levers if it ever returns: `DASH_FREQ_WRITE` 15 → 13–14 MHz (panel
 | `PAGE_SENSOR` | tap the **Sensor data source** settings row | Dedicated picker: Direct / MegaSquirt / **Bluetooth** buttons (like the GPS page). In Bluetooth mode shows the paired OBD-II dongle + live BLE status + a SCAN button. DONE saves, CANCEL reverts. |
 | `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). Drag-scrollable. RESCAN / BACK. |
 | `PAGE_PID_SCAN` | tap COOLANT PID on PAGE_SENSOR | Mode-01 PID scan (needs connected dongle + ignition); tap a row to map it as COOLANT (`btpid`). Drag-scrollable. RESCAN / BACK. |
+| `PAGE_TZ_PICKER` | Settings → **Time zone** row | **Scrollable standard-timezone list** (v0.1.152): drag to scroll, tap a row to highlight, footer **CANCEL / AUTO / DONE**. AUTO (green while GPS owns the zone) re-derives immediately and sets `atz` ON; DONE saves + sends `TZ,<id>` to the Teensy and sets `atz` OFF. Replaced the old "tap the row to cycle" enum. |
 | `PAGE_TEST_SRC` | Tools → **Start test mode** (when idle) | **"TEST DATA SOURCE"** (v0.1.147): **TEENSY** = existing `TESTSTART` (Teensy synthesizes + RECORDS a real SD session; exercises SD + upload) / **SCREEN** = dash-local simulator, **no Teensy needed** / CANCEL. Tap-only modal, returns to Tools. |
 
 ### Screen-side telemetry simulator (v0.1.147) — test the UI with no Teensy
@@ -1173,8 +1222,8 @@ is a CONTINUOUS active scan, ~+90 mA; passive may list some dongles as
 "(unnamed)" — still pairable by address); TX power 0 dBm for conn/adv/scan;
 ~64 KB free-internal-heap guard before controller init (parks the task with a
 visible reason via `obd::lastErr()` instead of crashing). **NimBLE adds ~180 KB
-of flash → the 4M dash binary is now ~94% of the 1.25 MB OTA slot (still fits;
-watch this headroom before adding more).**
+of flash → the dash binary was ~94 % of the old 1.31 MB OTA slot; since v0.1.152 the A/B
+slots are 6 MB so this is no longer a release constraint.**
 
 ### Track picker
 Pre-seeded with 15 common US road courses (`TRACKS[]` near the top of `RaceDash.ino`). To add tracks, extend that array (TODO: editable from settings).
@@ -1545,7 +1594,8 @@ post-processing side, not the Teensy (keep the logged stream calibrated-but-raw)
   `onDisconnect` has no reason arg, `setPower(esp_power_level_t)`.) Also: NimBLE init is done
   **inside the OBD task**, not the caller — running it on the shallow UI/tap-handler stack was a
   second crash vector. Chosen over stock Bluedroid because it's ~180 KB (vs ~400 KB) — the 4M
-  dash binary is ~94 % of the 1.25 MB OTA slot. **The ESP32-S3 is BLE-only (no classic BT/SPP),
+  dash binary used ~94 % of the old 1.31 MB slot (6 MB slots since v0.1.152, so headroom is
+  no longer the concern). **The ESP32-S3 is BLE-only (no classic BT/SPP),
   so the OBD dongle MUST be a BLE ELM327** (e.g. Vgate iCar Pro BLE), not a classic one.
 
 ## Toolchain note (Linux build host)

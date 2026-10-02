@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.150"
+#define FIRMWARE_VERSION "0.1.152"
 
 #include <Preferences.h>
 #include <time.h>
@@ -38,6 +38,7 @@
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
 #include "board_config.h"   // per-panel RGB pin map + timing (DASH_BOARD 7|5|51|71)
 #include "aem_afr.h"
+#include "rtc_pcf8563.h"    // PCF8563 RTC on the touch bus (0x51) - panel keeps time
 #include "obd_ble.h"       // Bluetooth-LE OBD-II (ELM327) client for sensor_type==2
 #include "zdeflate.h"      // tiny raw-DEFLATE for compressed uploads (v0.1.127 zblocks)
 
@@ -81,6 +82,8 @@ enum SettingId : uint8_t {
     ST_GPS_STATUS,  // INFO: Teensy's GPSBAUD report (locked baud + OK/NO DATA)
     ST_DEBUG_LOG,   // TOGGLE: write on-SD .dbg diagnostic logs (CFG,dbg_on)
     ST_SET_TIME,    // action: open time-set page
+    ST_AUTO_TIME,   // TOGGLE: NTP / GPS / panel RTC may set the clock automatically (v0.1.152)
+    ST_AUTO_TZ,     // TOGGLE: derive the time zone from GPS - track, else coordinates (v0.1.152)
     ST_VIDEO_EN,    // TOGGLE: Pi 5 video box on Teensy Serial1 (CFG,viden)
     ST_VIDEO_STATUS,// INFO: last VID,... from the box
     ST_COUNT,
@@ -792,6 +795,11 @@ struct Settings {
     // Time zone — index into TIMEZONES[] (defined below). Display only;
     // the Teensy's RTC + the wire-format TIME line are always UTC.
     uint8_t  timezone_idx     = 0;     // default UTC
+    // v0.1.152: automatic time + timezone, both default ON (that is the point of the coin
+    // cell and of GPS). Auto time OFF freezes the clock: only Settings -> Set time moves it.
+    // Auto timezone OFF freezes the zone: only the timezone picker changes it.
+    bool     auto_time        = true;
+    bool     auto_tz          = true;
 
     // LCD backlight brightness, 0-100 %. Applied board-specifically by
     // applyBrightness() (Advance: I2C 0x30 coprocessor; Basic: GPIO 2 PWM).
@@ -1110,6 +1118,9 @@ struct TrackInfo {
     // positional initializers that omit these get 0 via aggregate zero-fill):
     float       sf_lat2;                // S/F endpoint B. (0,0) => point-only -> radius fallback.
     float       sf_lon2;                // Two endpoints => precise LINE-CROSSING lap detection.
+    // v0.1.152 APPENDED: index into TIMEZONES[] for this venue, so a GPS fix alone is
+    // enough to get local time right (DST handled by the zone rules). 0 = UTC.
+    uint8_t     tz;
     uint8_t     aux;                    // 1 = manual-select-only VARIANT (never auto-picked).
                                         //     For facilities with overlapping circuits (Summit
                                         //     Point): auto-select always lands on the primary;
@@ -1137,24 +1148,24 @@ static const TrackConfig VIR_CFGS[]      = { {"Full Course"}, {"Grand Course"}, 
 // could never have matched those four before.
 static const TrackInfo TRACKS[] = {
     // name                     centre lat/lon           radius  S/F lat/lon               configs       n
-    { "Barber", 33.5328f, -86.6181f, 2.5f, 33.531077f, -86.621706f, nullptr, 0, 33.530972f, -86.621588f },  // osm-sf
-    { "CMP Full", 34.4884f, -80.5941f, 2.0f, 34.487516f, -80.596613f, nullptr, 0, 34.487412f, -80.596735f },  // osm-sf
-    { "CMP East", 34.4870f, -80.5880f, 1.2f, 34.487516f, -80.596613f, nullptr, 0, 34.487412f, -80.596735f },  // osm-sf VERIFY
-    { "CMP West", 34.4884f, -80.6000f, 1.0f, 34.487516f, -80.596613f, nullptr, 0, 34.487412f, -80.596735f },  // osm-sf VERIFY
-    { "COTA", 30.1328f, -97.6411f, 3.0f, 30.132368f, -97.640393f, nullptr, 0, 30.132254f, -97.640496f },  // osm-sf
-    { "Daytona", 29.1853f, -81.0697f, 3.0f, 29.184313f, -81.072454f, nullptr, 0, 29.184213f, -81.072335f },  // osm-sf VERIFY
-    { "Laguna Seca", 36.5847f, -121.7494f, 2.5f, 36.584093f, -121.757188f, nullptr, 0, 36.584080f, -121.757010f },  // osm-sf
-    { "Lime Rock", 41.9263f, -73.3856f, 2.0f, 41.928886f, -73.381634f, nullptr, 0, 41.928755f, -73.381713f },  // osm-sf
-    { "Mid-Ohio", 40.6896f, -82.6364f, 2.5f, 40.689477f, -82.637036f, MID_OHIO_CFGS, 3, 40.689620f, -82.637027f },  // osm-sf
-    { "Nelson Ledges", 41.3055f, -81.0180f, 1.5f, 41.303945f, -81.021750f, nullptr, 0, 41.303906f, -81.021566f },  // osm-sf VERIFY
-    { "NHMS", 43.3628f, -71.4630f, 2.0f, 43.362739f, -71.462085f, nullptr, 0, 43.362786f, -71.462272f },  // osm-sf
-    { "NJMP Thunderbolt", 39.3603f, -75.0687f, 2.0f, 39.360880f, -75.074045f, nullptr, 0, 39.361003f, -75.073949f },  // osm-sf
-    { "NJMP Lightning", 39.3636f, -75.0559f, 1.5f, 39.363346f, -75.052412f, nullptr, 0, 39.363265f, -75.052258f },  // osm-sf VERIFY
-    { "Pocono", 41.0561f, -75.5128f, 3.5f, 41.052446f, -75.510868f, nullptr, 0, 41.052313f, -75.510939f },  // osm-sf
-    { "Road America", 43.7986f, -87.9956f, 3.0f, 43.798079f, -87.989534f, nullptr, 0, 43.798076f, -87.989733f },  // osm-sf
-    { "Road Atlanta", 34.1469f, -83.8189f, 2.5f, 34.149649f, -83.813004f, nullptr, 0, 34.149770f, -83.812910f },  // osm-sf
-    { "Sebring", 27.4570f, -81.3568f, 3.5f, 27.450302f, -81.352701f, nullptr, 0, 27.450158f, -81.352700f },  // osm-sf
-    { "Sonoma", 38.1614f, -122.4544f, 2.5f, 38.160290f, -122.453223f, SONOMA_CFGS, 2, 38.160341f, -122.453052f },  // osm-sf
+    { "Barber", 33.5328f, -86.6181f, 2.5f, 33.531077f, -86.621706f, nullptr, 0, 33.530972f, -86.621588f, 2 },  // osm-sf
+    { "CMP Full", 34.4884f, -80.5941f, 2.0f, 34.487516f, -80.596613f, nullptr, 0, 34.487412f, -80.596735f, 1 },  // osm-sf
+    { "CMP East", 34.4870f, -80.5880f, 1.2f, 34.487516f, -80.596613f, nullptr, 0, 34.487412f, -80.596735f, 1 },  // osm-sf VERIFY
+    { "CMP West", 34.4884f, -80.6000f, 1.0f, 34.487516f, -80.596613f, nullptr, 0, 34.487412f, -80.596735f, 1 },  // osm-sf VERIFY
+    { "COTA", 30.1328f, -97.6411f, 3.0f, 30.132368f, -97.640393f, nullptr, 0, 30.132254f, -97.640496f, 2 },  // osm-sf
+    { "Daytona", 29.1853f, -81.0697f, 3.0f, 29.184313f, -81.072454f, nullptr, 0, 29.184213f, -81.072335f, 1 },  // osm-sf VERIFY
+    { "Laguna Seca", 36.5847f, -121.7494f, 2.5f, 36.584093f, -121.757188f, nullptr, 0, 36.584080f, -121.757010f, 5 },  // osm-sf
+    { "Lime Rock", 41.9263f, -73.3856f, 2.0f, 41.928886f, -73.381634f, nullptr, 0, 41.928755f, -73.381713f, 1 },  // osm-sf
+    { "Mid-Ohio", 40.6896f, -82.6364f, 2.5f, 40.689477f, -82.637036f, MID_OHIO_CFGS, 3, 40.689620f, -82.637027f, 1 },  // osm-sf
+    { "Nelson Ledges", 41.3055f, -81.0180f, 1.5f, 41.303945f, -81.021750f, nullptr, 0, 41.303906f, -81.021566f, 1 },  // osm-sf VERIFY
+    { "NHMS", 43.3628f, -71.4630f, 2.0f, 43.362739f, -71.462085f, nullptr, 0, 43.362786f, -71.462272f, 1 },  // osm-sf
+    { "NJMP Thunderbolt", 39.3603f, -75.0687f, 2.0f, 39.360880f, -75.074045f, nullptr, 0, 39.361003f, -75.073949f, 1 },  // osm-sf
+    { "NJMP Lightning", 39.3636f, -75.0559f, 1.5f, 39.363346f, -75.052412f, nullptr, 0, 39.363265f, -75.052258f, 1 },  // osm-sf VERIFY
+    { "Pocono", 41.0561f, -75.5128f, 3.5f, 41.052446f, -75.510868f, nullptr, 0, 41.052313f, -75.510939f, 1 },  // osm-sf
+    { "Road America", 43.7986f, -87.9956f, 3.0f, 43.798079f, -87.989534f, nullptr, 0, 43.798076f, -87.989733f, 2 },  // osm-sf
+    { "Road Atlanta", 34.1469f, -83.8189f, 2.5f, 34.149649f, -83.813004f, nullptr, 0, 34.149770f, -83.812910f, 1 },  // osm-sf
+    { "Sebring", 27.4570f, -81.3568f, 3.5f, 27.450302f, -81.352701f, nullptr, 0, 27.450158f, -81.352700f, 1 },  // osm-sf
+    { "Sonoma", 38.1614f, -122.4544f, 2.5f, 38.160290f, -122.453223f, SONOMA_CFGS, 2, 38.160341f, -122.453052f, 5 },  // osm-sf
     // Summit Point: ONE picker entry, three sub-tracks (configs). The
     // Jefferson/Shenandoah rows below are aux=1 = HIDDEN storage tombstones:
     // never auto-picked, never listed — they exist so each sub-track keeps
@@ -1164,22 +1175,22 @@ static const TrackInfo TRACKS[] = {
     // (2026-07-18, /tools/sfpicker; midpoint verified 1.7 m off the OSM
     // centerline). Facility centre/radius unchanged — they define "am I at
     // Summit Point", the line defines the lap crossing.
-    { "Summit Point",            39.2415f, -77.9779f, 2.0f, 39.235214f, -77.969128f, SUMMIT_CFGS, 3, 39.235189f, -77.969019f },
+    { "Summit Point",            39.2415f, -77.9779f, 2.0f, 39.235214f, -77.969128f, SUMMIT_CFGS, 3, 39.235189f, -77.969019f, 1 },
     // Jefferson S/F LINE user-picked 2026-07-18 (/tools/sfpicker; midpoint
     // verified 1.7 m off the OSM Jefferson Circuit centerline). Old pin was
     // 118 m from any tarmac — lap detection could never fire there.
-    { "Summit Point Jefferson",  39.231705f, -77.975314f, 1.2f, 39.234146f, -77.972436f, nullptr,  0, 39.234125f, -77.972320f, 1 },
-    { "Summit Point Shenandoah", 39.2450f, -77.9650f, 1.5f, 39.241349f, -77.979632f, nullptr, 0, 39.241207f, -77.979657f, 1 },  // osm-sf VERIFY
-    { "VIR", 36.5611f, -79.2103f, 2.5f, 36.568224f, -79.209125f, VIR_CFGS, 3, 36.568095f, -79.209045f },  // osm-sf
-    { "VIR South", 36.5620f, -79.2100f, 1.2f, 36.558404f, -79.209554f, nullptr, 0, 36.558461f, -79.209390f },  // osm-sf VERIFY
-    { "VIR Patriot", 36.5660f, -79.2120f, 1.0f, 36.557121f, -79.207920f, nullptr, 0, 36.557051f, -79.208077f },  // osm-sf VERIFY
-    { "Watkins Glen", 42.3417f, -76.9272f, 2.5f, 42.340868f, -76.928941f, WGL_CFGS, 2, 42.340859f, -76.928746f },  // osm-sf
+    { "Summit Point Jefferson",  39.231705f, -77.975314f, 1.2f, 39.234146f, -77.972436f, nullptr,  0, 39.234125f, -77.972320f, 1, 1 },
+    { "Summit Point Shenandoah", 39.2450f, -77.9650f, 1.5f, 39.241349f, -77.979632f, nullptr, 0, 39.241207f, -77.979657f, 1, 1 },  // osm-sf VERIFY
+    { "VIR", 36.5611f, -79.2103f, 2.5f, 36.568224f, -79.209125f, VIR_CFGS, 3, 36.568095f, -79.209045f, 1 },  // osm-sf
+    { "VIR South", 36.5620f, -79.2100f, 1.2f, 36.558404f, -79.209554f, nullptr, 0, 36.558461f, -79.209390f, 1 },  // osm-sf VERIFY
+    { "VIR Patriot", 36.5660f, -79.2120f, 1.0f, 36.557121f, -79.207920f, nullptr, 0, 36.557051f, -79.208077f, 1 },  // osm-sf VERIFY
+    { "Watkins Glen", 42.3417f, -76.9272f, 2.5f, 42.340868f, -76.928941f, WGL_CFGS, 2, 42.340859f, -76.928746f, 1 },  // osm-sf
     // Appended (TRACKS[] is append-only — keeps NVS sf_ovr indices stable).
     // S/F pinned from satellite (tools/track_sf_picker.html); refine on-site via STATUS → SET START/FINISH.
     // Thompson S/F LINE user-picked 2026-07-18 (midpoint verified 0.3 m off
     // the OSM Road Course centerline). Facility centre kept (proven in the
     // field for auto-select); only the crossing line changed.
-    { "Thompson",      41.979695f, -71.827086f, 1.5f, 41.979644f, -71.827130f, nullptr,    0, 41.979743f, -71.827036f },
+    { "Thompson",      41.979695f, -71.827086f, 1.5f, 41.979644f, -71.827130f, nullptr,    0, 41.979743f, -71.827036f, 1 },
 };
 constexpr int N_TRACKS = sizeof(TRACKS) / sizeof(TRACKS[0]);
 
@@ -1209,6 +1220,36 @@ static bool segmentsCross(float p0Lat,float p0Lon,float p1Lat,float p1Lon,
     const double d1=sfCross_(cx,cy,dx,dy,ax,ay), d2=sfCross_(cx,cy,dx,dy,bx,by);
     const double d3=sfCross_(ax,ay,bx,by,cx,cy), d4=sfCross_(ax,ay,bx,by,dx,dy);
     return ((d1>0)!=(d2>0)) && ((d3>0)!=(d4>0));
+}
+
+// v0.1.152 time-zone policy ---------------------------------------------------
+// Authority order: a manual pick in Settings -> Time zone (Auto timezone = OFF) beats
+// everything; otherwise the venue's own TRACKS[].tz when a GPS fix identifies the track;
+// otherwise a coordinate estimate (longitude -> nearest whole-hour zone, preferring the
+// DST-observing variant of that offset, which picks ET over a no-DST -5 and GMT over UTC).
+static int tzFromGps(float lat, float lon) {
+    int off = (int)lroundf(lon / 15.0f);
+    if (off >   2) off =   2;
+    if (off < -10) off = -10;
+    int firstAny = -1;
+    for (int i = 0; i < N_TIMEZONES; i++) {
+        if (TIMEZONES[i].stdOffsetHr != off) continue;
+        if (firstAny < 0) firstAny = i;
+        if (TIMEZONES[i].observesDst) return i;
+    }
+    return (firstAny >= 0) ? firstAny : 0;
+}
+
+static void tzApplyAuto(bool force) {
+    if (!s.auto_tz) return;
+    const int ti = closestTrackIdx();
+    const int z  = (ti >= 0) ? (int)TRACKS[ti].tz : tzFromGps(g.lat_deg, g.lon_deg);
+    if (z >= N_TIMEZONES) return;
+    if (!force && s.timezone_idx == (uint8_t)z) return;
+    s.timezone_idx = (uint8_t)z;
+    Serial.printf("TZ,%s\n", TIMEZONES[z].id);
+    Serial.printf("[tz] auto %s (%s)\n", TIMEZONES[z].id,
+                  (ti >= 0) ? TRACKS[ti].name : "GPS estimate");
 }
 
 // Returns index of closest track within its radius, OR -1 if no GPS / no
@@ -1464,6 +1505,12 @@ struct TrackPickerState {
 };
 static TrackPickerState tp;
 
+// Timezone picker state (v0.1.152). Same drag-scroll pattern as the track picker:
+// declared up here so handleTouch() can read scrollY/dirty directly.
+struct TzPickerState { int8_t selected; int8_t active; int scrollY; bool dirty; };
+static TzPickerState tzp;
+static constexpr int TZ_BODY_TOP = 72, TZ_ROW_DY = 46, TZ_FOOT_Y = 408, TZ_FOOT_H = 56;
+
 // Config picker — shown after track selection when the track has multiple
 // layouts sharing the same S/F line. Tap-only (no scroll; max 3 configs).
 struct ConfigPickerState {
@@ -1517,6 +1564,8 @@ static void loadSettings() {
     s.auto_start_mph     = prefs.getUShort("astmph",   s.auto_start_mph);
     s.auto_start_sec     = prefs.getUShort("astsec",   s.auto_start_sec);
     s.timezone_idx       = prefs.getUChar ("tz",       s.timezone_idx);
+    s.auto_time          = prefs.getBool  ("atime",    s.auto_time);
+    s.auto_tz            = prefs.getBool  ("atz",      s.auto_tz);
     // Ignore retired 'inet', including old installations saved as Ethernet.
     prefs.getString      ("wssid",    s.wifi_ssid, sizeof(s.wifi_ssid));
     prefs.getString      ("wpass",    s.wifi_pass, sizeof(s.wifi_pass));
@@ -1616,6 +1665,8 @@ static void saveSettings() {
     // (sendCfgToTeensy() is called at end of this function so any save also
     // re-syncs the cloud config to the Teensy.)
     prefs.putUChar ("tz",       s.timezone_idx);
+    prefs.putBool  ("atime",    s.auto_time);
+    prefs.putBool  ("atz",      s.auto_tz);
     prefs.putUChar ("inet",     1);  // same legacy meaning: WiFi; safe on rollback
     prefs.putString("wssid",    s.wifi_ssid);
     prefs.putString("wpass",    s.wifi_pass);
@@ -1761,6 +1812,7 @@ enum Page : uint8_t {
     PAGE_COACH         = 17,  // AI coach checklist: tap an item to tick it off
     PAGE_LAP_REVIEW    = 18,  // on-SD session lap list opened from Sessions
     PAGE_TEST_SRC      = 19,  // "Start test mode": TEENSY (records real SD session) or SCREEN (local sim) (v0.1.147)
+    PAGE_TZ_PICKER     = 20,  // scrollable standard-timezone picker, opened from Settings (v0.1.152)
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -2238,7 +2290,22 @@ static bool parseTimeLine(const String& line) {
     // TIME,<unix_epoch>  — RTC value from the Teensy, sent every 2 s
     const int comma = line.indexOf(',');
     if (comma < 0) return false;
-    rtc_epoch = (uint32_t)line.substring(comma + 1).toInt();
+    const uint32_t e = (uint32_t)line.substring(comma + 1).toInt();
+    rtc_epoch = e;
+
+    // v0.1.152 one-way trust: the panel's coin-cell clock is authoritative when it is
+    // valid (that is the whole point of keeping it), so we never let the Teensy drag it
+    // backwards. Only when the panel has no trustworthy time (VL set / nothing fitted)
+    // do we adopt the Teensy's GPS- or NTP-derived value - and then we store it in the
+    // coin cell so the next cold start already knows the time.
+    if (s.auto_time && e > RTC_EPOCH_MIN && !rtc_time_valid) {
+        struct timeval tv = { (time_t)e, 0 };
+        settimeofday(&tv, nullptr);
+        if (rtc_present && rtcWrite((time_t)e))
+            Serial.printf("[rtc] PCF8563 seeded from Teensy TIME: %lu\n", (unsigned long)e);
+        else
+            Serial.printf("[rtc] system time seeded from Teensy TIME: %lu\n", (unsigned long)e);
+    }
     return true;
 }
 
@@ -4726,6 +4793,28 @@ static void handleTouch() {
         }
         return;
     }
+    if (currentPage == PAGE_TZ_PICKER) {
+        if (now && !tt.active) {
+            tt.startX = x; tt.startY = y; tt.lastX = x; tt.lastY = y;
+            tt.startMs = millis(); tt.active = true; tt.gesture = GESTURE_NONE;
+            tt.scrollAtStart = tzp.scrollY;
+        } else if (now && tt.active) {
+            const int dx = x - tt.startX, dy = y - tt.startY;
+            if (tt.gesture == GESTURE_NONE
+                && (abs(dx) > GESTURE_THRESH || abs(dy) > GESTURE_THRESH)) {
+                tt.gesture = (abs(dy) > abs(dx)) ? GESTURE_DRAG_V : GESTURE_SWIPE_H;
+            }
+            if (tt.gesture == GESTURE_DRAG_V) {
+                tzp.scrollY = tt.scrollAtStart - dy; clampTzScroll(); tzp.dirty = true;
+            }
+            tt.lastX = x; tt.lastY = y;
+        } else if (!now && tt.active) {
+            if (tt.gesture == GESTURE_NONE) handleTzPickerTap(tt.startX, tt.startY);
+            tt.active = false;
+        }
+        return;
+    }
+
     if (currentPage == PAGE_TRACK_PICKER) {
         if (now && !tt.active) {
             tt.startX = x; tt.startY = y;
@@ -4965,6 +5054,7 @@ static void handleDashTap(int x, int y) {
                 if (km <= TRACKS[last_track_idx].radius_km) idx = last_track_idx;
             }
             if (idx < 0) idx = closestTrackIdx();
+            tzApplyAuto(false);   // v0.1.152: zone from GPS when Auto timezone is ON
             if (idx >= 0) {
                 // AUTO flow never prompts (v0.1.115): a config track defaults
                 // to its PRIMARY sub-track (config 0 — e.g. Summit Point Main).
@@ -5153,6 +5243,7 @@ static uint16_t computeBgColor() {
 // when the new value differs from the cached one — this is what eliminates
 // the per-frame flicker. Dirtied to force-redraw on bg state changes.
 struct LastDrawn {
+    char     clock_str[8] = "";      // v0.1.152 local wall clock (HH:MM), bottom-right
     uint16_t bg          = 0xDEAD;   // (kept for compat; the dash body bg is always black now)
     uint16_t flash_bg    = 0xDEAD;   // shift-alert band colour last painted (v0.1.147)
     int16_t  rpm_fillW   = -1;       // last drawn bar fill width in px
@@ -5410,29 +5501,42 @@ static void drawDashPage() {
         if (fillW != ld.rpm_fillW || fillColor != ld.rpm_color) {
             const int ix = RPM_BAR_X + 2;
             const int iy = RPM_BAR_Y + 2;
-            // v0.1.147 PSRAM-bandwidth fix: the bar used to re-push its whole
+            // v0.1.147 PSRAM-bandwidth fix #1: the bar used to re-push its whole
             // 756x76 (115 KB) sprite on EVERY rpm tick (25 Hz) = ~6 MB/s of
             // PSRAM traffic fighting the LCD DMA -> bottom-of-screen shake.
-            // Now: full sprite push only when the colour/band state changes
-            // (invalidated: ld.rpm_fillW == -1, or the gradient colour moved);
-            // otherwise paint just the DELTA band with a narrow fillRect.
-            // Solid fills are as scan-safe as a sprite push (single step, no
-            // fill-then-draw) but WRITE-only: no sprite render, no 115 KB read.
+            // Solid fills are as scan-safe as a sprite push but WRITE-only: no
+            // sprite render, no 115 KB read.
+            //
+            // v0.1.151 PSRAM-bandwidth fix #2 — the RECOLOUR is the remaining big one.
+            // The bar is ONE solid colour picked from a 24-step gradient, so a colour-step
+            // change refilled the whole filled area: up to 756x76 = 57 KB in a SINGLE burst.
+            // With a jittering RPM that can fire many times a second, and a burst that long
+            // stalls the framebuffer DMA for ~30 scan lines, so everything BELOW the bar
+            // tears and snaps back at VSYNC — the bottom-of-screen shake. The WIDTH must
+            // still track RPM at 25 Hz (a narrow strip, a few hundred bytes), but the colour
+            // only has to be right a few times a second. So cap the recolour to 200 ms and
+            // paint width deltas in the last-painted colour meanwhile; a pending colour is
+            // picked up by the next frame once the cap expires (ld.rpm_color only advances
+            // when we actually recolour, so nothing extra has to be remembered).
+            static uint32_t rpm_colour_ms = 0;
+            const bool recolour = (fillColor != ld.rpm_color)
+                                  && (nowMs - rpm_colour_ms >= 200);
             if (ld.rpm_fillW < 0) {                       // invalidated: paint everything
                 if (fillW > 0)  tft.fillRect(ix, iy, fillW, ih, fillColor);
                 if (fillW < iw) tft.fillRect(ix + fillW, iy, iw - fillW, ih, flashBg);
-            } else if (fillColor != ld.rpm_color) {       // gradient step moved: recolour the fill
+                ld.rpm_color = fillColor; rpm_colour_ms = nowMs;
+            } else if (recolour) {                        // <=5 Hz: recolour the whole fill
                 if (fillW > 0) tft.fillRect(ix, iy, fillW, ih, fillColor);
                 if (fillW < ld.rpm_fillW)
                     tft.fillRect(ix + fillW, iy, ld.rpm_fillW - fillW, ih, flashBg);
-            } else {                                      // same colour: delta band only
+                ld.rpm_color = fillColor; rpm_colour_ms = nowMs;
+            } else {                                      // width only: delta band, same colour
                 if (fillW < ld.rpm_fillW)
                     tft.fillRect(ix + fillW, iy, ld.rpm_fillW - fillW, ih, flashBg);
                 else if (fillW > ld.rpm_fillW)
-                    tft.fillRect(ix + ld.rpm_fillW, iy, fillW - ld.rpm_fillW, ih, fillColor);
+                    tft.fillRect(ix + ld.rpm_fillW, iy, fillW - ld.rpm_fillW, ih, ld.rpm_color);
             }
             ld.rpm_fillW = fillW;
-            ld.rpm_color = fillColor;
         }
     }
 
@@ -5580,7 +5684,17 @@ static void drawDashPage() {
         // typically still fine; this is a dash-link problem, not a GPS one).
         const bool link_stale = (g.last_ms == 0) || (millis() - g.last_ms > 3000);
         const int spd_int = link_stale ? -2 : (int)(g.mph + 0.5f);   // -1 = never-drawn sentinel
-        if (spd_int != ld.spd_int) {
+        // v0.1.151 — RATE CAP THE 72 KB SPRITE. spr_speed is 360x200 = 72,000 bytes and
+        // was repainted on every whole-MPH change, i.e. on nearly every 25 Hz telemetry
+        // frame (~1.8 MB/s into PSRAM). That bursts straight into the RGB scan-out DMA
+        // (no bounce buffer on this core) and shows up as a tear line at the BOTTOM of
+        // the frame — home page only, because it is the only page that updates. 10 Hz is
+        // imperceptible for a whole-number readout and is the same cap already applied to
+        // the RPM number, PRED and the delta bar. A forced repaint (invalidated sentinel,
+        // page entry, flash end) still paints immediately.
+        static uint32_t spd_ms = 0;
+        if (spd_int != ld.spd_int && (ld.spd_int < 0 || nowMs - spd_ms >= 200)) {
+            spd_ms = nowMs;
             char buf[8];
             if (spd_int < 0) snprintf(buf, sizeof(buf), "--");
             else             snprintf(buf, sizeof(buf), "%d", spd_int);
@@ -6095,6 +6209,36 @@ static void drawDashPage() {
     tft.setFont(&fonts::Font2);
     tft.setTextDatum(textdatum_t::top_left);
 
+    // ---- Local wall clock, bottom-right, tiny (v0.1.152) --------------------------
+    // The point of the coin cell / NTP / GPS time: the driver wants the TIME, not only
+    // session elapsed. HOURS:MINUTES only. Redraws once a minute (one small text cell).
+    // Grey when the clock is real, orange when nothing has ever set it.
+    {
+        const time_t nowu  = time(nullptr);
+        const bool   known = (uint32_t)nowu > RTC_EPOCH_MIN;
+        char cbuf[8];
+        if (known) {
+            const time_t loc = utcToLocal(nowu, TIMEZONES[s.timezone_idx % N_TIMEZONES]);
+            struct tm   *lt  = gmtime(&loc);       // utcToLocal() already applied zone + DST
+            snprintf(cbuf, sizeof(cbuf), "%02d:%02d",
+                     lt ? lt->tm_hour : 0, lt ? lt->tm_min : 0);
+        } else {
+            snprintf(cbuf, sizeof(cbuf), "--:--");
+        }
+        if (strcmp(cbuf, ld.clock_str) != 0) {
+            strncpy(ld.clock_str, cbuf, sizeof(ld.clock_str) - 1);
+            ld.clock_str[sizeof(ld.clock_str) - 1] = 0;
+            tft.setFont(&fonts::Font2);
+            tft.setTextSize(1);
+            tft.setTextDatum(textdatum_t::top_right);
+            tft.setTextPadding(90);
+            tft.setTextColor(known ? TFT_LIGHTGREY : TFT_ORANGE, bg);
+            tft.drawString(cbuf, 776, 448);
+            tft.setTextPadding(0);
+            tft.setTextDatum(textdatum_t::top_left);
+        }
+    }
+
     // Right column (v0.1.147): ONE line of GPS fix quality ("3D" green / "2D"
     // yellow / "--" red, "OFF"/"STALE" when the link/module says so — sats
     // and the raw status live on the STATUS page) + session elapsed TIME.
@@ -6382,6 +6526,8 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_TIMEZONE,     "Time zone",              SettingRow::ENUM    },
     { ST_GPS_BAUD,     "GPS settings",           SettingRow::ENUM    },
     { ST_GPS_STATUS,   "GPS link",               SettingRow::INFO    },
+    { ST_AUTO_TIME,    "Auto time",               SettingRow::TOGGLE  },
+    { ST_AUTO_TZ,      "Auto timezone",           SettingRow::TOGGLE  },
     { ST_SET_TIME,     "Set time",                SettingRow::ACTION  },
 };
 
@@ -6524,6 +6670,8 @@ static const char* boolValueOnRow(SettingId id) {
         case ST_REC_SD:      return s.record_sd         ? "ON" : "OFF";
         case ST_REC_CLOUD:   return s.record_cloud      ? "ON" : "OFF";
         case ST_AUTO_TRACK:  return s.auto_select_track ? "ON" : "OFF";
+        case ST_AUTO_TIME:   return s.auto_time ? "ON" : "OFF";
+        case ST_AUTO_TZ:     return s.auto_tz   ? "ON" : "OFF";
         case ST_DEBUG_LOG:   return s.debug_enabled ? "ON" : "OFF";
         case ST_AUTO_START:  return s.auto_start        ? "ON" : "OFF";
         case ST_SHOW_TEMP:   return s.show_coolant      ? "ON" : "OFF";
@@ -6806,10 +6954,16 @@ static void wifiTickNtp() {
         (ota_state == OTA_S_TEENSY_DOWNLOADING ||
          ota_state == OTA_S_TEENSY_WAITING)) return;
     const time_t t = time(nullptr);
-    if (t > 1700000000) {   // sane (year 2023+)
+    if (t > 1700000000 && s.auto_time) {   // sane (year 2023+) and Auto time is ON
         Serial.printf("SETTIME,%lu\n", (unsigned long)t);
         rtc_epoch     = (uint32_t)t;
         wifi_ntp_done = true;
+        // Seed the panel's own coin-cell clock so the time survives the next power cycle
+        // with no network at all (v0.1.152).
+        if (rtc_present && rtcWrite(t))
+            Serial.printf("[rtc] PCF8563 set from NTP: %lu\n", (unsigned long)t);
+        else if (rtc_present)
+            Serial.println("[rtc] PCF8563 write FAILED");
         Serial.printf("[wifi-ntp] synced epoch=%lu\n", (unsigned long)t);
     }
 }
@@ -7699,6 +7853,7 @@ static int rowGroup(SettingId id) {
         case ST_CL_AUTH_USER: case ST_CL_AUTH_PASS: return SG_CLOUD;
         case ST_TIMEZONE: case ST_GPS_BAUD: case ST_GPS_STATUS:
         case ST_DEBUG_LOG:
+        case ST_AUTO_TIME: case ST_AUTO_TZ:
         case ST_SET_TIME: return SG_TIME;
         default: return SG_DISPLAY;
     }
@@ -8051,6 +8206,10 @@ static void handleSettingsTap(int x, int y) {
                     case ST_REC_SD:     s.record_sd         = !s.record_sd;         break;
                     case ST_REC_CLOUD:  s.record_cloud      = !s.record_cloud;      break;
                     case ST_AUTO_TRACK: s.auto_select_track = !s.auto_select_track; break;
+                    case ST_AUTO_TIME:  s.auto_time = !s.auto_time; break;
+                    case ST_AUTO_TZ:    s.auto_tz = !s.auto_tz;
+                                        if (s.auto_tz) tzApplyAuto(true);   // re-arm now
+                                        break;
                     case ST_DEBUG_LOG:  s.debug_enabled = !s.debug_enabled;
                                         Serial.printf("CFG,dbg_on,%d\n", (int)s.debug_enabled); break;
                     case ST_AUTO_START: s.auto_start        = !s.auto_start;        break;
@@ -8072,6 +8231,7 @@ static void handleSettingsTap(int x, int y) {
         } else if (r.kind == SettingRow::COLOR) {
             if (inRect(x, y, CTRL_COLOR_X, ry, CTRL_COLOR_W, SETTINGS_ROW_HEIGHT)) {
                 switch (r.id) {
+                    case ST_TIMEZONE:      openTzPicker(); return;   // v0.1.152: scrollable sub-menu
                     case ST_A1_COL:        s.alert1_color_idx   = (s.alert1_color_idx   + 1) % N_PALETTE; break;
                     case ST_AM_COL:        s.alertmax_color_idx = (s.alertmax_color_idx + 1) % N_PALETTE; break;
                     case ST_TEMP_WARN_COL: s.coolant_warn_col   = (s.coolant_warn_col   + 1) % N_PALETTE; break;
@@ -8554,6 +8714,109 @@ static void confirmTrackAndStart() {
 static void cancelTrackPicker() {
     currentPage = PAGE_DASH;
     pageJustEntered = true;
+}
+
+// ---------------------------------------------------------------------------
+// Timezone picker (v0.1.152). The old row cycled through zones one tap at a time,
+// which is hopeless past a handful. Scroll, tap to highlight, DONE to save.
+// ---------------------------------------------------------------------------
+static int  tzMaxScroll() { const int t = N_TIMEZONES * TZ_ROW_DY, v = TZ_FOOT_Y - 10 - TZ_BODY_TOP;
+                            return (t > v) ? (t - v) : 0; }
+static void clampTzScroll() { if (tzp.scrollY < 0) tzp.scrollY = 0;
+                             const int m = tzMaxScroll(); if (tzp.scrollY > m) tzp.scrollY = m; }
+
+static void openTzPicker() {
+    tzp.selected = (int8_t)s.timezone_idx;
+    tzp.active   = (int8_t)s.timezone_idx;
+    const int cent = tzp.selected * TZ_ROW_DY - (TZ_FOOT_Y - 10 - TZ_BODY_TOP) / 2;
+    tzp.scrollY  = (cent > 0) ? cent : 0;
+    clampTzScroll();
+    tzp.dirty = true;
+    currentPage = PAGE_TZ_PICKER;
+    pageJustEntered = true;
+}
+
+static void cancelTzPicker() {
+    s.timezone_idx = (uint8_t)tzp.active;          // undo the highlight
+    currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true;
+}
+
+static void saveTzPicker() {
+    s.timezone_idx = (uint8_t)tzp.selected;
+    s.auto_tz = false;                             // a manual choice outranks GPS from now on
+    saveSettings();                                // NVS + CFG re-sync to the Teensy
+    Serial.printf("TZ,%s\n", TIMEZONES[s.timezone_idx % N_TIMEZONES].id);
+    currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true;
+}
+
+static void fmtTzOffset(const TimeZone &z, char *out, size_t n) {
+    const int h = z.stdOffsetHr;
+    snprintf(out, n, "UTC%s%d%s", (h < 0) ? "-" : "+", (h < 0) ? -h : h, z.observesDst ? " +DST" : "");
+}
+
+static void drawTzPicker() {
+    clampTzScroll();
+    if (pageJustEntered) {
+        tft.fillScreen(TFT_BLACK);
+        tft.setFont(&fonts::Font4); tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextDatum(textdatum_t::top_left);
+        tft.drawString("Time zone", 20, 18);
+        tft.setFont(&fonts::Font2); tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawString("drag to scroll  -  tap to choose  -  AUTO uses GPS", 20, 46);
+        pageJustEntered = false; tzp.dirty = true;
+    }
+    if (!tzp.dirty) return;
+    tzp.dirty = false;
+    const int viewH = TZ_FOOT_Y - 10 - TZ_BODY_TOP;
+    tft.fillRect(0, TZ_BODY_TOP, 800, viewH, TFT_BLACK);
+    tft.setClipRect(0, TZ_BODY_TOP, 800, viewH);
+    for (int i = 0; i < N_TIMEZONES; i++) {
+        const int ry = TZ_BODY_TOP + i * TZ_ROW_DY - tzp.scrollY;
+        if (ry + TZ_ROW_DY < TZ_BODY_TOP || ry > TZ_FOOT_Y - 10) continue;
+        const bool sel = (i == tzp.selected), act = (i == (int)s.timezone_idx);
+        const uint16_t bgrow = sel ? TFT_DARKCYAN : TFT_BLACK;
+        tft.fillRect(0, ry, 800, TZ_ROW_DY - 2, bgrow);
+        tft.setFont(&fonts::Font4);
+        tft.setTextDatum(textdatum_t::top_left);
+        tft.setTextColor(act ? TFT_GREEN : TFT_WHITE, bgrow);
+        tft.drawString(TIMEZONES[i].name, 24, ry + 8);
+        char off[24]; fmtTzOffset(TIMEZONES[i], off, sizeof(off));
+        tft.setFont(&fonts::Font2);
+        tft.setTextDatum(textdatum_t::top_right);
+        tft.setTextColor(act ? TFT_GREEN : TFT_LIGHTGREY, bgrow);
+        tft.drawString(off, 776, ry + 14);
+        tft.setTextDatum(textdatum_t::top_left);
+    }
+    tft.clearClipRect();
+    tft.fillRect(0, TZ_FOOT_Y, 800, TZ_FOOT_H, TFT_BLACK);
+    auto btn = [](int x, const char *lbl, uint16_t bg) {
+        tft.fillRect(x, TZ_FOOT_Y, 220, TZ_FOOT_H, bg);
+        tft.drawRect(x, TZ_FOOT_Y, 220, TZ_FOOT_H, TFT_WHITE);
+        tft.setFont(&fonts::Font4); tft.setTextSize(1);
+        tft.setTextColor(TFT_WHITE, bg);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString(lbl, x + 110, TZ_FOOT_Y + TZ_FOOT_H / 2);
+        tft.setTextDatum(textdatum_t::top_left);
+    };
+    btn(20,  "CANCEL", TFT_MAROON);
+    btn(290, "AUTO",   s.auto_tz ? TFT_DARKGREEN : TFT_DARKGREY);
+    btn(560, "DONE",   TFT_DARKGREEN);
+}
+
+static void handleTzPickerTap(int x, int y) {
+    if (y >= TZ_FOOT_Y) {
+        if (x < 240)       cancelTzPicker();
+        else if (x < 510) { s.auto_tz = true;      // re-arm and take the zone from GPS now
+                            tzApplyAuto(true);
+                            tzp.selected = (int8_t)s.timezone_idx;
+                            tzp.dirty = true; }
+        else               saveTzPicker();
+        return;
+    }
+    if (y >= TZ_BODY_TOP) {
+        const int i = (y - TZ_BODY_TOP + tzp.scrollY) / TZ_ROW_DY;
+        if (i >= 0 && i < N_TIMEZONES) { tzp.selected = (int8_t)i; tzp.dirty = true; }
+    }
 }
 
 static void drawTrackPicker() {
@@ -12025,6 +12288,7 @@ void setup() {
     pinMode(19, OUTPUT);                          // vendor strap (left LOW)
     Wire.begin(DASH_TOUCH_SDA, DASH_TOUCH_SCL);   // 15 / 16
     delay(50);
+    rtcBegin();   // v0.1.152: PCF8563 at 0x51 on this same bus - restore time before WiFi/NTP
     {
         // Wait (<=3 s) for the coprocessor (0x30) + GT911 (0x5D). If they don't
         // answer, kick them awake (cmd 250 + GPIO 1 toggle) and retry.
@@ -12242,6 +12506,35 @@ static void dashHealthTick() {
     }
 }
 
+// ---- Panel-clock -> Teensy time broadcast (v0.1.152) --------------------------
+// The panel has the coin cell, so it is the long-term reference: at the track there is no
+// WiFi and the Teensy's own cell may be flat, while GPS may not have a fix yet. Whenever
+// the Teensy's last TIME, differs from ours by more than a few seconds we re-send
+// SETTIME. Rate-limited, and never while an upload is streaming or a Teensy OTA is in
+// flight (a stray line there jams the ARQ / lands mid-flash).
+static void rtcTimeSyncTick() {
+    static uint32_t last_ms = 0, last_epoch_sent = 0;
+    if (!rtc_present || !rtc_time_valid) return;
+    if (!s.auto_time) return;                          // Auto time OFF: clock is user-owned
+    if (uf.state != UF_IDLE) return;
+    if (currentPage == PAGE_OTA &&
+        (ota_state == OTA_S_TEENSY_DOWNLOADING || ota_state == OTA_S_TEENSY_WAITING)) return;
+    const uint32_t now_ms = millis();
+    if (now_ms - last_ms < 30000) return;             // every 30 s at most
+    last_ms = now_ms;
+    const time_t t = time(nullptr);
+    if ((uint32_t)t <= RTC_EPOCH_MIN) return;
+    if (rtc_epoch == 0) return;                       // no TIME, heard yet: Teensy not up
+    const int32_t diff = (int32_t)((uint32_t)t - rtc_epoch);
+    if (diff > 5 || diff < -5) {
+        if ((uint32_t)t != last_epoch_sent) {
+            last_epoch_sent = (uint32_t)t;
+            Serial.printf("SETTIME,%lu\n", (unsigned long)t);
+            Serial.printf("[rtc] pushed panel clock to Teensy (delta %ld s)\n", (long)diff);
+        }
+    }
+}
+
 void loop() {
     pumpUart();
     simTick();        // screen-side telemetry simulator, 25 Hz when active (v0.1.147)
@@ -12363,6 +12656,11 @@ void loop() {
             lastDraw = now;
             drawTrackPicker();
         }
+    } else if (currentPage == PAGE_TZ_PICKER) {
+        if ((tzp.dirty && now - lastDraw >= 33) || pageJustEntered) {
+            lastDraw = now;
+            drawTzPicker();
+        }
     } else if (currentPage == PAGE_CONFIG_PICKER) {
         if (cp.dirty || pageJustEntered) { lastDraw = now; drawConfigPicker(); }
     } else if (currentPage == PAGE_STATUS) {
@@ -12451,4 +12749,13 @@ void loop() {
             }
         }
     }
+    rtcTimeSyncTick();   // panel coin-cell clock -> Teensy SETTIME broadcast (v0.1.152)
+
+    // v0.1.151 loop yield. Measured on the bench: the loop ran unthrottled at ~36,000
+    // iterations/s. This core shares core 1 with the Arduino event loop and the WiFi task,
+    // and the RGB framebuffer DMA has NO bounce buffer, so it competes directly with the
+    // flash/icache bus traffic an unthrottled loop generates. One tick costs nothing at our
+    // real rates (telemetry 25 Hz, touch still polled 1,000x/s) and cut our own bus traffic
+    // by ~39x in measurement. Panel timing/config is unchanged: polarity 1/1, 15 MHz.
+    vTaskDelay(1);
 }

@@ -1,0 +1,28 @@
+# CrowPanel Advance (N16R8, 16 MB flash) — A/B OTA with real headroom.
+#
+# The stock "default" scheme is a 4 MB layout: 2 x 1,310,720 B app slots. On a 16 MB
+# module that is absurd — the dash is already at 96% of it, so any new feature risks a
+# dead OTA. This file is picked up automatically because arduino-esp32's prebuild hook
+# copies a sketch-local partitions.csv FIRST (see platform.txt recipe.hooks.prebuild.1),
+# ahead of variant and platform tables — so no FQBN change is needed:
+#   sketch-local  >  variant  >  PartitionScheme=<scheme>
+#
+# Layout (16 MB = 0x1000000):
+#   nvs       0x9000    20 KB   Preferences/NVS (unchanged offset: existing settings keep)
+#   otadata   0xE000     8 KB   which app slot is active (unchanged offset)
+#   app0      0x10000    6 MB   ota_0
+#   app1      0x610000   6 MB   ota_1   (4.7x headroom over today's 1.26 MB image)
+#   spiffs    0xC10000  ~3.8 MB data   reserved for future on-panel caching
+#
+# nvs and otadata deliberately keep their stock offsets so a USB reflash migrates an
+# existing unit in place instead of wiping its settings.
+#
+# NOTE: a partition table can only be written by a USB/esptool flash. OTA updates the app
+# slot only, so each unit needs ONE bench flash to move onto this layout (after that its
+# OTAs can use the full 6 MB slot).
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xE000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x600000,
+app1,       app,  ota_1,    0x610000, 0x600000,
+spiffs,     data, spiffs,   0xC10000, 0x3D0000,

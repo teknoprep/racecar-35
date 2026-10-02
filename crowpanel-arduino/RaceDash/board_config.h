@@ -234,6 +234,10 @@
 #define DASH_VSYNC_PULSE_WIDTH 4
 #define DASH_VSYNC_BACK_PORCH  8
 
+// Sync polarity: INVERTED (1/1) on BOTH Advance panels — this is what the field-proven
+// 5" example uses and what the 7" glass actually locks to. (v0.1.151 tried the 0/0 values
+// from a third-party 7" starter: it made the flicker far worse, so 1/1 is confirmed by
+// experiment on THIS glass. Do not "fix" this from another repo's config again.)
 #define DASH_HSYNC_POLARITY  1
 #define DASH_VSYNC_POLARITY  1
 #define DASH_PCLK_ACTIVE_NEG 0
