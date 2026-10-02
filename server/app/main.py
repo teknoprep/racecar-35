@@ -6268,6 +6268,19 @@ _REVIEW_HTML = (
   .card-body { padding: var(--sp-md); }
   #map { height: 560px; width: 100%; background: var(--bg); }
   .leaflet-container { background: var(--bg); }
+  /* On-map key for the two cars: amber = the lap being viewed, red = the
+     comparison lap (its ghost LINE + its dot). Sits inside #map, which Leaflet
+     makes position:relative, so it overlays the tiles. */
+  .dotlegend { position: absolute; left: 10px; bottom: 10px; z-index: 1000;
+    pointer-events: none; background: rgba(14,16,20,0.80);
+    border: 1px solid var(--line); border-radius: var(--r-md);
+    padding: 7px 10px; font: 600 11px/1.7 var(--ff-mono); color: var(--text); }
+  .dotlegend .dl-row { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+  .dotlegend .dl-dot { width: 10px; height: 10px; border-radius: var(--r-full);
+    border: 2px solid #1A1300; flex: 0 0 auto; }
+  .dotlegend .dl-line { width: 26px; border-top: 2px dashed #FF7A7A;
+    opacity: 0.85; flex: 0 0 auto; }
+  .dotlegend .dl-note { color: var(--muted); font-weight: 400; }
   .tiles { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-md); }
   .tile { background: var(--surface); border: 1px solid var(--line);
     border-radius: var(--r-md); padding: var(--sp-md); }
@@ -6460,7 +6473,13 @@ _REVIEW_HTML = (
       <div class="card">
         <div class="card-head"><span class="t-label">Track Map</span>
           <span class="t-label" id="gps-status">\u2014</span></div>
-        <div id="map"></div>
+        <div id="map">
+          <div class="dotlegend" id="dotlegend">
+            <div class="dl-row"><span class="dl-dot" style="background:#FFB020"></span><span id="dl-you">your lap (amber)</span></div>
+            <div class="dl-row" id="dl-refrow"><span class="dl-line"></span><span class="dl-dot" style="background:#FF5D5D"></span><span id="dl-ref">comparison lap (red)</span></div>
+            <div class="dl-row dl-note" id="dl-note"></div>
+          </div>
+        </div>
       </div>
       <div class="tiles">
         <div class="tile full">
@@ -7036,12 +7055,34 @@ _REVIEW_HTML = (
     if (refLine) map.removeLayer(refLine);
     const sameLap = ref && ref.ctx===selfCtx && ref.lap.lap===primLapArg.lap;
     if (ref && !sameLap){
+      // The ghost lap is the SAME car the red dot follows, so draw it in the
+      // same red — light + semi-transparent + dashed, so it reads as "not you"
+      // and still loses to the amber line (weight 4, solid) underneath it.
       refLine=L.polyline(ctxSeg(ref.ctx, ref.lap),
-        {color:'#6CD07A', weight:2, opacity:0.55, dashArray:'4 5'}).addTo(map);
+        {color:'#FF7A7A', weight:2, opacity:0.6, dashArray:'5 7'}).addTo(map);
     }
     const seg=ctxSeg(selfCtx, primLapArg);
     selLine=L.polyline(seg, {color:'#FFB020', weight:4, opacity:0.95}).addTo(map);
     if (seg.length) map.fitBounds(selLine.getBounds(), {padding:[20,20]});
+    updateDotLegend();
+  }
+
+  // ---- on-map key: which dot/line is which car ------------------------
+  function updateDotLegend(){
+    const you=el('dl-you'), ref=el('dl-ref'), row=el('dl-refrow'), note=el('dl-note');
+    if (!you) return;
+    you.textContent = primLap ? ('lap '+primLap.lap+'  \u2014 the lap you are viewing')
+                              : 'the lap you are viewing';
+    const sameLap = !!(currentRef && primLap && currentRef.ctx===selfCtx
+                       && currentRef.lap.lap===primLap.lap);
+    const showRef = !!(currentRef && primLap && !sameLap);
+    if (row) row.style.display = showRef ? '' : 'none';
+    if (ref && showRef) ref.textContent = currentRef.label+'  \u2014 the other car';
+    if (note){
+      if (sameLap) note.textContent = 'no second line: it is the same lap';
+      else if (showRef && syncMode!=='time') note.textContent = 'same-place sync: line shown, dot hidden';
+      else note.textContent = '';
+    }
   }
 
   // ---- delta chart + follow-cursor -----------------------------------
@@ -7150,6 +7191,7 @@ _REVIEW_HTML = (
     el('delta-sel').textContent='\u00b7 lap '+primLap.lap+' vs '+(ref?ref.label:'\u2014');
     highlight(primLap, ref);
     drawDelta(primLap, ref);
+    updateDotLegend();
     render(Number(slider.value));
   }
   function selectPrimary(lap, rowsEl){
@@ -7160,6 +7202,7 @@ _REVIEW_HTML = (
     el('delta-sel').textContent='\u00b7 lap '+lap.lap+' vs '+(currentRef?currentRef.label:'\u2014');
     highlight(lap, currentRef);
     drawDelta(lap, currentRef);
+    updateDotLegend();
     slider.value=String(lapWindow.i0); render(lapWindow.i0);
   }
 
@@ -7235,6 +7278,7 @@ _REVIEW_HTML = (
   el('sync-mode').addEventListener('change', ()=>{
     syncMode=el('sync-mode').value;
     render(Number(slider.value));
+    updateDotLegend();
   });
 
   // ---- load this session's laps + wire the table ---------------------
