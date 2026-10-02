@@ -1166,7 +1166,9 @@ async def admin_page(request: Request) -> Response:
     page = (_ADMIN_HTML
             .replace("__USER_CHIP__", _user_chip_html(user))
             .replace("__ROWS__", _admin_rows_html(self_email))
-            .replace("__SELF__", html.escape(self_email.lower())))
+            .replace("__SELF__", html.escape(self_email.lower()))
+            .replace("__HINT_NOW__", html.escape(HOST_UPDATE_HINT_NOW))
+            .replace("__HINT_INSTALL__", html.escape(HOST_UPDATE_HINT_INSTALL)))
     return HTMLResponse(page)
 
 
@@ -2290,6 +2292,16 @@ async def coach_reopen(request: Request, user: str,
 UPDATE_REQ  = DATA_DIR / "update_request.json"
 UPDATE_STAT = DATA_DIR / "update_status.json"
 
+# Copy-pasteable repair hints for the admin UI. The container cannot run these
+# itself (no docker socket / no git checkout) — they run on the SERVER HOST.
+# Override the checkout path with RACECAR_HOST_REPO if yours differs.
+_HOST_REPO = os.environ.get("RACECAR_HOST_REPO", "/docker/racecar.api.blueuc.com").strip()
+HOST_UPDATE_HINT_NOW = f"cd {_HOST_REPO} && sudo ./server/host_updater.sh --now"
+HOST_UPDATE_HINT_INSTALL = (
+    f"cd {_HOST_REPO} && sudo ./server/host_updater.sh --install"
+    "   # one-time: installs the systemd watcher so the button works"
+)
+
 
 @app.post("/admin/update")
 async def admin_update(request: Request) -> JSONResponse:
@@ -2312,7 +2324,12 @@ async def admin_update(request: Request) -> JSONResponse:
 async def admin_update_status(request: Request) -> JSONResponse:
     """Progress written by the host watcher, plus whether a request is pending.
     After a successful rebuild this process is NEW, so `running_since` moving is
-    itself proof the update landed."""
+    itself proof the update landed.
+
+    Also reports WHETHER THE WATCHER HAS EVER ANSWERED (watcher_ever) and the
+    ages of the files, because 'queued… waiting for host watcher' forever is
+    almost always the watcher never having been installed on the host — a
+    silent failure the UI used to hide."""
     require_admin(request)
     st = {}
     if UPDATE_STAT.exists():
@@ -2326,8 +2343,23 @@ async def admin_update_status(request: Request) -> JSONResponse:
             pending = json.loads(UPDATE_REQ.read_text("utf-8"))
         except Exception:
             pending = {"state": "unreadable"}
-    return JSONResponse({"ok": True, "status": st, "pending": pending,
-                         "running_since": _PROC_START, "now": int(time.time())})
+    now = int(time.time())
+
+    def _age(p: pathlib.Path):
+        try:
+            return max(0, now - int(p.stat().st_mtime))
+        except Exception:
+            return None
+
+    return JSONResponse({
+        "ok": True, "status": st, "pending": pending,
+        "running_since": _PROC_START, "now": now,
+        "status_age_s": _age(UPDATE_STAT),
+        "pending_age_s": _age(UPDATE_REQ),
+        "watcher_ever": UPDATE_STAT.exists(),
+        "hint_now": HOST_UPDATE_HINT_NOW,
+        "hint_install": HOST_UPDATE_HINT_INSTALL,
+    })
 
 
 _KNOWN_TRACKS: list = []
@@ -5375,33 +5407,74 @@ _ADMIN_HTML = (
   (function(){
     var b=document.getElementById('srvupd'), m=document.getElementById('srvupdmsg');
     if(!b) return;
-    var poll=null, t0=0;
+    var poll=null, t0=0, clickedAt=0, DEADLINE=3600000;
+    var NOW_CMD='__HINT_NOW__', INST_CMD='__HINT_INSTALL__';
     function fmt(s){ return s||''; }
+    function age(s){ return (s===null||s===undefined) ? '' : ' (' + s + 's ago)'; }
+    function stuck(j, elapsed){
+      // The watcher has NEVER written a status file -> it is not installed.
+      // That is the usual reason the button 'never works'.
+      if(!j.watcher_ever) return true;
+      // A request older than 45 s with the host still idle means nothing picked it up.
+      var st=(j.status&&j.status.state)||'';
+      if(elapsed>45 && j.pending && st!=='pulling' && st!=='building') return true;
+      return false;
+    }
     async function tick(){
       try{
         var r=await fetch('/admin/update/status'); var j=await r.json();
         var st=(j.status&&j.status.state)||'', pend=!!j.pending;
+        var elapsed=(Date.now()-clickedAt)/1000;
         if(j.running_since && t0 && j.running_since>t0){
-          m.textContent='updated \\u2713 server restarted'; b.disabled=false;
-          clearInterval(poll); poll=null; return;
+          m.style.color='#2e7d32';
+          m.textContent='updated \u2713 server restarted';
+          b.disabled=false; clearInterval(poll); poll=null; return;
         }
-        m.textContent = pend ? 'queued\\u2026 waiting for host watcher'
-                             : (st ? ('host: '+fmt(st)) : 'queued\\u2026');
+        if(st==='done' && !pend && j.status_age_s!==null && elapsed>j.status_age_s && j.status_age_s<600){
+          m.style.color='#2e7d32';
+          m.textContent='updated \u2713 host reported done';
+          b.disabled=false; clearInterval(poll); poll=null; return;
+        }
+        if(st==='failed'){
+          m.style.color='#c62828';
+          m.textContent='update FAILED: '+fmt(j.status&&j.status.detail);
+          b.disabled=false; clearInterval(poll); poll=null; return;
+        }
+        if(stuck(j, elapsed)){
+          m.style.color='#c62828';
+          m.textContent = 'no host watcher response \u2014 run this ON THE SERVER HOST:  '
+            + (j.watcher_ever ? NOW_CMD : INST_CMD);
+          b.disabled=false; clearInterval(poll); poll=null; return;
+        }
+        if(poll && Date.now()-clickedAt>DEADLINE){
+          m.style.color='#c62828';
+          m.textContent='still no response after 60 min \u2014 run: '+NOW_CMD;
+          b.disabled=false; clearInterval(poll); poll=null; return;
+        }
+        m.style.color='';
+        m.textContent = pend
+          ? ('queued\u2026 waiting for host watcher' + (st?(' (host: '+fmt(st)+')'):''))
+          : (st ? ('host: '+fmt(st)+age(j.status_age_s)) : 'queued\u2026');
       }catch(e){}
     }
     b.addEventListener('click', async function(){
       if(!confirm('Update the server?\\n\\ngit pull + docker compose up -d --build\\nThe site will restart.')) return;
-      b.disabled=true; m.textContent='requesting\\u2026';
+      b.disabled=true; m.style.color=''; m.textContent='requesting\u2026';
       try{
         var s=await (await fetch('/admin/update/status')).json();
         t0=s.running_since||0;
         var r=await fetch('/admin/update',{method:'POST'});
         var j=await r.json();
-        if(!r.ok){ m.textContent='error: '+((j&&j.detail)||r.status); b.disabled=false; return; }
-        m.textContent='queued\\u2026';
+        if(!r.ok){ m.style.color='#c62828'; m.textContent='error: '+((j&&j.detail)||r.status); b.disabled=false; return; }
+        clickedAt=Date.now();
+        m.textContent='queued\u2026';
         if(!poll) poll=setInterval(tick,3000);
-      }catch(e){ m.textContent='failed: '+e.message; b.disabled=false; }
+        tick();
+      }catch(e){ m.style.color='#c62828'; m.textContent='failed: '+e.message; b.disabled=false; }
     });
+    // On load, if a request is already pending, say plainly whether the host has
+    // ever answered instead of showing an open-ended spinner.
+    tick();
   })();
   </script>
   <a class="btn" href="/admin/report" style="margin-right:var(--sp-md)">report</a>

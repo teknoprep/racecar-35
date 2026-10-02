@@ -27,6 +27,7 @@
 #
 #   Modes:
 #       --status      show detected paths, pending request, last result
+#       --doctor      one-shot health check: why doesn't the button work?
 #       --now         force an update right now, ignoring the request flag
 #       --watch       run the instant watcher in the foreground (what the
 #                     systemd service runs)
@@ -188,7 +189,52 @@ EOF
     rm -f "$SVC" "$TIMER" "$TIMERSVC"; systemctl daemon-reload
     echo "removed."; exit 0 ;;
 
+  --doctor)
+    # "The update button never works" — answer it in one command. Read-only.
+    fail=0
+    chk() { printf '%-14s %s\n' "$1" "$2"; }
+    echo "racecar-35 updater health check"
+    echo "--------------------------------"
+    echo "script       : $SELF"
+    echo "repo         : $REPO"
+    echo "server dir   : $SERVER_DIR"
+    echo "data dir     : $DATA"
+    echo
+    if [ -d "$REPO/.git" ]; then chk "repo"    "ok (.git present)";
+      else chk "repo"    "FAIL: $REPO is not a git checkout — git pull cannot work"; fail=1; fi
+    if [ -f "$COMPOSE_FILE" ]; then chk "compose"  "ok ($(basename "$COMPOSE_FILE"))";
+      else chk "compose"  "FAIL: $COMPOSE_FILE missing — wrong repo? install refuses without it"; fail=1; fi
+    if docker info >/dev/null 2>&1; then chk "docker"   "ok";
+      else chk "docker"   "FAIL: cannot talk to the docker daemon (need root?)"; fail=1; fi
+    if mkdir -p "$DATA" 2>/dev/null && [ -w "$DATA" ]; then chk "data dir"  "ok (writable)";
+      else chk "data dir"  "FAIL: $DATA not writable — the portal cannot drop a request here"; fail=1; fi
+    if command -v inotifywait >/dev/null 2>&1; then chk "inotify"  "ok (instant reaction)";
+      else chk "inotify"  "warn: inotify-tools missing -> 10 s polling fallback (apt-get install -y inotify-tools)"; fi
+    w=$(systemctl is-active racecar-updater 2>/dev/null || true)
+    t=$(systemctl is-active racecar-updater-safety.timer 2>/dev/null || true)
+    if [ -f "$SVC" ]; then chk "unit"     "ok ($SVC)";
+      else chk "unit"     "FAIL: not installed -> THIS is why the button only ever says 'queued'."; fail=1; fi
+    case "$w" in active) chk "watcher"  "ok (running)";;
+      *) chk "watcher"  "FAIL: service state '${w:-unknown}' -> button requests are never consumed"; fail=1;; esac
+    case "$t" in active) chk "timer"    "ok (safety sweep every 5 min)";;
+      *) chk "timer"    "warn: safety timer '${t:-not installed}' (the watcher alone is enough)";; esac
+    if timeout 20 git -C "$REPO" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
+      chk "git remote" "ok (pull/network reachable)";
+    else chk "git remote" "FAIL: cannot reach origin from $REPO — 'git pull' will fail"; fail=1; fi
+    echo
+    echo "request      : $([ -f "$REQ" ] && echo PENDING || echo none)"
+    echo -n "last status  : "; [ -f "$STAT" ] && cat "$STAT" || echo "(none — the watcher has NEVER reported)"
+    echo
+    if [ "$fail" = "0" ]; then
+      echo "VERDICT: the updater is healthy. Press the button, or run: $SELF --now"
+    else
+      echo "VERDICT: the updater is NOT working."
+      echo "         Fix it with (as root):  $SELF --install"
+      echo "         and to ship the pending change right now:  $SELF --now"
+    fi
+    exit $fail ;;
+
   --now)  run_update; exit $? ;;
   "")     [ -f "$REQ" ] && { run_update; exit $?; }; exit 0 ;;
-  *)      echo "unknown option: $1 (try --status, --install, --now, --watch)"; exit 1 ;;
+  *)      echo "unknown option: $1 (try --status, --doctor, --install, --now, --watch)"; exit 1 ;;
 esac

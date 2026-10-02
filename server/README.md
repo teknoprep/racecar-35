@@ -364,6 +364,58 @@ release** published to BOTH places:
    OTA up to it one last time.
 4. From then on, publish only with `publish_firmware.sh` — no CDN lag.
 
+## The “update server” button (host updater)
+
+The `/admin` header has an **update server** button. It cannot rebuild the app
+from inside the container (no docker socket, no git checkout), so it only
+**writes a request** (`<data>/update_request.json`); a small host-side watcher,
+`server/host_updater.sh`, runs `git pull && docker compose … up -d --build` and
+writes progress back to `<data>/update_status.json`, which the button polls.
+
+### One-time install (on the server host, as root)
+
+```bash
+cd /docker/racecar.api.blueuc.com
+sudo bash ./server/host_updater.sh --install    # use `bash` — see the note below
+sudo apt-get install -y inotify-tools          # optional: instant instead of 10 s polling
+```
+
+It installs `racecar-updater.service` (blocks on inotify, reacts instantly) and
+a 5-minute safety timer that catches a request the watcher missed. Do **not**
+copy the script to `/usr/local/bin` — it self-locates the repo/data paths from
+its own position.
+
+⚠️ Call it as `bash ./server/host_updater.sh` (or `chmod +x` it once). If the
+executable bit is missing, `sudo ./server/host_updater.sh --install` just says
+`Permission denied` — an easy 30 minutes to lose.
+
+### “It just says queued… waiting for host watcher”
+
+That means the request file is there and **nothing consumed it** — nearly always
+the watcher was never installed. One command answers it:
+
+```bash
+sudo bash ./server/host_updater.sh --doctor     # read-only health check + verdict
+```
+
+It checks the checkout, compose file, docker daemon, data-dir writability,
+inotify, the systemd units, the watcher/timer state and origin reachability, then
+prints either `VERDICT: the updater is healthy` or the exact fix. Related:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| queued forever, `host: …` never appears | watcher not installed / not running | `--doctor`, then `--install` |
+| `Permission denied` on install | exec bit missing in the checkout | call it with `bash` (fixed in git, but old checkouts are 644) |
+| `host: failed` — `git pull: …` | host checkout can’t reach/authenticate to origin | fix the remote on the host; `--doctor` tests it |
+| `host: failed` — `compose: …` | image build error | read the tail in `update_status.json`, fix, `--now` |
+| button appears to do nothing at all | request written but UI had no answer | the admin UI now shows the reason + the command to run |
+
+Ship a pending change **right now**, synchronously, printing the result:
+
+```bash
+sudo bash ./server/host_updater.sh --now
+```
+
 ## Behind nginx (production)
 
 Minimal nginx server block, assuming you've already got TLS termination on
