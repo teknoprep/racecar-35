@@ -163,6 +163,38 @@ INFO racecar.cloud: received 192.168.1.123 mode=w email=anon session=1714... tra
 
 And opening `http://<host>:8089/` in a browser shows the new session in the table.
 
+## Basemap for the session map (review page)
+
+The review page's Leaflet map takes its tiles from `RACECAR_MAP_TILES`, and the
+default is **keyless Esri imagery** — the same source `/tools/sfpicker` and the
+lineview popout already use.
+
+Why it is configurable: the previous basemap was CARTO's `dark_nolabels`, and
+CARTO's raster basemaps now **require an API key**. Without one,
+`basemaps.cartocdn.com` returns a 256x256 **“API KEY REQUIRED”** placeholder
+tile instead of map data — the giveaway is that two different tile coordinates
+come back byte-identical. So no key is needed at all; the map simply moved to a
+provider that does not require one.
+
+Read at startup, so **`docker compose up -d` is enough — no `--build`**:
+
+| Var | Default | Notes |
+| --- | --- | --- |
+| `RACECAR_MAP_TILES` | Esri `World_Imagery` | Tile URL template; empty = no basemap |
+| `RACECAR_MAP_ATTRIB` | `Imagery © Esri, Maxar, Earthstar Geographics` | Attribution shown in the corner |
+| `RACECAR_MAP_MAXZOOM` | `19` | Leaflet max zoom |
+
+Dark map instead of imagery (keeps the old look; Esri's canvas basemaps have
+native data only to z16, so zooming past that upscales):
+
+```bash
+RACECAR_MAP_TILES='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}'
+RACECAR_MAP_ATTRIB='Tiles (c) Esri'
+```
+
+⚠️ Esri tile paths are `/{z}/{y}/{x}` (row/col) — **not** `/{z}/{x}/{y}`.
+Swapping those two gives you a map of the wrong place, not an error.
+
 ## AI corner analysis (review page)
 
 The review page has an **AI Corner Analysis** card. Click **circle a section**,

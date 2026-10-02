@@ -105,6 +105,45 @@ if not AI_MODELS and AI_MODEL:
 AI_DEFAULT_MODEL = AI_MODEL or (AI_MODELS[0] if AI_MODELS else "")
 
 
+# ---------------------------------------------------------------------------
+# Basemap for the session map (review page / playback).
+#
+# ⚠️ CARTO's raster basemaps now REQUIRE an API key. Without one,
+# basemaps.cartocdn.com serves a 256x256 "API KEY REQUIRED" placeholder tile
+# instead of map data — two different tile coordinates come back byte-identical
+# (verified), which is exactly the "the map says API KEY REQUIRED" symptom.
+# So the default here is Esri's KEYLESS imagery: the same source the S/F picker
+# (/tools/sfpicker), the standalone tools/track_sf_picker.html and the lineview
+# popout already use, and it keeps detail to z19 over a race track.
+#
+# Override with env only — no rebuild needed, just `docker compose up -d`:
+#   RACECAR_MAP_TILES=https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}
+#   RACECAR_MAP_ATTRIB=Tiles (c) Esri
+#   RACECAR_MAP_MAXZOOM=19
+# BLANK means "use the default" (a blank var in .env must not kill the map);
+# the literal RACECAR_MAP_TILES=none removes the basemap (traces on the surface).
+# NOTE: Esri tile URLs are /{z}/{y}/{x} (row/col) — not /{z}/{x}/{y} — and the
+# Canvas basemaps only have native data to z16, so over-zooming they upscale.
+# ---------------------------------------------------------------------------
+_DEFAULT_MAP_TILES = (
+    "https://server.arcgisonline.com/ArcGIS/rest/services/"
+    "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+)
+_map_tiles_env = os.environ.get("RACECAR_MAP_TILES", "").strip()
+if _map_tiles_env.lower() == "none":
+    MAP_TILES = ""                              # explicit opt-out
+else:
+    MAP_TILES = _map_tiles_env or _DEFAULT_MAP_TILES
+MAP_ATTRIB = os.environ.get("RACECAR_MAP_ATTRIB", "").strip() or (
+    "Imagery \u00a9 Esri, Maxar, Earthstar Geographics"
+)
+_zoom_env = os.environ.get("RACECAR_MAP_MAXZOOM", "").strip()
+try:
+    MAP_MAXZOOM = int(_zoom_env) if _zoom_env else 19
+except ValueError:
+    MAP_MAXZOOM = 19
+
+
 def ai_enabled() -> bool:
     return bool(AI_API_KEY)
 
@@ -4920,7 +4959,10 @@ async def review(request: Request, user: str, filename: str) -> Response:
     )
     return _REVIEW_HTML.replace("__USER__", safe_name(user)) \
                        .replace("__FILE__", p.name) \
-                       .replace("__WHEN__", when)
+                       .replace("__WHEN__", when) \
+                       .replace("__MAP_TILES__", json.dumps(MAP_TILES)) \
+                       .replace("__MAP_ATTRIB__", json.dumps(MAP_ATTRIB)) \
+                       .replace("__MAP_MAXZOOM__", str(MAP_MAXZOOM))
 
 
 # ---------------------------------------------------------------------------
@@ -6520,11 +6562,15 @@ _REVIEW_HTML = (
       ? (data.count + ' of ' + data.total + ' samples')
       : (data.count + ' samples');
 
-  // ---- Leaflet map (dark tiles match the surface palette) -------------
+  // ---- Leaflet map (basemap from the server config; default = keyless Esri
+  // imagery. CARTO's dark tiles now need an API key and would render a
+  // "API KEY REQUIRED" placeholder here.) ---------------------------------
   const map = L.map('map', { zoomControl: true, attributionControl: true });
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
-    maxZoom: 19, attribution: '\u00a9 OpenStreetMap \u00a9 CARTO'
-  }).addTo(map);
+  if (__MAP_TILES__) {
+    L.tileLayer(__MAP_TILES__, {
+      maxZoom: __MAP_MAXZOOM__, attribution: __MAP_ATTRIB__
+    }).addTo(map);
+  }
 
   // Track centerline = all samples that have a valid lat/lon.
   const latlngs = [];
