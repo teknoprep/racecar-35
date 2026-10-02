@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.152"
+#define FIRMWARE_VERSION "0.1.153"
 
 #include <Preferences.h>
 #include <time.h>
@@ -5299,6 +5299,9 @@ static void invalidateAll() {
     ld.psi_x10  = INT32_MIN; ld.psi_col_tag  = UINT32_MAX;
     ld.afr_x10  = INT32_MIN; ld.afr_col_tag  = UINT32_MAX;
     ld.volt_x10 = INT32_MIN; ld.volt_col_tag = UINT32_MAX;
+    ld.clock_str[0] = 0;      // v0.1.153: the wall clock must repaint after a page re-entry
+                              // (a swipe clears the screen but not the cache, so keying it on
+                              //  the string alone left it blank until the next minute ticked)
     ld.trkbtn_state = 0xFF;
 }
 
