@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.165"
+#define FIRMWARE_VERSION "0.1.166"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -428,6 +428,7 @@ static void handleQLaps(const char* args);        // lap-time summary for on-SD 
 // Arduino's auto-prototype pass does not handle variadic functions, so declare it here
 // (the definition lives next to canDiagReport()).
 static void usbTele(const char* fmt, ...);
+static void canAckTest();
 static void openCanSniff();                       // CAN sniffer: open /cansniff/ file
 static void closeCanSniff();                      // CAN sniffer: flush + close
 static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf);
@@ -760,7 +761,9 @@ static void pumpDashCommands() {
 }
 
 static void handleUsbCommand(const String& line) {
-    if (line == "VER?") {
+    if (line == "ACKTEST") {
+        canAckTest();
+    } else if (line == "VER?") {
         usbTele("VER,teensy,%s\n", FIRMWARE_VERSION);
     } else if (line == "SDRE") {
         // Manual SD re-detection. Useful from `pio device monitor` to test
@@ -1228,6 +1231,44 @@ static void canDiagNote(uint32_t id, uint8_t len, const uint8_t* buf) {
 
 // CAN (re)init sequence, factored out so the TX self-test can recover the
 // controller from a bus-off without rebooting.
+// v0.1.166: ACKTEST — one-shot CAN transmit/ACK self-test, run from a USB serial terminal.
+// It answers the ONLY question that matters when the bus storms: can this node put a frame on
+// the wire and have somebody ACK it? Every transmit slot is either ACKed (the frame completes)
+// or not (the controller retries, its TEC climbs, and past 256 it goes bus-off). Before
+// v0.1.162 a test like this bricked reception because nothing recovered the controller — the
+// bus-off recovery task added then makes it safe, and this reports the counters around it.
+//   ACKTEST        -> sends ONE frame on 0x7F0 and reports what happened
+static void canAckTest() {
+    CAN_message_t m{};
+    m.id = 0x7F0;                       // deliberately unused by MS3 dash (0x5E8+) and RC35 (0x700/1)
+    m.len = 8;
+    for (uint8_t i = 0; i < 8; i++) m.buf[i] = (uint8_t)(0xA0 + i);
+
+    CAN_error_t e0{}, e1{};
+    const bool h0 = Can1.error(e0, false);
+    const uint32_t t0 = millis();
+    const uint16_t txq_before = Can1.getTXQueueCount();
+    const bool queued = Can1.write(m);
+    // give it a moment: an ACKed frame leaves the mailbox immediately, an unACKed one retries
+    while (millis() - t0 < 1500) { Can1.events(); }
+    const bool h1 = Can1.error(e1, false);
+    const uint16_t txq_after = Can1.getTXQueueCount();
+
+    usbTele("ACKTEST,queued=%d,left_mailbox=%d,txq_before=%u,txq_after=%u\n",
+            (int)queued, (int)(txq_after < txq_before || txq_after == 0), txq_before, txq_after);
+    usbTele("ACKTEST,state=%s,TEC=%u->%u,REC=%u->%u,ACK_ERR=%u->%u,FLT=%s\n",
+            h1 ? (char*)e1.state : "?", h0 ? e0.TX_ERR_COUNTER : 0, h1 ? e1.TX_ERR_COUNTER : 0,
+            h0 ? e0.RX_ERR_COUNTER : 0, h1 ? e1.RX_ERR_COUNTER : 0,
+            h0 ? e0.ACK_ERR : 0, h1 ? e1.ACK_ERR : 0, h1 ? (char*)e1.FLT_CONF : "?");
+    // A frame that cannot be ACKed leaves TEC climbing and (past 256) a bus-off, which the
+    // v0.1.162 recovery task then clears. TEC unchanged + mailbox empty == somebody ACKed us.
+    const bool acked = (h1 ? e1.TX_ERR_COUNTER : 0) == (h0 ? e0.TX_ERR_COUNTER : 0);
+    usbTele("ACKTEST,%s  (TEC must stay flat: a rising TEC means nobody ACKs our frames -\n"
+            "          check transceiver TXD (pin 1/D) -> Teensy pin 22, and Rs (pin 8) -> GND)\n",
+            acked ? "PASS - the bus ACKed our frame, so our transmit/ACK path IS alive"
+                  : "FAIL - our frame was never ACKed");
+}
+
 static void canBegin() {
     Can1.begin();
     Can1.setBaudRate(CAN_BAUD);   // normal mode -> FlexCAN auto-ACKs

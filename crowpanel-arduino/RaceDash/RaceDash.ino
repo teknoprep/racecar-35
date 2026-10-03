@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.165"
+#define FIRMWARE_VERSION "0.1.166"
 
 #include <Preferences.h>
 #include <time.h>
@@ -10746,7 +10746,10 @@ static void otaDoTeensyWaiting() {
     // v0.1.164: 30 s -> 60 s after the commit is seen. The Teensy can sit in flash_move()
     // longer than 30 s (the quiet window is 8 s and the reboot/self-test follows), and a
     // timeout that fires too early reports a FAILED update on a perfectly good flash.
-    const uint32_t TEENSY_REBOOT_TIMEOUT_MS = ota_teensy_commit_seen ? 60000UL : 180000UL;
+    // v0.1.166: 60 s -> 120 s. The Teensy can sit in flash_move() and then take a while to
+    // come up (and a dashboard talking to it also slows it down). A timeout that fires
+    // early reports a FAILED update on a perfectly good flash, which is worse than waiting.
+    const uint32_t TEENSY_REBOOT_TIMEOUT_MS = ota_teensy_commit_seen ? 120000UL : 240000UL;
     constexpr uint32_t TEENSY_VER_PING_MS   = 1000;
 
     // Quiet-after-commit window: the Teensy can take several seconds inside
