@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.164"
+#define FIRMWARE_VERSION "0.1.165"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -425,6 +425,9 @@ static void handleQDel(const char* basename);     // dash-initiated upload: dele
 static void handleQPrevList();                    // archived /sessions files
 static void handleQArchive(const char* basename); // move uploaded queue file into history
 static void handleQLaps(const char* args);        // lap-time summary for on-SD review
+// Arduino's auto-prototype pass does not handle variadic functions, so declare it here
+// (the definition lives next to canDiagReport()).
+static void usbTele(const char* fmt, ...);
 static void openCanSniff();                       // CAN sniffer: open /cansniff/ file
 static void closeCanSniff();                      // CAN sniffer: flush + close
 static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf);
@@ -758,7 +761,7 @@ static void pumpDashCommands() {
 
 static void handleUsbCommand(const String& line) {
     if (line == "VER?") {
-        Serial.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
+        usbTele("VER,teensy,%s\n", FIRMWARE_VERSION);
     } else if (line == "SDRE") {
         // Manual SD re-detection. Useful from `pio device monitor` to test
         // recovery without rebooting or physically replugging the card.
@@ -1196,6 +1199,7 @@ static struct CanDiag {
     uint8_t  base_hits     = 0;    // frames matching CAN_BASE_ID+0..3 this window
     uint8_t  bench_hits    = 0;    // RC35 bench frames (0x700/0x701) this window
     uint32_t last_report_ms = 0;
+    bool     storm_mode    = false;   // >600 frames/s: skip per-frame bookkeeping (v0.1.165)
     uint8_t  last_buf[8]   = {0};  // payload of previous frame (for dup detection)
     uint8_t  last_len      = 0xFF;
     uint32_t last_id       = 0xFFFFFFFF;
@@ -1291,6 +1295,22 @@ static void canBusOffRecover(CAN_error_t& err, bool have_err) {
     can_diag.last_report_ms = now;                      // report again straight away
 }
 
+// v0.1.165: telemetry/debug lines that must NEVER stall the loop.
+// The Teensy's USB CDC buffer is small and Serial.write BLOCKS when it fills — so a host that
+// holds the port open and drains it slowly (a forgotten `pio device monitor`, a terminal, a
+// stale agent process) drags the WHOLE loop down with it, including the 100 Hz dash emit. A
+// 10 ms emit floor is worth nothing if four USB mirrors per emit are waiting on a slow reader.
+// Dropping a debug line costs nothing: the DASH still gets everything on Serial3.
+static void usbTele(const char* fmt, ...) {
+    if (!Serial) return;                              // no USB host configured at all
+    if (Serial.availableForWrite() < 160) return;     // host not draining: DROP, never block
+    char buf[300];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    Serial.write((const uint8_t*)buf, strlen(buf));
+}
+
 static void canDiagReport() {
     const uint32_t now = millis();
     if (now - can_diag.last_report_ms < 1000) return;
@@ -1325,7 +1345,7 @@ static void canDiagReport() {
     (void)can_tx_test_state; (void)can_tx_test_result;
 
     const uint32_t dpct = can_diag.rx_window ? (can_diag.dup_window * 100UL / can_diag.rx_window) : 0;
-    Serial.printf("CANDIAG frames/s=%lu dup=%lu%% total=%lu base_hits=%u ids=[%s] "
+    usbTele("CANDIAG frames/s=%lu dup=%lu%% total=%lu base_hits=%u ids=[%s] "
                   "state=%s ACK_ERR=%d CRC_ERR=%d FRM=%d STF=%d TXerr=%u RXerr=%u flt=%s\n",
                   (unsigned long)can_diag.rx_window, (unsigned long)dpct,
                   (unsigned long)can_diag.rx_total, can_diag.base_hits, ids,
@@ -1336,7 +1356,7 @@ static void canDiagReport() {
                   have_err ? (char*)err.FLT_CONF : "?");
     // RC35 bench-frame visibility — USB ONLY. Deliberately NOT a CANDIAG field:
     // the dash parses that line's format.
-    Serial.printf("BENCH frames/s=%u oil=%d rpm=%u (RC35 0x%03lX/0x%03lX)\n",
+    usbTele("BENCH frames/s=%u oil=%d rpm=%u (RC35 0x%03lX/0x%03lX)\n",
                   can_diag.bench_hits, can_ecu.oil_x10, can_ecu.rpm,
                   (unsigned long)CAN_BENCH_CORE_ID, (unsigned long)CAN_BENCH_AUX_ID);
     // Also surface it on the dash link so it can be shown without a USB cable.
@@ -1348,6 +1368,7 @@ static void canDiagReport() {
                        have_err ? err.TX_ERR_COUNTER : 0,
                        have_err ? err.RX_ERR_COUNTER : 0,
                        can_tx_test_result);
+    can_diag.storm_mode = (can_diag.rx_window > 600);   // v0.1.165
     can_diag.rx_window = 0;
     can_diag.dup_window = 0;
     can_diag.ids_count = 0;
@@ -1363,7 +1384,11 @@ static void pumpCAN() {
     const uint32_t now = millis();
     while (Can1.read(msg)) {
         // Diagnostics: count EVERY frame + record its ID/payload, regardless of match.
-        canDiagNote(msg.id, msg.len, msg.buf);
+        // v0.1.165 ("just grab what you want"): in a retransmit storm the only thing
+        // that matters is draining the FIFO and parsing the ids we know. The per-frame
+        // duplicate/ID bookkeeping is pure overhead then, so skip it and count the storm
+        // once per second in canDiagReport() instead.
+        if (!can_diag.storm_mode) canDiagNote(msg.id, msg.len, msg.buf);
         if (msg.id >= CAN_BASE_ID && msg.id <= CAN_BASE_ID + 3) can_diag.base_hits++;
         if (msg.id == CAN_BENCH_CORE_ID || msg.id == CAN_BENCH_AUX_ID) can_diag.bench_hits++;
         // Sniffer: capture the raw frame (any ID) before our targeted parse.
@@ -1931,6 +1956,16 @@ static void formatSDCard() {
 // Flushed every ~1 s so a power loss costs at most ~1 s of frames.
 // ---------------------------------------------------------------------------
 static File32   cansniff_file;
+// v0.1.165: rate cap. The sniffer used to write EVERY frame to SD. On a bench with the
+// broadcaster injecting 200 frames/s (and a retransmit storm pushing thousands) that is
+// thousands of SD line writes per second, and SD sync() stalls the loop — the same stall
+// the 32 KB GPS RX buffer exists to survive, except here it starves the whole dash link.
+// Cap the log at CANSNIFF_MAX_PER_S and COUNT the drops instead of dying.
+static uint16_t cansniff_win_n     = 0;
+static uint16_t cansniff_win_s     = 0;   // frames actually written in the last second
+static uint32_t cansniff_drop      = 0;   // frames skipped by the cap
+static uint32_t cansniff_win_ms    = 0;
+static constexpr uint16_t CANSNIFF_MAX_PER_S = 300;
 static bool     cansniff_file_open    = false;
 static uint32_t cansniff_start_ms     = 0;
 static uint32_t cansniff_last_flush_ms = 0;
@@ -2005,6 +2040,14 @@ static void closeCanSniff() {
 }
 
 static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf) {
+    // v0.1.165 rate cap (see CANSNIFF_MAX_PER_S): drop, count, and keep the loop alive.
+    {
+        const uint32_t nowc = millis();
+        if (nowc - cansniff_win_ms >= 1000) { cansniff_win_ms = nowc; cansniff_win_s = cansniff_win_n; cansniff_win_n = 0; }
+        if (cansniff_win_n >= CANSNIFF_MAX_PER_S) { cansniff_drop++; return; }
+        cansniff_win_n++;
+    }
+
     if (!cansniff_file_open) return;
     if (len > 8) len = 8;
     char line[80];
@@ -3912,14 +3955,14 @@ static void emitToDash() {
 
     DASH_SERIAL.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u\n",
                        fix, sats, lat_deg, lon_deg, mph, hdg_deg, status);
-    Serial.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u  (raw_bytes=%lu)\n",
+    usbTele("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u  (raw_bytes=%lu)\n",
                   fix, sats, lat_deg, lon_deg, mph, hdg_deg, status,
                   (unsigned long)gnss_raw_bytes);
 
     // ENG line: RPM + oil PSI + coolant — all sourced per sensor_type above.
     // The dash RPM bar always reads eng.rpm from this line.
     DASH_SERIAL.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
-    Serial.printf("ENG,%u,%d,%d  [src=%s]\n", rpm, oil_psi_x10, cool_f_x10,
+    usbTele("ENG,%u,%d,%d  [src=%s]\n", rpm, oil_psi_x10, cool_f_x10,
                   use_can ? (g_cfg.sensor_type == 1 ? "CAN" : "CAN(auto)") : "direct");
     // ECU line: full MS3Pro CAN dataset. Dash uses these when sensor_type==1
     // (MegaSquirt) for coolant temp, AFR, MAP, TPS, IAT, and battery.
@@ -3929,13 +3972,13 @@ static void emitToDash() {
                        rpm, can_ecu.clt_f_x10, can_ecu.map_x10,
                        can_ecu.tps_x10, can_ecu.afr_x10,
                        can_ecu.iat_f_x10, can_ecu.bat_x10, can_ecu.oil_x10);
-    Serial.printf("ECU,%u,%d,%d,%d,%d,%d,%d,%d\n",
+    usbTele("ECU,%u,%d,%d,%d,%d,%d,%d,%d\n",
                   rpm, can_ecu.clt_f_x10, can_ecu.map_x10,
                   can_ecu.tps_x10, can_ecu.afr_x10,
                   can_ecu.iat_f_x10, can_ecu.bat_x10, can_ecu.oil_x10);
     DASH_SERIAL.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                        ax, ay, az, gx, gy, gz);
-    Serial.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
+    usbTele("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                   ax, ay, az, gx, gy, gz);
 
     // Lap counter: precise start/finish LINE crossing on the GPS stream.
