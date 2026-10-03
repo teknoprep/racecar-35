@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.157"
+#define FIRMWARE_VERSION "0.1.158"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1640,9 +1640,20 @@ static void monDefaults() {
     // this seed, and changing it later must NOT rewrite per-item sources. Where the seeded
     // source carries no data for an item (OIL / RPM are never on CAN or BT) the item falls
     // back to DIRECT, which is exactly what the pre-0.1.156 code read for them.
+    // v0.1.158: the fallback when the global source carries no data for an item must be a
+    // source that CAN. Falling back to DIRECT unconditionally left VOLT pointing at a battery
+    // ADC this board does not have, so selecting VOLT showed NOTHING on a Direct-mode unit.
+    // Preference: the global source when the item supports it, else DIRECT if supported
+    // (OIL / RPM — the pre-0.1.156 reading), else CANBUS, else BT.
     const uint8_t seed = (s.sensor_type == 1) ? MON_SRC_CAN : (s.sensor_type == 2) ? MON_SRC_BT : MON_SRC_DIRECT;
     for (uint8_t i = 0; i < MON_COUNT; ++i) {
-        mon_cfg.src[i]     = (MON_SRC_MASK[i] & MON_SRCBIT(seed)) ? seed : (uint8_t)MON_SRC_DIRECT;
+        uint8_t pick = seed;
+        if (!(MON_SRC_MASK[i] & MON_SRCBIT(seed)))
+            pick = (MON_SRC_MASK[i] & MON_SRCBIT(MON_SRC_DIRECT)) ? (uint8_t)MON_SRC_DIRECT
+                 : (MON_SRC_MASK[i] & MON_SRCBIT(MON_SRC_CAN))    ? (uint8_t)MON_SRC_CAN
+                 : (MON_SRC_MASK[i] & MON_SRCBIT(MON_SRC_BT))     ? (uint8_t)MON_SRC_BT
+                                                                  : (uint8_t)MON_SRC_DIRECT;
+        mon_cfg.src[i]     = pick;
         mon_cfg.can_bus[i] = MON_CAN_MS3;
     }
     // One control: the AEM analogue input (s.aem_afr) IS the AFR item's DIRECT source, and
@@ -5424,7 +5435,11 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
         int16_t bv = -1;
         if (btOk && obd::voltX10() > 0)           bv = obd::voltX10();
         else if (canOk && ecu.bat_x10 > 0)        bv = ecu.bat_x10;
-        ok = (eng.rpm >= ENGINE_RUNNING_RPM) && (bv > 0);
+        // v0.1.158: the DISPLAY is no longer gated on the engine running — "I selected VOLT
+        // and see nothing" was the complaint, and a parked ignition-on voltage is useful
+        // information. The WARN is still gated on rpm >= ENGINE_RUNNING_RPM; that gate moved
+        // to monItemWarnActive() (~12.4 V parked is normal, not a dead alternator).
+        ok = (bv > 0);
         v  = bv;
         break; }
     case MON_AFR:
@@ -5467,7 +5482,9 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
 // (not running / no source) disappears instead, and so does AFR when it has no source
 // (DIRECT with the AEM input off, or BT) - the pre-0.1.156 "AFR without a source" rule.
 static bool monItemFaultVisible(uint8_t item) {
-    if (item == MON_VOLT) return false;
+    // v0.1.158: VOLT shows a grey "VOLT: ---" instead of vanishing. Vanishing is precisely what
+    // made "I selected VOLT and see nothing" unreadable — a row you asked for that simply
+    // isn't there looks identical to a bug. AFR still hides when no AFR source exists.
     if (item == MON_AFR) {
         const uint8_t src = mon_cfg.src[MON_AFR];
         return (src == MON_SRC_DIRECT) ? s.aem_afr : (src == MON_SRC_CAN);
@@ -5478,6 +5495,9 @@ static bool monItemFaultVisible(uint8_t item) {
 // Warning test against the item's own thresholds (x10 natural unit, same scale as v).
 static bool monItemWarnActive(uint8_t item, int32_t v) {
     if (item >= MON_COUNT) return false;
+    // VOLT warns only WHILE RUNNING (v0.1.158 moved this gate down from the value path, so the
+    // row can show a parked voltage without the warning block firing over it).
+    if (item == MON_VOLT && eng.rpm < ENGINE_RUNNING_RPM) return false;
     return (mon_cfg.warn_lo[item] != MON_WARN_OFF && v <= mon_cfg.warn_lo[item])
         || (mon_cfg.warn_hi[item] != MON_WARN_OFF && v >= mon_cfg.warn_hi[item]);
 }

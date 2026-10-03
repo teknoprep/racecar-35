@@ -1056,6 +1056,16 @@ row afterwards does NOT rewrite per-item sources.
   as garbage: `monItemValueX10()` requires `can_bus == MON_CAN_MS3` before it decodes.
 - The global `Sensor data source` still turns the **Teensy's** acquisition on; the per-item
   source only picks which already-received stream the *display* uses.
+- **v0.1.158 — "I selected VOLT and see nothing".** Two causes, both fixed: (1) the seeding
+  fallback was "global source, else DIRECT", and DIRECT has **no battery ADC on this board**, so
+  a Direct-mode unit got a VOLT row that could never hold a value — the fallback now picks a
+  source the item CAN read (global if supported → DIRECT → CANBUS → BT), which also keeps OIL and
+  RPM on DIRECT as the pre-0.1.156 code read them; (2) the VOLT **display** was gated on
+  `rpm >= ENGINE_RUNNING_RPM`, which is a *warning* rule (parked ~12.4 V is normal, not a dead
+  alternator) — the display is now ungated and the rpm gate lives in `monItemWarnActive()`, so a
+  parked voltage can be watched without the warning block firing. VOLT also shows a grey
+  `VOLT: ---` when its source has no data instead of vanishing: a row you asked for that simply
+  isn't there is indistinguishable from a bug.
 
 ### AEM lives in the monitor menu, and BLE may own the radio there (v0.1.157)
 - **AEM 30-0300 input** is now an option **inside the menu** — the `AEM input` row on the AFR
