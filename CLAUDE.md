@@ -676,7 +676,13 @@ Up to 25 Hz when GPS PVT is fresh; 1 Hz heartbeat fallback when not.
 ```
 GPS,<fix>,<sats>,<lat_deg>,<lon_deg>,<speed_mph>,<heading_deg>,<gps_status>
 ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>
-ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>
+ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>[,<oil_x10>]
+                   # v0.1.159: the 9th field is BENCH OIL (PSI x10) from the RC35 bench frames,
+                   # -1 unless those are live. Deliberately NOT folded into ENG's oil: the dash's
+                   # per-item SOURCE picks DIRECT (the A2 transducer) vs CANBUS, so the two must
+                   # stay distinguishable on the wire. Trailing fields are safe (the dash reads by
+                   # index and tolerates short lines) — an old dash ignores it, and a real MS3
+                   # yields -1 because its Simplified Dash broadcast has no oil channel at all.
 IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
 AFR,<status>,<afr_x100>,<lambda_x10000>,<gauge_mV>  (v0.1.149, AEM gauge input)
 SD,REC,<0|1>,<file>,<samples>   (+ SD,READY/FMT/NONE/ERR/ACTIVE status forms)
@@ -1042,7 +1048,7 @@ row afterwards does NOT rewrite per-item sources.
 | Item | DIRECT | BLUETOOTH | CANBUS (MegaSquirt) |
 | --- | --- | --- | --- |
 | TEMP | `eng.coolant_f_x10` (NTC ADC) | `obd::coolantF_x10()` | `ecu.coolant_f_x10` |
-| OIL  | `eng.oil_psi_x10` (A2) | — | — |
+| OIL  | `eng.oil_psi_x10` (A2) | — | `ecu.oil_x10` — RC35 bench frames ONLY |
 | VOLT | — (this board has no battery ADC) | `obd::voltX10()` (ATRV) | `ecu.bat_x10` |
 | AFR  | the AEM analogue input | — | `ecu.afr_x10` |
 | IAT  | — | `obd::iatF_x10()` | `ecu.iat_f_x10` |
@@ -1096,6 +1102,20 @@ choice — it still decides what the Teensy samples and writes to the SD log.
 - **Warn priority is the display order** — `activeSensorWarning()` walks `mon_cfg.order[]` and
   takes the first enabled item that is warning. The old fixed OIL > TEMP > VOLT > AFR is gone,
   so re-ordering the list re-orders the warning menu (put oil first if you want it loudest).
+- **25 Hz data refresh (v0.1.159):** the block is capped at **40 ms**, not 100 ms, and so are the
+  speed sprite, the RPM number, PRED and the delta bar — the GPS/ENG/ECU stream is 25 Hz, so the
+  display must not be the bottleneck. Everything is still keyed on the DISPLAYED value and text
+  still paints its own background, so the anti-flicker rules are unchanged; only the caps moved.
+  If THE SHAKE ever returns, these caps (and the speed sprite, 360x200 — by far the biggest single
+  push) are the first thing to relax back. The RPM-**bar colour** cap stays at 200 ms on purpose:
+  the bar's width already tracks RPM every frame, and that cap only gates a gradient recolour that
+  can refill up to 57 KB in one burst.
+- **RPM carries NO monitor thresholds (v0.1.160):** its item page shows Display + Source only.
+  RPM's alerting is the SHIFT alert in the main Settings menu (Alerts on/off, Alert RPM + colour +
+  blink Hz, MAX RPM + colour + Hz), which drives the RPM-bar flash. A generic warn-low/high pair in
+  the monitor would be a second, weaker control for the same decision, and a monitor warning fires
+  the 2 Hz sensor flash block — the wrong bell for a shift. `monItemWarnActive()` returns false for
+  RPM as well, so even a stale `mon` blob carrying thresholds cannot make it flash.
 - **`MON_RPM` is a selectable item** (HIDDEN by default — the RPM bar already shows it), and its
   row displays rpm **rounded to the nearest 10** so the block's content tag — and the 36 KB
   sprite push behind it — keys on the displayed value instead of every revolution (the THE SHAKE
@@ -1546,7 +1566,28 @@ for up to `TOUCH_RELEASE_MS` after the last real sample. Do not remove this.
 The pre-touch-work dash is preserved at `crowpanel-arduino/RaceDash_v0139_orig/` so a screen
 can be swapped/reverted easily.
 
-## MS3Pro CAN (MegaSquirt RPM / coolant / AFR)
+## ### RC35 bench CAN frames (0x700 / 0x701) — v0.1.159
+The logger also parses **RC35 bench frames**, our own layout, which exist because the MS3
+Simplified Dash broadcast has **no oil channel at all** (so OIL could never come from CAN on a
+bench with no transducer). `tools/RC35_BENCH_CAN.md` is the **authoritative** layout and the
+encoder/decoder (golden bytes + a pty cadence test) live in `tools/can_sim.py` +
+`tests/test_can_sim.py` — that side is owned by the bench-tool work; the firmware side is here:
+```
+0x700 RC35_CORE  [0:2] rpm u16   [2:4] map kPa x10 u16   [4] tps % x2 u8
+                 [5] clt whole F u8   [6] iat whole F u8   [7] seq u8
+0x701 RC35_AUX   [0] afr x10 u8   [1] batt V x10 u8   [2:4] oil PSI x10 u16
+                 [4] adv degBTDC i8 (signed)   [5:8] reserved (0)
+```
+- Easy-to-miss scalings: **tps is %x2** (`x10 = buf[4]*5`), **clt/iat are WHOLE F** (`x10 = byte*10`);
+  everything else is already x10.
+- Bench oil expires on **its own clock** (`can_ecu.bench_ms`): a real MS3 keeps `last_ms` fresh
+  forever, so a shared timestamp would latch a stale oil value from the last bench run.
+- `can_diag.bench_hits` is counted and printed on **USB only** (`BENCH frames/s=... oil=... rpm=...`);
+  the `CANDIAG,` line the dash parses is deliberately unchanged.
+- `ENG`'s oil stays `readOilPsiX10()`; the bench oil rides the **9th `ECU` field** instead, so the
+  dash's per-item SOURCE can choose between the transducer and the CAN sender.
+
+MS3Pro CAN (MegaSquirt RPM / coolant / AFR)
 
 The Teensy reads the MS3Pro ECU over **CAN1 (TX 22, RX 23)** via an **SN65HVD230 ("VP230")**
 3.3 V transceiver — **NOT** an MCP2551 (that's 5 V and would damage the Teensy). The blue
@@ -1890,6 +1931,10 @@ tools/can_sim.py                         Bench CAN tool (v0.1.154): drives a CAN
 tools/can_bench_test.py                  One-shot "does the logger see the CAN bus?" bench test: passive listen,
                                          then inject while reading the Teensy's 1 Hz CANDIAG line, then a verdict
                                          (`--wave sweep|coolant|afr|iat|both|all`)
+tools/RC35_BENCH_CAN.md                  AUTHORITATIVE RC35 bench CAN frame layout (0x700/0x701) + the firmware
+                                         handover list; the tool side is owned by tools/can_sim.py
+tests/                                    pytest suite (peer-owned): can_sim golden bytes + pty cadence,
+                                         fabrication guard, wifi-only, aem_afr
 tools/validate_dash.py                   Structural checks on RaceDash.ino (LastDrawn/invalidateAll coverage, NVS
                                          blob guards, SettingId↔ROWS sync, PAGE_MON_CFG wiring)
 crowpanel-arduino/RaceDash_v0139_orig/    Pre-touch-rework backup of RaceDash (swap/revert screens easily)

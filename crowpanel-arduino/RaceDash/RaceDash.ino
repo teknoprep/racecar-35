@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.158"
+#define FIRMWARE_VERSION "0.1.160"
 
 #include <Preferences.h>
 #include <time.h>
@@ -140,14 +140,15 @@ static MonCfg mon_cfg;
 // Which sources can EVER carry data for each item on THIS hardware (bit 1<<MonSrc). The
 // per-item resolution lives in monItemValueX10(); this mirrors it so the seed (monDefaults)
 // and the item page can tell a real source from a "none" one:
-//   TEMP D|B|C   OIL D        (no oil-pressure source in the MS3 broadcast or over OBD2)
+//   TEMP D|B|C   OIL D|C      (CAN oil = RC35 bench frames ONLY: an MS3 broadcast has no oil;
+//                              BT has none either)
 //   VOLT B|C     (no battery ADC on this board)      AFR D|C  (D = AEM 30-0300 input)
 //   IAT  B|C     MAP  C       (the dash polls no OBD MAP PID)
 //   TPS  B|C     RPM  D|C     (BLE is far too slow for RPM)
 #define MON_SRCBIT(x) ((uint8_t)(1u << (x)))
 static const uint8_t MON_SRC_MASK[MON_COUNT] = {
     /* TEMP */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
-    /* OIL  */ MON_SRCBIT(MON_SRC_DIRECT),
+    /* OIL  */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_CAN),
     /* VOLT */ MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
     /* AFR  */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_CAN),
     /* IAT  */ MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
@@ -455,6 +456,7 @@ struct EcuState {
     int16_t  afr_x10       = -1;     // air/fuel ratio × 10 (e.g. 145 = 14.5)
     int16_t  iat_f_x10     = -1;     // intake air temp, °F × 10
     int16_t  bat_x10       = -1;     // battery voltage, V × 10
+    int16_t  oil_x10       = -1;     // oil pressure, psi × 10 - RC35 bench CAN frames ONLY (9th ECU field)
     uint32_t last_ms       = 0;
 };
 static EcuState ecu;
@@ -2447,6 +2449,9 @@ static bool parseEcuLine(const String& line) {
     if (n >= 5) ecu.afr_x10       = (int16_t)field(4).toInt();
     if (n >= 6) ecu.iat_f_x10     = (int16_t)field(5).toInt();
     if (n >= 7) ecu.bat_x10       = (int16_t)field(6).toInt();
+    // 9th field (oil, psi x10) = RC35 bench CAN oil. An old-format line (no 9th field)
+    // RESETS it to -1 so a stale value can never outlive the format that carried it.
+    ecu.oil_x10 = (n >= 8) ? (int16_t)field(7).toInt() : (int16_t)-1;
     ecu.last_ms = millis();
     return true;
 }
@@ -5394,7 +5399,7 @@ static void formatAemStatus(char* buf, size_t cap) {
 // SOURCE TABLE ("none" = no such source exists on this hardware -> invalid -> "---"/hidden):
 //   item  DIRECT                    BLUETOOTH (OBD2)            CANBUS (MS3, needs !ecuStale)
 //   TEMP  eng.coolant_f_x10         obd::coolantF_x10 (fresh)   ecu.coolant_f_x10
-//   OIL   eng.oil_psi_x10           none (not an OBD PID here)  none (not in the MS3 broadcast)
+//   OIL   eng.oil_psi_x10           none (not an OBD PID here)  ecu.oil_x10 (RC35 bench frames only)
 //   VOLT  none (no battery ADC)     obd::voltX10 (fresh)        ecu.bat_x10     [engine-running gate]
 //   AFR   AEM 30-0300 (s.aem_afr)   none                        ecu.afr_x10
 //   IAT   none                      obd::iatF_x10 (fresh)       ecu.iat_f_x10
@@ -5424,9 +5429,12 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
         ok = (v >= 0) && (direct || btOk || canOk);
         break;
     case MON_OIL:
-        // Oil PSI is DIRECT only - the MS3 broadcast and OBD2 carry no oil pressure here.
-        v  = direct ? eng.oil_psi_x10 : -1;
-        ok = direct && (v >= 0);
+        // DIRECT = the A2 transducer. CANBUS = ecu.oil_x10, the RC35 bench frames' oil (the
+        // Teensy sends -1 when they are not live). An MS3's Simplified Dash broadcast has NO
+        // oil channel, so OIL-over-CANBUS is for the RC35 bench frames / a future aux CAN oil
+        // sender. OBD2 carries no oil pressure here.
+        v  = direct ? eng.oil_psi_x10 : fromCan ? ecu.oil_x10 : -1;
+        ok = (v >= 0) && (direct || canOk);
         break;
     case MON_VOLT: {
         // Valid only while the engine is RUNNING and a live source exists (BT ATRV /
@@ -5495,6 +5503,9 @@ static bool monItemFaultVisible(uint8_t item) {
 // Warning test against the item's own thresholds (x10 natural unit, same scale as v).
 static bool monItemWarnActive(uint8_t item, int32_t v) {
     if (item >= MON_COUNT) return false;
+    // RPM NEVER warns from the monitor (v0.1.160): the shift alerts in the main Settings menu
+    // own that. Belt and braces — an older "mon" blob could still carry thresholds for it.
+    if (item == MON_RPM) return false;
     // VOLT warns only WHILE RUNNING (v0.1.158 moved this gate down from the value path, so the
     // row can show a parked voltage without the warning block firing over it).
     if (item == MON_VOLT && eng.rpm < ENGINE_RUNNING_RPM) return false;
@@ -5772,6 +5783,7 @@ static void drawDashPage() {
         ecu.tps_x10       = -1;
         ecu.iat_f_x10     = -1;
         ecu.bat_x10       = -1;
+        ecu.oil_x10       = -1;
         // Don't touch g.last_ms / eng.last_ms / ecu.last_ms — those are the
         // parser's freshness timestamps. The next received line refills.
     }
@@ -5948,11 +5960,13 @@ static void drawDashPage() {
     }
 
     // ---- RPM number, just under the bar at the right edge (Font2) ----
-    // Rate-capped to 10 Hz (v0.1.147): the number is informational; re-pushing
-    // it at 25 Hz was pure PSRAM churn. Invalidation (-1) always paints.
+    // Rate-capped to 25 Hz (40 ms; was 10 Hz / 100 ms v0.1.147-0.1.158): the data stream is
+    // 25 Hz, so the display must not be the bottleneck. Still keyed on the displayed value
+    // (eng.rpm), not a raw x10. If THE SHAKE returns, relax this back to 100 ms first.
+    // Invalidation (-1) always paints.
     static uint32_t rpm_text_ms = 0;
     if ((int32_t)eng.rpm != ld.rpm_text
-        && (ld.rpm_text < 0 || nowMs - rpm_text_ms >= 100)) {
+        && (ld.rpm_text < 0 || nowMs - rpm_text_ms >= 40)) {
         rpm_text_ms = nowMs;
         char rpmBuf[8]; snprintf(rpmBuf, sizeof(rpmBuf), "%u", (unsigned)eng.rpm);
         const uint16_t rpmCol = (flashBg == TFT_BLACK) ? TFT_LIGHTGREY : TFT_BLACK;  // contrast on a lit band
@@ -5995,9 +6009,9 @@ static void drawDashPage() {
             if (d > -DBAR_DEAD_MS && d < DBAR_DEAD_MS) px = 0;
             else px = (int16_t)((d * halfW) / DBAR_FULL_MS);
         }
-        static uint32_t dbar_ms = 0;   // 10 Hz cap (v0.1.147); invalidation always paints
+        static uint32_t dbar_ms = 0;   // 25 Hz cap (40 ms; was 100 ms); invalidation always paints
         if (px != ld.delta_bar_px
-            && (ld.delta_bar_px == INT16_MIN || nowMs - dbar_ms >= 100)) {
+            && (ld.delta_bar_px == INT16_MIN || nowMs - dbar_ms >= 40)) {
             dbar_ms = nowMs;
             const int      cx     = DBAR_W / 2;                   // 378
             const int      deadPx = (DBAR_DEAD_MS * halfW) / DBAR_FULL_MS;   // ~18 px
@@ -6095,12 +6109,17 @@ static void drawDashPage() {
         // was repainted on every whole-MPH change, i.e. on nearly every 25 Hz telemetry
         // frame (~1.8 MB/s into PSRAM). That bursts straight into the RGB scan-out DMA
         // (no bounce buffer on this core) and shows up as a tear line at the BOTTOM of
-        // the frame — home page only, because it is the only page that updates. 10 Hz is
-        // imperceptible for a whole-number readout and is the same cap already applied to
-        // the RPM number, PRED and the delta bar. A forced repaint (invalidated sentinel,
-        // page entry, flash end) still paints immediately.
+        // the frame — home page only, because it is the only page that updates. The cap was
+        // 200 ms (5 Hz) in v0.1.151-0.1.158 and is now 40 ms (25 Hz): 25 Hz is DELIBERATE,
+        // the data is 25 Hz and the display must not be the bottleneck. It is still keyed on
+        // the displayed whole-MPH value, so it only pushes when the number changes. If the
+        // bottom-of-screen shake described in CLAUDE.md ("THE SHAKE") ever returns, THESE
+        // caps (speed, sensor monitor, RPM number, PRED, delta bar) and their old 100/200 ms
+        // values are the first thing to relax back - this 360x200 speed sprite is by far the
+        // biggest single push. A forced repaint (invalidated sentinel, page entry, flash end)
+        // still paints immediately.
         static uint32_t spd_ms = 0;
-        if (spd_int != ld.spd_int && (ld.spd_int < 0 || nowMs - spd_ms >= 200)) {
+        if (spd_int != ld.spd_int && (ld.spd_int < 0 || nowMs - spd_ms >= 40)) {
             spd_ms = nowMs;
             char buf[8];
             if (spd_int < 0) snprintf(buf, sizeof(buf), "--");
@@ -6385,7 +6404,10 @@ static void drawDashPage() {
     // stack of TEMP / OIL / VOLT / AFR / IAT / MAP / TPS rows (Settings -> "Sensor
     // monitor order"). The whole 260x140 block is drawn into ONE sprite and pushed once,
     // and ONLY when its content tag changed (visible count + per row: item, DISPLAYED
-    // value, colour, warn, fault) — capped at 10 Hz, except a forced redraw
+    // value, colour, warn, fault) — capped at 25 Hz (40 ms; was 10 Hz / 100 ms until
+    // v0.1.158): 25 Hz is DELIBERATE, the data is 25 Hz and the display must not be the
+    // bottleneck. If THE SHAKE (CLAUDE.md) ever returns, relax this cap back to 100 ms
+    // first (together with the speed sprite's cap). Except a forced redraw
     // (ld.sens_tag == 0) which paints immediately. The old per-row sprites each
     // re-pushed on their own; one push per change is less PSRAM traffic (see THE SHAKE).
     // Each row is one string ("TEMP: 220°F") so the warn colour covers label and value;
@@ -6399,7 +6421,7 @@ static void drawDashPage() {
         MonRow rows[MON_COUNT];
         const int      nrows = monCollectRows(rows, nowMs);
         const uint32_t tag   = monRowsTag(rows, nrows);
-        if (tag != ld.sens_tag && (ld.sens_tag == 0 || nowMs - sens_last_ms >= 100)) {
+        if (tag != ld.sens_tag && (ld.sens_tag == 0 || nowMs - sens_last_ms >= 40)) {
             if (dash_sprites_ready) {
                 monPaintBlock(&spr_sens, 0, 0, rows, nrows);
                 spr_sens.pushSprite(WARN_X, WARN_Y);
@@ -6503,11 +6525,12 @@ static void drawDashPage() {
         // Blank (grey --) when not recording — lap timing is session-only.
         const uint32_t predMs = recording ? predictiveLapMs() : 0;
         const uint32_t cs = predMs / 10;
-        // 10 Hz cap (v0.1.147): hundredths tick 25x/s; the eye can't read that
-        // and each repaint is a PSRAM sprite push. Invalidation always paints.
+        // 25 Hz cap (40 ms; was 10 Hz / 100 ms): hundredths tick faster than that, so this
+        // is the ceiling on sprite pushes (still keyed on the displayed hundredths).
+        // Invalidation always paints. Relax back to 100 ms if THE SHAKE returns.
         static uint32_t pred_ms = 0;
         if (cs != ld.pred_lap_cs
-            && (ld.pred_lap_cs == UINT32_MAX || nowMs - pred_ms >= 100)) {
+            && (ld.pred_lap_cs == UINT32_MAX || nowMs - pred_ms >= 40)) {
             pred_ms = nowMs;
             char buf[12];
             uint16_t col;
@@ -9155,7 +9178,13 @@ static int monItemRows(uint8_t item, uint8_t* kinds) {
     // source is, because switching it on also tells the Teensy to READ and LOG the gauge
     // (CFG,afraem) — an input decision, not only a display one.
     if (item == MON_AFR) kinds[n++] = MIR_AEM;
-    kinds[n++] = MIR_LO; kinds[n++] = MIR_HI; kinds[n++] = MIR_COLOR;
+    // v0.1.160: RPM gets NO warn rows. Its alerting already lives in the main Settings menu as
+    // the shift alerts (Alerts on/off, Alert RPM + colour + blink Hz, MAX RPM + colour + Hz)
+    // and those drive the whole-bar flash. A generic warn-low/high pair here would be a second,
+    // weaker control for the same decision — and a monitor warning fires the 2 Hz sensor flash
+    // block, which is the wrong bell for a shift. RPM keeps Display + Source, so it can still
+    // be shown and read from any source; it just doesn't carry monitor thresholds.
+    if (item != MON_RPM) { kinds[n++] = MIR_LO; kinds[n++] = MIR_HI; kinds[n++] = MIR_COLOR; }
     return n;
 }
 

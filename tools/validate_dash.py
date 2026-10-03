@@ -296,6 +296,28 @@ def main():
         if not re.search(r"ST_AEM_STATUS:\s*return false", code):
             fail("14: the AEM row is still visible in Settings (ST_AEM_STATUS must return false)")
 
+    # ---- 15. OIL over CANBUS (RC35 bench frames) + 25 Hz monitor refresh ---------
+    # OIL's source mask must include CAN (otherwise its pill reads maroon "(no data)"),
+    # the ECU parser must read the 9th (oil) field, and the monitor block's repaint cap
+    # must be <= 40 ms (the data stream is 25 Hz; the display must not be the bottleneck).
+    oil_m = re.search(r"/\*\s*OIL\s*\*/([^,]*?(?:\|[^,]*?)*),\s*(?=/\*)", raw[raw.find("MON_SRC_MASK["):][:1500])
+    if not (oil_m and "MON_SRC_CAN" in oil_m.group(1)):
+        fail("15: MON_SRC_MASK[MON_OIL] does not include MON_SRC_CAN (RC35 bench oil)")
+    pe_body, _ = block_after(code, r"static\s+bool\s+parseEcuLine\s*\([^)]*\)\s*\{")
+    if pe_body is None or not re.search(r"\becu\s*\.\s*oil_x10\b", pe_body):
+        fail("15: parseEcuLine() does not set ecu.oil_x10 (9th ECU field)")
+    cap = re.search(r"nowMs\s*-\s*sens_last_ms\s*>=\s*(\d+)", code)
+    if not cap:
+        fail("15: could not find the sensor-monitor repaint cap (nowMs - sens_last_ms >= N)")
+    elif int(cap.group(1)) > 40:
+        fail("15: sensor-monitor repaint cap is %s ms; must be <= 40 ms (25 Hz)" % cap.group(1))
+
+    # 16 (v0.1.160): RPM must not carry monitor warn rows - the shift alerts own that.
+    if re.search(r"item\s*!=\s*MON_RPM", rows_fn) is None:
+        fail("16: monItemRows() does not exclude the warn rows for MON_RPM")
+    if re.search(r"item\s*==\s*MON_RPM\s*\)\s*return false", code) is None:
+        fail("16: monItemWarnActive() does not force MON_RPM to never warn")
+
     if fails:
         print("validate_dash: FAIL (%d)  %s" % (len(fails), path))
         for f in fails:
@@ -316,6 +338,8 @@ def main():
     print(" 12 per-item src + can_bus seeded in monDefaults(), validated in monCfgValid()")
     print(" 13 item page: Source row + CAN-bus row (CANBUS only), draw + tap")
     print(" 14 AFR has an AEM input row (writes s.aem_afr); Source drives it; hidden in Settings")
+    print(" 15 OIL has a CAN source bit; ECU parse reads oil_x10; monitor cap <= 40 ms")
+    print(" 16 RPM carries no monitor warn rows (shift alerts own RPM)")
     return 0
 
 

@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.158"
+#define FIRMWARE_VERSION "0.1.160"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -135,6 +135,8 @@ namespace {
   constexpr uint32_t CAN_BAUD           = 500000;
   constexpr uint32_t CAN_STALE_MS       = 2000;     // no frames → reset fields to -1
   constexpr uint32_t CAN_BASE_ID        = 0x5E8;    // MS3Pro Simplified Dash base (1512)
+  constexpr uint32_t CAN_BENCH_CORE_ID  = 0x700;    // RC35 bench: rpm/map/tps/TEMP/IAT
+  constexpr uint32_t CAN_BENCH_AUX_ID   = 0x701;    // RC35 bench: afr/batt/oil/adv
 
   // ---- Oil pressure: generic 5V 0.5-4.5V transducer, 150 PSI full scale ----
   // Wired through a 10k / 20k voltage divider so the 0.5-4.5V sensor output
@@ -1173,6 +1175,8 @@ static struct CanEcu {
     int16_t  iat_f_x10  = -1;
     int16_t  bat_x10    = -1;
     uint32_t last_ms    = 0;   // millis() of most recent valid frame (any ID)
+    int16_t  oil_x10    = -1;  // RC35 bench frames only (a real MS3 dash has no oil)
+    uint32_t bench_ms   = 0;   // millis() of the most recent RC35 bench frame
 } can_ecu;
 
 // CAN RX diagnostics — independent of whether any frame ID matched our parser.
@@ -1190,6 +1194,7 @@ static struct CanDiag {
     uint32_t ids_seen[8]   = {0};  // distinct IDs in this window (ring, dropped if >8)
     uint8_t  ids_count     = 0;
     uint8_t  base_hits     = 0;    // frames matching CAN_BASE_ID+0..3 this window
+    uint8_t  bench_hits    = 0;    // RC35 bench frames (0x700/0x701) this window
     uint32_t last_report_ms = 0;
     uint8_t  last_buf[8]   = {0};  // payload of previous frame (for dup detection)
     uint8_t  last_len      = 0xFF;
@@ -1274,6 +1279,11 @@ static void canDiagReport() {
                   have_err ? err.FRM_ERR : 0, have_err ? err.STF_ERR : 0,
                   have_err ? err.TX_ERR_COUNTER : 0, have_err ? err.RX_ERR_COUNTER : 0,
                   have_err ? (char*)err.FLT_CONF : "?");
+    // RC35 bench-frame visibility — USB ONLY. Deliberately NOT a CANDIAG field:
+    // the dash parses that line's format.
+    Serial.printf("BENCH frames/s=%u oil=%d rpm=%u (RC35 0x%03lX/0x%03lX)\n",
+                  can_diag.bench_hits, can_ecu.oil_x10, can_ecu.rpm,
+                  (unsigned long)CAN_BENCH_CORE_ID, (unsigned long)CAN_BENCH_AUX_ID);
     // Also surface it on the dash link so it can be shown without a USB cable.
     // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>,<RXerr>,<txtest>
     DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u,%u,%u\n",
@@ -1287,6 +1297,7 @@ static void canDiagReport() {
     can_diag.dup_window = 0;
     can_diag.ids_count = 0;
     can_diag.base_hits = 0;
+    can_diag.bench_hits = 0;
 }
 
 // CAN sniffer: when cansniff_active (declared near the top), EVERY frame on
@@ -1299,6 +1310,7 @@ static void pumpCAN() {
         // Diagnostics: count EVERY frame + record its ID/payload, regardless of match.
         canDiagNote(msg.id, msg.len, msg.buf);
         if (msg.id >= CAN_BASE_ID && msg.id <= CAN_BASE_ID + 3) can_diag.base_hits++;
+        if (msg.id == CAN_BENCH_CORE_ID || msg.id == CAN_BENCH_AUX_ID) can_diag.bench_hits++;
         // Sniffer: capture the raw frame (any ID) before our targeted parse.
         if (cansniff_active) {
             cansniffLog(msg.id, msg.flags.extended, msg.len, msg.buf);
@@ -1324,6 +1336,25 @@ static void pumpCAN() {
                 can_ecu.bat_x10    = (int16_t)(((uint16_t)msg.buf[0] << 8) | msg.buf[1]);
                 can_ecu.last_ms    = now;
                 break;
+            // RC35 bench frames (layout: tools/RC35_BENCH_CAN.md). Our own
+            // layout carrying every channel the dash shows, INCLUDING oil
+            // (an MS3 Simplified Dash broadcast has none).
+            case CAN_BENCH_CORE_ID:   // 0x700: rpm, map, tps(%x2), clt(F), iat(F), seq
+                can_ecu.rpm        = (((uint16_t)msg.buf[0] << 8) | msg.buf[1]);
+                can_ecu.map_x10    = (int16_t)(((uint16_t)msg.buf[2] << 8) | msg.buf[3]);
+                can_ecu.tps_x10    = (int16_t)msg.buf[4] * 5;    // % x2 -> x10
+                can_ecu.clt_f_x10  = (int16_t)msg.buf[5] * 10;   // whole F -> x10
+                can_ecu.iat_f_x10  = (int16_t)msg.buf[6] * 10;
+                can_ecu.last_ms    = now;
+                can_ecu.bench_ms   = now;
+                break;
+            case CAN_BENCH_AUX_ID:    // 0x701: afr(x10), batt(x10), oil(psi x10), adv
+                can_ecu.afr_x10    = (int16_t)msg.buf[0];
+                can_ecu.bat_x10    = (int16_t)msg.buf[1];
+                can_ecu.oil_x10    = (int16_t)(((uint16_t)msg.buf[2] << 8) | msg.buf[3]);
+                can_ecu.last_ms    = now;
+                can_ecu.bench_ms   = now;
+                break;
             default:
                 break;
         }
@@ -1332,6 +1363,12 @@ static void pumpCAN() {
     // so the dash shows '---' instead of frozen last-known values.
     if (can_ecu.last_ms != 0 && now - can_ecu.last_ms > CAN_STALE_MS) {
         can_ecu = CanEcu{};
+    }
+    // Bench oil expires on its OWN clock: a real MS3 keeps last_ms fresh
+    // forever, so without this a stopped bench source would latch stale oil.
+    if (can_ecu.bench_ms != 0 && now - can_ecu.bench_ms > CAN_STALE_MS) {
+        can_ecu.oil_x10  = -1;
+        can_ecu.bench_ms = 0;
     }
 }
 
@@ -3779,6 +3816,10 @@ static void emitToDash() {
     const uint16_t directRpm  = computeRpmAndReset();   // always drain the tach FIFO
     const int16_t  directCool = readCoolantFx10();       // always keep EMA warm
     uint16_t       rpm         = use_can ? can_ecu.rpm       : directRpm;
+    // ENG oil stays the DIRECT transducer (A2) even when RC35 bench frames are
+    // live: the dash has a per-item source selector, so the wire must keep the
+    // direct sender and the CAN sender distinguishable. CAN oil rides the 9th
+    // field of the ECU line instead.
     int16_t        oil_psi_x10 = readOilPsiX10();
     int16_t        cool_f_x10  = bt_live ? bt_clt_f_x10
                                : (use_can ? can_ecu.clt_f_x10 : directCool);
@@ -3820,14 +3861,16 @@ static void emitToDash() {
                   use_can ? (g_cfg.sensor_type == 1 ? "CAN" : "CAN(auto)") : "direct");
     // ECU line: full MS3Pro CAN dataset. Dash uses these when sensor_type==1
     // (MegaSquirt) for coolant temp, AFR, MAP, TPS, IAT, and battery.
-    DASH_SERIAL.printf("ECU,%u,%d,%d,%d,%d,%d,%d\n",
+    // 9th field (oil, psi x10) = RC35 bench CAN oil, -1 when bench frames are
+    // not live. Appended LAST so old parsers (index-based, extra-tolerant) work.
+    DASH_SERIAL.printf("ECU,%u,%d,%d,%d,%d,%d,%d,%d\n",
                        rpm, can_ecu.clt_f_x10, can_ecu.map_x10,
                        can_ecu.tps_x10, can_ecu.afr_x10,
-                       can_ecu.iat_f_x10, can_ecu.bat_x10);
-    Serial.printf("ECU,%u,%d,%d,%d,%d,%d,%d\n",
+                       can_ecu.iat_f_x10, can_ecu.bat_x10, can_ecu.oil_x10);
+    Serial.printf("ECU,%u,%d,%d,%d,%d,%d,%d,%d\n",
                   rpm, can_ecu.clt_f_x10, can_ecu.map_x10,
                   can_ecu.tps_x10, can_ecu.afr_x10,
-                  can_ecu.iat_f_x10, can_ecu.bat_x10);
+                  can_ecu.iat_f_x10, can_ecu.bat_x10, can_ecu.oil_x10);
     DASH_SERIAL.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                        ax, ay, az, gx, gy, gz);
     Serial.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
