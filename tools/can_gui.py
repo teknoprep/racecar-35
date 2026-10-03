@@ -265,6 +265,9 @@ class App:
         # dash-clone feed: filled from the Teensy's lines when connected (faithful), else from
         # the broadcaster's values with a modelled speed (the bench has no GPS).
         self.dash_state = {}
+        self.tool_t = None            # the broadcaster's own elapsed seconds
+        self.tool_t_wall = 0.0        # ...and when we last saw it, for phase lock
+        self.feed_note = '-'
         self.dash = None
         self.dash_cfg = dash_view.MonCfg()
         self.dash_win = None
@@ -445,8 +448,8 @@ class App:
                 st["recording"] = st.get("recording", False)
             self._vl += 1
             now = time.time()
-            if now - self._vt0 >= 1.0:
-                self.value_rate = int(self._vl / (now - self._vt0))
+            if now - self._vt0 >= 5.0:      # 5 s: a ~1/s print rate reads stably
+                self.value_rate = int(round(self._vl / (now - self._vt0)))
                 self._vl, self._vt0 = 0, now
             for k in self.history:
                 if k in v:
@@ -461,6 +464,10 @@ class App:
         m = RE_TOOLRATE.search(line)
         if m:
             self.tool_frames_s = int(m.group(1))
+        mt = RE_BENCH_T.search(line)      # "  t= 205.6s ..." = the tool's clock
+        if mt:
+            self.tool_t = float(mt.group(1))
+            self.tool_t_wall = time.time()
 
         c = parse_candiag(line) or parse_candiag_usb(line)
         if c:
@@ -630,6 +637,33 @@ class App:
         if not (self.dash_win and self.dash_win.winfo_exists()):
             return
         st = self.dash_state
+        # THE FIX for the Dash View sitting at ~1 Hz: their tool only PRINTS values about
+        # once a second, but the frames leave at cycles/s. bench_values() is the very
+        # function that produces those frames, so calling it at 25 Hz - phase-locked to
+        # the tool's own t= clock so the phase matches - shows what is really on the wire
+        # rather than what happened to get printed. The frame BYTES panel still uses the
+        # printed values, and rc35_frames() to encode them.
+        if (self.bc.running() and self.tool_t is not None
+                and not st.get("from_teensy") and _HAVE_ENCODER
+                and hasattr(_sim, "bench_values")):
+            t = self.tool_t + (time.time() - self.tool_t_wall)
+            try:
+                bv = _sim.bench_values(t, self.prof_var.get())
+                st["rpm"] = bv.get("rpm")
+                st["clt"] = bv.get("clt_f")
+                st["oil"] = bv.get("oil_psi")
+                st["volt"] = bv.get("batt_v")
+                st["afr"] = bv.get("afr")
+                st["iat"] = bv.get("iat_f")
+                st["map"] = bv.get("map_kpa")
+                st["tps"] = bv.get("tps_pct")
+                st["speed_mph"] = max(0.0, ((bv.get("rpm") or 0.0) - 900.0) / 33.0)
+                st["gps_text"] = "GPS (modelled)"
+                self.feed_note = "tool waveform @25 Hz (phase-locked to t=)"
+            except Exception:
+                self.feed_note = "value lines only (bench_values failed)"
+        elif st.get("from_teensy"):
+            self.feed_note = "Teensy telemetry lines (faithful)"
         st["rpm_max"] = 7000
         st["clock"] = time.strftime("%H:%M")
         if self.rec_start and st.get("recording"):
@@ -652,6 +686,8 @@ class App:
         st["rpm_bar_color"] = "#ff0000" if warn else "#00c000"
         self.dash.set_state(**st)
         self.dash.redraw(blink_on=int(time.time() * 2) % 2 == 0)
+        if self.dash_win and self.dash_win.winfo_exists():
+            self.dash_win.title("Dash view - feed: " + self.feed_note)
         self.root.after(40, self._dash_tick)          # 25 Hz, like the firmware
 
     def _verdict(self):

@@ -176,16 +176,18 @@ class DashView:
         cv.create_text(600 * s, 230 * s, text=txt, fill="#ffffff", font=self.f_px["speed"])
 
         # middle column: PRED / LAP / BEST (labels x264, values to their right)
+        # firmware: labels at x264 y378/406/434, value sprites pushed at (325, 372/400/428).
+        # (v0.1.165 fix: I had drawn the labels at x=20, which collided with the sensor block.)
         for i, (lab, key) in enumerate((("PRED", "pred_ms"), ("LAP", "last_ms"), ("BEST", "best_ms"))):
             y = (378 + i * 28) * s
-            cv.create_text(20 * s, y, text=lab, fill="#7f93a8", font=self.f_px["lbl"], anchor="w")
+            cv.create_text(264 * s, y, text=lab, fill="#7f93a8", font=self.f_px["lbl"], anchor="w")
             ms = st.get(key)
             col = "#ffffff"
             if key == "pred_ms" and ms is not None and st.get("last_ms") is not None:
                 col = "#00ff00" if ms < st["last_ms"] else "#ff8080"
             if key == "best_ms":
                 col = "#00ff00"
-            cv.create_text(266 * s, y, text=_lap(ms), fill=col, font=self.f_px["row4"], anchor="w")
+            cv.create_text(325 * s, y, text=_lap(ms), fill=col, font=self.f_px["row4"], anchor="w")
 
         # right column: LAP n / GPS / TIME (values at x610)
         rows = [("LAP " + (str(st["lap_n"]) if st.get("lap_n") else "--"), "#ffff00"),
@@ -214,14 +216,19 @@ class DashView:
                 cv.create_text(20 * s, (ry + pitch / 2) * s, text=text, fill=col,
                                font=fnt, anchor="w")
 
-        # START/STOP button + REC badge
+        # START/STOP + TRACK: firmware RECBTN_X/Y/W/H = 30,155,160,70 and TRKBTN_Y = 235.
+        # (v0.1.165 fix: I had it at y=380, which overlapped the sensor monitor block.)
         rec = st.get("recording")
-        cv.create_rectangle(20 * s, 380 * s, (20 + 160) * s, (380 + 70) * s,
-                            outline="#ffffff", fill="#5b1e1e" if rec else "#1e5b2a")
-        cv.create_text(100 * s, 415 * s, text="STOP" if rec else "START", fill="#ffffff",
+        cv.create_rectangle(30 * s, 155 * s, (30 + 160) * s, (155 + 70) * s,
+                            outline="#ffffff", fill="#ff0000" if rec else "#00c000")
+        cv.create_text(110 * s, 190 * s, text="STOP" if rec else "START", fill="#ffffff",
                        font=self.f_px["mid"])
+        cv.create_rectangle(30 * s, 235 * s, (30 + 160) * s, (235 + 70) * s,
+                            outline="#ffffff", fill="#1e3f5b")
+        cv.create_text(110 * s, 270 * s, text=st.get("track_name") or "TRACK",
+                       fill="#ffffff", font=self.f_px["row2"])
         if rec:
-            cv.create_text(200 * s, 150 * s, text="REC", fill="#ff0000", font=self.f_px["row4"], anchor="w")
+            cv.create_text(200 * s, 140 * s, text="REC", fill="#ff0000", font=self.f_px["row4"], anchor="w")
 
         # wall clock, tiny, bottom-right
         cv.create_text(776 * s, 448 * s, text=st.get("clock") or "--:--",
