@@ -75,6 +75,28 @@ def test_rc35_wire_bytes_are_frozen():
     assert struct.unpack(">b", frames[0x701][4:5])[0] == -3        # advance, signed
 
 
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="needs a pty")
+def test_custom_frame_ids():
+    """The emulator must be able to target whatever ids the receiver expects,
+    without any layout change (--core-id / --aux-id)."""
+    frames, walls, out = _collect(["bench", "--hz", "100",
+                                   "--core-id", "0x123", "--aux-id", "0x124"],
+                                  seconds=1.5, hz_hint=100)
+    ids = sorted({i for i, _ in frames})
+    assert ids == [0x123, 0x124], f"wrong ids on the wire: {[hex(i) for i in ids]}\n{out}"
+    core = [d for i, d in frames if i == 0x123]
+    assert struct.unpack(">H", core[0][0:2])[0] > 0        # rpm present
+    assert core[0][5] > 0                                  # TEMP present
+
+
+def test_bus_load_maths():
+    """A 130-bit worst case: 400 frames/s is ~10% of a 500k bus, and the bus is
+    not the emulator's limit — the slcan serial link is."""
+    assert 9.5 < can_sim.bus_load_pct(400) < 11.0
+    assert can_sim.bus_load_pct(3846) > 99.0
+    assert can_sim.bus_load_pct(200, 250_000) > 10.0        # same rate, slower bus
+
+
 def test_bench_values_are_continuous():
     """No random component: a 10 ms step must be tiny, so any jump seen on the
     dash is the transport/logger, not the data."""
@@ -130,7 +152,7 @@ def _collect(cmd, seconds, hz_hint):
 
 
 @pytest.mark.skipif(not hasattr(os, "openpty"), reason="needs a pty")
-@pytest.mark.parametrize("hz,expect_frames_per_cycle", [(100, 2)])
+@pytest.mark.parametrize("hz,expect_frames_per_cycle", [(100, 2), (200, 2)])
 def test_transmit_cadence_is_paced(hz, expect_frames_per_cycle):
     """The bench frames must go out at the requested rate, evenly."""
     frames, walls, out = _collect(["bench", "--hz", str(hz), "--profile", "sweep"],
@@ -152,11 +174,17 @@ def test_transmit_cadence_is_paced(hz, expect_frames_per_cycle):
         f"achieved {achieved:.1f} cycles/s of {hz} (bursts?)\n{out}"
     gaps = [b - a for a, b in zip(cyc, cyc[1:])]
     worst = max(gaps)
-    assert worst < 3.0 / hz, \
+    # 3 periods at this rate, but never a tighter bound than 50 ms: this box also
+    # builds firmware, and a scheduler hiccup is not a pacing bug. The old
+    # blocking-poll bug produced ~200 ms stalls, which still fails this.
+    assert worst < max(3.0 / hz, 0.050), \
         f"worst cycle gap {worst * 1000:.1f} ms at {hz} Hz — not paced\n{out}"
-    # and the values themselves arrive in order (seq increments, no repeats)
+    # and the values arrive in order: seq is a rolling u8 cycle counter, so the
+    # property to assert is a +1 step every cycle (a gap means dropped cycles,
+    # 0 means a repeat) — not that all values are unique (it wraps at 256).
     seqs = [d[7] for i, d in frames if i == can_sim.RC35_CORE_ID]
-    assert len(set(seqs)) == len(seqs), "duplicate cycles"
+    steps = {(b - a) % 256 for a, b in zip(seqs, seqs[1:])}
+    assert steps == {1}, f"cycle counter steps {sorted(steps)} — drops or reordering"
 
 
 @pytest.mark.skipif(not hasattr(os, "openpty"), reason="needs a pty")

@@ -105,22 +105,27 @@ def i8(v):
 
 def rc35_frames(rpm=0.0, clt_f=180.0, map_kpa=100.0, tps_pct=0.0,
                 iat_f=90.0, afr=14.7, batt_v=13.8, oil_psi=45.0,
-                adv_deg=18.0, seq=0):
-    """Build the two RC35 bench frames — every channel, every cycle."""
+                adv_deg=18.0, seq=0,
+                core_id=RC35_CORE_ID, aux_id=RC35_AUX_ID):
+    """Build the two RC35 bench frames — every channel, every cycle.
+
+    The ids are parameters so the emulator can be pointed at whatever the current
+    receiver expects (`bench --core-id/--aux-id`) without touching the layout.
+    """
     core = (u16(rpm) + u16(map_kpa * 10) + u8(tps_pct * 2) + u8(clt_f)
             + u8(iat_f) + u8(seq))
     aux = (u8(afr * 10) + u8(batt_v * 10) + u16(oil_psi * 10) + i8(adv_deg)
            + b"\x00\x00\x00")
-    return {RC35_CORE_ID: core, RC35_AUX_ID: aux}
+    return {core_id: core, aux_id: aux}
 
 
-def decode_rc35(msg_id, data):
-    """Inverse of rc35_frames() — the firmware parser must agree with this."""
-    if msg_id == RC35_CORE_ID and len(data) >= 8:
+def decode_rc35(msg_id, data, core_id=RC35_CORE_ID, aux_id=RC35_AUX_ID):
+    """Inverse of rc35_frames() — the receiver's parser must agree with this."""
+    if msg_id == core_id and len(data) >= 8:
         rpm, mp = struct.unpack(">HH", data[0:4])
         return (f"RPM {rpm:5d}  MAP {mp / 10:6.1f} kPa  TPS {data[4] / 2:5.1f} %  "
                 f"TEMP {data[5]:3d} F  IAT {data[6]:3d} F  seq {data[7]}")
-    if msg_id == RC35_AUX_ID and len(data) >= 5:
+    if msg_id == aux_id and len(data) >= 5:
         oil = struct.unpack(">H", data[2:4])[0]
         adv = struct.unpack(">b", data[4:5])[0]
         return (f"AFR {data[0] / 10:5.2f}  VOLT {data[1] / 10:5.1f} V  "
@@ -345,6 +350,20 @@ def decode_ms3(msg_id, data):
 # ---------------------------------------------------------------------------
 BITRATE_CODE = {"10k": "S0", "20k": "S1", "50k": "S2", "100k": "S3", "125k": "S4",
                 "250k": "S5", "500k": "S6", "800k": "S7", "1m": "S8"}
+BITRATE_BPS = {"10k": 10_000, "20k": 20_000, "50k": 50_000, "100k": 100_000,
+               "125k": 125_000, "250k": 250_000, "500k": 500_000,
+               "800k": 800_000, "1m": 1_000_000}
+
+
+def bus_load_pct(frames_per_s, bitrate_bps=500_000, bits_per_frame=130):
+    """Rough CAN bus utilisation (%).
+
+    A standard 8-byte frame is ~111 bits + up to ~19 stuffing bits; this uses the
+    pessimistic 130 so the number flatters nothing. At 500 kbit/s ~3800 frames/s
+    is the theoretical ceiling, so a few hundred frames/s is a few percent — the
+    slcan **USB serial** link, not the bus, is what caps the emulator.
+    """
+    return (frames_per_s * bits_per_frame / float(bitrate_bps)) * 100.0
 
 
 class SLCAN:
@@ -449,6 +468,67 @@ class SLCAN:
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+def _bench_cycle(bus, t, profile, rpm, seq, core_id, aux_id):
+    """One whole cycle: build every channel, one serial write."""
+    bus.send_many(rc35_frames(**bench_values(t, profile, rpm), seq=seq & 0xFF,
+                             core_id=core_id, aux_id=aux_id))
+
+
+def bench_autotune(bus, args, seconds_per_step=1.5, ceiling=2000.0):
+    """Ramp the cycle rate until the link can't keep up; report the real ceiling.
+
+    The CAN bus is not the limit (500 kbit/s carries ~3800 frames/s, and two
+    channels at a few hundred cycles/s is a few percent). The **slcan USB serial
+    link** is: every frame goes out as ~25 ASCII bytes. So the honest answer to
+    "how fast can this go" is a measurement, not a constant.
+    """
+    print("[bench] --autotune: ramping the cycle rate until the link degrades")
+    bps = BITRATE_BPS.get(args.bitrate, 500_000)
+    hz = float(args.hz)
+    best = 0.0
+    while hz <= ceiling:
+        if bus_load_pct(hz * 2, bps) > args.max_load:
+            print(f"    stopped at {hz:.0f} Hz: {bus_load_pct(hz * 2, bps):.0f}% bus load "
+                  f"exceeds --max-load {args.max_load:.0f}% — a saturated bus starts "
+                  f"starving the receiver, which is the bug you are trying to test for")
+            break
+        t0 = time.time()
+        n = 0
+        last = t0
+        worst = 0.0
+        qmax = 0
+        while time.time() - t0 < seconds_per_step:
+            t = time.time() - t0
+            _bench_cycle(bus, t, args.profile, args.rpm, n, args.core_id, args.aux_id)
+            n += 1
+            now = time.time()
+            if n > 1:
+                worst = max(worst, now - last)
+            last = now
+            try:
+                qmax = max(qmax, bus.ser.out_waiting)
+            except OSError:
+                pass
+            d = (t0 + n / hz) - time.time()
+            if d > 0:
+                time.sleep(d)
+        el = time.time() - t0
+        achieved = n / el if el > 0 else 0
+        ok = achieved >= hz * 0.90 and qmax < 256
+        print(f"    asked {hz:6.0f} Hz -> got {achieved:6.0f} cycles/s "
+              f"({achieved * 2:5.0f} frames/s), worst gap {worst * 1000:5.1f} ms, "
+              f"tx queue max {qmax:4d} B   {'ok' if ok else 'TOO FAST'}")
+        if not ok:
+            break
+        best = hz
+        hz = hz * 2 if hz >= 100 else hz + 50
+    print(f"[bench] sustainable: ~{best:.0f} Hz cycles = {best * 2:.0f} frames/s "
+          f"(bus load ≈ {bus_load_pct(best * 2, bps):.1f}% at {args.bitrate}).")
+    print("[bench] If that is lower than expected, the slcan serial link is the "
+          "bottleneck, not the bus — try a higher --serial-baud.")
+    return best
+
+
 def cmd_bench(args):
     """Fast, steady RC35 bench broadcast — every channel, every cycle.
 
@@ -458,7 +538,15 @@ def cmd_bench(args):
     guessed at.
     """
     period = 1.0 / args.hz
-    nframes = len(RC35_IDS)
+    bps = BITRATE_BPS.get(args.bitrate, 500_000)
+    nframes = 2
+    if not args.dry_run and args.autotune:
+        bus = SLCAN(args.port, args.bitrate, serial_baud=args.serial_baud)
+        try:
+            bench_autotune(bus, args)
+        finally:
+            bus.close()
+        return
     if args.dry_run:
         print(f"[bench] --dry-run: {nframes} frames/cycle at {args.hz:g} Hz "
               f"= {args.hz * nframes:g} frames/s. No serial port opened.\n")
@@ -466,19 +554,28 @@ def cmd_bench(args):
             t = k * period
             v = bench_values(t, args.profile, args.rpm)
             print(f"  t={t:5.2f}s  {fmt_values(v)}")
-            for mid, payload in rc35_frames(**v, seq=k & 0xFF).items():
+            for mid, payload in rc35_frames(**v, seq=k & 0xFF,
+                                            core_id=args.core_id,
+                                            aux_id=args.aux_id).items():
                 print(f"    0x{mid:03X} [{len(payload)}] {payload.hex().upper():<18}"
-                      f"-> {decode_rc35(mid, payload)}")
+                      f"-> {decode_rc35(mid, payload, args.core_id, args.aux_id)}")
         return
 
     bus = SLCAN(args.port, args.bitrate, serial_baud=args.serial_baud)
-    print(f"[bench] RC35 bench frames 0x{RC35_CORE_ID:03X} + 0x{RC35_AUX_ID:03X} at "
-          f"{args.hz:g} Hz cycles = {args.hz * nframes:g} frames/s")
-    print("[bench] channels every cycle: RPM TEMP OIL VOLT AFR IAT MAP TPS")
+    print(f"[bench] RC35 bench frames 0x{args.core_id:03X} + 0x{args.aux_id:03X} at "
+          f"{args.hz:g} Hz cycles = {args.hz * nframes:g} frames/s "
+          f"(bus load ≈ {bus_load_pct(args.hz * nframes, bps):.1f}% at {args.bitrate})")
+    print("[bench] channels every cycle: RPM TEMP OIL VOLT AFR IAT MAP TPS (+ ADV)")
     print(f"[bench] profile: {args.profile}"
           + (f" (rpm {args.rpm:g})" if args.profile == 'steady' else ""))
-    print("[bench] the logger's dash samples at <=25 Hz; a faster source cannot look")
-    print("[bench] faster on screen. Ctrl-C to stop.\n")
+    print("[bench] the dash's own monitor block repaints at ~10 Hz, so past ~20 Hz")
+    print("[bench] cycles the SCREEN cannot show it — the wire still carries it.")
+    print("[bench] Ctrl-C to stop.\n")
+    req_load = bus_load_pct(args.hz * nframes, bps)
+    if req_load > args.max_load:
+        print(f"[bench] ⚠️  {req_load:.0f}% bus load exceeds --max-load {args.max_load:.0f}%: "
+              f"a saturated bus can starve the receiver's loop, which then LOOKS like "
+              f"a slow display. Lower --hz to test the display, raise it only to stress it.\n")
     t0 = time.time()
     n = 0
     recent = []
@@ -487,7 +584,7 @@ def cmd_bench(args):
         while True:
             t = time.time() - t0
             v = bench_values(t, args.profile, args.rpm)
-            bus.send_many(rc35_frames(**v, seq=n & 0xFF))
+            _bench_cycle(bus, t, args.profile, args.rpm, n, args.core_id, args.aux_id)
             n += 1
             now = time.time()
             recent.append(now)
@@ -501,11 +598,14 @@ def cmd_bench(args):
                 except OSError:
                     backlog = -1
                 print(f"  t={t:6.1f}s  {len(recent):3d} cycles/s  "
-                      f"worst gap {worst:5.1f} ms  tx queue {backlog:4d} B   {fmt_values(v)}")
+                      f"worst gap {worst:5.1f} ms  tx queue {backlog:4d} B  "
+                      f"load {bus_load_pct(len(recent) * nframes, bps):4.1f}%   "
+                      f"{fmt_values(v)}")
                 last_report = now
             for msg_id, payload, ext, remote in bus.poll():
                 print(f"  [rx] 0x{msg_id:03X} [{len(payload)}] {payload.hex().upper()}"
-                      f"  {decode_rc35(msg_id, payload) or decode_ms3(msg_id, payload)}")
+                      f"  {decode_rc35(msg_id, payload, args.core_id, args.aux_id)}"
+                      f"{decode_ms3(msg_id, payload)}")
             if args.duration and t > args.duration:
                 break
             nxt = t0 + n * period
@@ -826,10 +926,20 @@ def main():
 
     sp = sub.add_parser("bench", help="fake data for the bench: RC35 frames with every channel, fast + steady")
     common(sp)
-    sp.add_argument("--hz", type=float, default=100.0,
-                    help="cycles/s; 2 frames per cycle, so 100 = 200 frames/s (default 100)")
+    sp.add_argument("--hz", type=float, default=200.0,
+                    help="cycles/s; 2 frames per cycle, so 200 = 400 frames/s (default 200)")
     sp.add_argument("--serial-baud", type=int, default=115200,
-                    help="USB serial baud to the adapter (default 115200)")
+                    help="USB serial baud to the adapter (default 115200; USB CDC usually "
+                         "ignores it and runs at USB speed — measure with --autotune)")
+    sp.add_argument("--core-id", type=lambda x: int(x, 0), default=RC35_CORE_ID,
+                    help="frame id for the CORE frame (default 0x700)")
+    sp.add_argument("--aux-id", type=lambda x: int(x, 0), default=RC35_AUX_ID,
+                    help="frame id for the AUX frame (default 0x701)")
+    sp.add_argument("--autotune", action="store_true",
+                    help="ramp the rate and MEASURE the sustainable ceiling, then exit")
+    sp.add_argument("--max-load", type=float, default=60.0,
+                    help="stop ramping at this %% bus load (default 60; a saturated bus "
+                         "starves the receiver and looks like a slow display)")
     sp.add_argument("--profile", default="sweep", choices=("sweep", "steady", "pull", "chop"),
                     help="sweep = one slow sine (default); steady = fixed --rpm; "
                          "pull = gear-by-gear WOT; chop = hard steps on every channel "

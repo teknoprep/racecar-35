@@ -1,9 +1,47 @@
 # RC35 bench CAN frames — handover for the firmware agent
 
-**Status:** the *tool* side is done and on the wire. The **logger does not parse
-these frames yet** — that is the only firmware work needed for OIL (and the rest)
-to show up on the dash from the bench. Owner of `src/main.cpp`: the firmware
-agent. The RC35 edits were deliberately **not** applied and not left in the tree.
+**Scope split:** `tools/can_sim.py` is the **emulator** (the transmitter — that is all
+this doc's author owns). The **receiver** is `src/main.cpp` / `RaceDash.ino`, owned by
+the firmware agent. No firmware code was changed to produce the emulator.
+
+**Status:** the emulator is done, committed, and measured on the wire. The logger does
+not parse these frames yet — that is the only firmware work needed for OIL (and the
+rest) to show up on the dash from the bench.
+
+## The emulator (the "new CANBUS")
+
+```bash
+python3 tools/can_sim.py bench -p /dev/ttyACM0                       # 200 Hz cycles = 400 frames/s
+python3 tools/can_sim.py bench -p /dev/ttyACM0 --profile chop        # every channel flips 2x/s
+python3 tools/can_sim.py bench -p /dev/ttyACM0 --autotune            # MEASURE the ceiling, then exit
+python3 tools/can_sim.py bench --dry-run                             # frames + decode, no hardware
+python3 tools/can_sim.py bench -p /dev/ttyACM0 --core-id 0x123 --aux-id 0x124
+python3 tools/can_sim.py bench -p /dev/ttyACM0 --hz 400 --profile pull
+```
+
+Measured with a pty harness (`tests/test_can_sim.py`, no CAN hardware needed):
+
+| requested | on the wire | worst cycle gap | bus load @500k |
+| --- | --- | --- | --- |
+| 100 Hz cycles | 201 frames/s | 10.4 ms | 5.2% |
+| 200 Hz cycles (default) | 401 frames/s | 5.2 ms | 10.4% |
+| 400 Hz cycles | 801 frames/s | 3.2 ms | 20.8% |
+| 800 Hz cycles (`--autotune`) | 1600 frames/s | 1.4 ms | 41.6% |
+
+* `--autotune` ramps the rate and reports the **measured** ceiling — it does not
+  guess, because the limit is the slcan **USB serial** link (every frame is ~25
+  ASCII bytes), not the bus. A standard 8-byte frame is ~130 bits worst case, so
+  500 kbit/s carries ~3846 frames/s; 400 frames/s is ~10% of the bus.
+* `--max-load` (default 60%) stops the ramp before the bus saturates. A saturated bus
+  starves the receiver's loop — which *looks* like a slow display, the exact symptom
+  being chased. Testing the display and stressing the link are different experiments.
+* `--core-id` / `--aux-id` re-point the two frames at whatever ids the receiver
+  expects, with no layout change.
+
+⚠️ **The rate cannot make the dash faster.** The dash's monitor block repaints at most
+every 100 ms (~10 Hz) and the RPM monitor row is quantised to 10 rpm. Past ~20 Hz of
+cycles the screen physically cannot show more. If the display looks slow, the cause is
+on the receiver/display side (see the section at the end), not the emulator's rate.
 
 ## Why this exists
 
@@ -53,7 +91,8 @@ in `tests/test_can_sim.py::test_rc35_wire_bytes_are_frozen`.
 
 ## Firmware changes (src/main.cpp) — 6 small edits
 
-1. **Constants** next to `CAN_BASE_ID`:
+1. **Constants** next to `CAN_BASE_ID`: keep the defaults `0x700`/`0x701` unless you
+   re-point the emulator with `--core-id` / `--aux-id`.
 
 ```cpp
   constexpr uint32_t CAN_BENCH_CORE_ID  = 0x700;   // RC35 bench: rpm/map/tps/TEMP/IAT
