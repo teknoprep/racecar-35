@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.163"
+#define FIRMWARE_VERSION "0.1.164"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -1229,6 +1229,28 @@ static void canBegin() {
     Can1.setBaudRate(CAN_BAUD);   // normal mode -> FlexCAN auto-ACKs
     Can1.setMaxMB(16);
     Can1.enableFIFO();
+    // v0.1.164: ASSERT normal (ACKing) mode — do not trust the library to have done it.
+    // FlexCAN_T4::begin() sets CTRL1[LOM] (LISTEN-ONLY) and relies on setBaudRate() to clear
+    // it, but setBaudRate() can return EARLY — before the CTRL1 rewrite that clears LOM —
+    // when the computed bit timing is rejected (result <5 / >25 / error >300). A controller
+    // left in listen-only RECEIVES every frame perfectly and counts it, but NEVER drives the
+    // ACK bit: the sender retransmits forever ("STORM 3844 FPS"), the bus saturates, and the
+    // displayed values crawl at a few Hz while everything else looks healthy. It also explains
+    // the old "transmitting kills the bus" note: a listen-only node's writes cannot complete,
+    // so its TX error counter climbs to bus-off. Clear the bit explicitly, in freeze mode,
+    // on every (re)init — including the bus-off recovery path.
+    {
+        // Freeze-mode dance done by hand: FLEXCAN_EnterFreezeMode() is a PRIVATE MEMBER of the
+        // template class, so a sketch cannot call it. CTRL1 is only writable in freeze mode, so
+        // set MCR[FRZ] and wait (bounded - this must never hang the loop) for MCR[FRZ_ACK].
+        volatile uint32_t* mcr   = &FLEXCANb_MCR(FLEXCAN1_BASE);
+        const bool frz_negate = !(*mcr & FLEXCAN_MCR_FRZ_ACK);
+        *mcr |= FLEXCAN_MCR_FRZ;
+        const uint32_t t0 = millis();
+        while (!(*mcr & FLEXCAN_MCR_FRZ_ACK) && (millis() - t0 < 20)) { }
+        FLEXCANb_CTRL1(FLEXCAN1_BASE) &= ~FLEXCAN_CTRL_LOM;   // 0 = normal mode: ACKs frames
+        if (frz_negate) *mcr &= ~FLEXCAN_MCR_FRZ;
+    }
 }
 
 // One-shot TX/ACK self-test state. Proves whether the Teensy can actually put
