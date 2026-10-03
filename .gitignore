@@ -37,3 +37,5 @@ desktop.ini
 
 # transient run logs (freeerouting/render stderr etc.)
 logs/
+__pycache__/
+*.pyc
