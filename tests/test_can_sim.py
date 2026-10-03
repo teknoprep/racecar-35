@@ -89,6 +89,57 @@ def test_custom_frame_ids():
     assert core[0][5] > 0                                  # TEMP present
 
 
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="needs a pty")
+def test_peer_reader_parses_logger_counters():
+    """--peer-port is the only proof of a TX/ACK fault on a firmware that reports
+    nothing about transmits, so its parsing must be exact. A pty stands in for
+    the logger."""
+    master, slave = pty.openpty()
+    reader = can_sim.PeerReader(os.ttyname(slave))
+    reader.start()
+    deadline = time.time() + 3
+    while reader.ser is None and time.time() < deadline:
+        time.sleep(0.05)          # pyserial FLUSHES input on open — write after it
+    assert reader.ser is not None, "reader never opened the pty"
+    for line in (b"BENCH frames/s=200 oil=450 rpm=3650 (RC35 ids 0x700/0x701)\r\n",
+                 b"CANDIAG,200,12345,0,0,0,0,0,0\r\n",
+                 b"ENG,3650,-1,1800  [src=CAN(auto)]\r\n"):
+        os.write(master, line)
+        time.sleep(0.15)
+    deadline = time.time() + 3
+    while reader.bench_fps is None and time.time() < deadline:
+        time.sleep(0.05)
+    assert reader.bench_fps == 200, reader.summary()
+    assert reader.bench_oil == 450, reader.summary()
+    assert reader.candiag_fps == 200, reader.summary()
+    assert "BENCH 200/s" in reader.summary()
+    reader.stop()
+    os.close(master)
+    os.close(slave)
+
+
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="needs a pty")
+def test_peer_reader_reports_no_bench_line():
+    """An older receiver firmware answers on serial but prints no BENCH line — it
+    must be reported as such, not silently treated as zero frames."""
+    master, slave = pty.openpty()
+    reader = can_sim.PeerReader(os.ttyname(slave))
+    reader.start()
+    deadline = time.time() + 3
+    while reader.ser is None and time.time() < deadline:
+        time.sleep(0.05)
+    assert reader.ser is not None
+    os.write(master, b"VER,teensy,0.1.150\r\n")
+    deadline = time.time() + 2
+    while reader.lines == 0 and time.time() < deadline:
+        time.sleep(0.05)
+    assert reader.bench_fps is None
+    assert "NO BENCH line" in reader.summary(), reader.summary()
+    reader.stop()
+    os.close(master)
+    os.close(slave)
+
+
 def test_bus_load_maths():
     """A 130-bit worst case: 400 frames/s is ~10% of a 500k bus, and the bus is
     not the emulator's limit — the slcan serial link is."""

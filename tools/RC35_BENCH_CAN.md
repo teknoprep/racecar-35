@@ -184,6 +184,51 @@ updating at 1 Hz or 25 Hz. `chop` flips every channel hard, twice a second.
   read from `ecu.*` only in that mode (`fromCan`), so in Direct mode those four
   rows will not display the bench values even though they are on the bus.
 
+## Proving the bus from the emulator side (TX / ACK accounting)
+
+**A CAN transmitter needs another node to ACK it.** With only the CANable on the bus,
+*every* frame fails to complete — no receiver, no data, anywhere. That is not a bug to
+find, it is a missing node.
+
+What the adapter itself exposes (measured on this bench — CANable 2.5, ElmueSoft
+`Slcan: 100`): **nothing per transmit.** A lone-node blast of 600 frames produced no
+`\r` (accepted), no `\x07` BEL (no ACK / bus error), no backpressure (`out_waiting` 0),
+no slow writes. So on this firmware a TX/ACK failure is *invisible* from the adapter
+side — there is no counter to read.
+
+What `bench` now reports every second, so the adapter side is at least accounted for:
+
+| field | meaning |
+| --- | --- |
+| `tx fail N (M/s)` | `\x07` BEL responses seen, and the rate. **Rising = the adapter could not put frames on the bus** (no ACK, bitrate, bus-off, wiring). Works on firmwares that report it. |
+| `tx queue N B` | adapter's un-drained USB buffer — growth means it has stopped accepting frames |
+| `slow_writes` / `max_write` | writes that blocked >5 ms: the adapter stalling us |
+
+And it says so explicitly when the firmware is silent, rather than implying success:
+
+```
+[bench] adapter: tx_ok=0 (accepted) tx_fail=0 slow_writes=0 max_write=0.9 ms
+[bench] NOTE: this slcan firmware reports NOTHING per transmit ... the receiver's own
+        counter is the proof.
+```
+
+**The decisive test** — pass the logger's own serial port and let its counter arbitrate:
+
+```bash
+python3 tools/can_sim.py bench -p /dev/ttyACM0 --peer-port /dev/ttyACM1 --hz 50 --duration 10
+```
+
+The tool then prints the receiver's 1 Hz `BENCH frames/s=` / `CANDIAG` counters next to
+ours and a verdict:
+
+* receiver counts **0** while we transmit → frames never got onto the bus / were never
+  ACKed → logger unpowered or unplugged, CANH/CANL, 120 Ω termination, common ground,
+  or a bitrate mismatch.
+* receiver counts **>0** → frames left the adapter *and* were ACKed. Anything still
+  missing on the dash is downstream (per-item source, display), not the bus.
+* serial works but **no BENCH line** → the receiver's firmware predates 0.1.159 (no
+  RC35 parser), so it will ignore these frames entirely.
+
 ## The "screen refreshes slowly" investigation
 
 Measured facts (not guesses):

@@ -43,8 +43,10 @@ slcan bitrate code: S0=10k S1=20k S2=50k S3=100k S4=125k S5=250k S6=500k S7=800k
 
 import argparse
 import math
+import re
 import struct
 import sys
+import threading
 import time
 
 try:
@@ -369,6 +371,16 @@ def bus_load_pct(frames_per_s, bitrate_bps=500_000, bits_per_frame=130):
 class SLCAN:
     def __init__(self, port, bitrate="500k", serial_baud=115200, verbose=True):
         self.verbose = verbose
+        # --- adapter-side transmit accounting ------------------------------------
+        # LAWICEL-class slcan answers each transmit with \r (accepted) or \x07 BEL
+        # (no ACK / bus error). Some firmwares (CANable 2.x "Slcan: 100") answer
+        # NOTHING at all — then a TX/ACK failure is invisible here and the only
+        # proof is the RECEIVER's own frame counter (see PeerReader / --peer-port).
+        self.tx_ok       = 0     # bare \r seen  -> adapter accepted a transmit
+        self.tx_err      = 0     # \x07 seen     -> adapter reported a TX failure
+        self.tx_err_prev = 0
+        self.slow_writes = 0     # writes that took >5 ms (adapter stalling us)
+        self.max_write_ms = 0.0
         self.ser = serial.Serial(port, serial_baud, timeout=0.2)
         time.sleep(0.2)
         self.ser.reset_input_buffer()
@@ -405,14 +417,24 @@ class SLCAN:
         """Write a whole cycle (all of its frames) in ONE serial write.
 
         One syscall per cycle instead of one per frame: larger, fewer writes are
-        what keeps the injected cadence even on a USB CDC adapter.
+        what keeps the injected cadence even on a USB CDC adapter. The write is
+        timed — a write that blocks means the adapter has stopped draining us,
+        which is an adapter-side failure signal that works even on firmwares that
+        report nothing about transmits.
         """
         out = bytearray()
         for msg_id, payload in frames.items():
             payload = bytes(payload)
             out += b"t%03X%d%s\r" % (msg_id, len(payload),
                                       payload.hex().upper().encode())
-        return self.ser.write(bytes(out))
+        t0 = time.time()
+        n = self.ser.write(bytes(out))
+        ms = (time.time() - t0) * 1000.0
+        if ms > self.max_write_ms:
+            self.max_write_ms = ms
+        if ms > 5.0:
+            self.slow_writes += 1
+        return n
 
     def poll(self):
         """Yield every complete frame received since the last call — NEVER blocks.
@@ -434,8 +456,18 @@ class SLCAN:
             line, self.buf = self.buf.split(b"\r", 1)
             line = line.strip()
             if not line:
+                self.tx_ok += 1          # a bare CR = "transmit accepted"
                 continue
             ch = line[:1]
+            if ch == b"\x07":
+                # BEL = the adapter could NOT put the frame on the bus: nobody
+                # ACKed it (no second node, wrong bitrate, bus-off, wiring) or a
+                # bus error occurred. This is the signal worth counting.
+                self.tx_err += 1
+                if self.verbose:
+                    print("[slcan] \x07 TX FAILURE reported by the adapter "
+                          "(no ACK / bus error)")
+                continue
             try:
                 if ch in (b"t", b"r"):                      # std data / remote
                     msg_id = int(line[1:4], 16)
@@ -447,8 +479,6 @@ class SLCAN:
                     dlc = int(line[9:10], 16)
                     payload = bytes.fromhex(line[10:10 + dlc * 2].decode())
                     yield msg_id, payload, True, ch == b"R"
-                elif line.startswith(b"\x07"):
-                    print("[slcan] adapter reported an ERROR (likely no ACK on the bus)")
                 else:
                     if self.verbose:
                         print(f"[slcan] <{line!r}>")
@@ -529,6 +559,78 @@ def bench_autotune(bus, args, seconds_per_step=1.5, ceiling=2000.0):
     return best
 
 
+class PeerReader(threading.Thread):
+    """Read the RECEIVER's USB serial (the logger) and keep its frame counters.
+
+    This is the only way to separate "the adapter never got the frames onto the
+    bus" from "the frames arrived but were not ACKed / not exposed" when the
+    slcan firmware reports nothing about transmits. The logger prints
+    `BENCH frames/s=<n> ...` (firmware >= 0.1.159) and `CANDIAG,<frames/s>,<total>,...`
+    once a second; both are parsed here.
+    """
+    RE_BENCH = re.compile(r"BENCH frames/s=(\d+)")
+    RE_CANDIAG = re.compile(r"CANDIAG,(\d+),(\d+),")
+
+    def __init__(self, port, baud=115200, verbose=True):
+        super().__init__(daemon=True)
+        self.port = port
+        self.baud = baud
+        self.verbose = verbose
+        self.bench_fps = None      # frames/s the RECEIVER counted (None = no line yet)
+        self.bench_oil = None
+        self.candiag_fps = None
+        self.lines = 0
+        self.err = None
+        self._stop = threading.Event()
+        self.ser = None
+
+    def run(self):
+        try:
+            self.ser = serial.Serial(self.port, self.baud, timeout=0.5)
+        except Exception as exc:                      # noqa: BLE001
+            self.err = str(exc)
+            return
+        while not self._stop.is_set():
+            try:
+                raw = self.ser.readline()
+            except Exception as exc:                  # noqa: BLE001
+                self.err = str(exc)
+                return
+            if not raw:
+                continue
+            self.lines += 1
+            line = raw.decode(errors="replace")
+            m = self.RE_BENCH.search(line)
+            if m:
+                self.bench_fps = int(m.group(1))
+                om = re.search(r"oil=(-?\d+)", line)
+                if om:
+                    self.bench_oil = int(om.group(1))
+            m = self.RE_CANDIAG.search(line)
+            if m:
+                self.candiag_fps = int(m.group(1))
+
+    def stop(self):
+        self._stop.set()
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:                         # noqa: BLE001
+                pass
+
+    def summary(self):
+        if self.err:
+            return f"peer {self.port}: {self.err}"
+        if self.lines == 0:
+            return f"peer {self.port}: silent (no serial output)"
+        if self.bench_fps is None:
+            return (f"peer {self.port}: {self.lines} lines, NO BENCH line "
+                    f"(firmware older than 0.1.159, or wrong port)")
+        extra = f", oil={self.bench_oil}" if self.bench_oil is not None else ""
+        return (f"peer {self.port}: BENCH {self.bench_fps}/s{extra}"
+                + (f", CANDIAG {self.candiag_fps}/s" if self.candiag_fps is not None else ""))
+
+
 def cmd_bench(args):
     """Fast, steady RC35 bench broadcast — every channel, every cycle.
 
@@ -576,6 +678,11 @@ def cmd_bench(args):
         print(f"[bench] ⚠️  {req_load:.0f}% bus load exceeds --max-load {args.max_load:.0f}%: "
               f"a saturated bus can starve the receiver's loop, which then LOOKS like "
               f"a slow display. Lower --hz to test the display, raise it only to stress it.\n")
+    peer = None
+    if getattr(args, "peer_port", None):
+        peer = PeerReader(args.peer_port, getattr(args, "peer_baud", 115200))
+        peer.start()
+        print(f"[bench] watching the receiver on {args.peer_port} for its BENCH/CANDIAG counters\n")
     t0 = time.time()
     n = 0
     recent = []
@@ -599,8 +706,15 @@ def cmd_bench(args):
                     backlog = -1
                 print(f"  t={t:6.1f}s  {len(recent):3d} cycles/s  "
                       f"worst gap {worst:5.1f} ms  tx queue {backlog:4d} B  "
-                      f"load {bus_load_pct(len(recent) * nframes, bps):4.1f}%   "
-                      f"{fmt_values(v)}")
+                      f"load {bus_load_pct(len(recent) * nframes, bps):4.1f}%  "
+                      f"tx fail {bus.tx_err:4d} ({bus.tx_err - bus.tx_err_prev}/s)")
+                if bus.tx_err > bus.tx_err_prev:
+                    print("  ⚠️  adapter-reported TX failures are RISING: frames are not "
+                          "being ACKed (no second node / termination / bitrate / bus-off)")
+                bus.tx_err_prev = bus.tx_err
+                print(f"           {fmt_values(v)}")
+                if peer is not None:
+                    print(f"           {peer.summary()}")
                 last_report = now
             for msg_id, payload, ext, remote in bus.poll():
                 print(f"  [rx] 0x{msg_id:03X} [{len(payload)}] {payload.hex().upper()}"
@@ -616,10 +730,43 @@ def cmd_bench(args):
         pass
     finally:
         bus.close()
+        if peer is not None:
+            peer.stop()
         el = time.time() - t0
         if el > 0:
             print(f"\n[bench] sent {n} cycles ({n * nframes} frames) in {el:.1f}s = "
                   f"{n / el:.1f} cycles/s, {n * nframes / el:.0f} frames/s")
+            print(f"[bench] adapter: tx_ok={bus.tx_ok} (accepted) tx_fail={bus.tx_err} "
+                  f"slow_writes={bus.slow_writes} max_write={bus.max_write_ms:.1f} ms")
+            if bus.tx_ok == 0 and bus.tx_err == 0 and bus.slow_writes == 0:
+                print("[bench] NOTE: this slcan firmware reports NOTHING per transmit "
+                      "(no CR, no 0x07 BEL) — verified on a lone-node bus, where every "
+                      "frame must fail. So a TX/ACK failure is INVISIBLE from the "
+                      "adapter side here; the receiver's own counter is the proof.")
+            elif bus.tx_err:
+                print("[bench] VERDICT: the adapter reported TX failures → the frames are "
+                      "NOT reaching the bus: no ACKing node (logger unpowered/unwired), "
+                      "termination, bitrate, or bus-off.")
+            if peer is not None:
+                print(f"[bench] {peer.summary()}")
+                if peer.err or peer.lines == 0:
+                    print("[bench] VERDICT: receiver serial is unreadable — fix the peer "
+                          "port/baud before concluding anything about the bus.")
+                elif peer.bench_fps is None:
+                    print("[bench] VERDICT: receiver serial works but printed no BENCH "
+                          "line — its firmware predates 0.1.159 (no RC35 parser).")
+                elif peer.bench_fps == 0:
+                    print("[bench] VERDICT: receiver counts ZERO frames while we transmit → "
+                          "the frames never got onto the bus (or were never ACKed): "
+                          "check the logger is powered, CANH/CANL, 120Ω termination, "
+                          "common ground and 500k on BOTH nodes.")
+                else:
+                    print(f"[bench] VERDICT: receiver counted ~{peer.bench_fps} frames/s → "
+                          "frames left the adapter AND were ACKed. Anything still missing "
+                          "on the dash is downstream (per-item source setting / display).")
+            elif bus.tx_ok == 0 and bus.tx_err == 0:
+                print("[bench] VERDICT: unknown — re-run with --peer-port <logger port> so "
+                      "the receiver's counter can prove the bus side.")
             if args.duration and abs(n / el - args.hz) / args.hz > 0.1:
                 print(f"[bench] WARNING: achieved {n / el:.1f} Hz vs requested {args.hz:g} Hz "
                       f"— lower --hz, or raise --serial-baud if the adapter allows it")
@@ -937,6 +1084,13 @@ def main():
                     help="frame id for the AUX frame (default 0x701)")
     sp.add_argument("--autotune", action="store_true",
                     help="ramp the rate and MEASURE the sustainable ceiling, then exit")
+    sp.add_argument("--peer-port", default=None,
+                    help="the RECEIVER's serial port (the logger). Its 1 Hz "
+                         "'BENCH frames/s=' / CANDIAG counters are cross-checked "
+                         "against what we transmit, which is the ONLY way to prove "
+                         "a TX/ACK fault with a firmware that reports nothing")
+    sp.add_argument("--peer-baud", type=int, default=115200,
+                    help="baud for --peer-port (default 115200)")
     sp.add_argument("--max-load", type=float, default=60.0,
                     help="stop ramping at this %% bus load (default 60; a saturated bus "
                          "starves the receiver and looks like a slow display)")
