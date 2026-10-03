@@ -20,7 +20,7 @@ HZ="${3:-100}"
 # Anchored so these can never match THIS script's own command line (that mistake killed a
 # shell twice during development and left a stale broadcaster holding the port).
 GUI_PAT='^python3 tools/can_gui\.py'
-SIM_PAT='^/usr/bin/python3 -u .*tools/can_sim\.py'
+SIM_PAT='can_sim[.]py bench'
 
 status() {
     echo "GUI app:"
