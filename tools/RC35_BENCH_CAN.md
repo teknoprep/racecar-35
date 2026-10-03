@@ -129,9 +129,14 @@ visibility, print the bench counter on **USB only**:
 
 ```bash
 python3 tools/can_sim.py bench --dry-run          # prints frames + decode, no hardware
+python3 tools/can_sim.py bench --profile chop --dry-run   # hard steps on EVERY channel
 python3 tools/can_sim.py bench -p /dev/ttyACM0 --hz 100   # live; prints cycles/s + worst gap
 python3 -m pytest tests/test_can_sim.py -q        # golden bytes + pty cadence tests
 ```
+
+To judge a display's refresh rate, use **`--profile chop`**: a physically plausible
+sweep (the default, and `pull`) changes too slowly to see whether the screen is
+updating at 1 Hz or 25 Hz. `chop` flips every channel hard, twice a second.
 
 * Expected on the wire: **200 frames/s** at `--hz 100` (two frames per cycle),
   worst cycle gap a few ms, `tx queue 0 B`.
@@ -177,7 +182,12 @@ order of likelihood for "the data is slow on the screen":
    `cycles/s` should be ~100 and `worst gap` a few ms. (Source proven good.)
 2. **On the USB serial** — count `ENG,` lines per second: expect ~25. If it is
    ~1, the emit cadence regressed (look at `emit_floor_ms`).
-3. **On the dash** — with `--profile pull`, watch TPS/MAP/RPM together:
+3. **On the dash** — with `--profile chop` (hard steps on every channel), watch
+   TPS/MAP/RPM together:
    * all three slow → the UART link or the dash loop, not the values;
    * MAP/TPS slow, RPM live → the sensor-row path / sensor-source rule;
    * RPM alone laggy → `rpm_smooth`.
+
+   Also confirm each row's own source in Settings (v0.1.157 made the sensor SOURCE
+   per-item): a row set to Direct while the data arrives over CAN will sit still
+   no matter how fast the bus is.

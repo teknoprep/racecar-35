@@ -165,6 +165,22 @@ def coolant_at(t, cold=60.0, hot=228.0, ramp=90.0, hold=15.0):
 def bench_values(t, profile="sweep", rpm=3000.0):
     """One coherent snapshot: everything derived from load, so no channel
     contradicts another and nothing jumps discontinuously except a gear shift."""
+    if profile == "chop":
+        # Deliberately UNphysical: every channel flips hard between two values.
+        # A plausible sweep is too slow to judge a screen's refresh rate — this
+        # profile makes a 1 Hz display obvious and a live one instantaneous.
+        hi = (t % 2.0) < 1.0
+        return {
+            "rpm": 6800.0 if hi else 1400.0,
+            "tps_pct": 92.0 if hi else 8.0,
+            "map_kpa": 99.0 if hi else 30.0,
+            "oil_psi": 78.0 if hi else 24.0,
+            "afr": 12.6 if hi else 15.4,
+            "clt_f": 215.0 if (t % 6.0) < 3.0 else 165.0,
+            "iat_f": 140.0 if hi else 75.0,
+            "batt_v": 14.4 if hi else 12.4,
+            "adv_deg": 32.0 if hi else 12.0,
+        }
     r = rpm_wave(t, profile, rpm)
     load = max(0.0, min(1.0, (r - 900.0) / 5600.0))
     clt = coolant_at(t)
@@ -814,8 +830,10 @@ def main():
                     help="cycles/s; 2 frames per cycle, so 100 = 200 frames/s (default 100)")
     sp.add_argument("--serial-baud", type=int, default=115200,
                     help="USB serial baud to the adapter (default 115200)")
-    sp.add_argument("--profile", default="sweep", choices=("sweep", "steady", "pull"),
-                    help="sweep = one slow sine (default); steady = fixed --rpm; pull = gear-by-gear WOT")
+    sp.add_argument("--profile", default="sweep", choices=("sweep", "steady", "pull", "chop"),
+                    help="sweep = one slow sine (default); steady = fixed --rpm; "
+                         "pull = gear-by-gear WOT; chop = hard steps on every channel "
+                         "(use this to SEE the display refresh rate)")
     sp.add_argument("--rpm", type=float, default=3000.0, help="RPM for --profile steady")
     sp.add_argument("--duration", type=float, default=0)
     sp.add_argument("--dry-run", action="store_true",
