@@ -1945,3 +1945,37 @@ firmware/                                 OTA artifacts + manifest.json: teensy4
 _vendor/CrowPanel-ESP32-Display-Course-File/   Elecrow's reference source, all revs (cloned for offline use; gfx_conf.h block CrowPanel_50 = the 5" pin map/timing)
 LVGL_Library.pdf                          Generic upstream LVGL 9.0 docs (NOT Elecrow-specific, useless)
 ```
+
+### CAN reception must never stay deaf (v0.1.162)
+`canBusOffRecover()` runs from the 1 Hz `canDiagReport()`: if the controller reports **Bus Off**
+or its TX/RX error counters sit at the 250+ error-passive cliff, it calls `Can1.reset()` +
+`canBegin()` (once per 5 s, logged on USB). `canBegin()` existed for exactly this — its comment
+says it was "factored out so the TX self-test can recover the controller from a bus-off" — but
+**nothing ever called it again**, so one bad moment on a marginal bus left the receiver deaf for
+the whole session. That is the true shape of *"it gets one frame and then NEVER looks at the data
+again"*: not a parse fault, a controller that quietly stopped listening.
+
+### "The refresh sucks" — measure it, don't tune it (v0.1.162)
+- **The dash link had NO TX buffer**: a few-dozen-byte default against a ~250 B emit frame, so
+  every emit blocked the loop and the frame left in clumps — values arrived in bursts and the
+  dash repainted them in bursts. Now a 4 KB `dashTxBuf` via `addMemoryForWrite`.
+- **Emit floor 40 → 20 → 10 ms** (25 → 50 → 100 Hz). The display caps at 50 Hz and the panel
+  refreshes near 60, so 100 Hz on the wire halves worst-case latency into the screen; GPS fields
+  still arrive at their own 25 Hz and simply repeat.
+- **A CAN sniffer left running writes EVERY frame to SD** (200/s from the bench tool) and SD
+  `sync()` stalls the loop — the same stall the GPS RX buffer exists to survive.
+- **`Tools` prints a second line under CAN health: `UART <n> lines/s (link OK)`** — the MEASURED
+  arrival rate, the number that splits "the screen is slow" in half. ≥250 lines/s means the wire
+  is fine and any lag is display-side; single digits mean the stall is upstream and no display cap
+  can help. `uart_tele_lines_s` counts telemetry lines per second (~6 per 50 Hz emit).
+
+### Which sensor shows, and why "I don't see OIL/AFR/VOLT" happens (v0.1.163)
+Each item's SOURCE defaults from the **global** `Sensor data source`, so on a Direct-mode unit
+TEMP/OIL/AFR seed to DIRECT — their real sensors (NTC, A2 transducer, AEM gauge) — and on a bench
+with none of those wired they correctly show `---` or hide. IAT/MAP/TPS fall back to CAN (their
+masks have no DIRECT bit), which is why those three are the ones that "just work" on a bench with
+a CAN emulator. To see the CAN values for everything: **Settings → Sensor data source =
+MegaSquirt, then RESET on the Sensor monitor page** (RESET re-seeds every source AND mode from the
+global setting), or set each item's Source to CANBUS individually. VOLT now defaults to ALWAYS
+(it was seeded HIDDEN from the old `show_volt` flag, and it has no direct source to fall back to).
+

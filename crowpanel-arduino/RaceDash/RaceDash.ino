@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.162"
+#define FIRMWARE_VERSION "0.1.163"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1663,7 +1663,12 @@ static void monDefaults() {
     if (s.aem_afr) mon_cfg.src[MON_AFR] = MON_SRC_DIRECT;
     mon_cfg.mode[MON_TEMP] = s.show_coolant ? MON_ALWAYS : MON_OFF;
     mon_cfg.mode[MON_OIL]  = s.show_oil_psi ? MON_ALWAYS : MON_OFF;
-    mon_cfg.mode[MON_VOLT] = s.show_volt    ? MON_ALWAYS : MON_OFF;
+    // v0.1.163: VOLT defaults to ALWAYS. The legacy s.show_volt flag defaulted OFF only
+    // because the old dash row was an optional extra, and VOLT has no DIRECT source on this
+    // board anyway (no battery ADC) — so seeding it HIDDEN left a monitor item that could
+    // never appear without hunting through the menu. TEMP/OIL/AFR keep their legacy seeding:
+    // those DO have direct sensors and "where the number comes from" is a real choice.
+    mon_cfg.mode[MON_VOLT] = MON_ALWAYS;
     mon_cfg.mode[MON_AFR]  = s.show_afr     ? MON_ALWAYS : MON_OFF;
     mon_cfg.mode[MON_IAT]  = MON_ALWAYS;
     mon_cfg.mode[MON_MAP]  = MON_OFF;
