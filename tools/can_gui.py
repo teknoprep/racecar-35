@@ -44,6 +44,9 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit("pyserial missing")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dash_view                        # the dash clone (separate window)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CAN_SIM = os.path.join(HERE, "can_sim.py")
@@ -89,6 +92,10 @@ def parse_candiag_usb(line):
             "base_hits": int(base), "state": state.strip(), "ack_err": int(ack),
             "crc_err": int(crc), "frm_err": int(frm), "stf_err": int(stf),
             "tec": int(tec), "rec": int(rec)}
+
+
+# Their tool states the wire rate itself: "... at 100 Hz cycles = 200 frames/s (bus load ...)"
+RE_TOOLRATE = re.compile(r"=\s*(\d+)\s+frames/s")
 
 
 RE_BENCH_T = re.compile(r"^\s*t=\s*([\d.]+)s")
@@ -255,6 +262,13 @@ class App:
         self._vt0 = time.time()
         self.history = {k: [] for k, *_ in CHANNELS}
         self.frame_lines = []
+        # dash-clone feed: filled from the Teensy's lines when connected (faithful), else from
+        # the broadcaster's values with a modelled speed (the bench has no GPS).
+        self.dash_state = {}
+        self.dash = None
+        self.dash_cfg = dash_view.MonCfg()
+        self.dash_win = None
+        self.rec_start = None
 
         root.title("RC35 bench CAN console")
         root.geometry("1180x780")
@@ -294,6 +308,8 @@ class App:
         self.stop_btn.pack(side="left")
         self.state_lbl = tk.Label(top, text="idle", bg="#101418", fg="#ffcc66")
         self.state_lbl.pack(side="left", padx=10)
+        tk.Button(top, text="DASH VIEW", command=self.open_dash,
+                  bg="#1e3f5b", fg="white").pack(side="left", padx=8)
 
         # ---- values ----
         mid = tk.Frame(self.root, bg="#101418")
@@ -419,6 +435,14 @@ class App:
         v = parse_values(line)
         if v:
             self.values = v
+            if not self.dash_state.get("from_teensy"):
+                st = self.dash_state
+                st.update({k: v[k] for k in ("rpm", "clt", "oil", "volt", "afr", "iat", "map", "tps")})
+                # the bench has no GPS: model a plausible road speed from RPM so the big number
+                # moves instead of sitting at "--". Labelled in the window title area.
+                st["speed_mph"] = max(0.0, (v["rpm"] - 900) / 33.0)
+                st["gps_text"] = "GPS (modelled)"
+                st["recording"] = st.get("recording", False)
             self._vl += 1
             now = time.time()
             if now - self._vt0 >= 1.0:
@@ -434,6 +458,9 @@ class App:
         s = parse_status(line)
         if s:
             self.status = s
+        m = RE_TOOLRATE.search(line)
+        if m:
+            self.tool_frames_s = int(m.group(1))
 
         c = parse_candiag(line) or parse_candiag_usb(line)
         if c:
@@ -444,14 +471,27 @@ class App:
             self.teensy_ver = line.split("VER,teensy,", 1)[1].strip()
         if line.startswith("BENCH "):
             self.teensy_bench = line.strip()
+        self._feed_dash(line)
 
     def _tick(self):
         for key, name, unit, prec in CHANNELS:
             v = self.values.get(key)
             txt = "--" if v is None else f"{v:.{prec}f}"
             self.val_lbls[key].config(text=txt)
-        self.rate_lbl.config(text=f"value updates: {self.value_rate}/s   "
-                                  f"(Hz asked {self.hz_var.get()}, cycles/s is the truth)")
+        # THE wire rate: cycles/s x 2 (each RC35 cycle is a CORE + an AUX frame), cross-checked
+        # against the tool's own "= N frames/s" line. The printed-value rate below is the tool's
+        # DISPLAY cadence (~25/s at --hz 100) and says nothing about the frame rate - conflating
+        # the two is exactly the confusion this label exists to kill.
+        cyc = (self.status or {}).get("cycles", 0.0)
+        derived = int(round(cyc * 2))
+        tool = getattr(self, "tool_frames_s", None)
+        recv = (self.candiag or {}).get("fps")
+        self.rate_lbl.config(
+            text=(f"WIRE RATE: {cyc:.0f} cycles/s  ->  ~{derived} frames/s"
+                  + (f"  (tool says {tool})" if tool else "")
+                  + (f"   |  Teensy receives {recv} frames/s" if recv is not None else "")
+                  + f"   |   value lines printed {self.value_rate}/s"
+                    f" - the TOOL'S display cadence, NOT the frame rate"))
         for k, lbl in self.health_lbls.items():
             v = self.status.get(k)
             lbl.config(text="--" if v is None else f"{v:g}")
@@ -462,6 +502,51 @@ class App:
             text=(f"running pid {self.bc.proc.pid}  {int(up)}s" if self.bc.running() else "idle"),
             fg="#7fd07f" if self.bc.running() else "#ffcc66")
         self._verdict()
+
+    def _feed_dash(self, line):
+        """Mirror what the DASH extracts from the wire, so the clone shows what it shows."""
+        st = self.dash_state
+        try:
+            if line.startswith("ENG,"):
+                p = line.split(",")
+                if len(p) >= 4:
+                    st["rpm"] = float(p[1])
+                    if int(p[2]) >= 0:
+                        st["oil"] = int(p[2]) / 10.0
+                    if int(p[3]) >= 0:
+                        st["clt"] = int(p[3]) / 10.0
+                st["from_teensy"] = True
+            elif line.startswith("ECU,"):
+                p = line.split(",")
+                if len(p) >= 8:
+                    st["rpm"] = float(p[1])
+                    st["clt"] = int(p[2]) / 10.0
+                    st["map"] = int(p[3]) / 10.0
+                    st["tps"] = int(p[4]) / 10.0
+                    st["afr"] = int(p[5]) / 10.0 if int(p[5]) >= 0 else None
+                    st["iat"] = int(p[6]) / 10.0 if int(p[6]) >= 0 else None
+                    st["volt"] = int(p[7]) / 10.0 if int(p[7]) > 0 else None
+                    if len(p) >= 9 and int(p[8]) >= 0:      # v0.1.159: 9th field = bench oil
+                        st["oil"] = int(p[8]) / 10.0
+                st["from_teensy"] = True
+            elif line.startswith("GPS,"):
+                p = line.split(",")
+                if len(p) >= 8:
+                    fix, sats, mph, status = int(p[1]), int(p[2]), float(p[5]), int(p[7])
+                    st["speed_mph"] = mph
+                    st["gps_text"] = ("GPS 3D" if fix == 3 else "GPS 2D" if fix == 2
+                                      else "GPS --" if status in (0, 1) else "GPS STALE")
+                    st["sats"] = sats
+            elif line.startswith("TIME,"):
+                st["epoch"] = int(line.split(",")[1])
+            elif line.startswith("SD,REC,"):
+                p = line.split(",")
+                now = p[1] == "1"
+                if now and not st.get("recording"):
+                    self.rec_start = time.time()
+                st["recording"] = now
+        except (ValueError, IndexError):
+            pass
 
     def _render_frames(self, v):
         if not _HAVE_ENCODER:
@@ -486,14 +571,104 @@ class App:
             self.frames_txt.delete("1.0", "end")
             self.frames_txt.insert("1.0", txt)
 
+    # ---------------- dash clone ----------------
+    def open_dash(self):
+        if self.dash_win and self.dash_win.winfo_exists():
+            self.dash_win.lift()
+            return
+        w = tk.Toplevel(self.root)
+        w.title("Dash view — what the screen should show")
+        w.configure(bg="#101418")
+        self.dash_win = w
+        self.dash = dash_view.DashView(w, scale=self.args.dash_scale, cfg=self.dash_cfg)
+
+        strip = tk.Frame(w, bg="#101418")
+        strip.pack(fill="x")
+        tk.Label(strip, text="monitor order / mode  (mirrors the firmware's rules)", bg="#101418",
+                 fg="#9fb4c8").pack(side="left", padx=6)
+        for item in ("TEMP", "OIL", "VOLT", "AFR", "IAT", "MAP", "TPS", "RPM"):
+            cell = tk.Frame(strip, bg="#101418")
+            cell.pack(side="left", padx=3)
+            tk.Label(cell, text=item, bg="#101418", fg="#d8e0e8",
+                     font=("DejaVu Sans Mono", 9, "bold")).pack()
+            b = tk.Button(cell, text="", width=10, font=("DejaVu Sans Mono", 7),
+                          bg="#223", fg="white",
+                          command=lambda i=item: self._cycle_mode(i))
+            b.pack()
+            cell.mode_btn = b
+            tk.Button(cell, text="\u25b2", font=("DejaVu Sans Mono", 7), bg="#223", fg="white",
+                      command=lambda i=item: self._move(i, -1)).pack()
+            tk.Button(cell, text="\u25bc", font=("DejaVu Sans Mono", 7), bg="#223", fg="white",
+                      command=lambda i=item: self._move(i, +1)).pack()
+        self._sync_mode_buttons()
+        self.root.after(40, self._dash_tick)
+
+    def _cycle_mode(self, item):
+        self.dash_cfg.mode[item] = (self.dash_cfg.mode[item] + 1) % 3
+        self._sync_mode_buttons()
+
+    def _move(self, item, delta):
+        o = self.dash_cfg.order
+        i = o.index(item)
+        j = max(0, min(len(o) - 1, i + delta))
+        if i != j:
+            o[i], o[j] = o[j], o[i]
+
+    def _sync_mode_buttons(self):
+        if not (self.dash_win and self.dash_win.winfo_exists()):
+            return
+        for cell in self.dash_win.winfo_children()[1].winfo_children():
+            b = getattr(cell, "mode_btn", None)
+            if b is None:
+                continue
+            item = b.master.winfo_children()[0].cget("text")
+            m = self.dash_cfg.mode.get(item, 0)
+            b.config(text=dash_view.MON_MODE_NAMES[m],
+                     bg=("#1e5b2a" if m == 0 else "#3f3f1e" if m == 1 else "#3a3a3a"))
+
+    def _dash_tick(self):
+        if not (self.dash_win and self.dash_win.winfo_exists()):
+            return
+        st = self.dash_state
+        st["rpm_max"] = 7000
+        st["clock"] = time.strftime("%H:%M")
+        if self.rec_start and st.get("recording"):
+            el = int(time.time() - self.rec_start)
+            st["sess_time"] = f"{el // 3600}:{(el % 3600) // 60:02d}:{el % 60:02d}"
+        # the flash: first enabled item (in DISPLAY order) that is warning — firmware v0.1.155+
+        warn = None
+        if self.dash:
+            for item, val in ((i, st.get(i.lower() if i != "RPM" else "rpm"))
+                              for i in self.dash_cfg.order):
+                if self.dash_cfg.mode.get(item, 0) == 0 and item != "RPM" and \
+                   self.dash_cfg.item_warns(item, val) and val is not None and not \
+                   (item == "VOLT" and (st.get("rpm") or 0) < 500):
+                    col = dash_view.PALETTE[self.dash_cfg.col.get(item, 0)]
+                    warn = (item, col, self.dash.row_text(item, val).split(": ", 1)[1])
+                    break
+        st["warn"] = warn
+        st["flashing"] = bool(warn)
+        st["flash_color"] = warn[1] if warn else None
+        st["rpm_bar_color"] = "#ff0000" if warn else "#00c000"
+        self.dash.set_state(**st)
+        self.dash.redraw(blink_on=int(time.time() * 2) % 2 == 0)
+        self.root.after(40, self._dash_tick)          # 25 Hz, like the firmware
+
     def _verdict(self):
         """The debug the driver actually wants: is the Teensy seeing and ACKing?"""
         c = self.candiag
         tf = (self.status or {}).get("tx_fail", 0)
         if not c:
-            msg, col = ("Teensy: no CANDIAG seen yet — connect its USB port above, then run the "
-                        "broadcaster. Until then the ACK question is unanswerable from the "
-                        "adapter alone (its slcan firmware has no status commands)."), "#ffcc66"
+            if not self.teensy.ser:
+                msg = ("No CANDIAG because the Teensy's USB serial is NOT OPEN here. It prints "
+                       "CANDIAG once a second unconditionally, so plug the Teensy's USB into this "
+                       "PC (it shows up as /dev/ttyACM1 while the CANable holds ACM0) and pick it "
+                       "above. Without it the ACK question cannot be answered at all - this "
+                       "adapter's slcan firmware has no status commands.")
+            else:
+                msg = ("Teensy USB is open but no CANDIAG has arrived. Either it is not running "
+                       "dash firmware, or it is not powered.")
+            col = "#ffcc66"
             if tf:
                 msg += f"   Broadcaster reports tx fail={tf} (the adapter's own transmit-failure counter)."
             self.verdict.config(text="verdict: " + msg, fg=col)
@@ -572,6 +747,7 @@ def main():
     ap.add_argument("--profile", default=None)
     ap.add_argument("--teensy", default=None, help="Teensy USB serial port (e.g. /dev/ttyACM1)")
     ap.add_argument("--autostart", action="store_true", help="start broadcasting on launch")
+    ap.add_argument("--dash-scale", type=float, default=1.0, help="dash clone zoom (0.5-1.5)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
