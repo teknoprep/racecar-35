@@ -20,6 +20,12 @@ parses the sketch as text (stdlib only) and asserts:
   9. monDefaults() seeds thresholds with MON_WARN_OFF and from the legacy s.* fields
  10. the legacy alert rows (retired from the menu) are all still in the SettingId enum -
      they are the migration seed / rollback path and must never be deleted
+ 11. MON_SRC_NAMES has MON_SRC_COUNT entries, MON_CAN_NAMES has MON_CAN_COUNT entries and
+     MON_SRC_MASK has one entry per MonItem (v0.1.156 per-item source)
+ 12. every item's src[] / can_bus[] is seeded in monDefaults() and range-checked in monCfgValid()
+ 13. the item page draws a Source row and (for CANBUS) a CAN-bus row, and handles taps on both
+ 14. the AFR item page HAS an AEM input row (MIR_AEM / "AEM input") that writes s.aem_afr,
+     the AFR Source row still drives it (monAfrSyncAem), and Settings hides the AEM row
 
 Usage: tools/validate_dash.py [path/to/RaceDash.ino]   (exit 0 = ok, 1 = failures)
 """
@@ -228,6 +234,68 @@ def main():
             if r not in have:
                 fail("10: legacy row %s was deleted from enum SettingId (migration seed / rollback path - keep it, hide it in rowShouldShow())" % r)
 
+    # ---- 11. source / CAN-bus name tables ------------------------------------
+    def enum_names(header, count_name):
+        body, _ = block_after(code, header)
+        mem = re.findall(r"\b([A-Z][A-Z0-9_]+)\b", body) if body else []
+        return mem[:mem.index(count_name)] if count_name in mem else None
+    srcs = enum_names(r"enum\s+MonSrc\s*:\s*\w+\s*\{", "MON_SRC_COUNT")
+    cans = enum_names(r"enum\s+MonCanBus\s*:\s*\w+\s*\{", "MON_CAN_COUNT")
+    if srcs is None or cans is None:
+        fail("11: could not locate enum MonSrc / MonCanBus (with MON_SRC_COUNT / MON_CAN_COUNT)")
+    else:
+        for nm, want in (("MON_SRC_NAMES", len(srcs)), ("MON_CAN_NAMES", len(cans))):
+            m = re.search(r"%s\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}" % nm, code)
+            have = len(re.findall(r'"[^"]*"', m.group(1))) if m else -1
+            if have != want:
+                fail("11: %s has %d entries but its enum has %d members" % (nm, have, want))
+        m = re.search(r"MON_SRC_MASK\s*\[[^\]]*\]\s*=\s*\{(.*?)\};", code, re.S)
+        nmask = len(re.findall(r"/\*\s*[A-Z]+\s*\*/", raw[raw.find("MON_SRC_MASK["):][:1500])) if m else -1
+        if nmask != len(items):
+            fail("11: MON_SRC_MASK has %d entries but enum MonItem has %d items" % (nmask, len(items)))
+
+    # ---- 12. src/can_bus seeded + validated ------------------------------------
+    if md_body is not None:
+        for fld in ("src", "can_bus"):
+            if not re.search(r"mon_cfg\s*\.\s*%s\s*\[[^\]]*\]\s*=" % fld, md_body):
+                fail("12: monDefaults() does not seed mon_cfg.%s[]" % fld)
+        if not re.search(r"\bs\s*\.\s*sensor_type\b", md_body):
+            fail("12: monDefaults() does not seed src[] from the global s.sensor_type")
+    mv_body, _ = block_after(code, r"static\s+bool\s+monCfgValid\s*\([^)]*\)\s*\{")
+    if mv_body is None:
+        fail("12: could not locate monCfgValid()")
+    else:
+        if not re.search(r"\bsrc\s*\[[^\]]*\]\s*>=\s*MON_SRC_COUNT", mv_body):
+            fail("12: monCfgValid() does not reject src >= MON_SRC_COUNT")
+        if not re.search(r"\bcan_bus\s*\[[^\]]*\]\s*>=\s*MON_CAN_COUNT", mv_body):
+            fail("12: monCfgValid() does not reject can_bus >= MON_CAN_COUNT")
+
+    # ---- 13/14. item page rows ---------------------------------------------------
+    mi_body, _ = block_after(code, r"static\s+void\s+drawMonItem\s*\(\s*\)\s*\{")
+    rows_fn, _ = block_after(code, r"static\s+int\s+monItemRows\s*\([^)]*\)\s*\{")
+    tap_body, _ = block_after(code, r"static\s+void\s+handleMonItemTap\s*\([^)]*\)\s*\{")
+    if mi_body is None or rows_fn is None or tap_body is None:
+        fail("13: could not locate drawMonItem() / monItemRows() / handleMonItemTap()")
+    else:
+        if not (re.search(r"\bMIR_SRC\b", rows_fn) and re.search(r'"Source"', mi_body)
+                and re.search(r"\bMON_SRC_NAMES\b", mi_body) and re.search(r"\bcase\s+MIR_SRC\b", tap_body)):
+            fail("13: the item page does not draw/handle a Source row (MIR_SRC / \"Source\" / MON_SRC_NAMES)")
+        if not (re.search(r"\bMON_SRC_CAN\b[^;]*\)?\s*kinds\s*\[[^\]]*\]\s*=\s*MIR_CAN", rows_fn)
+                and re.search(r'"CAN bus"', mi_body) and re.search(r"\bMON_CAN_NAMES\b", mi_body)
+                and re.search(r"\bcase\s+MIR_CAN\b", tap_body)):
+            fail("13: the item page does not draw/handle a CAN-bus row shown only for src == MON_SRC_CAN")
+        # v0.1.157: the AEM option is ON the AFR item page as its own "AEM input" row; the
+        # AFR Source row still drives s.aem_afr (monAfrSyncAem); the Settings row is gone.
+        if not (re.search(r"\bMIR_AEM\b", rows_fn) and re.search(r'"AEM input"', mi_body)
+                and re.search(r"\bcase\s+MIR_AEM\b", tap_body)):
+            fail("14: the AFR item page has no AEM input row (MIR_AEM / \"AEM input\")")
+        if not re.search(r"\bs\.aem_afr\s*=", tap_body):
+            fail("14: the AEM input row does not write s.aem_afr")
+        if not re.search(r"MON_AFR[^;]*\)\s*monAfrSyncAem|item\s*==\s*MON_AFR\)\s*monAfrSyncAem", tap_body):
+            fail("14: the Source row does not drive the AEM input for the AFR item (monAfrSyncAem)")
+        if not re.search(r"ST_AEM_STATUS:\s*return false", code):
+            fail("14: the AEM row is still visible in Settings (ST_AEM_STATUS must return false)")
+
     if fails:
         print("validate_dash: FAIL (%d)  %s" % (len(fails), path))
         for f in fails:
@@ -244,6 +312,10 @@ def main():
     print('  8 "mon" blob sized with sizeof(MonCfg) in load + save')
     print("  9 monDefaults(): MON_WARN_OFF + legacy seeds")
     print(" 10 legacy alert rows still in enum SettingId")
+    print(" 11 MON_SRC_NAMES / MON_CAN_NAMES / MON_SRC_MASK lengths match their enums")
+    print(" 12 per-item src + can_bus seeded in monDefaults(), validated in monCfgValid()")
+    print(" 13 item page: Source row + CAN-bus row (CANBUS only), draw + tap")
+    print(" 14 AFR has an AEM input row (writes s.aem_afr); Source drives it; hidden in Settings")
     return 0
 
 

@@ -3,13 +3,24 @@
 
 Drives a **CANable (slcan firmware)** over USB serial to either:
 
-  * broadcast fake **MS3Pro "Simplified Dash Broadcasting"** frames at 50 Hz, so the
-    Teensy data logger can be tested on the bench with no engine running, or
-  * listen to and decode whatever is really on a CAN bus (including a live MS3).
+  * broadcast **RC35 bench frames** — fake TEMP / OIL / VOLT / AFR / IAT / MAP / TPS
+    (+ RPM) at 100 Hz so the data logger can be tested on the bench with no engine
+    running  (`bench`), or
+  * listen to and decode whatever is really on a CAN bus, including a live MS3
+    (`listen`).
 
-The Teensy firmware reads MS3 Simplified Dash on CAN1 (500 kbit/s) at base id
-**0x5E8** (1512). Byte layout (see src/main.cpp pumpCAN() and the MegaSquirt CAN
-Broadcast spec):
+The bench frames are ours, NOT MS3Pro framing:
+
+    0x700 RC35_CORE  [0:2] rpm u16        [2:4] map x10 kPa   [4] tps x2 %
+                     [5] clt/TEMP F       [6] iat F           [7] rolling seq
+    0x701 RC35_AUX   [0] afr x10          [1] batt x10 V      [2:4] oil x10 PSI
+                     [4] adv i8 BTDC      [5:8] reserved (0)
+
+src/main.cpp pumpCAN() parses those two ids into the same struct as the MS3
+frames, so the dash shows all seven channels with no MS3 on the bus at all.
+MS3Pro "Simplified Dash" framing still exists here for working with a REAL MS3
+(`ms3`, `coolant`, `afr`, `iat`) — it is compatibility code, not the fake-data
+source:
 
     0x5E8  [0:2] map x10 kPa   [2:4] rpm   [4:6] clt x10 F   [6:8] tps x10 %
     0x5E9  [4:6] mat/IAT x10 F
@@ -18,11 +29,14 @@ Broadcast spec):
 
 Examples
 --------
-    python3 tools/can_sim.py probe                     # find the slcan adapter + its version
-    python3 tools/can_sim.py listen -p /dev/ttyACM0    # decode everything on the bus
-    python3 tools/can_sim.py ms3    -p /dev/ttyACM0    # fake MS3 broadcast, values sweeping
-    python3 tools/can_sim.py ms3    -p /dev/ttyACM0 --rpm 6500 --clt 210 --afr 12.8 --static
-    python3 tools/can_sim.py send   -p /dev/ttyACM0 --id 0x5E8 --data 0300000000000000
+    python3 tools/can_sim.py bench  -p /dev/ttyACM0                 # fake data, 200 frames/s
+    python3 tools/can_sim.py bench  --dry-run                       # print frames, no hardware
+    python3 tools/can_sim.py bench  -p /dev/ttyACM0 --profile pull --hz 200
+    python3 tools/can_sim.py bench  -p /dev/ttyACM0 --profile steady --rpm 7000
+    python3 tools/can_sim.py probe                                  # find the adapter + version
+    python3 tools/can_sim.py listen -p /dev/ttyACM0                 # decode the bus
+    python3 tools/can_sim.py ms3    -p /dev/ttyACM0 --static         # REAL MS3 framing
+    python3 tools/can_sim.py send   -p /dev/ttyACM0 --id 0x700 --data 0BB8000000000000
 
 slcan bitrate code: S0=10k S1=20k S2=50k S3=100k S4=125k S5=250k S6=500k S7=800k S8=1M
 """
@@ -51,6 +65,126 @@ def s16(v):
 
 def u16(v):
     return struct.pack(">H", max(0, min(65535, int(round(v)))))
+
+
+# ---------------------------------------------------------------------------
+# RC35 bench broadcast — THE DEFAULT FAKE-DATA SOURCE (not MS3Pro framing)
+# ---------------------------------------------------------------------------
+# The logger only ever understood MS3Pro "Simplified Dash" frames, which is why
+# this tool used to impersonate an MS3Pro — and why OIL could never be sent: that
+# broadcast has no oil channel at all. These two frames carry every channel the
+# dash shows, in a layout that is OURS, not MegaSquirt's:
+#
+#   0x700 RC35_CORE  [0:2] rpm      u16   rpm          (1 rpm/LSB)
+#                    [2:4] map_kpa  u16   kPa x10
+#                    [4]   tps_pct  u8    % x2         (0..127.5)
+#                    [5]   clt_f    u8    degF         (TEMP, 0..255 F)
+#                    [6]   iat_f    u8    degF         (0..255 F)
+#                    [7]   seq      u8    cycle counter (drop detection)
+#
+#   0x701 RC35_AUX   [0]   afr_x10  u8    AFR x10      (147 = 14.7)
+#                    [1]   batt_x10 u8    V x10        (138 = 13.8 V)
+#                    [2:4] oil_x10  u16   PSI x10      (450 = 45.0 PSI)
+#                    [4]   adv_deg  i8    deg BTDC
+#                    [5:8] reserved --    must be 0 (room to grow)
+#
+# Keep this table in sync with pumpCAN() in src/main.cpp and with the decoder
+# below: rc35_frames() and decode_rc35() are the reference implementation.
+RC35_CORE_ID = 0x700
+RC35_AUX_ID = 0x701
+RC35_IDS = (RC35_CORE_ID, RC35_AUX_ID)
+
+
+def u8(v):
+    return struct.pack(">B", max(0, min(255, int(round(v)))))
+
+
+def i8(v):
+    return struct.pack(">b", max(-128, min(127, int(round(v)))))
+
+
+def rc35_frames(rpm=0.0, clt_f=180.0, map_kpa=100.0, tps_pct=0.0,
+                iat_f=90.0, afr=14.7, batt_v=13.8, oil_psi=45.0,
+                adv_deg=18.0, seq=0):
+    """Build the two RC35 bench frames — every channel, every cycle."""
+    core = (u16(rpm) + u16(map_kpa * 10) + u8(tps_pct * 2) + u8(clt_f)
+            + u8(iat_f) + u8(seq))
+    aux = (u8(afr * 10) + u8(batt_v * 10) + u16(oil_psi * 10) + i8(adv_deg)
+           + b"\x00\x00\x00")
+    return {RC35_CORE_ID: core, RC35_AUX_ID: aux}
+
+
+def decode_rc35(msg_id, data):
+    """Inverse of rc35_frames() — the firmware parser must agree with this."""
+    if msg_id == RC35_CORE_ID and len(data) >= 8:
+        rpm, mp = struct.unpack(">HH", data[0:4])
+        return (f"RPM {rpm:5d}  MAP {mp / 10:6.1f} kPa  TPS {data[4] / 2:5.1f} %  "
+                f"TEMP {data[5]:3d} F  IAT {data[6]:3d} F  seq {data[7]}")
+    if msg_id == RC35_AUX_ID and len(data) >= 5:
+        oil = struct.unpack(">H", data[2:4])[0]
+        adv = struct.unpack(">b", data[4:5])[0]
+        return (f"AFR {data[0] / 10:5.2f}  VOLT {data[1] / 10:5.1f} V  "
+                f"OIL {oil / 10:6.1f} PSI  ADV {adv:3d} BTDC")
+    return ""
+
+
+def rpm_wave(t, profile="sweep", rpm=3000.0, lo=900.0, hi=6400.0):
+    """Smooth, physically plausible RPM — NO random component.
+
+    Jitter on the dash should come from the transport (or the logger's own
+    sampling), never from the data, so a steady source can be told apart from a
+    broken link.
+    """
+    if profile == "steady":
+        return float(rpm)
+    if profile == "pull":
+        # 1st..5th gear WOT pull: ramp to the redline, shift, ramp again.
+        seg = 3.6
+        gears = ((2600, 6800), (3800, 6900), (4600, 7000),
+                 (5200, 7100), (5600, 7200))
+        p = t % (seg * len(gears))
+        lo_g, hi_g = gears[int(p // seg) % len(gears)]
+        return lo_g + (hi_g - lo_g) * ((p % seg) / seg)
+    # sweep (default): one slow ~10 s sine, like a dyno pull
+    return lo + (hi - lo) * (0.5 + 0.5 * math.sin(t * 0.6))
+
+
+def coolant_at(t, cold=60.0, hot=228.0, ramp=90.0, hold=15.0):
+    """Warm-up / cool-down cycle that crosses the dash's default 220 F warning."""
+    seg = ramp + hold
+    p = t % (2 * seg)
+    if p < ramp:
+        return cold + (hot - cold) * (p / ramp)
+    if p < seg:
+        return hot
+    if p < seg + ramp:
+        return hot - (hot - cold) * ((p - seg) / ramp)
+    return cold
+
+
+def bench_values(t, profile="sweep", rpm=3000.0):
+    """One coherent snapshot: everything derived from load, so no channel
+    contradicts another and nothing jumps discontinuously except a gear shift."""
+    r = rpm_wave(t, profile, rpm)
+    load = max(0.0, min(1.0, (r - 900.0) / 5600.0))
+    clt = coolant_at(t)
+    return {
+        "rpm": r,
+        "tps_pct": 6.0 + 88.0 * load,
+        "map_kpa": 28.0 + 72.0 * load,
+        "oil_psi": 22.0 + 55.0 * load,
+        "afr": 13.4 + 1.3 * (1.0 - load),
+        "clt_f": clt,
+        "iat_f": 70.0 + 40.0 * load + 0.12 * (clt - 60.0),
+        "batt_v": 13.9 - 0.5 * load,
+        "adv_deg": 30.0 - 16.0 * load,
+    }
+
+
+def fmt_values(v):
+    return (f"RPM {v['rpm']:5.0f}  TEMP {v['clt_f']:5.1f}F  OIL {v['oil_psi']:5.1f}  "
+            f"VOLT {v['batt_v']:5.2f}  AFR {v['afr']:5.2f}  IAT {v['iat_f']:5.1f}  "
+            f"MAP {v['map_kpa']:5.1f}  TPS {v['tps_pct']:5.1f}")
 
 
 def ms3_frames(rpm=0, clt_f=180.0, map_kpa=100.0, tps_pct=0.0,
@@ -232,9 +366,33 @@ class SLCAN:
             frame = b"t%03X%d%s\r" % (msg_id, len(payload), payload.hex().upper().encode())
         self.ser.write(frame)
 
+    def send_many(self, frames):
+        """Write a whole cycle (all of its frames) in ONE serial write.
+
+        One syscall per cycle instead of one per frame: larger, fewer writes are
+        what keeps the injected cadence even on a USB CDC adapter.
+        """
+        out = bytearray()
+        for msg_id, payload in frames.items():
+            payload = bytes(payload)
+            out += b"t%03X%d%s\r" % (msg_id, len(payload),
+                                      payload.hex().upper().encode())
+        return self.ser.write(bytes(out))
+
     def poll(self):
-        """Yield every complete frame received since the last call."""
-        data = self.ser.read(4096)
+        """Yield every complete frame received since the last call — NEVER blocks.
+
+        ⚠️ This used to call ser.read(4096) with the port's 0.2 s timeout, so on
+        an idle bus it stalled the caller for 200 ms. Every paced transmit loop
+        calls poll() once per cycle, so each cycle could take 10x its period and
+        the injected values came out in BURSTS — the "the RPM on the dash jumps
+        around" bug. Read only what has already arrived.
+        """
+        try:
+            avail = self.ser.in_waiting
+        except OSError:
+            avail = 0
+        data = self.ser.read(avail) if avail else b""
         if data:
             self.buf += data
         while b"\r" in self.buf:
@@ -275,6 +433,82 @@ class SLCAN:
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+def cmd_bench(args):
+    """Fast, steady RC35 bench broadcast — every channel, every cycle.
+
+    Paced on an absolute schedule (no drift accumulation), one serial write per
+    cycle, and it reports the ACHIEVED rate + worst gap + adapter TX backlog once
+    a second, so a jitter problem can be pinned on the transport instead of
+    guessed at.
+    """
+    period = 1.0 / args.hz
+    nframes = len(RC35_IDS)
+    if args.dry_run:
+        print(f"[bench] --dry-run: {nframes} frames/cycle at {args.hz:g} Hz "
+              f"= {args.hz * nframes:g} frames/s. No serial port opened.\n")
+        for k in (0, 5, 50):
+            t = k * period
+            v = bench_values(t, args.profile, args.rpm)
+            print(f"  t={t:5.2f}s  {fmt_values(v)}")
+            for mid, payload in rc35_frames(**v, seq=k & 0xFF).items():
+                print(f"    0x{mid:03X} [{len(payload)}] {payload.hex().upper():<18}"
+                      f"-> {decode_rc35(mid, payload)}")
+        return
+
+    bus = SLCAN(args.port, args.bitrate, serial_baud=args.serial_baud)
+    print(f"[bench] RC35 bench frames 0x{RC35_CORE_ID:03X} + 0x{RC35_AUX_ID:03X} at "
+          f"{args.hz:g} Hz cycles = {args.hz * nframes:g} frames/s")
+    print("[bench] channels every cycle: RPM TEMP OIL VOLT AFR IAT MAP TPS")
+    print(f"[bench] profile: {args.profile}"
+          + (f" (rpm {args.rpm:g})" if args.profile == 'steady' else ""))
+    print("[bench] the logger's dash samples at <=25 Hz; a faster source cannot look")
+    print("[bench] faster on screen. Ctrl-C to stop.\n")
+    t0 = time.time()
+    n = 0
+    recent = []
+    last_report = t0
+    try:
+        while True:
+            t = time.time() - t0
+            v = bench_values(t, args.profile, args.rpm)
+            bus.send_many(rc35_frames(**v, seq=n & 0xFF))
+            n += 1
+            now = time.time()
+            recent.append(now)
+            if now - last_report >= 1.0:
+                while recent and now - recent[0] > 1.0:
+                    recent.pop(0)
+                gaps = [b - a for a, b in zip(recent, recent[1:])]
+                worst = max(gaps) * 1000.0 if gaps else 0.0
+                try:
+                    backlog = bus.ser.out_waiting
+                except OSError:
+                    backlog = -1
+                print(f"  t={t:6.1f}s  {len(recent):3d} cycles/s  "
+                      f"worst gap {worst:5.1f} ms  tx queue {backlog:4d} B   {fmt_values(v)}")
+                last_report = now
+            for msg_id, payload, ext, remote in bus.poll():
+                print(f"  [rx] 0x{msg_id:03X} [{len(payload)}] {payload.hex().upper()}"
+                      f"  {decode_rc35(msg_id, payload) or decode_ms3(msg_id, payload)}")
+            if args.duration and t > args.duration:
+                break
+            nxt = t0 + n * period
+            d = nxt - time.time()
+            if d > 0:
+                time.sleep(d)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        bus.close()
+        el = time.time() - t0
+        if el > 0:
+            print(f"\n[bench] sent {n} cycles ({n * nframes} frames) in {el:.1f}s = "
+                  f"{n / el:.1f} cycles/s, {n * nframes / el:.0f} frames/s")
+            if args.duration and abs(n / el - args.hz) / args.hz > 0.1:
+                print(f"[bench] WARNING: achieved {n / el:.1f} Hz vs requested {args.hz:g} Hz "
+                      f"— lower --hz, or raise --serial-baud if the adapter allows it")
+
+
 def cmd_probe(args):
     import glob
     candidates = args.port and [args.port] or sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
@@ -313,9 +547,10 @@ def cmd_listen(args):
         while True:
             for msg_id, payload, ext, remote in bus.poll():
                 seen[msg_id] = seen.get(msg_id, 0) + 1
-                extra = decode_ms3(msg_id, payload)
+                extra = decode_rc35(msg_id, payload) or decode_ms3(msg_id, payload)
                 print(f"  {msg_id:04X}{'x' if ext else ' '} [{len(payload)}] {payload.hex().upper():<16}"
                       f" {extra}{'  (REMOTE)' if remote else ''}")
+            time.sleep(0.002)          # poll() is non-blocking now; don't spin a core
             if args.duration and time.time() - t0 > args.duration:
                 break
             now = time.time()
@@ -564,12 +799,28 @@ def cmd_send(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Racecar-35 CANable slcan tool (fake MS3 broadcast / bus listener)")
+    p = argparse.ArgumentParser(
+        description="Racecar-35 CANable slcan tool — RC35 bench frames (fake TEMP/OIL/VOLT/AFR/IAT/MAP/TPS) "
+                    "or bus listen/decode")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
         sp.add_argument("-p", "--port", default="/dev/ttyACM0")
         sp.add_argument("-b", "--bitrate", default="500k", choices=sorted(BITRATE_CODE))
+
+    sp = sub.add_parser("bench", help="fake data for the bench: RC35 frames with every channel, fast + steady")
+    common(sp)
+    sp.add_argument("--hz", type=float, default=100.0,
+                    help="cycles/s; 2 frames per cycle, so 100 = 200 frames/s (default 100)")
+    sp.add_argument("--serial-baud", type=int, default=115200,
+                    help="USB serial baud to the adapter (default 115200)")
+    sp.add_argument("--profile", default="sweep", choices=("sweep", "steady", "pull"),
+                    help="sweep = one slow sine (default); steady = fixed --rpm; pull = gear-by-gear WOT")
+    sp.add_argument("--rpm", type=float, default=3000.0, help="RPM for --profile steady")
+    sp.add_argument("--duration", type=float, default=0)
+    sp.add_argument("--dry-run", action="store_true",
+                    help="print the encoded frames + their decode, touch no hardware")
+    sp.set_defaults(func=cmd_bench)
 
     sp = sub.add_parser("probe", help="find the slcan adapter and print its version")
     sp.add_argument("-p", "--port", default=None)
@@ -580,7 +831,7 @@ def main():
     sp.add_argument("-d", "--duration", type=float, default=0)
     sp.set_defaults(func=cmd_listen)
 
-    sp = sub.add_parser("ms3", help="broadcast fake MS3 Simplified Dash frames")
+    sp = sub.add_parser("ms3", help="compatibility: broadcast real MS3Pro Simplified Dash frames")
     common(sp)
     sp.add_argument("--hz", type=float, default=50.0)
     sp.add_argument("--duration", type=float, default=0)

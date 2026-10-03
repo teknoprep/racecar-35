@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.155"
+#define FIRMWARE_VERSION "0.1.157"
 
 #include <Preferences.h>
 #include <time.h>
@@ -107,6 +107,18 @@ struct NumBounds { uint16_t lo, hi, step; };
 // MonItem ids are persisted (order[] in the "mon" blob) - APPEND ONLY, never renumber.
 enum MonItem : uint8_t { MON_TEMP, MON_OIL, MON_VOLT, MON_AFR, MON_IAT, MON_MAP, MON_TPS, MON_RPM, MON_COUNT };
 enum MonMode : uint8_t { MON_ALWAYS = 0, MON_WARN_ONLY = 1, MON_OFF = 2 };
+// v0.1.156: every monitor item picks its OWN data source (persisted in MonCfg::src, so
+// APPEND ONLY like MonItem). DIRECT = a sensor wired to the Teensy / this board, BT =
+// the BLE OBD-II dongle, CANBUS = a bus the Teensy decodes (see MonCanBus). Which
+// source actually has data for which item is the MON_SRC_MASK table below.
+enum MonSrc : uint8_t { MON_SRC_DIRECT = 0, MON_SRC_BT = 1, MON_SRC_CAN = 2, MON_SRC_COUNT };
+// CAN bus TYPE, only meaningful for an item whose source is CANBUS (MonCfg::can_bus).
+// EXTENDING: adding a CAN type = a new enum member here (before MON_CAN_COUNT), a new
+// entry in MON_CAN_NAMES, and a new decode branch in monItemValueX10() (the CAN column
+// of its source table). Only MegaSquirt (MS3Pro Simplified Dash) exists today.
+enum MonCanBus : uint8_t { MON_CAN_MS3 = 0, MON_CAN_COUNT };
+static const char* const MON_SRC_NAMES[MON_SRC_COUNT] = { "DIRECT", "BLUETOOTH", "CANBUS" };
+static const char* const MON_CAN_NAMES[MON_CAN_COUNT] = { "MegaSquirt" };
 // v0.1.155: the monitor owns every sensor DISPLAY + ALERT setting. Each item has its
 // own warn-low / warn-high threshold and warn colour. THRESHOLD UNITS are always x10
 // of the item's natural unit: degF (TEMP, IAT), psi (OIL), V (VOLT), AFR, kPa (MAP),
@@ -119,8 +131,30 @@ struct MonCfg {
     int32_t warn_lo[MON_COUNT];    // warn when value <= this (x10 natural unit) / MON_WARN_OFF
     int32_t warn_hi[MON_COUNT];    // warn when value >= this (x10 natural unit) / MON_WARN_OFF
     uint8_t warn_col[MON_COUNT];   // PALETTE index of the warning colour
+    // v0.1.156 - APPENDED, so every earlier field keeps its offset (a v0.1.155 blob is
+    // exactly offsetof(MonCfg, src) bytes and is migrated in loadSettings()).
+    uint8_t src[MON_COUNT];        // MonSrc, indexed by MonItem
+    uint8_t can_bus[MON_COUNT];    // MonCanBus, indexed by MonItem (used only when src == MON_SRC_CAN)
 };
 static MonCfg mon_cfg;
+// Which sources can EVER carry data for each item on THIS hardware (bit 1<<MonSrc). The
+// per-item resolution lives in monItemValueX10(); this mirrors it so the seed (monDefaults)
+// and the item page can tell a real source from a "none" one:
+//   TEMP D|B|C   OIL D        (no oil-pressure source in the MS3 broadcast or over OBD2)
+//   VOLT B|C     (no battery ADC on this board)      AFR D|C  (D = AEM 30-0300 input)
+//   IAT  B|C     MAP  C       (the dash polls no OBD MAP PID)
+//   TPS  B|C     RPM  D|C     (BLE is far too slow for RPM)
+#define MON_SRCBIT(x) ((uint8_t)(1u << (x)))
+static const uint8_t MON_SRC_MASK[MON_COUNT] = {
+    /* TEMP */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
+    /* OIL  */ MON_SRCBIT(MON_SRC_DIRECT),
+    /* VOLT */ MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
+    /* AFR  */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_CAN),
+    /* IAT  */ MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
+    /* MAP  */ MON_SRCBIT(MON_SRC_CAN),
+    /* TPS  */ MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
+    /* RPM  */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_CAN),
+};
 static const char* const MON_LABELS[MON_COUNT] = { "TEMP", "OIL", "VOLT", "AFR", "IAT", "MAP", "TPS", "RPM" };
 static const char* const MON_MODE_NAMES[3]     = { "ALWAYS", "WARN ONLY", "HIDDEN" };
 // One resolved, ready-to-paint row of the block (built fresh each frame; the
@@ -1575,6 +1609,14 @@ constexpr int TP_ROW_HEIGHT   = 36;
 
 static void clampPickerScroll();              // forward — body lives further down
 
+// Does any VISIBLE (not HIDDEN) item read the BLE OBD-II dongle? Together with the global
+// Sensor data source == Bluetooth this decides whether BLE is brought up at REC start.
+static bool monWantsBt() {
+    for (uint8_t i = 0; i < MON_COUNT; ++i)
+        if (mon_cfg.mode[i] != MON_OFF && mon_cfg.src[i] == MON_SRC_BT) return true;
+    return false;
+}
+
 // Sensor monitor defaults (v0.1.154, thresholds v0.1.155). MIGRATION: the four legacy
 // rows keep today's behaviour - each is ALWAYS when its old show flag is on, else
 // HIDDEN, and now ALSO inherit the legacy warn threshold(s) + colour from the old
@@ -1591,6 +1633,21 @@ static void monDefaults() {
         mon_cfg.warn_hi[i]  = MON_WARN_OFF;
         mon_cfg.warn_col[i] = col(s.coolant_warn_col);
     }
+    // v0.1.156: SEED each item's source from the GLOBAL Sensor data source (0 Direct ->
+    // DIRECT, 1 MegaSquirt -> CANBUS, 2 Bluetooth -> BT) and the CAN type from MS3. This
+    // runs ONLY on a first boot / reset / damaged blob: the global setting is now just the
+    // acquisition + logging choice (what the Teensy samples and writes to the SD log) plus
+    // this seed, and changing it later must NOT rewrite per-item sources. Where the seeded
+    // source carries no data for an item (OIL / RPM are never on CAN or BT) the item falls
+    // back to DIRECT, which is exactly what the pre-0.1.156 code read for them.
+    const uint8_t seed = (s.sensor_type == 1) ? MON_SRC_CAN : (s.sensor_type == 2) ? MON_SRC_BT : MON_SRC_DIRECT;
+    for (uint8_t i = 0; i < MON_COUNT; ++i) {
+        mon_cfg.src[i]     = (MON_SRC_MASK[i] & MON_SRCBIT(seed)) ? seed : (uint8_t)MON_SRC_DIRECT;
+        mon_cfg.can_bus[i] = MON_CAN_MS3;
+    }
+    // One control: the AEM analogue input (s.aem_afr) IS the AFR item's DIRECT source, and
+    // legacy AEM-wins-over-everything is preserved - aem_afr on => AFR source DIRECT.
+    if (s.aem_afr) mon_cfg.src[MON_AFR] = MON_SRC_DIRECT;
     mon_cfg.mode[MON_TEMP] = s.show_coolant ? MON_ALWAYS : MON_OFF;
     mon_cfg.mode[MON_OIL]  = s.show_oil_psi ? MON_ALWAYS : MON_OFF;
     mon_cfg.mode[MON_VOLT] = s.show_volt    ? MON_ALWAYS : MON_OFF;
@@ -1612,7 +1669,8 @@ static void monDefaults() {
 }
 
 // A stored blob is trusted only if every order[] entry is a valid item that
-// appears EXACTLY once, every mode[] entry is a valid mode, every warn colour is a
+// appears EXACTLY once, every mode[] entry is a valid mode, every src[] / can_bus[]
+// entry is a real MonSrc / MonCanBus, every warn colour is a
 // real PALETTE index and every warn value is MON_WARN_OFF or sane (|x10| <= 10 M -
 // the largest real value is 20000 rpm = 200000).
 static bool monCfgValid(const MonCfg& c) {
@@ -1621,6 +1679,8 @@ static bool monCfgValid(const MonCfg& c) {
         if (c.order[i] >= MON_COUNT) return false;
         if (c.mode[i]  >  MON_OFF)   return false;
         if (c.warn_col[i] >= N_PALETTE) return false;
+        if (c.src[i]      >= MON_SRC_COUNT) return false;   // v0.1.156
+        if (c.can_bus[i]  >= MON_CAN_COUNT) return false;
         if (c.warn_lo[i] != MON_WARN_OFF && (c.warn_lo[i] < -10000000 || c.warn_lo[i] > 10000000)) return false;
         if (c.warn_hi[i] != MON_WARN_OFF && (c.warn_hi[i] < -10000000 || c.warn_hi[i] > 10000000)) return false;
         if (seen & (1u << c.order[i])) return false;
@@ -1731,9 +1791,14 @@ static void loadSettings() {
     // Sensor monitor order/modes (one blob). Wrong size (first boot / struct change)
     // -> migrate from the legacy show flags; a right-sized but damaged blob is
     // rejected the same way, so a bad NVS read can never leave a row missing.
+    // v0.1.156: a v0.1.155 blob (everything up to MonCfg::src) is KEPT - order, modes,
+    // thresholds and colours survive; only the new src[]/can_bus[] are seeded.
     if (prefs.getBytesLength("mon") == sizeof(MonCfg))
         prefs.getBytes("mon", &mon_cfg, sizeof(MonCfg));
-    else
+    else if (prefs.getBytesLength("mon") == offsetof(MonCfg, src)) {
+        monDefaults();                                        // seeds src[] / can_bus[]
+        prefs.getBytes("mon", &mon_cfg, offsetof(MonCfg, src));   // overlays the stored prefix
+    } else
         monDefaults();
     if (!monCfgValid(mon_cfg)) monDefaults();
     prefs.end();
@@ -4220,7 +4285,7 @@ static void closeUploadModal() {
     ufReset();   // ensure UPLOAD button next tap starts a fresh flow
     // If a session is RECORDING (auto-start can begin one mid-upload), BT
     // needs the radio back for coolant; otherwise WiFi keeps it (paddock).
-    if (recording && s.sensor_type == 2 && s.bt_addr[0] && !obd::blocked()) {
+    if (recording && (s.sensor_type == 2 || monWantsBt()) && s.bt_addr[0] && !obd::blocked()) {
         btAcquireRadio();
         obd::begin();
         obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
@@ -5281,15 +5346,15 @@ static bool afrIsVisible() {
     return s.show_afr && (s.aem_afr || s.sensor_type == 1);
 }
 
-static int16_t selectedAfrX10() {
+// AEM 30-0300 analogue input (the AFR item's DIRECT source), AFR x10, or -1 on a fault /
+// stale / not-ready reading. v0.1.156: no CAN fallback here - the AFR item's source is the
+// user's explicit choice (mon_cfg.src[MON_AFR]); a bad AEM reading must NOT show CAN data.
+static int16_t aemAfrX10() {
     const uint32_t now = millis();
-    if (s.aem_afr) {
-        if (!aem_seen || now - aem_last_ms > 2000 || aem_reading.status != aemafr::VALID)
-            return -1;  // selected AEM fault must NOT fall back to CAN
-        return (int16_t)((aem_reading.afr_x100 + 5) / 10);
-    }
-    return (s.sensor_type == 1 && ecu.last_ms != 0 && now - ecu.last_ms <= 2000)
-        ? ecu.afr_x10 : -1;
+    if (!s.aem_afr) return -1;
+    if (!aem_seen || now - aem_last_ms > 2000 || aem_reading.status != aemafr::VALID)
+        return -1;
+    return (int16_t)((aem_reading.afr_x100 + 5) / 10);
 }
 
 static void formatAemStatus(char* buf, size_t cap) {
@@ -5312,56 +5377,85 @@ static void formatAemStatus(char* buf, size_t cap) {
 // Value = x10 of the item's natural unit (degF / psi / V / AFR / kPa / % ; RPM = rpm*10).
 // Returns false when the item has no valid/visible value (fault, stale ECU, no source,
 // VOLT while the engine is not running).
+//
+// v0.1.156: each item resolves from ITS OWN mon_cfg.src[item] - NOT the global Sensor
+// data source (that is now only the acquisition/logging choice + the monDefaults seed).
+// SOURCE TABLE ("none" = no such source exists on this hardware -> invalid -> "---"/hidden):
+//   item  DIRECT                    BLUETOOTH (OBD2)            CANBUS (MS3, needs !ecuStale)
+//   TEMP  eng.coolant_f_x10         obd::coolantF_x10 (fresh)   ecu.coolant_f_x10
+//   OIL   eng.oil_psi_x10           none (not an OBD PID here)  none (not in the MS3 broadcast)
+//   VOLT  none (no battery ADC)     obd::voltX10 (fresh)        ecu.bat_x10     [engine-running gate]
+//   AFR   AEM 30-0300 (s.aem_afr)   none                        ecu.afr_x10
+//   IAT   none                      obd::iatF_x10 (fresh)       ecu.iat_f_x10
+//   MAP   none                      none (no MAP PID polled)    ecu.map_x10
+//   TPS   none                      obd::tpsX10 (fresh, PID 0111) ecu.tps_x10
+//   RPM   eng.rpm                   none (BLE far too slow)     ecu.rpm
+// Adding a CAN bus type = one more branch on mon_cfg.can_bus[item] in the CAN column.
 // ---------------------------------------------------------------------------
 static bool monItemValueX10(uint8_t item, int32_t* outX10) {
+    if (item >= MON_COUNT) return false;
     const uint32_t nowMs    = millis();
-    const bool     fromMs3  = (s.sensor_type == 1);
-    const bool     fromBt   = (s.sensor_type == 2);   // BLE OBD-II dongle
+    const uint8_t  src      = mon_cfg.src[item];
+    const bool     fromBt   = (src == MON_SRC_BT);    // BLE OBD-II dongle
+    // CAN column. MON_CAN_MS3 is the only bus today; every other (future) type reads as
+    // "no data" until its decode branch exists, so a half-added bus can never show garbage.
+    const bool     fromCan  = (src == MON_SRC_CAN) && (mon_cfg.can_bus[item] == MON_CAN_MS3);
+    const bool     direct   = (src == MON_SRC_DIRECT);
     // ECU staleness: no CAN frames received in ~2 s -> treat MS3 fields as faulted.
     const bool     ecuStale = (ecu.last_ms == 0) || (nowMs - ecu.last_ms > 2000);
+    const bool     canOk    = fromCan && !ecuStale;
+    const bool     btOk     = fromBt && obd::dataFresh();
     int32_t v = -1;
     bool    ok = false;
     switch (item) {
-    case MON_TEMP: {
-        // Source depends on sensor_type: direct ADC (eng.*) vs MS3 CAN (ecu.*) vs BT.
-        const int16_t coolant = fromBt  ? obd::coolantF_x10()
-                              : fromMs3 ? ecu.coolant_f_x10
-                                        : eng.coolant_f_x10;
-        ok = !((coolant < 0) || (fromMs3 && ecuStale) || (fromBt && !obd::dataFresh()));
-        v  = coolant;
-        break; }
+    case MON_TEMP:
+        v  = direct ? eng.coolant_f_x10 : fromBt ? obd::coolantF_x10() : fromCan ? ecu.coolant_f_x10 : -1;
+        ok = (v >= 0) && (direct || btOk || canOk);
+        break;
     case MON_OIL:
-        // Oil PSI stays direct regardless - MS3 typically has no oil-PSI input.
-        ok = (eng.oil_psi_x10 >= 0);
-        v  = eng.oil_psi_x10;
+        // Oil PSI is DIRECT only - the MS3 broadcast and OBD2 carry no oil pressure here.
+        v  = direct ? eng.oil_psi_x10 : -1;
+        ok = direct && (v >= 0);
         break;
     case MON_VOLT: {
         // Valid only while the engine is RUNNING and a live source exists (BT ATRV /
         // MS3 CAN bat) - parked ignition-on reads ~12.4 V, which is normal, not a fault.
+        // DIRECT has none: this board has no battery-voltage ADC. Hidden, not "---".
         int16_t bv = -1;
-        if (fromBt && obd::dataFresh() && obd::voltX10() > 0)      bv = obd::voltX10();
-        else if (fromMs3 && !ecuStale && ecu.bat_x10 > 0)          bv = ecu.bat_x10;
+        if (btOk && obd::voltX10() > 0)           bv = obd::voltX10();
+        else if (canOk && ecu.bat_x10 > 0)        bv = ecu.bat_x10;
         ok = (eng.rpm >= ENGINE_RUNNING_RPM) && (bv > 0);
         v  = bv;
         break; }
-    case MON_AFR: {
-        // AEM analog input is independent of engine source; otherwise legacy MS3. A
-        // source must exist; the value is invalid on fault/stale (no CAN fallback).
-        const int16_t afr = selectedAfrX10();
-        ok = (s.aem_afr || s.sensor_type == 1) && (afr >= 0);
-        v  = afr;
-        break; }
-    case MON_IAT: ok = !(ecuStale || ecu.iat_f_x10 < 0); v = ecu.iat_f_x10; break;
-    case MON_MAP: ok = !(ecuStale || ecu.map_x10   < 0); v = ecu.map_x10;   break;
-    case MON_TPS: ok = !(ecuStale || ecu.tps_x10   < 0); v = ecu.tps_x10;   break;
+    case MON_AFR:
+        // DIRECT = the AEM analogue input (kept in step with s.aem_afr by the item page);
+        // BT has none. A bad/stale AEM reading is invalid - never a silent CAN fallback.
+        v  = direct ? aemAfrX10() : fromCan ? ecu.afr_x10 : -1;
+        ok = (v >= 0) && (direct || canOk);
+        break;
+    case MON_IAT:
+        v  = fromBt ? obd::iatF_x10() : fromCan ? ecu.iat_f_x10 : -1;
+        ok = (v >= 0) && (btOk || canOk);
+        break;
+    case MON_MAP:
+        // CAN only: the dash polls no OBD MAP PID and there is no MAP ADC.
+        v  = fromCan ? ecu.map_x10 : -1;
+        ok = canOk && (v >= 0);
+        break;
+    case MON_TPS:
+        // BT = obd_ble.h's tpsX10() (PID 0111, the same value the Status page / BTD relay use).
+        v  = fromBt ? obd::tpsX10() : fromCan ? ecu.tps_x10 : -1;
+        ok = (v >= 0) && (btOk || canOk);
+        break;
     case MON_RPM:
-        // The same RPM the dash page shows (eng.rpm). Always valid (0 = engine off).
-        // DISPLAYED rounded to the nearest 10 rpm: the block's content tag (and the
-        // 36 KB sprite push behind it) must key on the displayed value, not the raw
-        // one — same rule that fixed the TEMP/PSI tearing. The RPM bar still shows
-        // every revolution; this row is the coarse one.
-        ok = true;
-        v  = (int32_t)((eng.rpm + 5) / 10) * 100;   // rpm rounded to 10, still x10
+        // DIRECT = eng.rpm (the same RPM the dash page shows: opto tach, or Teensy CAN RPM
+        // in MegaSquirt mode); always valid, 0 = engine off. CAN = the dash's own ECU copy.
+        // BT none: BLE is far too slow for RPM. DISPLAYED rounded to the nearest 10 rpm: the
+        // block's content tag (and the 36 KB sprite push behind it) must key on the displayed
+        // value, not the raw one — same rule that fixed the TEMP/PSI tearing. The RPM bar
+        // still shows every revolution; this row is the coarse one.
+        if (direct)       { ok = true;   v = (int32_t)((eng.rpm + 5) / 10) * 100; }
+        else if (canOk)   { ok = true;   v = (int32_t)((ecu.rpm + 5) / 10) * 100; }
         break;
     default: break;
     }
@@ -5370,10 +5464,14 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
 }
 
 // When an item has NO valid value, does its row still show as a grey "---" fault? VOLT
-// (not running / no source) and AFR (no source configured) simply disappear instead.
+// (not running / no source) disappears instead, and so does AFR when it has no source
+// (DIRECT with the AEM input off, or BT) - the pre-0.1.156 "AFR without a source" rule.
 static bool monItemFaultVisible(uint8_t item) {
     if (item == MON_VOLT) return false;
-    if (item == MON_AFR)  return (s.aem_afr || s.sensor_type == 1);
+    if (item == MON_AFR) {
+        const uint8_t src = mon_cfg.src[MON_AFR];
+        return (src == MON_SRC_DIRECT) ? s.aem_afr : (src == MON_SRC_CAN);
+    }
     return true;
 }
 
@@ -7212,6 +7310,34 @@ static void btReleaseRadio() {
     net_owner_ms = millis();
     Serial.println("[net] radio -> WiFi (BLE draining)");
 }
+// v0.1.157: the sensor monitor menu is a place BLE is ALLOWED to own the radio. While an
+// item is configured to read over Bluetooth (and a dongle is paired), bring BLE up so the
+// OBD settings can be checked against what the monitor shows — previously that only happened
+// while RECORDING or on the pairing pages, because WiFi and BLE cannot coexist on this chip
+// (see the radio time-share notes). Leaving the menu hands the radio back to WiFi.
+static void monBtMenuTick() {
+    static uint32_t last_ms = 0;
+    if (millis() - last_ms < 500) return;
+    last_ms = millis();
+    const bool inMenu  = (currentPage == PAGE_MON_CFG || currentPage == PAGE_MON_ITEM);
+    const bool pairing = (currentPage == PAGE_SENSOR || currentPage == PAGE_BT_SCAN ||
+                          currentPage == PAGE_PID_SCAN);
+    // Only ever take the radio from a SETTLED WiFi state — never mid-handover, and never
+    // while recording (netOwnerTick owns the recording edges).
+    if (inMenu && monWantsBt() && s.bt_addr[0] && !recording && !upload_active &&
+        !obd::blocked() && net_owner == NET_WIFI) {
+        btAcquireRadio();
+        obd::begin();
+        if (obd::isDown()) obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
+        Serial.println("[net] radio -> BLE (sensor monitor has a Bluetooth item)");
+        return;
+    }
+    if (!inMenu && net_owner == NET_BT && !recording && !pairing && s.sensor_type != 2) {
+        btReleaseRadio();
+        Serial.println("[net] radio -> WiFi (left sensor monitor)");
+    }
+}
+
 static void netOwnerTick() {
     // Recording-edge watcher (single choke point — catches the START button,
     // auto-start, Teensy-side stops, everything that flips `recording`).
@@ -7219,7 +7345,8 @@ static void netOwnerTick() {
     if (recording != prev_rec) {
         prev_rec = recording;
         if (recording) {
-            if (s.sensor_type == 2 && s.bt_addr[0] && !obd::blocked() && !upload_active) {
+            // v0.1.156: also when any visible monitor item reads from Bluetooth (monWantsBt()).
+            if ((s.sensor_type == 2 || monWantsBt()) && s.bt_addr[0] && !obd::blocked() && !upload_active) {
                 btAcquireRadio();
                 obd::begin();
                 obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
@@ -7917,7 +8044,9 @@ static bool rowShouldShow(SettingId id) {
         case ST_AFR_WARN_COL:  return false;
 
         // AEM diagnostics only while the (now monitor-page) AEM input is enabled.
-        case ST_AEM_STATUS: return s.aem_afr;
+        case ST_AEM_STATUS: return false;   // v0.1.157: the AEM option lives on the AFR
+                                           // item page now (PAGE_MON_ITEM) — nothing
+                                           // sensor-related is left in Settings.
 
         // Cloud endpoint/credentials only matter when recording to cloud.
         case ST_CL_HOST:
@@ -8953,7 +9082,7 @@ static int monRowH() {
 
 static void openMonCfg() {
     monp.snap     = mon_cfg;     // CANCEL restores this
-    monp.aem_snap = s.aem_afr;   // ... and the AEM input toggle that now lives on the AFR item page
+    monp.aem_snap = s.aem_afr;   // ... and the AEM input, which the AFR item's Source row now drives
     monp.dirty = true;
     currentPage = PAGE_MON_CFG;
     pageJustEntered = true;
@@ -8961,7 +9090,7 @@ static void openMonCfg() {
 
 static void cancelMonCfg() {
     mon_cfg = monp.snap;
-    if (s.aem_afr != monp.aem_snap) {            // undo an AEM toggle made on the AFR item page
+    if (s.aem_afr != monp.aem_snap) {            // undo an AEM change made via the AFR item's Source row
         s.aem_afr = monp.aem_snap;
         aem_reading = aemafr::Reading{}; aem_seen = false;
         Serial.printf("CFG,afraem,%d\n", (int)s.aem_afr);
@@ -8978,14 +9107,19 @@ static void saveMonCfg() {
 
 // ---------------------------------------------------------------------------
 // Sensor monitor ITEM page (v0.1.155) - opened by tapping an item's name on the list.
-// Rows: Display (ALWAYS / WARN ONLY / HIDDEN), Warn low, Warn high (each - / value / +,
-// in the item's natural unit or OFF), Color (cycles the palette) and - on AFR only -
-// the AEM 30-0300 input toggle (s.aem_afr; replaces the retired Settings row). Edits go
+// Rows: Display (ALWAYS / WARN ONLY / HIDDEN), Source (DIRECT / BLUETOOTH / CANBUS, v0.1.156),
+// CAN bus (only while the source is CANBUS; cycles MON_CAN_NAMES), Warn low, Warn high (each
+// - / value / +, in the item's natural unit or OFF) and Color (cycles the palette). The AFR
+// item's Source row also drives the AEM 30-0300 input (s.aem_afr - see monAfrSyncAem). Edits go
 // straight into mon_cfg; the LIST page's CANCEL restores its snapshot and DONE saves,
 // so there is no second save path here. BACK returns to the list.
 // ---------------------------------------------------------------------------
-enum { MIR_DISPLAY, MIR_LO, MIR_HI, MIR_COLOR, MIR_AEM };
-static constexpr int MI_ROW_H = 60;                                  // row pitch (rows are drawn 56 tall)
+enum { MIR_DISPLAY, MIR_SRC, MIR_CAN, MIR_AEM, MIR_LO, MIR_HI, MIR_COLOR };
+// Rows (six normally; the AFR item can have seven when it also shows the CAN-bus row and
+// the AEM option) must fit between the header (MON_BODY_TOP = 72) and the footer
+// (MON_FOOT_Y = 408): 7 x 48 = 336 = exactly that gap, so monItemPitch() shrinks the pitch
+// for the longest list and rows are drawn 4 px shorter than the pitch.
+static constexpr int MI_ROW_H = 56;                                  // row pitch (rows are drawn 52 tall)
 static constexpr int MI_PILL_X = 330, MI_PILL_W = 420;               // tap-to-cycle pills
 static constexpr int MI_MINUS_X = 330, MI_BTN_W = 90;                // - button
 static constexpr int MI_VAL_X = 430, MI_VAL_W = 220;                 // value box between the buttons
@@ -8994,9 +9128,38 @@ static constexpr int MI_PLUS_X = 660;                                // + button
 // Row kinds shown for this item, top to bottom; returns the count.
 static int monItemRows(uint8_t item, uint8_t* kinds) {
     int n = 0;
-    kinds[n++] = MIR_DISPLAY; kinds[n++] = MIR_LO; kinds[n++] = MIR_HI; kinds[n++] = MIR_COLOR;
+    kinds[n++] = MIR_DISPLAY; kinds[n++] = MIR_SRC;
+    if (mon_cfg.src[item] == MON_SRC_CAN) kinds[n++] = MIR_CAN;
+    // v0.1.157: the AEM 30-0300 analogue gauge is an OPTION IN THIS MENU, not only a
+    // Settings row (that row is now hidden). It stays visible for AFR whatever the display
+    // source is, because switching it on also tells the Teensy to READ and LOG the gauge
+    // (CFG,afraem) — an input decision, not only a display one.
     if (item == MON_AFR) kinds[n++] = MIR_AEM;
+    kinds[n++] = MIR_LO; kinds[n++] = MIR_HI; kinds[n++] = MIR_COLOR;
     return n;
+}
+
+// Row pitch for this item's list. The page must fit every row between the header and the
+// footer, so an 7-row item (AFR, which also has the CAN-bus row and the AEM option) shrinks
+// the pitch instead of running into the footer.
+static int monItemPitch(uint8_t item) {
+    uint8_t kinds[7];
+    const int n = monItemRows(item, kinds);
+    int p = (MON_FOOT_Y - MON_BODY_TOP) / (n > 0 ? n : 1);
+    if (p > MI_ROW_H) p = MI_ROW_H;
+    return p;
+}
+
+// One control, not two: the AFR item's DIRECT source IS the AEM analogue input, and
+// s.aem_afr also decides what the Teensy LOGS (CFG,afraem). So DIRECT => aem_afr on; BT or
+// CAN => off. Same effect as the retired Settings / item-page toggle (the CFG line goes out
+// now; NVS is written by the list page's DONE, and its CANCEL restores monp.aem_snap).
+static void monAfrSyncAem() {
+    const bool want = (mon_cfg.src[MON_AFR] == MON_SRC_DIRECT);
+    if (s.aem_afr == want) return;
+    s.aem_afr = want;
+    aem_reading = aemafr::Reading{}; aem_seen = false;
+    Serial.printf("CFG,afraem,%d\n", (int)s.aem_afr);
 }
 
 // Adjust step, in x10 of the natural unit: 5 F / 1 psi / 0.1 V / 0.1 AFR / 5 F / 1 kPa / 1 % / 100 rpm.
@@ -9084,7 +9247,7 @@ static void drawMonItem() {
         tft.setFont(&fonts::Font4); tft.setTextSize(1);
         tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextDatum(textdatum_t::top_left);
         char hdr[32];
-        snprintf(hdr, sizeof(hdr), "%s  -  display & alerts", MON_LABELS[item]);
+        snprintf(hdr, sizeof(hdr), "%s  -  display, source & alerts", MON_LABELS[item]);
         tft.drawString(hdr, 20, 18);
         tft.setFont(&fonts::Font2); tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.drawString("changes apply now  -  DONE on the list page saves, CANCEL there undoes", 20, 46);
@@ -9092,19 +9255,22 @@ static void drawMonItem() {
     }
     if (!moni.dirty) return;
     moni.dirty = false;
-    uint8_t kinds[5];
+    uint8_t kinds[7];
     const int nrows = monItemRows(item, kinds);
-    const int rh = MI_ROW_H - 4;                 // drawn height
+    const int pitch = monItemPitch(item);        // shrinks for the 7-row AFR list
+    const int rh = pitch - 4;                    // drawn height
     for (int i = 0; i < nrows; i++) {
-        const int ry = MON_BODY_TOP + i * MI_ROW_H;
+        const int ry = MON_BODY_TOP + i * pitch;
         const int cy = ry + rh / 2;
         tft.fillRect(0, ry, 800, rh, TFT_BLACK);   // per-row repaint, no body-wide wipe
         tft.setFont(&fonts::Font4); tft.setTextSize(1);
         tft.setTextDatum(textdatum_t::middle_left);
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
         const uint8_t kind = kinds[i];
-        const char* lbl = kind == MIR_DISPLAY ? "Display" : kind == MIR_LO ? "Warn low"
-                        : kind == MIR_HI ? "Warn high" : kind == MIR_COLOR ? "Color" : "AEM input";
+        const char* lbl = kind == MIR_DISPLAY ? "Display" : kind == MIR_SRC ? "Source"
+                        : kind == MIR_CAN ? "CAN bus" : kind == MIR_AEM ? "AEM input"
+                        : kind == MIR_LO ? "Warn low"
+                        : kind == MIR_HI ? "Warn high" : "Color";
         tft.drawString(lbl, 24, cy);
         tft.setTextDatum(textdatum_t::middle_center);
         if (kind == MIR_DISPLAY) {
@@ -9115,6 +9281,31 @@ static void drawMonItem() {
             tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
             tft.setTextColor(TFT_WHITE, mbg);
             tft.drawString(MON_MODE_NAMES[mode], MI_PILL_X + MI_PILL_W / 2, cy);
+        } else if (kind == MIR_SRC) {
+            // A source with no data on this hardware (MON_SRC_MASK) is still selectable but
+            // painted maroon + "(no data)" so a dead choice is obvious rather than a mystery "---".
+            const uint8_t sv = mon_cfg.src[item] % MON_SRC_COUNT;
+            const bool has = (MON_SRC_MASK[item] & MON_SRCBIT(sv)) != 0;
+            const uint16_t sbg = has ? TFT_DARKGREEN : TFT_MAROON;
+            char sb[28]; snprintf(sb, sizeof(sb), has ? "%s" : "%s (no data)", MON_SRC_NAMES[sv]);
+            tft.fillRect(MI_PILL_X, ry, MI_PILL_W, rh, sbg);
+            tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
+            tft.setTextColor(TFT_WHITE, sbg);
+            tft.drawString(sb, MI_PILL_X + MI_PILL_W / 2, cy);
+        } else if (kind == MIR_CAN) {
+            const uint8_t cb = mon_cfg.can_bus[item] % MON_CAN_COUNT;
+            tft.fillRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_NAVY);
+            tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
+            tft.setTextColor(TFT_WHITE, TFT_NAVY);
+            tft.drawString(MON_CAN_NAMES[cb], MI_PILL_X + MI_PILL_W / 2, cy);
+        } else if (kind == MIR_AEM) {
+            // AEM 30-0300 analogue input: an INPUT enable (the Teensy reads + logs it, and
+            // the AFR row's DIRECT source is what displays it). Green when on.
+            const uint16_t abg = s.aem_afr ? TFT_DARKGREEN : TFT_DARKGREY;
+            tft.fillRect(MI_PILL_X, ry, MI_PILL_W, rh, abg);
+            tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
+            tft.setTextColor(TFT_WHITE, abg);
+            tft.drawString(s.aem_afr ? "ON" : "OFF", MI_PILL_X + MI_PILL_W / 2, cy);
         } else if (kind == MIR_LO || kind == MIR_HI) {
             const int32_t w = (kind == MIR_LO) ? mon_cfg.warn_lo[item] : mon_cfg.warn_hi[item];
             for (int b = 0; b < 2; b++) {
@@ -9129,21 +9320,19 @@ static void drawMonItem() {
             tft.drawRect(MI_VAL_X, ry, MI_VAL_W, rh, TFT_DARKGREY);
             tft.setTextColor(w == MON_WARN_OFF ? TFT_DARKGREY : TFT_WHITE, TFT_BLACK);
             tft.drawString(vb, MI_VAL_X + MI_VAL_W / 2, cy);
-        } else if (kind == MIR_COLOR) {
+        } else {   // MIR_COLOR
             const uint8_t cidx = mon_cfg.warn_col[item] % N_PALETTE;
             tft.fillRect(MI_PILL_X, ry, MI_PILL_W, rh, PALETTE[cidx]);
             tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
             tft.setTextColor(TFT_BLACK, PALETTE[cidx]);
             tft.drawString(PALETTE_NAMES[cidx], MI_PILL_X + MI_PILL_W / 2, cy);
-        } else {   // MIR_AEM
-            const uint16_t abg = s.aem_afr ? TFT_DARKGREEN : TFT_DARKGREY;
-            tft.fillRect(MI_PILL_X, ry, MI_PILL_W, rh, abg);
-            tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
-            tft.setTextColor(TFT_WHITE, abg);
-            tft.drawString(s.aem_afr ? "ON" : "OFF", MI_PILL_X + MI_PILL_W / 2, cy);
         }
         tft.setTextDatum(textdatum_t::top_left);
     }
+    // The CAN-bus / AEM rows come and go, so rows below shift: blank whatever is left
+    // under the last drawn row (one strip, only on a change — never a body-wide wipe).
+    const int used = MON_BODY_TOP + nrows * pitch;
+    if (used < MON_FOOT_Y) tft.fillRect(0, used, 800, MON_FOOT_Y - used, TFT_BLACK);
     // Footer: BACK only (the list page owns CANCEL / RESET / DONE).
     tft.fillRect(0, MON_FOOT_Y, 800, MON_FOOT_H, TFT_BLACK);
     tft.fillRect(20, MON_FOOT_Y, 220, MON_FOOT_H, TFT_DARKGREY);
@@ -9162,14 +9351,41 @@ static void handleMonItemTap(int x, int y) {
         return;
     }
     if (y < MON_BODY_TOP) return;
-    uint8_t kinds[5];
+    uint8_t kinds[7];
     const int nrows = monItemRows(item, kinds);
-    const int i = (y - MON_BODY_TOP) / MI_ROW_H;
+    const int i = (y - MON_BODY_TOP) / monItemPitch(item);
     if (i < 0 || i >= nrows) return;
     switch (kinds[i]) {
     case MIR_DISPLAY:
         if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
             mon_cfg.mode[item] = (uint8_t)((mon_cfg.mode[item] + 1) % 3);   // ALWAYS -> WARN ONLY -> HIDDEN
+            moni.dirty = true;
+        }
+        break;
+    case MIR_SRC:
+        if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
+            mon_cfg.src[item] = (uint8_t)((mon_cfg.src[item] + 1) % MON_SRC_COUNT);   // DIRECT -> BLUETOOTH -> CANBUS
+            if (item == MON_AFR) monAfrSyncAem();
+            ld.sens_tag = 0;                      // the block must re-resolve with the new source
+            moni.dirty = true;
+        }
+        break;
+    case MIR_CAN:
+        if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
+            mon_cfg.can_bus[item] = (uint8_t)((mon_cfg.can_bus[item] + 1) % MON_CAN_COUNT);
+            ld.sens_tag = 0;
+            moni.dirty = true;
+        }
+        break;
+    case MIR_AEM:
+        if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
+            s.aem_afr = !s.aem_afr;
+            // Switching the gauge on also points the AFR row at it, otherwise the pill
+            // would read ON while the row still showed a CAN number.
+            if (s.aem_afr) mon_cfg.src[MON_AFR] = MON_SRC_DIRECT;
+            aem_reading = aemafr::Reading{}; aem_seen = false;
+            Serial.printf("CFG,afraem,%d\n", (int)s.aem_afr);   // Teensy reads + logs it
+            ld.sens_tag = 0;
             moni.dirty = true;
         }
         break;
@@ -9182,14 +9398,6 @@ static void handleMonItemTap(int x, int y) {
     case MIR_COLOR:
         if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
             mon_cfg.warn_col[item] = (uint8_t)((mon_cfg.warn_col[item] + 1) % N_PALETTE);
-            moni.dirty = true;
-        }
-        break;
-    case MIR_AEM:
-        if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
-            s.aem_afr = !s.aem_afr;                       // same effect as the retired Settings row
-            aem_reading = aemafr::Reading{}; aem_seen = false;
-            Serial.printf("CFG,afraem,%d\n", (int)s.aem_afr);
             moni.dirty = true;
         }
         break;
@@ -12325,10 +12533,10 @@ static void drawStatusPage() {
             tft.drawString(ipbuf, LV, 81);
         }
     }
-    // BT — OBD dongle link (only meaningful with sensor source = Bluetooth)
+    // BT — OBD dongle link (only meaningful with sensor source = Bluetooth, or a monitor item on BT)
     {
         char buf[40]; uint16_t col;
-        if (s.sensor_type != 2) {
+        if (s.sensor_type != 2 && !monWantsBt()) {
             strncpy(buf, "OFF", sizeof(buf)); col = TFT_DARKGREY;
         } else if (obd::connected()) {
             const char* nm = s.bt_name[0] ? s.bt_name : s.bt_addr;
@@ -13008,6 +13216,7 @@ void loop() {
     dashHealthTick();  // 1 Hz ESP32 temp -> Teensy (heat diagnostics)
     videoHudTick();    // 5 Hz lap overlay to Pi 5 via Teensy Serial1
     netOwnerTick();   // WiFi<->BLE radio time-share arbiter (must run before wifiTick)
+    monBtMenuTick();  // v0.1.157: the same arbiter rule for the sensor monitor menu
     wifiTick();   // WiFi state machine + one-shot NTP push to Teensy (1 Hz tick)
     uploadTick(); // Dash-initiated upload state machine (UF_*)
 

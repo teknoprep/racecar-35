@@ -1000,7 +1000,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `atime` | bool | **Auto time** (v0.1.152, default **ON**). Settings → "Auto time". When ON: the panel RTC / NTP / the Teensy's GPS-derived `TIME,` may set the clock, and the panel writes NTP to its own coin-cell RTC and re-broadcasts `SETTIME` to the Teensy when they disagree. OFF freezes the clock — only Settings → "Set time" moves it. |
 | `atz` | bool | **Auto timezone** (v0.1.152, default **ON**). Settings → "Auto timezone". When ON the zone is derived from GPS at START: the venue's own `TRACKS[].tz` when the fix identifies the track, else a coordinate estimate (longitude → nearest whole-hour zone, DST-observing variant preferred). A manual pick in the timezone picker sets this OFF. |
 | `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
-| `mon` | blob | **The whole sensor monitor config** (v0.1.154, extended v0.1.155) — `MonCfg` = `order[MON_COUNT]` (MonItem ids, top of the stack first — **which is also the warning-flash priority**), `mode[MON_COUNT]` (0 ALWAYS / 1 WARN ONLY / 2 HIDDEN), `warn_lo`/`warn_hi[MON_COUNT]` (int32, ×10 of the item's natural unit; `MON_WARN_OFF` = disabled) and `warn_col[MON_COUNT]` (PALETTE index). THE control for what the bottom-left block shows and when it warns; edited on PAGE_MON_CFG and PAGE_MON_ITEM (Settings → "Sensor monitor order"). The load is length-guarded **and content-validated**; a size change (struct grew) or a damaged blob falls back to `monDefaults()`, which seeds modes AND thresholds/colours from the legacy `s_temp`/`s_psi`/`s_volt`/`s_afr`, `t_warn`/`p_warn`/`v_warn`/`afr_lo`/`afr_hi` and `*_col` keys — so an upgrading unit keeps the behaviour it had. The legacy **Show/warn** rows are no longer displayed (their keys, struct fields and load/save remain as the migration seed and the rollback path). |
+| `mon` | blob | **The whole sensor monitor config** (v0.1.154, extended v0.1.155) — `MonCfg` = `order[MON_COUNT]` (MonItem ids, top of the stack first — **which is also the warning-flash priority**), `mode[MON_COUNT]` (0 ALWAYS / 1 WARN ONLY / 2 HIDDEN), `warn_lo`/`warn_hi[MON_COUNT]` (int32, ×10 of the item's natural unit; `MON_WARN_OFF` = disabled) and `warn_col[MON_COUNT]` (PALETTE index), `src[MON_COUNT]` (v0.1.156: MonSrc — DIRECT / BLUETOOTH / CANBUS **per item**) and `can_bus[MON_COUNT]` (MonCanBus; only MegaSquirt exists today). THE control for what the bottom-left block shows and when it warns; edited on PAGE_MON_CFG and PAGE_MON_ITEM (Settings → "Sensor monitor order"). The load is length-guarded **and content-validated**; a size change (struct grew) or a damaged blob falls back to `monDefaults()`, which seeds modes AND thresholds/colours from the legacy `s_temp`/`s_psi`/`s_volt`/`s_afr`, `t_warn`/`p_warn`/`v_warn`/`afr_lo`/`afr_hi` and `*_col` keys — so an upgrading unit keeps the behaviour it had. The legacy **Show/warn** rows are no longer displayed (their keys, struct fields and load/save remain as the migration seed and the rollback path). |
 | `viden` | bool | **Video interconnect** (v0.1.150, default OFF). Settings → "Video interconnect". `CFG,viden,0\|1`. When ON, Teensy Serial1 (pins 0/1, 115200) talks to a **separate Raspberry Pi 5** video box: forwards `REC`/`TRACK`/`HUD` for 1080p front + rear PIP + overlay. Does not block START if the Pi is missing. See `hardware/video-recorder/` and `hardware/breadboard/`. |
 | `sf_unk` | blob | **UNKNOWN-track S/F** (one `SfOverride`, v0.1.129) — the ONLY on-car S/F capture left. SET S/F (STATUS page / dash TRACK button while recording) works ONLY when `lapTrackIdx() < 0`; lap timing + Teensy `CFG,sf` stamping run against it at unmapped tracks. DELETE S/F clears it. |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **⚠️ IGNORED since v0.1.129 for KNOWN tracks** — the baked S/F (web-managed via `/tools/sfpicker`) is the ONLY source; a stale on-device capture used to silently beat a freshly baked line and kill lap timing (the Summit Point incident). Blob still loaded/saved for back-compat, never consulted. On-car capture now exists ONLY for UNKNOWN tracks (`sf_unk` above). The dash LAP row shows a CYAN `SF <dist>` countdown (pre-arm, while recording) so a misplaced S/F is visible on lap 1. Historical: struct size changed in 0.1.82 (pre-0.1.82 blobs ignored once).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. **v0.1.112: a capture below 5 mph stores a POINT (radius method) — GPS heading is garbage at rest, so the old parked capture built a line pointing anywhere and silently killed lap detection for the whole track (the Thompson incident). Rolling capture (≥5 mph) builds the perpendicular line. The STATUS button label now shows live distance to the effective S/F (`custom`/`default`, meters); a maroon **CLR S/F** sub-button (only when an override exists) wipes a bad override trackside; `updateLapTimer()` emits a 20 s `DBG,lap trk=… ovr=… d_sf=…m armed=… laps=…` breadcrumb.** Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
@@ -1032,6 +1032,45 @@ and modes live in the `mon` NVS blob, edited on `PAGE_MON_CFG`.
   `mon` on a unit with no blob yet. Their NVS keys and the warn-threshold rows remain, and the
   threshold rows now follow the monitor mode instead of the old flags. Two controls for one
   decision is how a row ends up hidden while its switch still reads ON.
+### Per-item SOURCE: Direct / Bluetooth / CANBUS (v0.1.156)
+Each monitor item carries its own `src[]` + `can_bus[]`, so the bottom-left block can mix
+sources — e.g. coolant off the MS3 while oil pressure stays on the direct transducer.
+`monDefaults()` seeds every item from the **global** `Sensor data source` (which stays in
+Settings because it still decides what the Teensy *samples and logs*), but changing the global
+row afterwards does NOT rewrite per-item sources.
+
+| Item | DIRECT | BLUETOOTH | CANBUS (MegaSquirt) |
+| --- | --- | --- | --- |
+| TEMP | `eng.coolant_f_x10` (NTC ADC) | `obd::coolantF_x10()` | `ecu.coolant_f_x10` |
+| OIL  | `eng.oil_psi_x10` (A2) | — | — |
+| VOLT | — (this board has no battery ADC) | `obd::voltX10()` (ATRV) | `ecu.bat_x10` |
+| AFR  | the AEM analogue input | — | `ecu.afr_x10` |
+| IAT  | — | `obd::iatF_x10()` | `ecu.iat_f_x10` |
+| MAP  | — | — (no MAP PID is polled) | `ecu.map_x10` |
+| TPS  | — | `obd::tpsX10()` (PID 0111) | `ecu.tps_x10` |
+| RPM  | `eng.rpm` | — (BLE is far too slow) | `ecu.rpm` |
+
+- A combination with **no data** is still selectable (uniform UI) but its pill is **maroon and
+  reads "(no data)"** — an obvious dead choice instead of a mystery `---`.
+- A **future CAN type** added to `MonCanBus` without a decode branch reads as *no data*, never
+  as garbage: `monItemValueX10()` requires `can_bus == MON_CAN_MS3` before it decodes.
+- The global `Sensor data source` still turns the **Teensy's** acquisition on; the per-item
+  source only picks which already-received stream the *display* uses.
+
+### AEM lives in the monitor menu, and BLE may own the radio there (v0.1.157)
+- **AEM 30-0300 input** is now an option **inside the menu** — the `AEM input` row on the AFR
+  item page (the Settings row is hidden). It is an *input* switch: it tells the Teensy to read
+  and log the gauge (`CFG,afraem`), while the AFR row's **Source = DIRECT** is what displays it.
+  Enabling it therefore also sets the AFR source to DIRECT, so the two can never disagree.
+- **BLE is allowed to own the radio while you are in the monitor menu**: `monBtMenuTick()`
+  (called right after `netOwnerTick()`, 2 Hz) brings BLE up when `currentPage` is
+  PAGE_MON_CFG/PAGE_MON_ITEM **and** `monWantsBt()` **and** a dongle is paired — so OBD settings
+  can be checked against what the monitor shows, instead of only while recording or on the
+  pairing pages. It only ever takes the radio from a **settled `NET_WIFI`** state (never
+  mid-handover, never while recording or uploading), and **leaving the menu hands it back** to
+  WiFi. Same WiFi↔BLE time-share rule as everywhere else: the two radios still cannot be up at
+  once, so an upload/OTA waits until you leave the menu.
+
 ### Per-item alert thresholds + colours are the monitor's job (v0.1.155)
 Every sensor **display and alert** setting moved onto the monitor pages; the old alert rows
 (`Coolant warn (°F)`, `Oil low-warn`, `Voltage low-warn`, `AFR rich/lean-warn`, all four warn
@@ -1056,10 +1095,17 @@ choice — it still decides what the Teensy samples and writes to the SD log.
   and re-seeds from the legacy keys. That is by design — the length guard IS the migration.
 
 
-  `SettingId` ↔ `ROWS[]` in sync, `PAGE_MON_CFG` present in the enum + draw + touch dispatch,
-  and no references to the removed per-row `LastDrawn` fields. Run it before building a dash
-  release — it caught a real pre-existing bug (`chbtn_tag`, the COACH button, was never reset,
-  so it vanished after a page re-entry — same class as the v0.1.153 clock fix).
+- **`tools/validate_dash.py`** guards exactly the invariants this refactor touches (14 checks):
+  every `LastDrawn` field reset in `invalidateAll()`, the `mon` blob guarded in load + save,
+  `SettingId` ↔ `ROWS[]` in sync, `PAGE_MON_CFG`/`PAGE_MON_ITEM` present in the enum + draw +
+  touch dispatch, no references to the removed per-row `LastDrawn` fields, the source tables and
+  per-item seeding, and the AFR AEM row. **Run it WITHOUT a pipe** — `python3
+  tools/validate_dash.py | tail -3` reports *tail's* exit code, so a red check sails straight
+  into a publish; that actually happened during v0.1.157 (the release went out while check 14
+  was failing). Same rule as the publish verification above: a check that cannot fail the
+  pipeline is not a check. It has caught three real problems — `chbtn_tag` never reset in
+  `invalidateAll()` (a twin of the v0.1.153 clock blank after a page re-entry), that stale
+  assertion, and exactly this pipe trap.
 
 ### Sensor warning BLOCK (v0.1.147; was full-screen v0.1.110–0.1.146)
 When a sensor warning is active on the dash page, the **bottom-left sensor block**
@@ -1162,7 +1208,7 @@ Remaining levers if it ever returns: `DASH_FREQ_WRITE` 15 → 13–14 MHz (panel
 | `PAGE_SENSOR` | tap the **Sensor data source** settings row | Dedicated picker: Direct / MegaSquirt / **Bluetooth** buttons (like the GPS page). In Bluetooth mode shows the paired OBD-II dongle + live BLE status + a SCAN button. DONE saves, CANCEL reverts. |
 | `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). Drag-scrollable. RESCAN / BACK. |
 | `PAGE_PID_SCAN` | tap COOLANT PID on PAGE_SENSOR | Mode-01 PID scan (needs connected dongle + ignition); tap a row to map it as COOLANT (`btpid`). Drag-scrollable. RESCAN / BACK. |
-| `PAGE_MON_ITEM` | tap an item's **name** on PAGE_MON_CFG | **Per-item editor** (v0.1.155): Display (ALWAYS/WARN ONLY/HIDDEN), **Warn low**, **Warn high** (−/+ buttons, value in the item's own unit or `OFF`), Colour (cycles the palette), and for AFR the AEM-input choice. The ▲▼ on the list page still reorder. A tap on the mode pill or arrows does NOT open this page — only the name area does. |
+| `PAGE_MON_ITEM` | tap an item's **name** on PAGE_MON_CFG | **Per-item editor** (v0.1.155, sources v0.1.156): Display (ALWAYS/WARN ONLY/HIDDEN), **Source** (DIRECT / BLUETOOTH / CANBUS), **CAN bus** (only when the source is CANBUS — "MegaSquirt"), **AEM input** (AFR only, v0.1.157 — writes `s.aem_afr`; switching it on also points the AFR row at DIRECT so the pill can never read ON while the row shows a CAN number), Warn low, Warn high, Colour. The ▲▼ on the list page still reorder. A tap on a pill/button never opens this page — only the name area does. The row pitch shrinks for the 7-row AFR list (7 × 48 = 336 = the body height). |
 | `PAGE_MON_CFG` | Settings → **Sensor monitor order** | **Order + display editor for the bottom-left monitor block** (v0.1.154): one row per item (TEMP/OIL/VOLT/AFR/IAT/MAP/TPS) with ▲▼ reordering and a tappable mode cell cycling **ALWAYS → WARN ONLY → HIDDEN**. Footer CANCEL (restores the snapshot taken on entry) / RESET (defaults) / DONE (saves the `mon` blob). Warnings still fire for every item that isn't HIDDEN. |
 | `PAGE_TZ_PICKER` | Settings → **Time zone** row | **Scrollable standard-timezone list** (v0.1.152): drag to scroll, tap a row to highlight, footer **CANCEL / AUTO / DONE**. AUTO (green while GPS owns the zone) re-derives immediately and sets `atz` ON; DONE saves + sends `TZ,<id>` to the Teensy and sets `atz` OFF. Replaced the old "tap the row to cycle" enum. |
 | `PAGE_TEST_SRC` | Tools → **Start test mode** (when idle) | **"TEST DATA SOURCE"** (v0.1.147): **TEENSY** = existing `TESTSTART` (Teensy synthesizes + RECORDS a real SD session; exercises SD + upload) / **SCREEN** = dash-local simulator, **no Teensy needed** / CANCEL. Tap-only modal, returns to Tools. |
@@ -1260,7 +1306,10 @@ live bench backtraces; confirmed by test (WiFi off → BT works). Fix: a radio
 **time-share arbiter** in RaceDash.ino (`net_owner`: `NET_WIFI` /
 `NET_TO_WIFI` / `NET_BT`; `btAcquireRadio()` / `btReleaseRadio()` /
 `netOwnerTick()`; `wifiTick()` holds WiFi hard-off unless `NET_WIFI`).
-**Policy: BT owns the radio ONLY while `recording`** (that's when coolant
+**Policy: BT owns the radio ONLY while `recording`** (that's when coolant matters), **while the
+user is on PAGE_SENSOR/PAGE_BT_SCAN/PAGE_PID_SCAN pairing**, **or (v0.1.157) while the sensor
+monitor menu is open and an item's source is Bluetooth** — `monBtMenuTick()`, so the OBD
+settings can be checked against what the monitor shows (that's when coolant
 matters) **or while the user is on PAGE_SENSOR/PAGE_BT_SCAN pairing** — all
 paddock time is WiFi (uploads/OTA/NTP just work). `netOwnerTick()` watches the
 `recording` edges: REC start → WiFi hard-off (synchronous) → BLE up + dongle

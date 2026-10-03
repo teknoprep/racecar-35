@@ -6,8 +6,10 @@ actually see frames on the bus?** Two phases:
 
   1. PASSIVE — listen on the CANable for a few seconds. Tells us whether anything
      (MS3 or otherwise) is transmitting at all, and whether frames are being ACKed.
-  2. INJECT — broadcast fake MS3 Simplified-Dash frames (0x5E8..0x5EB @50 Hz) with
-     the CANable while reading the Teensy's USB serial for its 1 Hz CANDIAG line.
+  2. INJECT — broadcast RC35 bench frames (0x700/0x701 @100 Hz: rpm/temp/oil/volt/
+     afr/iat/map/tps) with the CANable while reading the Teensy's USB serial for
+     its 1 Hz CANDIAG + BENCH lines. `--frames ms3` injects MS3Pro Simplified Dash
+     (0x5E8..0x5EB) instead, for working with REAL MS3 framing.
 
 Verdict rules (CANDIAG frames/s over the last second):
   * frames/s >= 50 and base_hits > 0   -> the logger's CAN RX works.
@@ -29,7 +31,8 @@ import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from can_sim import (SLCAN, ms3_frames, coolant_frames, afr_wave, set_afr,   # noqa: E402
-                     iat_wave, set_iat)
+                     iat_wave, set_iat, bench_values, rc35_frames,
+                     decode_rc35, RC35_CORE_ID, RC35_AUX_ID)
 
 try:
     import serial
@@ -148,9 +151,9 @@ def phase_passive(can_port, bitrate, seconds):
     return total, counts
 
 
-def phase_inject(can_port, bitrate, seconds, teensy, wave='sweep'):
-    print(f"\n=== PHASE 2: injecting fake MS3 broadcast for {seconds}s ===")
-    print("(the Teensy's CANDIAG line is printed below as it arrives)")
+def phase_inject(can_port, bitrate, seconds, teensy, wave='sweep', frames='rc35'):
+    print(f"\n=== PHASE 2: injecting {frames.upper()} bench frames for {seconds}s ===")
+    print("(the Teensy's CANDIAG / BENCH lines are printed below as they arrive)")
     bus = SLCAN(can_port, bitrate, verbose=False)
     stop = threading.Event()
 
@@ -161,15 +164,18 @@ def phase_inject(can_port, bitrate, seconds, teensy, wave='sweep'):
         while not stop.is_set():
             t = time.time() - t0
             import math
-            if wave in ('coolant', 'afr', 'iat', 'both', 'all'):
-                clt, frames, phase = coolant_frames(t)
+            if frames == 'rc35':
+                # The fake-data path: every channel, every cycle, no MS3 framing.
+                bus.send_many(rc35_frames(**bench_values(t, 'sweep'), seq=n & 0xFF))
+            elif wave in ('coolant', 'afr', 'iat', 'both', 'all'):
+                clt, fr, phase = coolant_frames(t)
                 if wave in ('afr', 'both', 'all'):
                     a, _ = afr_wave(t)
-                    frames = set_afr(frames, a)
+                    fr = set_afr(fr, a)
                 if wave in ('iat', 'all'):
                     i, _ = iat_wave(t)
-                    frames = set_iat(frames, i)
-                for mid, payload in frames.items():
+                    fr = set_iat(fr, i)
+                for mid, payload in fr.items():
                     bus.send(mid, payload)
             else:
                 rpm = 900 + 5500 * (0.5 + 0.5 * math.sin(t * 0.7))
@@ -180,7 +186,7 @@ def phase_inject(can_port, bitrate, seconds, teensy, wave='sweep'):
                                                 tps, 95, afr, 13.8, 18).items():
                     bus.send(mid, payload)
             n += 1
-            # watch what (if anything) comes back
+            # watch what (if anything) comes back — poll() never blocks (see can_sim)
             for msg_id, payload, ext, remote in bus.poll():
                 print(f"  [bus rx] 0x{msg_id:03X} {payload.hex().upper()}")
             nxt = t0 + n * period
@@ -248,6 +254,9 @@ def main():
     ap.add_argument("--no-inject", action="store_true")
     ap.add_argument("--wave", default="sweep", choices=("sweep", "coolant", "afr", "iat", "both", "all"),
                     help="what to inject: general sweep, or the MS3Pro coolant warm-up")
+    ap.add_argument("--frames", default="rc35", choices=("rc35", "ms3"),
+                    help="rc35 = RC35 bench frames 0x700/0x701 (default, every channel incl. OIL); "
+                         "ms3 = MS3Pro Simplified Dash 0x5E8..0x5EB")
     a = ap.parse_args()
 
     canable, others = identify_ports()
@@ -268,7 +277,7 @@ def main():
     elif not a.no_inject:
         print("\n[warn] no Teensy port detected — running injection without reading CANDIAG")
 
-    phase_inject(can_port, a.bitrate, a.seconds, teensy, a.wave)
+    phase_inject(can_port, a.bitrate, a.seconds, teensy, a.wave, a.frames)
 
     if teensy:
         time.sleep(1.5)
