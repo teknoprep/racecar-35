@@ -27,7 +27,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.160"
+#define FIRMWARE_VERSION "0.1.162"
 
 #include <Preferences.h>
 #include <time.h>
@@ -4500,6 +4500,22 @@ static uint16_t uart_reinits    = 0;
 // which used to keep uart_last_ok_ms permanently fresh and the recovery
 // watchdog permanently asleep. That is the "reboot the screen and it never
 // re-talks to the Teensy" failure.
+// v0.1.162: the MEASUREMENT that ends "the refresh sorta sucks". Telemetry lines per second
+// is the emitted rate actually arriving over the wire — if the dash shows 3/s while the screen
+// is capped at 50, the bottleneck is upstream (Teensy emit / SD stalls / the CAN sniffer
+// writing every frame), not the display. Tools page prints it next to CAN health.
+static uint16_t uart_tele_lines   = 0;
+static uint16_t uart_tele_lines_s = 0;
+static uint32_t uart_tele_ms      = 0;
+static inline void uartRateTick() {
+    const uint32_t now = millis();
+    if (now - uart_tele_ms >= 1000) {
+        uart_tele_ms = now;
+        uart_tele_lines_s = uart_tele_lines;
+        uart_tele_lines = 0;
+    }
+}
+
 static bool uartLineIsTelemetry(const String& s) {
     return s.startsWith("GPS,")  || s.startsWith("ENG,")  || s.startsWith("ECU,")
         || s.startsWith("IMU,")  || s.startsWith("TIME,") || s.startsWith("HLTH,")
@@ -4518,7 +4534,7 @@ static void pumpUart() {
         if (c == '\r') continue;
         if (c == '\n') {
             const bool handled = parseLine(rxBuf);
-            if (handled && uartLineIsTelemetry(rxBuf)) uart_last_ok_ms = millis();
+            if (handled && uartLineIsTelemetry(rxBuf)) { uart_last_ok_ms = millis(); uart_tele_lines++; }
             rxBuf = "";
         }
         else if (rxBuf.length() < UART_LINE_MAX) { rxBuf += c; }
@@ -4604,7 +4620,7 @@ static bool sim_active_fwd() { return sim_active; }
 
 static void simInject(const char* line) {
     String sl(line);
-    if (parseLine(sl) && uartLineIsTelemetry(sl)) uart_last_ok_ms = millis();
+    if (parseLine(sl) && uartLineIsTelemetry(sl)) { uart_last_ok_ms = millis(); uart_tele_lines++; }
 }
 
 // Pick the track whose S/F the circle should pass through: the selected
@@ -5966,7 +5982,7 @@ static void drawDashPage() {
     // Invalidation (-1) always paints.
     static uint32_t rpm_text_ms = 0;
     if ((int32_t)eng.rpm != ld.rpm_text
-        && (ld.rpm_text < 0 || nowMs - rpm_text_ms >= 40)) {
+        && (ld.rpm_text < 0 || nowMs - rpm_text_ms >= 20)) {
         rpm_text_ms = nowMs;
         char rpmBuf[8]; snprintf(rpmBuf, sizeof(rpmBuf), "%u", (unsigned)eng.rpm);
         const uint16_t rpmCol = (flashBg == TFT_BLACK) ? TFT_LIGHTGREY : TFT_BLACK;  // contrast on a lit band
@@ -6011,7 +6027,7 @@ static void drawDashPage() {
         }
         static uint32_t dbar_ms = 0;   // 25 Hz cap (40 ms; was 100 ms); invalidation always paints
         if (px != ld.delta_bar_px
-            && (ld.delta_bar_px == INT16_MIN || nowMs - dbar_ms >= 40)) {
+            && (ld.delta_bar_px == INT16_MIN || nowMs - dbar_ms >= 20)) {
             dbar_ms = nowMs;
             const int      cx     = DBAR_W / 2;                   // 378
             const int      deadPx = (DBAR_DEAD_MS * halfW) / DBAR_FULL_MS;   // ~18 px
@@ -6119,7 +6135,7 @@ static void drawDashPage() {
         // biggest single push. A forced repaint (invalidated sentinel, page entry, flash end)
         // still paints immediately.
         static uint32_t spd_ms = 0;
-        if (spd_int != ld.spd_int && (ld.spd_int < 0 || nowMs - spd_ms >= 40)) {
+        if (spd_int != ld.spd_int && (ld.spd_int < 0 || nowMs - spd_ms >= 20)) {
             spd_ms = nowMs;
             char buf[8];
             if (spd_int < 0) snprintf(buf, sizeof(buf), "--");
@@ -6421,7 +6437,7 @@ static void drawDashPage() {
         MonRow rows[MON_COUNT];
         const int      nrows = monCollectRows(rows, nowMs);
         const uint32_t tag   = monRowsTag(rows, nrows);
-        if (tag != ld.sens_tag && (ld.sens_tag == 0 || nowMs - sens_last_ms >= 40)) {
+        if (tag != ld.sens_tag && (ld.sens_tag == 0 || nowMs - sens_last_ms >= 20)) {
             if (dash_sprites_ready) {
                 monPaintBlock(&spr_sens, 0, 0, rows, nrows);
                 spr_sens.pushSprite(WARN_X, WARN_Y);
@@ -6530,7 +6546,7 @@ static void drawDashPage() {
         // Invalidation always paints. Relax back to 100 ms if THE SHAKE returns.
         static uint32_t pred_ms = 0;
         if (cs != ld.pred_lap_cs
-            && (ld.pred_lap_cs == UINT32_MAX || nowMs - pred_ms >= 40)) {
+            && (ld.pred_lap_cs == UINT32_MAX || nowMs - pred_ms >= 20)) {
             pred_ms = nowMs;
             char buf[12];
             uint16_t col;
@@ -11750,7 +11766,7 @@ static void drawToolsPage() {
     //   0 fps / stale                           -> NO BUS  (grey) — wiring/broadcast
     {
         const int CAN_Y = TOOLS_BTN5_Y + TOOLS_BTN_H + 4;   // below button 5 (v0.1.116)
-        tft.fillRect(0, CAN_Y - 2, 800, 28, TFT_BLACK);
+        tft.fillRect(0, CAN_Y - 2, 800, 54, TFT_BLACK);   // 54: room for the UART row (v0.1.162)
         const bool fresh = (candiag_ms != 0) && (millis() - candiag_ms < 3000);
         char line[96]; uint16_t col;
         // Classify by FRAME RATE, not dup%. A real no-ACK retransmit storm runs
@@ -11801,6 +11817,21 @@ static void drawToolsPage() {
         tft.setTextColor(col, TFT_BLACK);
         tft.setTextDatum(textdatum_t::middle_center);
         tft.drawString(line, 400, CAN_Y + 10);
+        // v0.1.162: the MEASURED arrival rate. This is the number that splits "the screen is
+        // slow" in half: if this reads >=250 lines/s the data is arriving fine and any lag is
+        // the display's; if it reads single digits, the bottleneck is UPSTREAM of the screen
+        // (Teensy emit stalls - SD writes, the CAN sniffer logging every frame - or a UART
+        // problem), and no amount of display-side capping will change it.
+        {
+            char rl[64];
+            const bool link_ok = (uart_last_ok_ms != 0) && (millis() - uart_last_ok_ms < 2000);
+            snprintf(rl, sizeof(rl), "UART %u lines/s  %s", (unsigned)uart_tele_lines_s,
+                     link_ok ? "(link OK)" : "(NO TELEMETRY)");
+            tft.setTextColor((link_ok && uart_tele_lines_s >= 200) ? TFT_GREEN
+                           : link_ok ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
+            tft.drawString(rl, 400, CAN_Y + 38);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        }
     }
     tft.setTextDatum(textdatum_t::top_left);
 }

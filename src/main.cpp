@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.160"
+#define FIRMWARE_VERSION "0.1.162"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -1237,6 +1237,38 @@ static void canBegin() {
 static uint8_t  can_tx_test_state  = 0;
 static uint8_t  can_tx_test_result = 0;   // 0=untested, 1=PASS, 2=FAIL
 
+// v0.1.162: BUS-OFF RECOVERY. A FlexCAN controller that reaches bus-off stays off until
+// software re-initialises it. canBegin() already existed for exactly this ("factored out so
+// the TX self-test can recover the controller from a bus-off") but nothing ever called it
+// again — so ONE bad moment on a marginal bus (a late/missing ACK, a knock to the ground or a
+// terminating resistor) left the receiver deaf for the rest of the session. That is the real
+// shape of "it gets one frame of data and then it NEVER looks at the data again": not a parse
+// fault, a controller that quietly stopped listening. Recovery is rate-limited to 5 s and
+// logs to USB, and it re-arms as soon as the electrical problem is gone — so the logger comes
+// back by itself the moment the bus can be ACKed again.
+static uint32_t can_boff_last_ms = 0;
+static uint16_t can_boff_count   = 0;
+
+static void canBusOffRecover(CAN_error_t& err, bool have_err) {
+    if (!have_err) return;
+    const char* st = (const char*)err.state;
+    const bool bus_off = st && (strstr(st, "Bus Off") || strstr(st, "BUS OFF"));
+    // The error-passive cliff is the same story one step earlier: counters pinned at the
+    // 250+ limit mean the node can no longer be trusted to ACK, which starves EVERY node.
+    const bool dying = (err.TX_ERR_COUNTER >= 250) || (err.RX_ERR_COUNTER >= 250);
+    if (!bus_off && !dying) return;
+    const uint32_t now = millis();
+    if (now - can_boff_last_ms < 5000) return;          // at most one attempt per 5 s
+    can_boff_last_ms = now;
+    can_boff_count++;
+    Serial.printf("[can] controller %s (TEC=%u REC=%u) -> re-init, recovery #%u\n",
+                  st ? st : "error-passive", err.TX_ERR_COUNTER, err.RX_ERR_COUNTER,
+                  (unsigned)can_boff_count);
+    Can1.reset();
+    canBegin();
+    can_diag.last_report_ms = now;                      // report again straight away
+}
+
 static void canDiagReport() {
     const uint32_t now = millis();
     if (now - can_diag.last_report_ms < 1000) return;
@@ -1258,6 +1290,7 @@ static void canDiagReport() {
     Can1.events();
     CAN_error_t err;
     const bool have_err = Can1.error(err, false);
+    canBusOffRecover(err, have_err);   // v0.1.162: never stay deaf after a bus-off
 
     // TX/ACK self-test REMOVED (v0.1.55). v0.1.54 transmitted a probe frame to
     // test the ACK path; on this bus the transmit can't complete, so the node
@@ -3423,6 +3456,13 @@ void setup() {
     // also more resilient to any loop() jitter from SD sync / SPI bursts.
     static uint8_t dashRxBuf[32768];
     Serial3.addMemoryForRead(dashRxBuf, sizeof(dashRxBuf));
+    // v0.1.162: give the DASH LINK A TRANSMIT BUFFER. The default TX buffer is a few dozen
+    // bytes while one emit frame is ~250, so every emit BLOCKED the loop until the UART drained
+    // — and worse, the frame left in clumps, so the dash saw the values arrive in bursts and
+    // repainted them in bursts. That is the "the refresh sorta sucks" texture on a 921600 link
+    // that is nowhere near saturated. With a real buffer the write is a memcpy.
+    static uint8_t dashTxBuf[4096];
+    Serial3.addMemoryForWrite(dashTxBuf, sizeof(dashTxBuf));
 
     // SAME fix for the GPS UART (Serial2). Its default RX ring is only tens of
     // bytes — SMALLER than a single ~100-byte UBX-NAV-PVT frame at 25 Hz. The
@@ -4035,12 +4075,18 @@ void loop() {
     // never slower than a 25 Hz FLOOR regardless of GPS. RPM/ENG/IMU come from
     // the tach/CAN/IMU and are INDEPENDENT of GPS — the old 1 Hz fallback made
     // the dash RPM bar update only once/sec whenever GPS went stale (the
-    // "RPM haywire" symptom). A steady 40 ms floor keeps RPM smooth even when
-    // GPS is silent; when GPS is stale the (frozen) position just repeats,
-    // which the dash already renders as STALE. ~25 Hz over the 921600 link is
-    // ~6 KB/s = trivial.
+    // "RPM haywire" symptom). A steady floor keeps RPM smooth even when GPS is
+    // silent; when GPS is stale the (frozen) position just repeats, which the
+    // dash already renders as STALE.
+    //
+    // v0.1.161: floor 40 ms -> 20 ms (50 Hz). The DISPLAY was data-limited, not
+    // pixel-limited: the panel repaints near 60 Hz, but every fast channel (tach
+    // RPM, MS3 CAN, IMU at 250 Hz, the ADCs) was only crossing the wire 25x/s,
+    // so the screen could never show anything fresher. 50 Hz matches the panel's
+    // own refresh, and GPS fields simply repeat between their own 25 Hz updates.
+    // ~12 KB/s on the 921600 link, still trivial.
     static unsigned long lastEmit = 0;
-    const unsigned long emit_floor_ms = 40UL;   // 25 Hz floor, GPS-independent
+    const unsigned long emit_floor_ms = 10UL;   // 100 Hz floor, GPS-independent (v0.1.162)
     if (freshThisCall || millis() - lastEmit >= emit_floor_ms) {
         lastEmit = millis();
         emitToDash();
