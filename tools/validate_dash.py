@@ -12,6 +12,14 @@ parses the sketch as text (stdlib only) and asserts:
   3. every ST_ enum member (before ST_COUNT) has a ROWS[] entry, and vice versa
   4. PAGE_MON_CFG is in the Page enum, the page draw dispatch and the touch dispatch
   5. the removed LastDrawn fields (temp_x10 ... volt_col_tag) are referenced nowhere
+  6. every MonItem has a MON_LABELS entry, a monItemValueX10() case and a
+     monRowText() (display format) case
+  7. PAGE_MON_ITEM is in the Page enum, the page draw dispatch and the touch dispatch
+  8. the "mon" blob is read AND written with sizeof(MonCfg) (the length guard is the
+     migration: a resized struct re-seeds from the legacy keys)
+  9. monDefaults() seeds thresholds with MON_WARN_OFF and from the legacy s.* fields
+ 10. the legacy alert rows (retired from the menu) are all still in the SettingId enum -
+     they are the migration seed / rollback path and must never be deleted
 
 Usage: tools/validate_dash.py [path/to/RaceDash.ino]   (exit 0 = ok, 1 = failures)
 """
@@ -21,6 +29,11 @@ import sys
 
 DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                        "crowpanel-arduino", "RaceDash", "RaceDash.ino")
+
+LEGACY_ALERT_ROWS = ["ST_AEM_AFR", "ST_TEMP_WARN_F", "ST_TEMP_WARN_COL", "ST_PSI_WARN_PSI",
+                     "ST_PSI_WARN_COL", "ST_VOLT_WARN", "ST_VOLT_WARN_COL", "ST_AFR_WARN_LO",
+                     "ST_AFR_WARN_HI", "ST_AFR_WARN_COL", "ST_SHOW_TEMP", "ST_SHOW_PSI",
+                     "ST_SHOW_VOLT", "ST_SHOW_AFR"]
 
 REMOVED_FIELDS = ["temp_x10", "temp_col_tag", "psi_x10", "psi_col_tag",
                   "afr_x10", "afr_col_tag", "volt_x10", "volt_col_tag"]
@@ -163,6 +176,58 @@ def main():
         if ld_body and re.search(r"\b%s\b" % f, ld_body):
             fail("5: removed field %s is still declared in LastDrawn" % f)
 
+    # ---- 6. every MonItem has a label + value + format entry ----------------
+    mon_body, _ = block_after(code, r"enum\s+MonItem\s*:\s*\w+\s*\{")
+    items = re.findall(r"\b(MON_[A-Z0-9_]+)\b", mon_body) if mon_body else []
+    if "MON_COUNT" not in items:
+        fail("6: could not locate enum MonItem / MON_COUNT")
+    else:
+        items = items[:items.index("MON_COUNT")]
+        lab = re.search(r"MON_LABELS\s*\[[^\]]*\]\s*=\s*\{([^}]*)\}", code)
+        nlab = len(re.findall(r'"[^"]*"', lab.group(1))) if lab else -1
+        if nlab != len(items):
+            fail("6: MON_LABELS has %d entries but enum MonItem has %d items" % (nlab, len(items)))
+        val_body, _ = block_after(code, r"static\s+bool\s+monItemValueX10\s*\([^)]*\)\s*\{")
+        fmt_body, _ = block_after(code, r"static\s+int32_t\s+monRowText\s*\([^)]*\)\s*\{")
+        for it in items:
+            if val_body is None or not re.search(r"\bcase\s+%s\b" % it, val_body):
+                fail("6: monItemValueX10() has no case for %s" % it)
+            if fmt_body is None or not re.search(r"\bcase\s+%s\b" % it, fmt_body):
+                fail("6: monRowText() (display format) has no case for %s" % it)
+
+    # ---- 7. PAGE_MON_ITEM ---------------------------------------------------
+    if page_body is None or not re.search(r"\bPAGE_MON_ITEM\s*=", page_body):
+        fail("7: PAGE_MON_ITEM missing from the Page enum")
+    if not re.search(r"currentPage\s*==\s*PAGE_MON_ITEM\s*\)\s*\{[^}]*?\bdrawMonItem\s*\(\s*\)", code, re.S):
+        fail("7: PAGE_MON_ITEM has no draw dispatch (drawMonItem() under currentPage == PAGE_MON_ITEM)")
+    if not any("handleMonItemTap(" in code[m.end():m.end() + 1200]
+               for m in re.finditer(r"if\s*\(\s*currentPage\s*==\s*PAGE_MON_ITEM\s*\)\s*\{", code)):
+        fail("7: PAGE_MON_ITEM has no touch dispatch (handleMonItemTap() under currentPage == PAGE_MON_ITEM)")
+
+    # ---- 8. sizeof(MonCfg) on the blob, load AND save ------------------------
+    if load_body is not None and not re.search(r'getBytes\s*\(\s*"mon"\s*,[^;]*sizeof\(\s*MonCfg\s*\)', load_body):
+        fail('8: loadSettings() must read the "mon" blob with sizeof(MonCfg)')
+    if save_body is not None and not re.search(r'putBytes\s*\(\s*"mon"\s*,[^;]*sizeof\(\s*MonCfg\s*\)', save_body):
+        fail('8: saveSettings() must write the "mon" blob with sizeof(MonCfg)')
+
+    # ---- 9. monDefaults() uses MON_WARN_OFF + legacy seeds -------------------
+    md_body, _ = block_after(code, r"static\s+void\s+monDefaults\s*\(\s*\)\s*\{")
+    if md_body is None:
+        fail("9: could not locate monDefaults()")
+    else:
+        if "MON_WARN_OFF" not in md_body:
+            fail("9: monDefaults() does not use MON_WARN_OFF")
+        for seed in ("coolant_warn_f", "oil_warn_psi", "volt_warn_x10", "afr_warn_lo_x10", "afr_warn_hi_x10"):
+            if not re.search(r"\bs\s*\.\s*%s\b" % seed, md_body):
+                fail("9: monDefaults() no longer seeds from legacy s.%s" % seed)
+
+    # ---- 10. legacy alert rows must stay in the enum -------------------------
+    if enum_body is not None:
+        have = set(re.findall(r"\b(ST_[A-Z0-9_]+)\b", enum_body))
+        for r in LEGACY_ALERT_ROWS:
+            if r not in have:
+                fail("10: legacy row %s was deleted from enum SettingId (migration seed / rollback path - keep it, hide it in rowShouldShow())" % r)
+
     if fails:
         print("validate_dash: FAIL (%d)  %s" % (len(fails), path))
         for f in fails:
@@ -174,6 +239,11 @@ def main():
     print("  3 SettingId enum <-> ROWS[] in sync")
     print("  4 PAGE_MON_CFG: enum + draw dispatch + touch dispatch")
     print("  5 no references to removed LastDrawn fields")
+    print("  6 every MonItem: label + value case + format case")
+    print("  7 PAGE_MON_ITEM: enum + draw dispatch + touch dispatch")
+    print('  8 "mon" blob sized with sizeof(MonCfg) in load + save')
+    print("  9 monDefaults(): MON_WARN_OFF + legacy seeds")
+    print(" 10 legacy alert rows still in enum SettingId")
     return 0
 
 

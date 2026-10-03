@@ -333,9 +333,20 @@ def cmd_listen(args):
 
 
 def cmd_ms3(args):
+    ALL_CH = ('rpm', 'clt', 'afr', 'iat', 'map', 'tps', 'batt', 'adv')
+    sel = {c.strip().lower() for c in args.channels.split(',') if c.strip()}
+    if 'all' in sel or not sel:
+        sel = set(ALL_CH)
+    bad = sel - set(ALL_CH)
+    if bad:
+        sys.exit("unknown channel(s): %s  (known: %s, all)"
+                 % (', '.join(sorted(bad)), ', '.join(ALL_CH)))
+    args.channels_set = sel
     bus = SLCAN(args.port, args.bitrate)
     print(f"[ms3] broadcasting fake MS3 Simplified Dash at {args.hz} Hz on 0x5E8..0x5EB"
           f"{' (static)' if args.static else ' (sweeping)'}")
+    print(f"[ms3] animating: {', '.join(sorted(args.channels_set))}"
+          f"  — every channel is on the bus; the rest transmit steady")
     if args.duration:
         print(f"[ms3] stopping after {args.duration}s")
     print("[ms3] Ctrl-C to stop\n")
@@ -345,26 +356,36 @@ def cmd_ms3(args):
     try:
         while True:
             t = time.time() - t0
+            # Every channel is transmitted on every cycle so any monitor row the
+            # driver enables holds a real number. `--channels` picks which ones
+            # ANIMATE; the rest are held at a plausible steady value.
+            moving = args.channels_set
+            wave = {
+                'rpm':  900 + 5500 * (0.5 + 0.5 * math.sin(t * 0.7)),
+                'clt':  150 + 70 * (0.5 + 0.5 * math.sin(t * 0.13)),
+                'tps':  50 * (0.5 + 0.5 * math.sin(t * 0.7)),
+                'map':  30 + 70 * (0.5 + 0.5 * math.sin(t * 0.7)),
+                'afr':  14.7 - 2.2 * (0.5 + 0.5 * math.sin(t * 0.31)),
+                'batt': 13.8 - 0.6 * (0.5 + 0.5 * math.sin(t * 0.07)),
+                'iat':  90 + 25 * (0.5 + 0.5 * math.sin(t * 0.05)),
+                'adv':  12 + 14 * (0.5 + 0.5 * math.sin(t * 0.7)),
+            }
+            hold = {'rpm': 1800.0, 'clt': 190.0, 'tps': 20.0, 'map': 45.0,
+                    'afr': 14.7, 'batt': 13.9, 'iat': 100.0, 'adv': 20.0}
             if args.static:
-                rpm, clt, tps, afr, batt, iat, mapk, adv = (
-                    args.rpm, args.clt, 25.0, args.afr, 13.8, 95.0, 100.0, 18.0)
+                v = {'rpm': args.rpm, 'clt': args.clt, 'afr': args.afr, 'tps': 25.0,
+                     'map': 100.0, 'iat': 95.0, 'batt': 13.8, 'adv': 18.0}
             else:
-                # a slow, obviously-varying sweep so the dash shows movement
-                rpm = 900 + 5500 * (0.5 + 0.5 * math.sin(t * 0.7))
-                clt = 150 + 70 * (0.5 + 0.5 * math.sin(t * 0.13))
-                tps = 50 * (0.5 + 0.5 * math.sin(t * 0.7))
-                mapk = 30 + 70 * (0.5 + 0.5 * math.sin(t * 0.7))
-                afr = 14.7 - 2.2 * (0.5 + 0.5 * math.sin(t * 0.31))
-                batt = 13.8 - 0.6 * (0.5 + 0.5 * math.sin(t * 0.07))
-                iat = 90 + 25 * (0.5 + 0.5 * math.sin(t * 0.05))
-                adv = 12 + 14 * (0.5 + 0.5 * math.sin(t * 0.7))
-            for msg_id, payload in ms3_frames(rpm, clt, mapk, tps, iat, afr, batt, adv).items():
+                v = {k: (wave[k] if k in moving else hold[k]) for k in wave}
+            for msg_id, payload in ms3_frames(v['rpm'], v['clt'], v['map'], v['tps'],
+                                               v['iat'], v['afr'], v['batt'], v['adv']).items():
                 bus.send(msg_id, payload)
             n += 1
             if n % args.hz == 0:
                 el = time.time() - t0
-                print(f"  t={el:6.1f}s  RPM {rpm:5.0f}  CLT {clt:5.1f}F  MAP {mapk:5.1f}kPa  "
-                      f"TPS {tps:4.1f}%  IAT {iat:5.1f}F  AFR {afr:5.2f}  BATT {batt:4.1f}V")
+                shown = '  '.join(f"{k.upper()} {v[k]:.1f}{'*' if k in moving else ''}"
+                                  for k in ('rpm', 'clt', 'map', 'tps', 'iat', 'afr', 'batt', 'adv'))
+                print(f"  t={el:6.1f}s  {shown}")
             for msg_id, payload, ext, remote in bus.poll():
                 extra = decode_ms3(msg_id, payload)
                 print(f"  [rx] {msg_id:04X} [{len(payload)}] {payload.hex().upper()} {extra}")
@@ -564,6 +585,8 @@ def main():
     sp.add_argument("--hz", type=float, default=50.0)
     sp.add_argument("--duration", type=float, default=0)
     sp.add_argument("--static", action="store_true", help="hold constant values instead of sweeping")
+    sp.add_argument("--channels", default="all",
+                    help="comma list to ANIMATE: rpm,clt,afr,iat,map,tps,batt,adv (default all; others still transmit)")
     sp.add_argument("--rpm", type=float, default=3000)
     sp.add_argument("--clt", type=float, default=185)
     sp.add_argument("--afr", type=float, default=14.7)
