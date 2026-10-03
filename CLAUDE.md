@@ -1000,11 +1000,44 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `atime` | bool | **Auto time** (v0.1.152, default **ON**). Settings → "Auto time". When ON: the panel RTC / NTP / the Teensy's GPS-derived `TIME,` may set the clock, and the panel writes NTP to its own coin-cell RTC and re-broadcasts `SETTIME` to the Teensy when they disagree. OFF freezes the clock — only Settings → "Set time" moves it. |
 | `atz` | bool | **Auto timezone** (v0.1.152, default **ON**). Settings → "Auto timezone". When ON the zone is derived from GPS at START: the venue's own `TRACKS[].tz` when the fix identifies the track, else a coordinate estimate (longitude → nearest whole-hour zone, DST-observing variant preferred). A manual pick in the timezone picker sets this OFF. |
 | `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
+| `mon` | blob | **Sensor monitor order + per-item display mode** (v0.1.154) — `MonCfg` = `order[MON_COUNT]` (MonItem ids, top of the stack first) + `mode[MON_COUNT]` (0 ALWAYS / 1 WARN ONLY / 2 HIDDEN). THE control for what the bottom-left block shows; edited on PAGE_MON_CFG (Settings → "Sensor monitor order"). The load is length-guarded **and content-validated** (every item present exactly once, every mode in range) — a damaged blob falls back to `monDefaults()`, which seeds from the legacy `s_temp`/`s_psi`/`s_volt`/`s_afr` flags so no unit loses its rows. The legacy **Show** rows are no longer displayed (their keys and the warn-threshold rows stay). |
 | `viden` | bool | **Video interconnect** (v0.1.150, default OFF). Settings → "Video interconnect". `CFG,viden,0\|1`. When ON, Teensy Serial1 (pins 0/1, 115200) talks to a **separate Raspberry Pi 5** video box: forwards `REC`/`TRACK`/`HUD` for 1080p front + rear PIP + overlay. Does not block START if the Pi is missing. See `hardware/video-recorder/` and `hardware/breadboard/`. |
 | `sf_unk` | blob | **UNKNOWN-track S/F** (one `SfOverride`, v0.1.129) — the ONLY on-car S/F capture left. SET S/F (STATUS page / dash TRACK button while recording) works ONLY when `lapTrackIdx() < 0`; lap timing + Teensy `CFG,sf` stamping run against it at unmapped tracks. DELETE S/F clears it. |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **⚠️ IGNORED since v0.1.129 for KNOWN tracks** — the baked S/F (web-managed via `/tools/sfpicker`) is the ONLY source; a stale on-device capture used to silently beat a freshly baked line and kill lap timing (the Summit Point incident). Blob still loaded/saved for back-compat, never consulted. On-car capture now exists ONLY for UNKNOWN tracks (`sf_unk` above). The dash LAP row shows a CYAN `SF <dist>` countdown (pre-arm, while recording) so a misplaced S/F is visible on lap 1. Historical: struct size changed in 0.1.82 (pre-0.1.82 blobs ignored once).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. **v0.1.112: a capture below 5 mph stores a POINT (radius method) — GPS heading is garbage at rest, so the old parked capture built a line pointing anywhere and silently killed lap detection for the whole track (the Thompson incident). Rolling capture (≥5 mph) builds the perpendicular line. The STATUS button label now shows live distance to the effective S/F (`custom`/`default`, meters); a maroon **CLR S/F** sub-button (only when an override exists) wipes a bad override trackside; `updateLapTimer()` emits a 20 s `DBG,lap trk=… ovr=… d_sf=…m armed=… laps=…` breadcrumb.** Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
 
 `clampInvariants()` enforces `rpm_min < rpm_max`, `alert1_rpm < alertmax_rpm`, `alert1_hz < alertmax_hz` after every mutation.
+
+### Sensor monitor block — orderable, per-item, auto-sizing (v0.1.154)
+The bottom-left region (0,340,260×140) is no longer three fixed rows. It is a **user-ordered
+stack of up to 7 items** — TEMP, OIL, VOLT, AFR, IAT, MAP, TPS — each with a display mode
+(**ALWAYS / WARN ONLY / HIDDEN**). WARN ONLY shows the row only while that item's own warning
+is active, so a unit can be left showing **nothing until something is actually wrong**. Order
+and modes live in the `mon` NVS blob, edited on `PAGE_MON_CFG`.
+- **Auto-sizing:** `pitch = min(34, 140/n)`. 1–4 visible items look exactly as before (34 px,
+  Font4); 5 → 28 px, 6 → 23 px (Font2), 8 → 17 px, 10 → 14 px (Font0). The stack is
+  **bottom-anchored** (last item on the block's bottom edge, first item the top of the stack),
+  so it stays visually "bottom-left" as items come and go. NOTE `fonts::Font1` does not exist in
+  this LovyanGFX version — the densest step is **Font0**.
+- **One sprite, one push:** the whole block is drawn into `spr_sens` (260×140) and pushed ONLY
+  when its content tag changes (`monRowsTag()` = FNV over visible count + per row: item,
+  **displayed** value, colour, warn, fault) — 10 Hz cap, `ld.sens_tag == 0` forces an immediate
+  repaint. Same PSRAM discipline as THE SHAKE: keyed on displayed values, never per tick.
+- **Warn flash unchanged** in priority (OIL > TEMP > VOLT > AFR, 2 Hz, `spr_warn`) but its gate
+  is now the monitor **mode** (`!= HIDDEN`): WARN ONLY is a display mode, not a mute — any
+  enabled item still warns, and the ON phase owns the region (the OFF phase zeroes
+  `ld.sens_tag` so the block repaints over the black).
+- **VOLT keeps its engine-running + live-source gate** (parked ignition-on ~12.4 V is normal),
+  so it is simply absent then rather than showing a fault.
+- **The four legacy `Show …` rows are retired from the menu** (v0.1.154) — they now only seed
+  `mon` on a unit with no blob yet. Their NVS keys and the warn-threshold rows remain, and the
+  threshold rows now follow the monitor mode instead of the old flags. Two controls for one
+  decision is how a row ends up hidden while its switch still reads ON.
+- **`tools/validate_dash.py`** guards exactly the invariants this refactor touches: every
+  `LastDrawn` field reset in `invalidateAll()`, the `mon` blob guarded in load + save,
+  `SettingId` ↔ `ROWS[]` in sync, `PAGE_MON_CFG` present in the enum + draw + touch dispatch,
+  and no references to the removed per-row `LastDrawn` fields. Run it before building a dash
+  release — it caught a real pre-existing bug (`chbtn_tag`, the COACH button, was never reset,
+  so it vanished after a page re-entry — same class as the v0.1.153 clock fix).
 
 ### Sensor warning BLOCK (v0.1.147; was full-screen v0.1.110–0.1.146)
 When a sensor warning is active on the dash page, the **bottom-left sensor block**
@@ -1107,6 +1140,7 @@ Remaining levers if it ever returns: `DASH_FREQ_WRITE` 15 → 13–14 MHz (panel
 | `PAGE_SENSOR` | tap the **Sensor data source** settings row | Dedicated picker: Direct / MegaSquirt / **Bluetooth** buttons (like the GPS page). In Bluetooth mode shows the paired OBD-II dongle + live BLE status + a SCAN button. DONE saves, CANCEL reverts. |
 | `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). Drag-scrollable. RESCAN / BACK. |
 | `PAGE_PID_SCAN` | tap COOLANT PID on PAGE_SENSOR | Mode-01 PID scan (needs connected dongle + ignition); tap a row to map it as COOLANT (`btpid`). Drag-scrollable. RESCAN / BACK. |
+| `PAGE_MON_CFG` | Settings → **Sensor monitor order** | **Order + display editor for the bottom-left monitor block** (v0.1.154): one row per item (TEMP/OIL/VOLT/AFR/IAT/MAP/TPS) with ▲▼ reordering and a tappable mode cell cycling **ALWAYS → WARN ONLY → HIDDEN**. Footer CANCEL (restores the snapshot taken on entry) / RESET (defaults) / DONE (saves the `mon` blob). Warnings still fire for every item that isn't HIDDEN. |
 | `PAGE_TZ_PICKER` | Settings → **Time zone** row | **Scrollable standard-timezone list** (v0.1.152): drag to scroll, tap a row to highlight, footer **CANCEL / AUTO / DONE**. AUTO (green while GPS owns the zone) re-derives immediately and sets `atz` ON; DONE saves + sends `TZ,<id>` to the Teensy and sets `atz` OFF. Replaced the old "tap the row to cycle" enum. |
 | `PAGE_TEST_SRC` | Tools → **Start test mode** (when idle) | **"TEST DATA SOURCE"** (v0.1.147): **TEENSY** = existing `TESTSTART` (Teensy synthesizes + RECORDS a real SD session; exercises SD + upload) / **SCREEN** = dash-local simulator, **no Teensy needed** / CANCEL. Tap-only modal, returns to Tools. |
 
@@ -1767,6 +1801,15 @@ platformio.ini                            Teensy build (do NOT add a CrowPanel e
 crowpanel-arduino/RaceDash/RaceDash.ino   CrowPanel: dash UI + settings + keyboards + track picker + GT911 touch (LIVE, panel-agnostic)
 crowpanel-arduino/RaceDash/board_config.h Per-panel RGB pin map/timing/backlight/touch. LIVE: DASH_BOARD 51=crowpanel5adv, 71=crowpanel7adv (default). 7|5 = RETIRED Basics (#error)
 crowpanel-arduino/RaceDash/obd_ble.h      BLE OBD-II (ELM327) client — NimBLE on a core-0 task; coolant/IAT/voltage for sensor_type==2 (NOT RPM)
+tools/can_sim.py                         Bench CAN tool (v0.1.154): drives a CANable (slcan firmware) as a fake
+                                         MS3Pro Simplified-Dash broadcaster — coolant / AFR / IAT waveforms, a
+                                         static-value mode and a passive bus decoder — or sends raw frames
+                                         (`probe` / `listen` / `ms3` / `coolant` / `afr` / `iat` / `send`)
+tools/can_bench_test.py                  One-shot "does the logger see the CAN bus?" bench test: passive listen,
+                                         then inject while reading the Teensy's 1 Hz CANDIAG line, then a verdict
+                                         (`--wave sweep|coolant|afr|iat|both|all`)
+tools/validate_dash.py                   Structural checks on RaceDash.ino (LastDrawn/invalidateAll coverage, NVS
+                                         blob guards, SettingId↔ROWS sync, PAGE_MON_CFG wiring)
 crowpanel-arduino/RaceDash_v0139_orig/    Pre-touch-rework backup of RaceDash (swap/revert screens easily)
 crowpanel-arduino/PanelTest/PanelTest.ino Bare panel bring-up sketch — display only, NO touch (not a touch baseline)
 crowpanel-baseline/                       Dead PIO experiments — do not touch
