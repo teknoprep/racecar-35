@@ -2442,7 +2442,11 @@ def _seed_tracks() -> int:
     seed_dir = pathlib.Path(__file__).parent / "seed-tracks"
     if not seed_dir.is_dir():
         return 0
-    TRACKS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        TRACKS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:                      # read-only data dir: not fatal
+        log.warning("cannot seed tracks into %s: %s", TRACKS_DIR, e)
+        return 0
     n = 0
     for src in sorted(seed_dir.glob("*.json")):
         dst = TRACKS_DIR / src.name
