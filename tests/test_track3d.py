@@ -463,6 +463,75 @@ R.corners = {};
   R.corners.straightish = { found: RC3D.corners(p, {}).length };
 })();
 
+// ---- road colour = braking / accelerating / neither ----------------------
+R.colour = (function () {
+  // a trace that accelerates, holds, then brakes hard into a corner
+  var pts = [], lat0 = 39.0, lon0 = -77.0, v = 40, t = 0, out = [];
+  function push(secs, accel) {                  // accel in mph per second
+    var step = 1 / 25;
+    for (var k = 0; k < Math.round(secs / step); k++) {
+      v = Math.max(5, v + accel * step);
+      t += step;
+      lat0 += (v * 0.44704 * step) / 111320;
+      out.push({ t: 1700000000 + t, lat: lat0, lon: lon0, speed_mph: v, alt_m: 0 });
+    }
+  }
+  push(6, 6);        // accelerating  (~0.27 g)
+  push(6, 0);        // steady: must be GREY
+  push(3, -22);      // braking hard  (~1.0 g)
+  var p = RC3D.buildPath(out, { smooth: 3 });
+  function at(secs) {
+    var i = RC3D.indexOfTime(p.t, secs);
+    return { g: p.accel[i], c: RC3D.driveColour(p.accel[i]) };
+  }
+  var accel = at(3), steady = at(9), brake = at(13.5);
+  var grey = RC3D.NEUTRAL_GREY;
+  function near(c, ref, tol) {
+    return Math.abs(c[0] - ref[0]) < tol && Math.abs(c[1] - ref[1]) < tol &&
+           Math.abs(c[2] - ref[2]) < tol;
+  }
+  return {
+    accelG: accel.g, accelGreen: accel.c[1] - Math.max(accel.c[0], accel.c[2]),
+    steadyG: steady.g, steadyIsGrey: near(steady.c, grey, 0.02),
+    brakeG: brake.g, brakeRed: brake.c[0] - Math.max(brake.c[1], brake.c[2]),
+    brakeIsRedderThanAccel: (brake.c[0] - brake.c[1]) > (accel.c[1] - accel.c[0]),
+    // harder braking must be redder than light braking
+    soft: RC3D.driveColour(-0.1)[0] < RC3D.driveColour(-0.9)[0],
+    // and any real acceleration must read green, floored ("assume 100%")
+    tiny: RC3D.driveColour(0.05)[1] - RC3D.driveColour(0.05)[2],
+    zero: RC3D.driveColour(0),
+    // speed must NOT drive the colour any more
+    speedIrrelevant: RC3D.driveColour(0).join() ===
+                     RC3D.driveColour(0.0).join(),
+    at60: RC3D.driveColour(RC3D.accelAtS(p, p.total * 0.1)),
+    at90: RC3D.driveColour(RC3D.accelAtS(p, p.total * 0.9))
+  };
+})();
+
+// ---- plan view: the whole circuit fits, to scale -------------------------
+R.plan = (function () {
+  var o = { lat: ASSET.centre[0], lon: ASSET.centre[1] };
+  var line = ASSET.line.map(function (p) { return { lat: p[0], lon: p[1] }; });
+  var p = RC3D.buildPath(line, { smooth: 5, denseStep: 3 });
+  var b = ASSET.dem.bounds;                       // S,W,N,E
+  var p1 = RC3D.project(b[0], b[1], p.o), p2 = RC3D.project(b[2], b[3], p.o);
+  var spanX = Math.abs(p2.x - p1.x), spanZ = Math.abs(p2.z - p1.z);
+  var span = Math.max(spanX, spanZ);
+  // what the camera sees at the ground plane for a top-down view
+  var fov = 58 * Math.PI / 180;
+  var h = (span / 2) / Math.tan(fov / 2) * 1.12;
+  var visible = 2 * h * Math.tan(fov / 2);
+  // every station must be inside that footprint
+  var worst = 0;
+  for (var i = 0; i < p.dense.x.length; i++) {
+    var dx = Math.abs(p.dense.x[i] - (p1.x + p2.x) / 2);
+    var dz = Math.abs(p.dense.z[i] - (p1.z + p2.z) / 2);
+    worst = Math.max(worst, Math.max(dx, dz));
+  }
+  return { spanM: span, visibleM: visible, halfTrackM: worst,
+           fits: visible / 2 > worst, aspect: spanX / spanZ, planZoomable: true };
+})();
+
 console.log(JSON.stringify(R));
 """
 
@@ -660,6 +729,27 @@ class Track3DMathTests(unittest.TestCase):
         # (correctly dropped); corner 2 sits 200 m later, so its 500/400/300/200
         # boards would fall at/inside corner 1 - only the 100 m board survives
         self.assertEqual(pair["labels"], "43211", pair)
+
+        # 10e. road colour is the DRIVER'S INPUT: green accelerating, grey
+        #      neither, red braking (deeper with g) — never the speed
+        col = res["colour"]
+        self.assertGreater(col["accelG"], 0.1, "accel segment reads as accelerating")
+        self.assertGreater(col["accelGreen"], 0.1, "accelerating must be green")
+        self.assertTrue(col["steadyIsGrey"], col["steadyG"])
+        self.assertLess(abs(col["steadyG"]), 0.05, "steady must be neither")
+        self.assertLess(col["brakeG"], -0.3, "braking segment reads as braking")
+        self.assertGreater(col["brakeRed"], 0.1, "braking must be red")
+        self.assertTrue(col["brakeIsRedderThanAccel"])
+        self.assertTrue(col["soft"], "harder braking must be redder")
+        self.assertGreater(col["tiny"], 0.05, "any real acceleration is green")
+        self.assertAlmostEqual(col["zero"][0], col["zero"][1], delta=0.12)
+        self.assertTrue(col["speedIrrelevant"])
+
+        # 10f. the plan view fits the whole circuit (that is what shows its size)
+        pl = res["plan"]
+        self.assertTrue(pl["fits"], pl)
+        self.assertGreater(pl["spanM"], 500)
+        self.assertLess(pl["visibleM"] / pl["spanM"], 1.4, "plan view is not wasteful")
 
         # 10b. look-around eases back so the view can never be left behind
         rc = res["recentre"]

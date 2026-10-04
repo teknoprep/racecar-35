@@ -2479,18 +2479,59 @@ def _track_slug(track: str) -> str:
         return re.sub(r"[^a-z0-9]+", "-", (track or "").lower()).strip("-") or "track"
 
 
+def _available_slugs() -> list:
+    try:
+        return sorted(f.stem for f in TRACKS_DIR.glob("*.json"))
+    except OSError:
+        return []
+
+
 def _track_asset_for(track: str) -> Optional[dict]:
-    """The prepared asset for a track name, if one exists."""
+    """The prepared asset for a track name, if one exists.
+
+    Track names come from session filenames and are typed by hand, so a session
+    called "Summit Point Main" must still find a track prepared as "Summit
+    Point". Resolution order:
+      1. exact slug
+      2. the slug with a trailing config/variant word dropped/changed
+         (main, circuit, full, course, raceway...)
+      3. the longest prepared slug that is a prefix of this one, or vice versa
+         ("summit-point-main" -> "summit-point"), which is how one prepared
+         circuit covers its sub-configs.
+    """
     slug = _track_slug(track)
     p = _track_asset_path(slug)
-    if not p.is_file():
+    chosen = slug if p.is_file() else None
+    if chosen is None:
+        words = [w for w in slug.split("-") if w]
+        drop = {"main", "circuit", "full", "course", "raceway", "track", "long"}
+        for cut in range(len(words), 0, -1):
+            cand = "-".join(words[:cut])
+            if words[cut - 1] in drop or cut < len(words):
+                if _track_asset_path(cand).is_file():
+                    chosen = cand
+                    break
+        if chosen is None:
+            # longest common prefix with an existing asset, either direction
+            best = None
+            for have in _available_slugs():
+                if have == slug:
+                    best = have
+                    break
+                if slug.startswith(have + "-") or have.startswith(slug + "-"):
+                    if best is None or len(have) > len(best):
+                        best = have
+            chosen = best
+    if not chosen:
         return None
     try:
-        asset = json.loads(p.read_text("utf-8"))
-        asset["slug"] = slug
+        asset = json.loads(_track_asset_path(chosen).read_text("utf-8"))
+        asset["slug"] = chosen
+        if chosen != slug:
+            log.info("track %r resolved to prepared asset %r", track, chosen)
         return asset
     except Exception as e:
-        log.warning("track asset %s unreadable: %s", slug, e)
+        log.warning("track asset %s unreadable: %s", chosen, e)
         return None
 
 
@@ -2588,7 +2629,8 @@ async def session_track_asset(request: Request, user: str, filename: str) -> JSO
     asset = _track_asset_for(_track_key(p.name))
     if not asset:
         raise HTTPException(status_code=404, detail=json.dumps(
-            {"missing": True, "track": _track_key(p.name), "slug": slug}))
+            {"missing": True, "track": _track_key(p.name), "slug": slug,
+             "prepared": _available_slugs()[:40]}))
     return JSONResponse(asset)
 
 
@@ -2870,9 +2912,13 @@ async def caps() -> dict:
     width tag), real terrain from the DEM, and the imagery itself draped as the
     ground — see app/trackprep.py and /trackassets.
     5 = corner brake boards (5 4 3 2 1), shipped seed tracks, OSM ways matched by
-    the driven line's SHAPE, and the sessions list with a best-lap column."""
+    the driven line's SHAPE, and the sessions list with a best-lap column.
+    6 = road colour is the DRIVER'S INPUT (green accelerating / grey neither /
+    red braking, scaled by longitudinal g), a plan view with a scale bar and a
+    car arrow for the whole circuit, forgiving track-name lookup, and
+    auto-prepare on first view of a track."""
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 5}
+            "track3d_v": 6}
 
 
 
@@ -7311,6 +7357,11 @@ _TRACK3D_HTML = (
   #mini { position:absolute; right:14px; bottom:64px; z-index:10; display:none;
     background:rgba(14,16,20,0.66); border:1px solid var(--line);
     border-radius:10px; pointer-events:none; }
+  #scalebar { position:absolute; left:14px; bottom:12px; z-index:12; display:none;
+    align-items:center; gap:8px; color:var(--text);
+    font:600 11px ui-monospace, Menlo, Consolas, monospace; text-shadow:0 0 4px #000; }
+  #scalebar i { display:block; height:10px; width:140px;
+    border-left:2px solid #fff; border-right:2px solid #fff; border-bottom:2px solid #fff; }
   #notice { position:absolute; left:50%; top:16px; transform:translateX(-50%); z-index:20;
     background:rgba(14,16,20,0.94); border:1px solid var(--line); border-radius:6px;
     padding:9px 15px; font:600 12px Inter,sans-serif; max-width:78vw; }
@@ -7345,12 +7396,13 @@ _TRACK3D_HTML = (
   <div class="row"><span class="k">lap time</span><span id="h-lapt">—</span></div>
   <div class="row"><span class="k">best</span><span id="h-best">—</span></div>
   <div class="row"><span class="k">altitude</span><span id="h-alt">—</span></div>
+  <div class="row"><span class="k">long g</span><span id="h-g">—</span></div>
 </div>
 <div id="legend">
-  <div class="li"><span class="sw" style="background:#266FE6"></span>slowest</div>
-  <div class="li"><span class="sw" style="background:#59D98C"></span>slow</div>
-  <div class="li"><span class="sw" style="background:#FFD24A"></span>fast</div>
-  <div class="li"><span class="sw" style="background:#FF4D4D"></span>fastest</div>
+  <div class="li"><span class="sw" style="background:#5CE07F"></span>accelerating</div>
+  <div class="li"><span class="sw" style="background:#767A85"></span>neither (steady / coasting)</div>
+  <div class="li"><span class="sw" style="background:#FF4D4D"></span>braking</div>
+  <div class="li" id="lg-g" style="color:var(--muted)">red deepens with g, green with rate</div>
   <div class="li" id="lg-ideal" style="display:none"><span class="sw" style="background:#6CD07A"></span>ideal line (fastest real lap)</div>
   <div class="li"><span class="dot" style="background:#FF4D4D"></span>brake</div>
   <div class="li"><span class="dot" style="background:#FFB020"></span>apex</div>
@@ -7359,6 +7411,7 @@ _TRACK3D_HTML = (
   <div class="li" id="lg-track" style="display:none"></div>
 </div>
 <canvas id="mini" width="200" height="200"></canvas>
+<div id="scalebar"><i></i><span id="scale-txt">—</span></div>
 <div id="bar">
   <button id="b-play">▶ drive</button>
   <input id="b-scrub" type="range" min="0" max="1000" value="0" step="1" style="flex:1 1 150px;min-width:100px">
@@ -7379,9 +7432,13 @@ _TRACK3D_HTML = (
     <span class="meta">road</span>
     <input id="b-road" type="range" min="6" max="24" step="1" value="12" style="width:74px"></label>
   <span class="sep"></span>
+  <select id="b-view" title="chase = driving view; plan = whole circuit from above, over the real imagery">
+    <option value="chase">chase</option>
+    <option value="plan">plan</option>
+  </select>
   <label id="b-ground-lab" style="display:none" title="drape the prepared satellite imagery on the ground: real asphalt, kerbs, grass and run-off"><input type="checkbox" id="b-ground" checked>imagery ground</label>
   <button id="b-prep" style="display:none" type="button" title="pre-render this track from satellite imagery + OpenStreetMap on the server (once per track)">prepare track</button>
-  <label><input type="checkbox" id="b-speedcol" checked>speed colour</label>
+  <label title="road colour = your inputs, not your speed: green accelerating, grey neither, red braking (deeper with the g)"><input type="checkbox" id="b-speedcol" checked>accel / brake</label>
   <label title="render scale: higher supersamples the view, which is what removes jagged/crawling edges. Pick 1x if the GPU struggles"><span class="meta">sharp</span>
     <select id="b-scale"><option value="1">1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
   <label><input type="checkbox" id="b-markers" checked>markers</label>
@@ -7556,6 +7613,18 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     mph = RC3D.smooth(RC3D.fillNulls(mph, 0), Math.max(3, win));
 
     var t = RC3D.timeline(samples);
+
+    // Longitudinal acceleration in g, from SPEED (not RPM): it is gear
+    // independent, which is the whole point — 1st and 4th cannot be compared on
+    // an rpm rate, and we do not log gear. Braking is the same measurement with
+    // a negative sign, so the "how red" scale is a real g figure.
+    var acc = new Array(n);
+    for (i = 0; i < n; i++) {
+      var i0 = Math.max(0, i - 1), i1 = Math.min(n - 1, i + 1);
+      var dt = t[i1] - t[i0];
+      acc[i] = dt > 0.001 ? (((mph[i1] - mph[i0]) * 0.44704) / dt) / 9.80665 : 0;
+    }
+    acc = RC3D.smooth(acc, Math.max(3, win));      // one more pass to kill 25 Hz noise
     var cum = new Array(n);
     cum[0] = 0;
     for (i = 1; i < n; i++) {
@@ -7610,7 +7679,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       tan[i] = [tx / L, tz / L];
     }
     return {
-      o: o, n: n, x: X, y: Y, z: Z, t: t, speed: mph, cum: cum, total: total,
+      o: o, n: n, x: X, y: Y, z: Z, t: t, speed: mph, accel: acc, cum: cum, total: total,
       yRef: yMin, dense: { x: dx2, y: dy2, z: dz2, s: ds2, total: dTotal, tan: tan }
     };
   };
@@ -7688,6 +7757,37 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     lo = 0; hi = n - 1;
     while (lo < hi) { mid = (lo + hi + 1) >> 1; if (cum[mid] <= s) lo = mid; else hi = mid - 1; }
     return path.speed[lo] || 0;
+  };
+
+  // Longitudinal g at arc length s (nearest sample).
+  RC3D.accelAtS = function (path, s) {
+    var cum = path.cum, a = path.accel, n = cum.length, lo, hi, mid;
+    if (!n || !a) return 0;
+    lo = 0; hi = n - 1;
+    while (lo < hi) { mid = (lo + hi + 1) >> 1; if (cum[mid] <= s) lo = mid; else hi = mid - 1; }
+    return a[lo] || 0;
+  };
+
+  // Road colour = what the driver is doing, not how fast:
+  //   accelerating -> GREEN  (brighter with the rate; any real rise is green)
+  //   braking      -> RED    (deeper with the deceleration in g)
+  //   neither      -> GREY   (steady throttle, coasting, a corner taken flat)
+  // Braking intensity is real g, read off speed, so 0.6 g reads full red.
+  // Green is deliberately floored: the car's acceleration is not reliably
+  // measurable from 25 Hz speed (nor comparable between gears), so we claim
+  // "accelerating" and scale only mildly, rather than inventing a percentage.
+  RC3D.NEUTRAL_GREY = [0.46, 0.48, 0.52];
+  RC3D.driveColour = function (aG) {
+    var thr = 0.035, accelFull = 0.28, brakeFull = 0.6;
+    if (aG > thr) {
+      var t = Math.max(0.40, Math.min(1, (aG - thr) / (accelFull - thr)));
+      return [0.20 + 0.06 * (1 - t), 0.42 + 0.52 * t, 0.24 + 0.08 * (1 - t)];
+    }
+    if (aG < -thr) {
+      var u = Math.max(0.32, Math.min(1, (-aG - thr) / (brakeFull - thr)));
+      return [0.38 + 0.58 * u, 0.13 + 0.12 * (1 - u), 0.13 + 0.08 * (1 - u)];
+    }
+    return RC3D.NEUTRAL_GREY.slice();
   };
 
   // Blue -> green -> yellow -> red across [lo, hi] mph.
@@ -8136,9 +8236,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   var S = [], PATH = null, BASE = null, LAPS = [], LAPNO = 0;
   var TA = 0, TB = 0, NOW = 0, SMIN = 0, SMAX = 0, cur = null;
   var meshes = { road: null, kerbs: null, markers: null, ghost: null, ideal: null,
-                 gantry: null, ground: null, signs: null };
+                 gantry: null, ground: null, signs: null, car: null };
   var ASSET = null, TEX = null, assetSample = null;   // prepared-track data
   var look = { yaw: 0, pitch: 0 };
+  var view = "chase";                                     // "chase" | "plan"
+  var planZoom = 1;                                       // wheel zoom in plan view
   var realWidth = null;                                   // metres, from the asset
   var CORNERS = [];                                       // detected corners
   var opts = { smooth: 5, eye: 1.15, road: 12, speedColour: true, markers: true,
@@ -8226,9 +8328,19 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       if (mph > hi) hi = mph;
     }
     for (i = 0; i < r.s.length; i++) {
-      c = colourBySpeed
-        ? RC3D.speedColour(RC3D.mphAtS(path, r.s[i]), lo, Math.max(hi, lo + 20))
-        : (solidColour || [0.135, 0.145, 0.165]);
+      if (colourBySpeed) {
+        // accel / brake / neither — the driver's input, not the speed
+        c = RC3D.driveColour(RC3D.accelAtS(path, r.s[i]));
+        if (extra.tex) {
+          // over satellite imagery, blend toward the state colour instead of
+          // replacing it, so the real surface stays visible underneath
+          var mix = 0.62;
+          c = [c[0] * mix + 0.42 * (1 - mix), c[1] * mix + 0.42 * (1 - mix),
+               c[2] * mix + 0.42 * (1 - mix)];
+        }
+      } else {
+        c = solidColour || [0.135, 0.145, 0.165];
+      }
       cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
     }
     geo.setAttribute("color", new THREE.BufferAttribute(cols, 3));
@@ -8331,6 +8443,32 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       grp.add(board);
     }
     return grp;
+  }
+
+  // In plan mode you are looking at the whole circuit, so there has to be a
+  // "you are here": an arrow on the ribbon, amber, pointing along the tangent.
+  function makeCarMarker() {
+    var grp = new THREE.Group();
+    var cone = new THREE.Mesh(new THREE.ConeGeometry(2.6, 7.0, 4),
+                              new THREE.MeshBasicMaterial({ color: 0xFFB020 }));
+    cone.rotation.x = Math.PI / 2;          // lie it down, pointing along +z
+    grp.add(cone);
+    var ring = new THREE.Mesh(new THREE.RingGeometry(3.6, 5.0, 28),
+                              new THREE.MeshBasicMaterial({ color: 0xFFB020,
+                                side: THREE.DoubleSide, transparent: true,
+                                opacity: 0.85 }));
+    ring.rotation.x = -Math.PI / 2;
+    grp.add(ring);
+    return grp;
+  }
+
+  function placeCar(p) {
+    if (!meshes.car) return;
+    var pos = RC3D.pointAtS(PATH, p);
+    meshes.car.position.set(pos.x, pos.y + 0.6, pos.z);
+    meshes.car.rotation.y = Math.atan2(pos.tan[0], pos.tan[1]);
+    // never buried in a hill
+    meshes.car.children[0].position.y = 0;
   }
 
   function makeKerbs(path, width) {
@@ -8491,6 +8629,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         if (meshes.gantry) scene.add(meshes.gantry);
       }
       rebuildGround();
+      if (!meshes.car) {
+        meshes.car = makeCarMarker();
+        if (meshes.car) scene.add(meshes.car);
+      }
+      if (meshes.car) meshes.car.visible = (view === "plan");
     } catch (e) {
       console.warn("[track3d] rebuild:", e && e.message ? e.message : e);
     }
@@ -8508,12 +8651,67 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     camera.updateProjectionMatrix();
   }
 
+  // Plan view = the whole circuit from above, over the prepared imagery, with a
+  // scale bar. This is the "how big is the track" answer: real surface, real
+  // width, real corner boards, to scale.
+  var PLAN = { up: null };
+  function planFrame() {
+    var b = null, i;
+    if (ASSET && ASSET.dem && ASSET.dem.bounds) b = ASSET.dem.bounds;      // [S,W,N,E]
+    if (!b && ASSET && ASSET.bbox) b = ASSET.bbox;
+    var minX, maxX, minZ, maxZ, cx, cz, span, y0;
+    if (b) {
+      var p1 = RC3D.project(b[0], b[1], PATH.o), p2 = RC3D.project(b[2], b[3], PATH.o);
+      minX = Math.min(p1.x, p2.x); maxX = Math.max(p1.x, p2.x);
+      minZ = Math.min(p1.z, p2.z); maxZ = Math.max(p1.z, p2.z);
+      y0 = 0;
+    } else {
+      minX = maxX = PATH.dense.x[0]; minZ = maxZ = PATH.dense.z[0];
+      y0 = PATH.dense.y[0];
+      for (i = 0; i < PATH.dense.x.length; i++) {
+        minX = Math.min(minX, PATH.dense.x[i]); maxX = Math.max(maxX, PATH.dense.x[i]);
+        minZ = Math.min(minZ, PATH.dense.z[i]); maxZ = Math.max(maxZ, PATH.dense.z[i]);
+        y0 = Math.min(y0, PATH.dense.y[i]);
+      }
+    }
+    cx = (minX + maxX) / 2; cz = (minZ + maxZ) / 2;
+    span = Math.max(maxX - minX, maxZ - minZ, 60);
+    var fov = camera.fov * Math.PI / 180;
+    var h = (span / 2) / Math.tan(fov / 2) * 1.12 / planZoom;   // fit, with a margin
+    PLAN.up = null;
+    return { c: { x: cx, y: y0, z: cz }, h: h, span: span };
+  }
+
+  function updateScaleBar(spanMeters, h) {
+    var bar = el("scalebar"), txt = el("scale-txt");
+    if (!bar) return;
+    if (view !== "plan") { bar.style.display = "none"; return; }
+    bar.style.display = "flex";
+    // metres per pixel at the ground plane for a top-down view
+    var hpx = canvas.clientHeight || 1;
+    var mPerPx = (2 * h * Math.tan(camera.fov * Math.PI / 360)) / hpx;
+    var want = 100;                                   // aim for a ~100 m bar
+    var px = want / mPerPx;
+    while (px > 260) { want /= 2; px = want / mPerPx; }
+    while (px < 60) { want *= 2; px = want / mPerPx; }
+    bar.firstChild.style.width = Math.round(px) + "px";
+    txt.textContent = want >= 1000 ? (want / 1000) + " km" : want + " m";
+  }
+
   function render() {
     if (!PATH) return;
     var L = lapObj(LAPNO);
     var st = RC3D.frameState(PATH, NOW, L, { eye: opts.eye, bank: bank });
-    var eye = new THREE.Vector3(st.eye.x, st.eye.y, st.eye.z);
-    var tgt = new THREE.Vector3(st.target.x, st.target.y, st.target.z);
+    var eye, tgt;
+    if (view === "plan") {
+      var pf = planFrame();
+      eye = new THREE.Vector3(pf.c.x, pf.c.y + pf.h, pf.c.z + 0.02);
+      tgt = new THREE.Vector3(pf.c.x, pf.c.y, pf.c.z);
+      updateScaleBar(pf.span, pf.h);
+    } else {
+      eye = new THREE.Vector3(st.eye.x, st.eye.y, st.eye.z);
+      tgt = new THREE.Vector3(st.target.x, st.target.y, st.target.z);
+    }
     if (look.yaw || look.pitch) {
       // temporary look-around: rotate the aim, the eye stays on the car
       var dir = tgt.clone().sub(eye).normalize();
@@ -8522,10 +8720,16 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       tgt = eye.clone().add(dir.normalize().multiplyScalar(st.lead));
     }
     camera.position.copy(eye);
-    camera.up.set(0, 1, 0);
-    camera.lookAt(tgt);
-    if (st.roll) camera.rotateZ(st.roll);
-    camera.fov = Math.max(60, Math.min(84, 66 + st.mph * 0.09));
+    if (view === "plan") {
+      camera.up.set(0, 0, -1);            // north (-z) up, like a track map
+      camera.lookAt(tgt);
+      camera.fov = 58;
+    } else {
+      camera.up.set(0, 1, 0);
+      camera.lookAt(tgt);
+      if (st.roll) camera.rotateZ(st.roll);
+      camera.fov = Math.max(60, Math.min(84, 66 + st.mph * 0.09));
+    }
     camera.updateProjectionMatrix();
     renderer.render(scene, camera);
 
@@ -8536,6 +8740,16 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     el("h-best").textContent = L && L.seconds ? fmtLap(L.seconds) : "—";
     el("h-alt").textContent = (cur && typeof cur.alt_m === "number")
       ? Math.round(cur.alt_m) + " m" : "—";
+    if (meshes.car) {
+      meshes.car.visible = (view === "plan");
+      if (view === "plan") placeCar(st.s);
+    }
+    var g = RC3D.accelAtS(PATH, st.s);
+    if (el("h-g")) {
+      el("h-g").textContent = (g >= 0 ? "+" : "") + g.toFixed(2) + " g";
+      el("h-g").style.color = (g > 0.035) ? "#5CE07F"
+        : (g < -0.035 ? "#FF6B6B" : "var(--muted)");
+    }
     el("h-bar").style.width = Math.min(100, (st.mph / 160) * 100) + "%";
     if (el("lg-corner")) {
       if (CORNERS.length) {
@@ -8719,6 +8933,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     });
     el("b-loop").addEventListener("change", function () { loopLap = el("b-loop").checked; });
     el("b-bank").addEventListener("change", function () { bank = el("b-bank").checked; });
+    if (el("b-view")) el("b-view").addEventListener("change", function () {
+      view = el("b-view").value === "plan" ? "plan" : "chase";
+      if (view === "chase") { look.yaw = 0; look.pitch = 0; }
+      render();
+    });
     if (el("b-brakes")) el("b-brakes").addEventListener("change", function () {
       opts.brakes = el("b-brakes").checked; rebuild();
     });
@@ -8750,6 +8969,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     });
     canvas.addEventListener("wheel", function (e) {
       e.preventDefault();
+      if (view === "plan") {
+        planZoom = Math.max(0.35, Math.min(6, planZoom * (e.deltaY > 0 ? 0.88 : 1.14)));
+        return;
+      }
       opts.eye = Math.max(0.5, Math.min(6, opts.eye + (e.deltaY > 0 ? 0.15 : -0.15)));
       el("b-eye").value = String(opts.eye);
     }, { passive: false });
@@ -8801,9 +9024,29 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     } catch (e) {
       console.warn("[track3d] asset apply:", e && e.message ? e.message : e);
     }
+    // A prepared track is worth SHOWING first: open on the whole circuit over
+    // the real imagery (that is the "how big is the track" view), one click from
+    // the driving view. Without imagery there is nothing to see from above, so
+    // stay in the car.
+    if (asset.texture && view === "chase" && !applyAsset.choseView) {
+      applyAsset.choseView = true;
+      view = "plan";
+      if (el("b-view")) el("b-view").value = "plan";
+      notice("plan view: whole circuit over the real imagery (" +
+             (asset.length_m ? (asset.length_m / 1000).toFixed(2) + " km" : "?") +
+             ") — switch view to \u201cchase\u201d to drive it");
+      setTimeout(hideNotice, 6000);
+    }
     var attr = (asset.texture && asset.texture.attrib) || "";
     var src = (asset.source && asset.source.line) || "?";
     el("lg-track").style.display = "flex";
+    if (!applyAsset.announced && !window.__rc3AssetNote) {
+      window.__rc3AssetNote = true;
+      notice("prepared track: " + asset.track +
+             (asset.length_m ? " \u00b7 " + (asset.length_m / 1000).toFixed(2) + " km" : "") +
+             " \u00b7 real width + terrain from imagery");
+      setTimeout(hideNotice, 4000);
+    }
     el("lg-track").textContent = asset.track +
       (asset.length_m ? " (" + (asset.length_m / 1000).toFixed(2) + " km)" : "") +
       " — " + (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide (" +
@@ -8838,17 +9081,22 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       return r.json().then(function (j) {
         var d = j && j.detail;
         if (typeof d === "string") { try { d = JSON.parse(d); } catch (e) { d = null; } }
-        if (d && d.missing) {
-          var b = el("b-prep");
-          b.style.display = "inline-block";
-          b.textContent = "prepare track (" + d.track + ")";
-          b.title = "pre-render " + d.track + " from satellite imagery + OSM";
-        }
+        if (!d || !d.missing) return;
+        var b = el("b-prep");
+        b.style.display = "inline-block";
+        b.textContent = "prepare track (" + d.track + ")";
+        b.title = "pre-render " + d.track + " from satellite imagery + OSM";
+        // No prepared track for this circuit yet: do NOT just sit on a
+        // synthetic ribbon and hope somebody clicks. Bake it now (once per
+        // track, cached) and tell the driver what is happening.
+        notice("no prepared track for \u201c" + d.track +
+               "\u201d — preparing it from satellite imagery (one-off, ~20 s)\u2026");
+        prepareTrack(true);
       }).catch(function () {});
     }).catch(function () {});
   }
 
-  function prepareTrack() {
+  function prepareTrack(auto) {
     var b = el("b-prep");
     b.disabled = true;
     b.textContent = "preparing…";
@@ -8877,7 +9125,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       if (st.state === "failed") {
         b.disabled = false;
         b.textContent = "retry prepare";
-        notice("prepare failed: " + (st.error || "unknown"), true);
+        notice("prepare failed: " + (st.error || "unknown") +
+               (st.error && /GPS|osm|raceway/i.test(st.error)
+                 ? " — this circuit may not exist in OpenStreetMap" : ""), true);
         return;
       }
       b.textContent = "preparing… (" + (st.state || "?") + ")";

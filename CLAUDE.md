@@ -517,6 +517,36 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
+### 3D road colour = the driver's INPUT, not the speed (v-server)
+The ribbon is coloured by what the driver is doing, computed per station from the **speed trace** (gear
+independent — an rpm rate cannot compare 1st with 4th, and gear is not logged): `path.accel[i]` = dv/dt in g,
+smoothed twice.
+- **accelerating → green**, floored at 0.40 brightness so ANY real rise reads green (we claim "accelerating"
+  and scale only mildly rather than inventing a percentage from 25 Hz noise)
+- **braking → red**, deepening to full at 0.6 g (a real g figure, read off the deceleration)
+- **neither (steady throttle / coasting / flat corner) → grey** `[0.46,0.48,0.52]`
+- over a baked texture the colour is BLENDED (mix 0.62) so the real surface stays visible underneath.
+Never the speed: `RC3D.driveColour(g)` takes g only. The HUD shows the live `long g` in the same colours, the
+legend explains green/grey/red, and the toggle reads **accel / brake**.
+
+### Plan view: the whole circuit, to scale, over the real imagery (v-server)
+The 3D bar has a **view** selector: `chase` (in the car) and **`plan`** — a north-up top-down camera that fits
+the whole circuit from the asset's DEM bounds (with a margin), showing the baked satellite ground at the real
+width, the accel/brake-coloured ribbon, corner boards and **an amber car arrow at your current position**.
+A **scale bar** (auto 100 m/500 m/1 km) makes the size literal. The wheel zooms. A prepared track **opens in
+plan** (one click to `chase`) because that is the view that answers "how big is the track"; without imagery it
+stays in the car.
+
+### Prepared tracks: auto-prepare + forgiving track names (v-server)
+Two reasons a driver could sit on a synthetic ribbon and never see the real track: their session's track name
+did not match a prepared slug, and nothing started the pre-render. Now:
+- `_track_asset_for()` resolves **exact slug → family match** (drops `main`/`circuit`/`full`/`course`/… so
+  "Summit Point Main" finds a track prepared as "Summit Point", and `summit-point-main` matches the
+  longest prepared prefix/suffix).
+- the 3D page **auto-prepares** on first view when the asset is missing (notice: "preparing it from satellite
+  imagery (one-off, ~20 s)"), polls `/track-prep/status`, and reloads with the real track. A recorded failure
+  stops the auto-retry and leaves a **retry prepare** button with the reason.
+
 ### Corner brake boards in the 3D view (v-server)
 Real circuits mark a braking zone with numbered boards (5 4 3 2 1 = hundreds of metres) and only bother where
 they are needed. `RC3D.corners()` measures the TOTAL heading change through each corner on the smoothed path
