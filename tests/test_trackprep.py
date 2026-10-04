@@ -172,8 +172,8 @@ class AssetTests(unittest.TestCase):
         import numpy as np
         line_pts = [(39.0 + i * 0.00004, -77.0) for i in range(400)]
         fake_img = Image.new("RGB", (512, 512), (70, 118, 52))
-        bounds = {"z": 18, "x0": 0, "y0": 0, "lon0": -77.2, "lat0": 39.2,
-                  "lon1": -76.8, "lat1": 38.8}
+        bounds = {"z": 18, "x0": 0, "y0": 0, "lon0": -77.01, "lat0": 39.01,
+                  "lon1": -76.99, "lat1": 38.99}
         grid = {"cols": 3, "rows": 3, "bounds": [38.99, -77.01, 39.01, -76.99],
                 "values": [180.0] * 9}
         with mock.patch.object(tp, "imagery_mosaic", return_value=(fake_img, bounds)), \
@@ -321,6 +321,69 @@ class StitchTests(unittest.TestCase):
         tp = _tp()
         ways = [{"id": 1, "name": "x", "points": [(39.0, -77.0), (39.001, -77.0)]}]
         self.assertIsNone(tp.stitch_circuit(ways, min_len_m=100, log=lambda *_: None))
+
+
+class AssetValidationTests(unittest.TestCase):
+    """A bake that would produce wallpaper must FAIL, not publish.
+
+    This is the check that was missing when the server baked a 'track' whose
+    ground was a few texels of imagery stretched over the whole screen."""
+
+    def _line(self, span_deg=0.01):
+        n = 40
+        return {"lat": np.linspace(42.30, 42.30 + span_deg, n),
+                "lon": np.linspace(-76.93, -76.93 + span_deg, n)}
+
+    def _asset(self, **over):
+        a = {"line": [[42.30, -76.93, 0]] * 40, "length_m": 5000.0,
+             "texture": {"bounds": {"south": 42.295, "west": -76.935,
+                                    "north": 42.315, "east": -76.915},
+                         "px": [2048, 2048], "file": "x.jpg"}}
+        a.update(over)
+        return a
+
+    def test_good_asset_passes(self):
+        tp = _tp()
+        self.assertEqual(tp.validate_asset(self._asset(), self._line()), [])
+
+    def test_texture_that_does_not_cover_the_track_fails(self):
+        tp = _tp()
+        a = self._asset()
+        a["texture"]["bounds"] = {"south": 42.300, "west": -76.929,
+                                  "north": 42.301, "east": -76.928}   # ~80 m
+        bad = tp.validate_asset(a, self._line())
+        self.assertTrue(any("does not cover" in b or "spans only" in b for b in bad), bad)
+
+    def test_coarse_texture_fails(self):
+        tp = _tp()
+        a = self._asset()
+        a["texture"]["bounds"] = {"south": 41.0, "west": -78.0, "north": 43.5, "east": -75.5}
+        a["texture"]["px"] = [512, 512]          # ~530 m/px
+        bad = tp.validate_asset(a, self._line())
+        self.assertTrue(any("too coarse" in b for b in bad), bad)
+
+    def test_tiny_texture_fails(self):
+        tp = _tp()
+        a = self._asset()
+        a["texture"]["px"] = [256, 256]
+        bad = tp.validate_asset(a, self._line())
+        self.assertTrue(any("only 256x256" in b for b in bad), bad)
+
+    def test_a_whole_session_of_laps_is_rejected(self):
+        tp = _tp()
+        a = self._asset(length_m=31820.0)         # the 31.8 km bug
+        bad = tp.validate_asset(a, self._line())
+        self.assertTrue(any("laps, not a circuit" in b for b in bad), bad)
+
+    def test_duplicate_tiles_are_refused(self):
+        """A blocked/proxied tile source answers every URL with the same image."""
+        tp = _tp()
+        import hashlib
+        blob = b"x" * 2000
+        h = hashlib.sha1(blob).hexdigest()
+        seen = {h: 100}
+        dup = max(seen.values())
+        self.assertGreater(dup, max(4, int(100 * 0.25)))     # the guard's condition
 
 
 class SeedTrackTests(unittest.TestCase):

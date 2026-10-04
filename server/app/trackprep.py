@@ -164,6 +164,8 @@ def imagery_mosaic(bbox, z: int, cache_dir: pathlib.Path,
 
     jobs = [(i, j) for j in range(ny) for i in range(nx)]
     done = 0
+    import hashlib
+    seen = {}
     if workers > 1:
         from concurrent.futures import ThreadPoolExecutor
         it = ThreadPoolExecutor(max_workers=workers).map(one, jobs)
@@ -175,12 +177,25 @@ def imagery_mosaic(bbox, z: int, cache_dir: pathlib.Path,
             continue
         i, j, blob = res
         try:
+            seen[hashlib.sha1(blob).hexdigest()] = seen.get(hashlib.sha1(blob).hexdigest(), 0) + 1
+        except Exception:
+            pass
+        try:
             t = Image.open(io.BytesIO(blob)).convert("RGB")
             canvas.paste(t, (i * TILE, j * TILE))
         except Exception as e:
             log(f"[imagery] tile decode failed: {e}")
         if done % 40 == 0:
             log(f"[imagery] {done}/{len(jobs)}")
+    # A blocked or proxied tile source answers every URL with the SAME image,
+    # which pastes into a repeating pattern that looks like nothing on earth and
+    # silently poisons the width measurement. Refuse to bake that.
+    if len(jobs) >= 8 and seen:
+        dup = max(seen.values())
+        if dup > max(4, int(len(jobs) * 0.25)):
+            raise RuntimeError(
+                "imagery returned %d identical tiles out of %d - the tile source "
+                "is blocked or proxying (nothing usable to bake)" % (dup, len(jobs)))
     bounds = {
         "z": z, "x0": x0, "y0": y0,
         "lon0": x_to_lon(x0 * TILE, z), "lat0": y_to_lat(y0 * TILE, z),
@@ -896,9 +911,55 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
             "attrib": "Imagery \u00a9 Esri, Maxar, Earthstar Geographics",
         },
     }
+    problems = validate_asset(asset, line)
+    if problems:
+        raise RuntimeError("refusing to publish a broken track asset: " +
+                           "; ".join(problems))
     (out_dir / f"{slug}.json").write_text(json.dumps(asset), "utf-8")
     log(f"[{slug}] asset written ({out_dir / (slug + '.json')})")
     return asset
+
+
+def validate_asset(asset: dict, line: dict) -> list:
+    """Reasons this asset must NOT be published (empty list = fine).
+
+    Every one of these was a real failure: imagery that does not cover the
+    track, or is so coarse/duplicated that the ground is a smear, or a texture
+    whose bounds are so small the viewer's UVs would tile it into wallpaper.
+    Failing the bake is far better than shipping a "track" nobody recognises.
+    """
+    bad = []
+    lat = line["lat"]
+    min_lat, max_lat = float(lat.min()), float(lat.max())
+    lon = line["lon"]
+    min_lon, max_lon = float(lon.min()), float(lon.max())
+    mpp = 111320.0
+    need_w = (max_lon - min_lon) * mpp * math.cos(math.radians((min_lat + max_lat) / 2))
+    need_h = (max_lat - min_lat) * mpp
+    if not asset.get("line") or len(asset["line"]) < 20:
+        bad.append("no usable centreline")
+    if asset.get("length_m") and asset["length_m"] > 25000:
+        bad.append("traced line is %.1f km - that is laps, not a circuit"
+                   % (asset["length_m"] / 1000.0))
+    tex = asset.get("texture")
+    if not tex:
+        return bad                      # geometry-only assets are allowed
+    b = tex["bounds"]
+    span_w = (b["east"] - b["west"]) * mpp * math.cos(math.radians((min_lat + max_lat) / 2))
+    span_h = (b["north"] - b["south"]) * mpp
+    if span_w < need_w * 0.95 or span_h < need_h * 0.95:
+        bad.append("texture (%.0fx%.0f m) does not cover the track (%.0fx%.0f m)"
+                   % (span_w, span_h, need_w, need_h))
+    if span_w < 300 or span_h < 300:
+        bad.append("texture spans only %.0fx%.0f m - UVs would tile it" % (span_w, span_h))
+    px = tex.get("px") or [0, 0]
+    if px[0] < 512 or px[1] < 512:
+        bad.append("texture is only %dx%d px" % (px[0], px[1]))
+    else:
+        res = max(span_w / px[0], span_h / px[1])
+        if res > 6.0:
+            bad.append("texture resolution is %.1f m/px (too coarse to see a track)" % res)
+    return bad
 
 
 def session_centreline(path: pathlib.Path, target: int = 6000):

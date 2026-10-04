@@ -2452,7 +2452,17 @@ def _seed_tracks() -> int:
     for src in sorted(seed_dir.glob("*.json")):
         dst = TRACKS_DIR / src.name
         if dst.exists():
-            continue
+            # Replace a STALE asset (an older prep_version, i.e. baked by a
+            # method we know was wrong) with the shipped one, but never trample
+            # a current locally-baked asset.
+            try:
+                have = json.loads(dst.read_text("utf-8"))
+                if int(have.get("prep_version") or 0) >= PREP_VERSION:
+                    continue
+                log.info("replacing stale seeded track %s (prep_version %s)",
+                         dst.name, have.get("prep_version"))
+            except Exception:
+                continue
         try:
             shutil.copy2(src, dst)
             tex = src.with_suffix(".jpg")
@@ -2685,7 +2695,8 @@ async def session_track_asset(request: Request, user: str, filename: str) -> JSO
 
 
 @app.post("/sessions/{user}/{filename}/track-prep")
-async def session_track_prep(request: Request, user: str, filename: str) -> JSONResponse:
+async def session_track_prep(request: Request, user: str, filename: str,
+                             force: int = Query(0)) -> JSONResponse:
     """Kick off a pre-render for this session's track (owner-or-admin).
 
     Uses OUR driven line when the session has one (best: it is the line the car
@@ -2700,6 +2711,12 @@ async def session_track_prep(request: Request, user: str, filename: str) -> JSON
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"trackprep unavailable: {e}")
     slug = _track_slug(track)
+    if force:                            # re-bake even though an asset exists
+        try:
+            _track_asset_path(slug).unlink()
+            (TRACKS_DIR / (slug + ".jpg")).unlink()
+        except OSError:
+            pass
     with _PREP_LOCK:
         cur = (_PREP.get(slug) or {}).get("state")
         if cur == "running":
@@ -2972,9 +2989,16 @@ async def caps() -> dict:
     centreline from the fastest single lap (not the whole session),
     self-calibrating imagery width (median+MAD, clamped to 8-15 m with the raw
     value kept), ground imagery sharing the road's uv frame, and a
-    PREP_VERSION that invalidates wrongly-built assets."""
+    PREP_VERSION that invalidates wrongly-built assets.
+    8 = a bake that would produce wallpaper now FAILS instead of publishing:
+    duplicate-tile detection (a blocked/proxied tile source answers every URL
+    with the same image), an asset validator (texture must cover the track, be
+    >= 512 px and finer than 6 m/px, and the line must look like a circuit not
+    laps), the viewer clamps the texture so it can never tile, anisotropy for
+    crisp ground, and seeds replace a STALE asset (so a broken baked track is
+    healed by the shipped one)."""
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 7}
+            "track3d_v": 8}
 
 
 
@@ -9080,7 +9104,45 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
                 encodeURIComponent(FILE) + "/track-prep";
   var prepPoll = null;
 
+  function assetProblem(asset) {
+    // Mirrors the server-side validator: never draw wallpaper at the driver.
+    var t = asset.texture;
+    if (!t) return null;                       // geometry-only is fine
+    var b = t.bounds;
+    var mpp = 111320.0;
+    var midLat = (b.north + b.south) / 2;
+    var w = (b.east - b.west) * mpp * Math.cos(midLat * Math.PI / 180);
+    var hgt = (b.north - b.south) * mpp;
+    if (!(w > 300 && hgt > 300)) {
+      return "its imagery covers only " + Math.round(w) + "x" + Math.round(hgt) +
+             " m, so the ground would be stretched into wallpaper";
+    }
+    var px = t.px || [0, 0];
+    if (px[0] < 512 || px[1] < 512) {
+      return "its imagery is only " + px[0] + "x" + px[1] + " px";
+    }
+    if (Math.max(w / px[0], hgt / px[1]) > 6) {
+      return "its imagery is too coarse (" +
+             (Math.max(w / px[0], hgt / px[1])).toFixed(1) + " m/px) to show a track";
+    }
+    return null;
+  }
+
   function applyAsset(asset) {
+    var problem = asset ? assetProblem(asset) : null;
+    if (problem) {
+      notice("the prepared data for this track is unusable: " + problem +
+             " \u2014 re-baking it from imagery\u2026");
+      ASSET = null;
+      assetSample = null;
+      var btn = el("b-prep");
+      if (btn) {
+        btn.style.display = "inline-block";
+        btn.textContent = "re-prepare track";
+      }
+      prepareTrack(true, true);
+      return;
+    }
     ASSET = asset;
     if (!asset || !PATH) return;
     try {
@@ -9127,6 +9189,18 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       var url = "/trackassets/" + encodeURIComponent(asset.slug) + "/texture.jpg";
       new THREE.TextureLoader().load(url, function (t) {
         t.colorSpace = THREE.SRGBColorSpace;
+        // Clamp, never repeat: if anything about the asset's bounds is off, a
+        // clamped texture smears at worst, while a repeating one turns the
+        // ground into wallpaper. Anisotropy keeps the ground crisp where it
+        // meets the horizon instead of turning to mush.
+        t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+        t.generateMipmaps = true;
+        t.minFilter = THREE.LinearMipmapLinearFilter;
+        t.magFilter = THREE.LinearFilter;
+        try {
+          t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        } catch (e) {}
+        t.needsUpdate = true;
         TEX = t;
         rebuild();
       }, undefined, function () {
@@ -9161,11 +9235,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     }).catch(function () {});
   }
 
-  function prepareTrack(auto) {
+  function prepareTrack(auto, force) {
     var b = el("b-prep");
     b.disabled = true;
     b.textContent = "preparing…";
-    fetch(prepUrl, { method: "POST" }).then(function (r) {
+    fetch(prepUrl + (force ? "?force=1" : ""), { method: "POST" }).then(function (r) {
       return r.json().then(function (j) {
         if (!r.ok) throw new Error((j && j.detail) || ("HTTP " + r.status));
         pollPrep();

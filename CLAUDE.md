@@ -517,6 +517,24 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
+### Prepared tracks: a bad bake must FAIL, never publish (v-server)
+The failure that survived the three bugs above: the ground rendered as a few texels of imagery stretched
+over the whole screen (a wallpaper-like grid with dashed paint markings magnified). Reproduced the correct
+path locally (texture 2048x4608 covering 2034x905 m, UV span 0.93 - fine), so the bad texture was what the
+SERVER baked, and the pipeline published it silently. Now:
+- **duplicate-tile detection** at mosaic time: a blocked/proxied tile source answers every URL with the SAME
+  image, which pastes into a pattern that looks like nothing on earth and poisons the width measurement. If
+  >25 % of tiles (and >=5) are byte-identical, the bake RAISES.
+- **`validate_asset()`** before writing: the texture must cover the track bbox, span >=300 m, be >=512 px and
+  finer than 6 m/px, and the traced line must be <25 km (the "whole session = 31.8 km" bug). Any failure
+  raises, so the prep job reports a reason instead of publishing.
+- the viewer **clamps the texture** (`ClampToEdgeWrapping` + mipmaps + max anisotropy): clamped imagery smears
+  at worst; repeating imagery IS the wallpaper. It also re-checks the asset (`assetProblem()`) and, if
+  unusable, says why and re-prepares with `?force=1` (which deletes the stale asset first).
+- **`_seed_tracks()` replaces a STALE asset** with the shipped seed (it used to skip any existing file, which
+  is why a broken baked track stayed broken). Seeds: Summit Point family + **Watkins Glen Grand Prix**, all
+  validated against the same rules the server enforces.
+
 ### Prepared tracks: the three bugs that made them look wrong (v-server)
 1. **A circuit is many OSM ways, not one.** Watkins Glen's 5.5 km lap is mapped as 23 ways ("The Esses",
    "The Boot", "The Ninety"…), the longest only 924 m, with 4 junction nodes carrying pit-lane / short-course
