@@ -309,18 +309,96 @@ def osm_raceways(bbox, timeout: float = 90.0, log=print):
     return []
 
 
-def osm_best(track: str, bbox, log=print):
-    """Pick the raceway way whose name best matches `track` (else the longest)."""
+def way_length_m(points) -> float:
+    """Approximate length of a lat/lon polyline (metres)."""
+    total = 0.0
+    for i in range(1, len(points)):
+        (a0, o0), (a1, o1) = points[i - 1], points[i]
+        x = (o1 - o0) * M_PER_DEG_LAT * math.cos(math.radians((a0 + a1) / 2))
+        y = (a1 - a0) * M_PER_DEG_LAT
+        total += math.hypot(x, y)
+    return total
+
+
+def osm_match_by_trace(points, ways, max_dist_m: float = 35.0, log=print):
+    """Which OSM way IS the circuit we drove? Compare SHAPE, not names.
+
+    Names are hopeless here: a session says "Thompson" while OSM calls that
+    circuit's ways "Road Course" / "Thompson Speedway", and carries Pit Lane,
+    Short Course and Drifting Course fragments in the same bbox. Measured on the
+    real data: the name matcher picked a 560 m fragment, this picks the 1612 m
+    circuit (mean distance ~1 m from the driven line).
+
+    Returns (way, mean_dist_m); refuses anything further than max_dist_m.
+    """
+    if len(points) < 10 or not ways:
+        return None, None
+    step = max(1, len(points) // 400)
+    probe = points[::step]
+    lat0 = sum(p[0] for p in probe) / len(probe)
+    kx = M_PER_DEG_LAT * math.cos(math.radians(lat0))
+    ox, oy = probe[0][1], probe[0][0]
+    px = [((p[1] - ox) * kx, (p[0] - oy) * M_PER_DEG_LAT) for p in probe]
+    best, best_d = None, 1e18
+    for w in ways:
+        wp = w["points"]
+        if len(wp) < 4:
+            continue
+        wx = [((q[1] - ox) * kx, (q[0] - oy) * M_PER_DEG_LAT) for q in wp]
+        cell = 20.0
+        grid = {}
+        for i, (x, y) in enumerate(wx):
+            grid.setdefault((int(x // cell), int(y // cell)), []).append(i)
+        total, n = 0.0, 0
+        for (x, y) in px:
+            gx, gy = int(x // cell), int(y // cell)
+            near = 1e18
+            for a in (-1, 0, 1):
+                for b in (-1, 0, 1):
+                    for i in grid.get((gx + a, gy + b), ()):
+                        dx, dy = wx[i][0] - x, wx[i][1] - y
+                        d = dx * dx + dy * dy
+                        if d < near:
+                            near = d
+            total += math.sqrt(near) if near < 1e17 else 500.0
+            n += 1
+        mean_d = total / max(1, n)
+        if mean_d < best_d:
+            best, best_d = w, mean_d
+    if best is None or best_d > max_dist_m:
+        log("[osm] no way follows the driven line (closest %.0f m)" % (best_d if best else -1))
+        return None, (None if best is None else best_d)
+    log("[osm] trace match: way %s %r %.0f m, mean %.1f m from the driven line"
+        % (best["id"], best.get("name"), way_length_m(best["points"]), best_d))
+    return best, best_d
+
+
+def osm_best(track: str, bbox, min_len_m: float = 400.0, log=print):
+    """Name-based pick, for when there is no driven line to match against.
+
+    A name match alone is not enough (a pit-lane fragment can share the name), so
+    candidates are weighted by length and anything under min_len_m is only used
+    if nothing longer exists.
+    """
     ways = osm_raceways(bbox, log=log)
     if not ways:
         return None
+    long_enough = [w for w in ways if way_length_m(w["points"]) >= min_len_m]
+    pool = long_enough or ways
+    if not long_enough:
+        log("[osm] no way >= %.0f m found; using the longest fragment" % min_len_m)
     want = set(re.findall(r"[a-z0-9]+", (track or "").lower()))
     best, score = None, -1.0
-    for w in ways:
+    for w in pool:
         have = set(re.findall(r"[a-z0-9]+", (w.get("name") or "").lower()))
-        s = len(want & have) / max(1, len(want)) + min(0.4, len(w["points"]) / 500.0)
+        overlap = len(want & have) / max(1, len(want))
+        s = overlap + 0.6 * min(1.0, way_length_m(w["points"]) / 1500.0)
         if s > score:
             best, score = w, s
+    if best is not None:
+        best["length_m"] = way_length_m(best["points"])
+        log("[osm] picked way %s %r %.0f m (%d pts)"
+            % (best["id"], best.get("name"), best["length_m"], len(best["points"])))
     return best
 
 
@@ -547,6 +625,7 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
                    "dem": "AWS terrarium z14",
                    "osm_id": opts.get("osm_id")},
         "centre": [float(np.mean(lats)), float(np.mean(lons))],
+        "length_m": round(float(line["total_m"]), 1),
         "bbox": [min_lat, min_lon, max_lat, max_lon],
         "line": [[float(a), float(b), None if e is None else round(float(e), 1)]
                  for a, b, e in zip(lats, lons, elev)],
@@ -621,7 +700,9 @@ def main(argv=None) -> int:
     ap.add_argument("--osm", help="OSM raceway name to trace (needs --near)")
     ap.add_argument("--near", help="lat,lon hint used to search OSM, e.g. 39.24,-77.96")
     ap.add_argument("--osm-id", type=int, help="use this exact OSM way id")
-    ap.add_argument("--line", help="json file of [[lat,lon],...]")
+    ap.add_argument("--line", help="json file of [[lat,lon],...] (a driven line)")
+    ap.add_argument("--osm-from-trace", action="store_true",
+                    help="borrow OSM's surveyed width, matching the way by shape")
     ap.add_argument("--zoom", type=int, default=18)
     ap.add_argument("--list-tracks", action="store_true")
     ap.add_argument("--list-osm", action="store_true")
@@ -647,12 +728,46 @@ def main(argv=None) -> int:
                   f"width={w['width_m']} surface={w['surface']}")
         return 0
 
-    points, source, osm_id, osm_w = _line_from_any(a, want_source=True)
+    # Our own driven line is the best geometry we have: it is the line the car
+    # actually takes. OSM is then used for what it knows BETTER — a surveyed
+    # `width` tag — matched to the trace by SHAPE, never by name.
+    points = None
+    source = None
+    osm_id = None
+    osm_w = None
+    if a.session or a.line:
+        points, source, _, _ = _line_from_any(
+            type("A", (), {"session": a.session, "line": a.line, "osm": None,
+                           "osm_id": None, "near": None})(), want_source=True)
+        if a.osm or a.osm_id or a.osm_from_trace:
+            near = a.near
+            if not near:
+                near = "%.5f,%.5f" % (sum(p[0] for p in points) / len(points),
+                                      sum(p[1] for p in points) / len(points))
+            lat, lon = [float(x) for x in near.split(",")]
+            ways = osm_raceways((lat - 0.06, lon - 0.08, lat + 0.06, lon + 0.08))
+            way = None
+            if a.osm_id:
+                way = next((x for x in ways if x["id"] == a.osm_id), None)
+            if way is None:
+                way, _ = osm_match_by_trace(points, ways)
+            if way is not None:
+                osm_id, osm_w = way["id"], way.get("width_m")
+                source = "%s+osm:%s" % (source, way["id"])
+                if osm_w:
+                    print("[osm] borrowed surveyed width %s m from way %s"
+                          % (osm_w, way["id"]))
+    else:
+        if not (a.osm or a.osm_id):
+            raise SystemExit("give one of --session / --line / --osm")
+        points, source, osm_id, osm_w = _line_from_any(a, want_source=True)
+
     asset = build_asset(a.track, points, data_dir,
                         {"zoom": a.zoom, "line_source": source, "osm_id": osm_id,
                          "osm_width_m": osm_w})
-    print(json.dumps({k: asset[k] for k in
-                      ("track", "slug", "source", "width_confidence")}, indent=1))
+    print(json.dumps({k: asset.get(k) for k in
+                      ("track", "slug", "source", "width_source", "width_imagery_m",
+                       "width_osm_m", "width_agreement", "length_m")}, indent=1))
     return 0
 
 

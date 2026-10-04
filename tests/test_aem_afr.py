@@ -124,9 +124,14 @@ uint32_t session_last_flush_ms = 10000, session_samples = 0, dbg_sdwr_max_us = 0
 bool session_file_open = true;
 struct { bool aem_afr = true; } g_cfg;
 aemafr::Reading aem_reading;
-struct { uint32_t last_ms = 10000; int tps_x10 = 999; } can_ecu;
+// Full CAN / BLE stub: the sample writer now logs every live channel
+// (map/iat/batt/afr_can/oil_can_psi), not just the dash's display set.
+struct { uint32_t last_ms = 10000; int tps_x10 = 999; int map_x10 = 1012;
+         int iat_f_x10 = 882; int bat_x10 = 139; int afr_x10 = 147;
+         int oil_x10 = 421; } can_ecu;
 uint32_t bt_last_ms = 10000;
 int bt_tps_x10 = 500, bt_spark_x10 = -35;
+int bt_iat_f_x10 = 900, bt_volt_x10 = 141;
 struct File {
     std::string bytes;
     int write(const uint8_t* p, size_t n) { bytes.append((const char*)p,n); return n; }
@@ -137,6 +142,7 @@ void emitSessionStatus(bool) {}
 ''' + fn + r'''
 void sample(float huge = 0) {
     writeSessionSample(3, 50, huge ? huge : -89.999999f, huge ? huge : -179.999999f,
+        huge ? huge : 249.5f, true,
         huge ? huge : 299.9f, huge ? huge : 359.9f, 65535, 30000, 30000,
         huge ? huge : -2.0f, huge ? huge : -2.0f, huge ? huge : -2.0f,
         huge ? huge : -250.0f, huge ? huge : -250.0f, huge ? huge : -250.0f, 999);
@@ -158,6 +164,19 @@ int main() {
         self.assertEqual(rows[0]['lambda'], .9853)
         self.assertEqual(rows[0]['afr_source'], 'aem30-0300')
         self.assertEqual(rows[0]['spark_deg'], -3.5)
+        # Every channel the system holds is logged, not just what the dash
+        # displays: altitude (the review page's Altitude tile + /track3d read
+        # it), MS3 CAN map/iat/batt/afr, and the RC35 bench CAN oil.
+        self.assertEqual(rows[0]['alt_m'], 249.5)
+        self.assertEqual(rows[0]['map_kpa'], 101.2)
+        self.assertEqual(rows[0]['iat_f'], 88.2)      # CAN wins over the dongle
+        self.assertEqual(rows[0]['batt_v'], 13.9)
+        self.assertEqual(rows[0]['afr_can'], 14.7)
+        self.assertEqual(rows[0]['oil_can_psi'], 42.1)
+        # afr_can/oil_can_psi are SEPARATE keys from the AEM afr/lambda and the
+        # direct-transducer oil_psi: provenance must never be ambiguous, so both
+        # oil channels ride the same line with their own key.
+        self.assertEqual(rows[0]['oil_psi'], 3000.0)
         self.assertLess(max(map(len, output.splitlines())), 640)
         self.assertGreater(len(output.splitlines()[0]), 320)  # catches old upload-buffer truncation
         for row, status in zip(rows[1:4], ['not_ready', 'error', 'not_ready']):

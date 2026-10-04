@@ -201,6 +201,89 @@ class AssetTests(unittest.TestCase):
         self.assertEqual(tp.slugify(""), "track")
 
 
+class OsmTraceMatchTests(unittest.TestCase):
+    """Picking which OSM way IS the circuit. The real Thompson data has a 1612 m
+    'Road Course' plus a 560 m 'Thompson Speedway' fragment and a pit lane, and
+    the name matcher picked the fragment — so these tests are the shape match."""
+
+    def _ways(self):
+        # a circuit loop (the truth), a short fragment with the "right" name,
+        # and a pit lane beside the main straight
+        loop = []
+        for i in range(120):
+            a = 2 * math.pi * i / 120
+            loop.append((39.0 + 0.004 * math.cos(a), -77.0 + 0.005 * math.sin(a)))
+        frag = [(39.01, -77.0 + 0.0001 * i) for i in range(15)]
+        pit = [(39.0005 + 0.0001 * i, -76.998) for i in range(20)]
+        return [{"id": 1, "name": "Road Course", "width_m": None, "points": loop},
+                {"id": 2, "name": "Thompson Speedway", "width_m": None, "points": frag},
+                {"id": 3, "name": "Pit Lane", "width_m": 12.0, "points": pit}]
+
+    def test_shape_beats_name(self):
+        tp = _tp()
+        import random
+        random.seed(3)
+        loop = self._ways()[0]["points"]
+        trace = [(p[0] + random.uniform(-2, 2) / 111320,
+                  p[1] + random.uniform(-2, 2) / 111320) for p in loop]
+        way, dist = tp.osm_match_by_trace(trace, self._ways(), log=lambda *_: None)
+        self.assertIsNotNone(way)
+        self.assertEqual(way["id"], 1)
+        self.assertLess(dist, 5.0)
+        # The name matcher, with its length floor, ALSO refuses the fragment
+        # (patch the fetch out: osm_best would otherwise hit Overpass).
+        with mock.patch.object(tp, "osm_raceways", return_value=self._ways()):
+            picked = tp.osm_best("Thompson Speedway", (38.99, -77.02, 39.02, -76.98),
+                                 log=lambda *_: None)
+            # ...and without the floor, the name alone picks the 120 m fragment:
+            # that is exactly the real-data bug the shape match exists to fix.
+            naive = tp.osm_best("Thompson Speedway", (38.99, -77.02, 39.02, -76.98),
+                                min_len_m=0, log=lambda *_: None)
+        self.assertEqual(picked["id"], 1, "length floor should reject the fragment")
+        self.assertEqual(naive["id"], 2, "name alone picks the fragment")
+
+    def test_a_trace_nowhere_near_any_way_is_refused(self):
+        tp = _tp()
+        far = [(39.2 + 0.001 * i, -77.3) for i in range(50)]
+        way, dist = tp.osm_match_by_trace(far, self._ways(), log=lambda *_: None)
+        self.assertIsNone(way)
+
+    def test_way_length(self):
+        tp = _tp()
+        # 0.01 deg of latitude is ~1113 m
+        self.assertAlmostEqual(tp.way_length_m([(39.0, -77.0), (39.01, -77.0)]),
+                               1113, delta=5)
+        self.assertAlmostEqual(tp.way_length_m([(39.0, -77.0)]), 0.0)
+
+
+class SeedTrackTests(unittest.TestCase):
+    """The prepared tracks that ship with the server, so the 3D view is worth
+    looking at before anyone has clicked 'prepare track'."""
+
+    def test_seeds_are_valid_assets_of_real_circuits(self):
+        d = ROOT / "server/app/seed-tracks"
+        seeds = sorted(d.glob("*.json"))
+        self.assertGreaterEqual(len(seeds), 3, "expected the Summit Point family")
+        expect = {"summit-point": (2900, 3200, 8.0, 11.0),
+                  "summit-point-jefferson": (1500, 1750, 9.0, 12.0),
+                  "summit-point-shenandoah": (3000, 3300, 9.0, 11.0)}
+        for f in seeds:
+            a = json.loads(f.read_text())
+            self.assertIn(a["slug"], expect, a["slug"])
+            lo, hi, wlo, whi = expect[a["slug"]]
+            # length is how we know the OSM way really is that circuit, and how a
+            # bad match (a 100 m pit fragment) gets caught
+            self.assertGreater(a["length_m"], lo, a["slug"])
+            self.assertLess(a["length_m"], hi, a["slug"])
+            w = a.get("width_osm_m") or a.get("width_imagery_m")
+            self.assertGreater(w, wlo)
+            self.assertLess(w, whi)
+            self.assertGreaterEqual(a["width_confidence"], 0.5)
+            self.assertEqual(len(a["line"]), len(a["width_m"]))
+            self.assertTrue((d / a["texture"]["file"]).is_file(), a["texture"]["file"])
+            self.assertIn("Esri", a["texture"]["attrib"])
+
+
 class FixtureSchemaTests(unittest.TestCase):
     """The baked Shenandoah asset (real imagery/DEM/OSM data) is the viewer
     test's input — pin its schema so a pipeline change cannot silently break it."""

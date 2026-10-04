@@ -382,6 +382,87 @@ R.asset = (function () {
   };
 })();
 
+// ---- corners + brake boards: geometry with a KNOWN angle ------------------
+// build a path of straights joined by arcs of a chosen total heading change
+function trackWith(arcDeg, radius) {
+  var pts = [], lat0 = 39.0, lon0 = -77.0, heading = 0;   // heading: deg clockwise from north
+  var step = 2.0;
+  function push(dist, turnPerM) {
+    var n = Math.max(1, Math.round(dist / step));
+    for (var k = 0; k < n; k++) {
+      heading += turnPerM * step * 180 / Math.PI;
+      var r = heading * Math.PI / 180;
+      var east = Math.sin(r) * step, north = Math.cos(r) * step;
+      lat0 += north / 111320;
+      lon0 += east / (111320 * Math.cos(lat0 * Math.PI / 180));
+      pts.push({ lat: lat0, lon: lon0, speed_mph: 60, alt_m: 0 });
+    }
+  }
+  push(700, 0);                                  // long straight in
+  var arcM = Math.abs(arcDeg) * Math.PI / 180 * radius;
+  push(arcM, (arcDeg > 0 ? 1 : -1) / radius);     // the corner
+  push(700, 0);                                  // long straight out
+  return RC3D.buildPath(pts, { smooth: 3, denseStep: 2 });
+}
+R.corners = {};
+[[95, 55], [70, 80], [50, 140], [38, 200], [20, 400]].forEach(function (spec) {
+  var p = trackWith(spec[0], spec[1]);
+  var cs = RC3D.corners(p, {});
+  var mk = RC3D.brakeMarkers(p, cs, {});
+  R.corners[spec[0] + "deg"] = {
+    found: cs.length,
+    deg: cs.length ? Math.round(cs[0].deg) : null,
+    dir: cs.length ? cs[0].dir : null,
+    radius: cs.length ? Math.round(cs[0].radius_m) : null,
+    labels: mk.map(function (m) { return m.label; }).join(""),
+    distances: mk.map(function (m) { return m.m; }),
+    sides: mk.map(function (m) { return m.side; }).join(""),
+    beforeEntry: mk.every(function (m) { return m.s <= cs[0].s0 + 0.001; }),
+    apexInside: cs.length ? (cs[0].apex_s >= cs[0].s0 - 0.001 &&
+                             cs[0].apex_s <= cs[0].s1 + 0.001) : null
+  };
+});
+// two corners close together: the far boards of the second must be dropped
+(function () {
+  var pts = [], lat0 = 39.0, lon0 = -77.0, heading = 0, step = 2.0;
+  function push(dist, turnPerM) {
+    var n = Math.max(1, Math.round(dist / step));
+    for (var k = 0; k < n; k++) {
+      heading += turnPerM * step * 180 / Math.PI;
+      var r = heading * Math.PI / 180;
+      lat0 += (Math.cos(r) * step) / 111320;
+      lon0 += (Math.sin(r) * step) / (111320 * Math.cos(lat0 * Math.PI / 180));
+      pts.push({ lat: lat0, lon: lon0, speed_mph: 60, alt_m: 0 });
+    }
+  }
+  push(500, 0);
+  push(90 * Math.PI / 180 * 60, 1 / 60);          // corner 1 (90 deg)
+  push(200, 0);                                   // short link
+  push(90 * Math.PI / 180 * 60, 1 / 60);          // corner 2 (90 deg)
+  push(600, 0);
+  var p = RC3D.buildPath(pts, { smooth: 3, denseStep: 2 });
+  var cs = RC3D.corners(p, {});
+  var mk = RC3D.brakeMarkers(p, cs, {});
+  // no board may stand INSIDE a corner (or within 12 m of its entry - a board
+  // has to be somewhere the driver can read it while braking, not mid-apex)
+  var bad = 0;
+  for (var i = 0; i < mk.length; i++) {
+    for (var c = 0; c < cs.length; c++) {
+      if (mk[i].s > cs[c].s0 - 12 && mk[i].s < cs[c].s1) bad++;
+    }
+  }
+  R.corners.pair = { corners: cs.length, boards: mk.length, insideLink: bad,
+                     labels: mk.map(function (m) { return m.label; }).join(""),
+                     s0: cs.map(function (c) { return Math.round(c.s0); }),
+                     s1: cs.map(function (c) { return Math.round(c.s1); }),
+                     boards_s: mk.map(function (m) { return Math.round(m.s); }) };
+})();
+// and an almost-straight path has no corners at all
+(function () {
+  var p = trackWith(6, 900);
+  R.corners.straightish = { found: RC3D.corners(p, {}).length };
+})();
+
 console.log(JSON.stringify(R));
 """
 
@@ -544,6 +625,41 @@ class Track3DMathTests(unittest.TestCase):
                         "road is not on the terrain field the mesh uses")
         self.assertLess(a["worstGap"], 4.0, "road floats off the DEM mesh vertices")
         self.assertGreater(a["densify"], 1000, "DEM mesh is too coarse to be a ground")
+
+        # 10d. brake boards: the ladder depends on corner severity, and a gentle
+        #      bend (under ~45 deg, so 38 and 20 too) gets NOTHING
+        c95 = res["corners"]["95deg"]
+        self.assertEqual(c95["found"], 1)
+        self.assertAlmostEqual(c95["deg"], 95, delta=8)
+        self.assertEqual(c95["dir"], 1)                     # right-hander
+        self.assertEqual(c95["labels"], "54321")
+        self.assertEqual(c95["distances"], [500, 400, 300, 200, 100])
+        self.assertEqual(c95["sides"], "-1-1-1-1-1")        # outside of a right turn = left
+        self.assertTrue(c95["beforeEntry"], "a board landed inside the corner")
+        self.assertTrue(c95["apexInside"])
+        self.assertAlmostEqual(c95["radius"], 55, delta=25)
+
+        c70 = res["corners"]["70deg"]
+        self.assertEqual(c70["labels"], "321")
+        self.assertEqual(c70["distances"], [300, 200, 100])
+
+        c50 = res["corners"]["50deg"]
+        self.assertEqual(c50["labels"], "21")
+        self.assertEqual(c50["distances"], [200, 100])
+
+        for gentle in ("38deg", "20deg"):
+            g = res["corners"][gentle]
+            self.assertEqual(g["labels"], "", f"{gentle} must have no brake boards")
+            self.assertEqual(g["found"], 0)
+
+        self.assertEqual(res["corners"]["straightish"]["found"], 0)
+        pair = res["corners"]["pair"]
+        self.assertEqual(pair["corners"], 2)
+        self.assertEqual(pair["insideLink"], 0, "a board landed inside a corner")
+        # corner 1's entry is 490 m in, so its 500 m board has nowhere to stand
+        # (correctly dropped); corner 2 sits 200 m later, so its 500/400/300/200
+        # boards would fall at/inside corner 1 - only the 100 m board survives
+        self.assertEqual(pair["labels"], "43211", pair)
 
         # 10b. look-around eases back so the view can never be left behind
         rc = res["recentre"]

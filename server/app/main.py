@@ -37,6 +37,7 @@ import base64
 import hashlib
 import hmac
 import html
+import asyncio
 import json
 import logging
 import math
@@ -2434,6 +2435,35 @@ def _trackprep():
     return importlib.import_module("trackprep")
 
 
+def _seed_tracks() -> int:
+    """Copy any shipped seed track into DATA_DIR/tracks (never overwriting one
+    baked locally). Seeds are tracks we have already measured off real imagery,
+    so the 3D view is worth looking at before anyone clicks 'prepare track'."""
+    seed_dir = pathlib.Path(__file__).parent / "seed-tracks"
+    if not seed_dir.is_dir():
+        return 0
+    TRACKS_DIR.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for src in sorted(seed_dir.glob("*.json")):
+        dst = TRACKS_DIR / src.name
+        if dst.exists():
+            continue
+        try:
+            shutil.copy2(src, dst)
+            tex = src.with_suffix(".jpg")
+            if tex.is_file():
+                shutil.copy2(tex, TRACKS_DIR / tex.name)
+            n += 1
+        except OSError as e:
+            log.warning("seed track %s failed: %s", src.name, e)
+    if n:
+        log.info("seeded %d prepared track(s) into %s", n, TRACKS_DIR)
+    return n
+
+
+_seed_tracks()
+
+
 def _track_asset_path(slug: str) -> pathlib.Path:
     return TRACKS_DIR / (safe_name(slug, default="") + ".json")
 
@@ -2518,6 +2548,7 @@ async def trackassets(request: Request) -> JSONResponse:
                         "width_m": a.get("width_osm_m") or a.get("width_imagery_m"),
                         "width_source": a.get("width_source"),
                         "stations": len(a.get("line") or []),
+                        "length_m": a.get("length_m"),
                         "has_texture": bool(a.get("texture")),
                         "source": (a.get("source") or {}).get("line")})
     return JSONResponse({"ok": True, "tracks": out})
@@ -2583,6 +2614,22 @@ async def session_track_prep(request: Request, user: str, filename: str) -> JSON
     try:
         points = tp.session_centreline(p)
         source, osm_id, osm_w = "session", None, None
+        # Borrow OSM's surveyed width when we can identify which way we drove.
+        # Matched by SHAPE (a session says "Thompson", OSM says "Road Course"),
+        # and it is only a width: our own line stays the geometry.
+        try:
+            lat0 = sum(x[0] for x in points) / len(points)
+            lon0 = sum(x[1] for x in points) / len(points)
+            ways = tp.osm_raceways((lat0 - 0.06, lon0 - 0.08, lat0 + 0.06, lon0 + 0.08))
+            way, dist = tp.osm_match_by_trace(points, ways, log=lambda m: _prep_log(slug, m))
+            if way is not None:
+                osm_id = way["id"]
+                osm_w = way.get("width_m")
+                source = "session+osm:%s" % way["id"]
+                _prep_log(slug, "borrowed OSM width %s m from way %s (%.1f m from our line)"
+                          % (osm_w, way["id"], dist or 0))
+        except Exception as e:
+            _prep_log(slug, "osm width lookup skipped: %s" % e)
     except Exception as e:
         _prep_log(slug, f"no usable session line ({e}); trying OpenStreetMap")
         try:
@@ -2817,9 +2864,11 @@ async def caps() -> dict:
     rounder markers, auto-recentring free look and the position mini-map,
     4 = PREPARED TRACKS: real width measured from satellite imagery (or the OSM
     width tag), real terrain from the DEM, and the imagery itself draped as the
-    ground — see app/trackprep.py and /trackassets."""
+    ground — see app/trackprep.py and /trackassets.
+    5 = corner brake boards (5 4 3 2 1), shipped seed tracks, OSM ways matched by
+    the driven line's SHAPE, and the sessions list with a best-lap column."""
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 4}
+            "track3d_v": 5}
 
 
 
@@ -4504,6 +4553,128 @@ def _apply_lap_meta(payload: dict, user: str, session_name: str) -> dict:
     return payload
 
 
+# ---------------------------------------------------------------------------
+# Best-lap summary cache for the sessions list.
+#
+# The list wants one number per session ("which one do I want to open?"), but
+# computing it means reading the whole NDJSON and running lap detection — a few
+# seconds on a 27 MB file. So: cache PER FILE, keyed on (mtime, size) on disk
+# AND in memory, and never block the list request on a cold file. The list
+# renders whatever is already cached and the page fills the rest in through
+# /laps/summary, which computes a few at a time off the event loop.
+# ---------------------------------------------------------------------------
+LAPCACHE_DIR = DATA_DIR / "lapcache"
+_LAP_SUMMARY_MEM: dict = {}          # (name, mtime, size) -> summary
+_LAP_SUMMARY_LOCK = threading.Lock()
+_LAP_SUMMARY_MAX_PER_CALL = 4        # uncached files one /laps/summary may do
+
+
+def _lap_summary_cached(user: str, p: pathlib.Path) -> Optional[dict]:
+    """Cached summary if (mtime, size) still match, else None."""
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    key = (str(p), int(st.st_mtime), int(st.st_size))
+    with _LAP_SUMMARY_LOCK:
+        hit = _LAP_SUMMARY_MEM.get(key)
+    if hit:
+        return hit
+    cp = LAPCACHE_DIR / safe_name(user) / (p.name + ".json")
+    try:
+        if cp.is_file():
+            d = json.loads(cp.read_text("utf-8"))
+            if d.get("mtime") == int(st.st_mtime) and d.get("size") == int(st.st_size):
+                with _LAP_SUMMARY_LOCK:
+                    _LAP_SUMMARY_MEM[key] = d
+                return d
+    except Exception:
+        pass
+    return None
+
+
+def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
+    """Compute (+ cache) the best lap of one session. Blocking: call it from a
+    worker thread, never from the event loop."""
+    if not force:
+        hit = _lap_summary_cached(user, p)
+        if hit:
+            return hit
+    st = p.stat()
+    summary = {"mtime": int(st.st_mtime), "size": int(st.st_size),
+               "computed": int(time.time()), "best_s": None, "best_lap": None,
+               "laps": 0, "excluded": 0, "source": None, "error": None}
+    try:
+        payload = _apply_lap_meta(_laps_payload(p), user, p.name)
+        best = payload.get("best_lap")
+        laps = payload.get("laps") or []
+        secs = None
+        for lp in laps:
+            if lp.get("lap") == best:
+                secs = float(lp.get("seconds") or 0) or None
+        summary.update(best_s=secs, best_lap=best, laps=len(laps),
+                       excluded=len(payload.get("excluded_laps") or []),
+                       source=payload.get("source"))
+    except Exception as e:
+        summary["error"] = str(e)[:200]
+    cp = LAPCACHE_DIR / safe_name(user) / (p.name + ".json")
+    try:
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cp.with_suffix(".tmp")
+        tmp.write_text(json.dumps(summary), "utf-8")
+        tmp.replace(cp)
+    except OSError:
+        pass
+    with _LAP_SUMMARY_LOCK:
+        _LAP_SUMMARY_MEM[(str(p), summary["mtime"], summary["size"])] = summary
+    return summary
+
+
+def _fmt_lap_s(secs) -> str:
+    if not secs or not math.isfinite(float(secs)):
+        return "—"
+    secs = float(secs)
+    m = int(secs // 60)
+    r = secs - m * 60
+    return (f"{m}:" + ("0" if r < 10 else "") + f"{r:.2f}") if m else f"{r:.2f}"
+
+
+@app.get("/laps/summary")
+async def laps_summary(request: Request, files: str = Query("")):
+    """Best lap for a list of "user/filename" pairs (the sessions list fills its
+    own cells with this). Cached summaries come back immediately; at most
+    _LAP_SUMMARY_MAX_PER_CALL cold files are computed, off the event loop, and
+    the page simply asks again for the rest."""
+    require_web_user(request)
+    out: dict = {}
+    pending: list = []
+    budget = _LAP_SUMMARY_MAX_PER_CALL
+    for item in [x for x in (files or "").split(",") if x.strip()][:400]:
+        if "/" not in item:
+            continue
+        u, _, fn = item.partition("/")
+        u = safe_name(u)
+        if oauth_enabled() and not can_view_dir(str((current_user(request) or {}).get("email", "")), u):
+            continue
+        try:
+            p = _resolve_session(u, fn)
+        except HTTPException:
+            continue
+        hit = _lap_summary_cached(u, p)
+        if hit is not None:
+            out[f"{u}/{fn}"] = hit
+        elif budget > 0:
+            budget -= 1
+            pending.append((f"{u}/{fn}", u, p))
+    if pending:
+        loop = asyncio.get_running_loop()
+        results = await asyncio.gather(
+            *[loop.run_in_executor(None, _lap_summary, u, p) for _, u, p in pending])
+        for (key, _, _), res in zip(pending, results):
+            out[key] = res
+    return JSONResponse({"ok": True, "laps": out})
+
+
 def _laps_payload(p: pathlib.Path) -> dict:
     """Core of /laps — shared by the authenticated route and /shared/<token>/laps."""
     samples: list = []
@@ -6072,6 +6243,12 @@ _INDEX_HEAD = f"""<!doctype html>
 <title>racecar-35 sessions</title>
 {_FONTS_LINK}
 <style>{_BASE_CSS}
+ /* The sessions list is a table of numbers: it wants the width. */
+ main {{ max-width: 2400px; }}
+ th.best {{ cursor: pointer; white-space: nowrap; }}
+ th.best span {{ color: var(--muted); font-weight: 400; }}
+ td.best {{ white-space: nowrap; font-variant-numeric: tabular-nums; }}
+ td.best.sortkey {{ color: var(--primary); }}
  table {{ width: 100%; border-collapse: separate; border-spacing: 0;
    background: var(--surface); border: 1px solid var(--line);
    border-radius: var(--r-md); overflow: hidden; }}
@@ -6124,6 +6301,71 @@ _INDEX_JS = """
   const vis = $('vis');
   const nomatch = $('nomatch');
   const result = $('uploadResult');
+
+  // ---- best lap per session -------------------------------------------
+  // The list must never wait on lap detection (it reads whole session files),
+  // so cells render "…", the server answers with whatever is already cached,
+  // and a few cold ones get computed per request until the column is full.
+  (function(){
+    const cells = Array.from(document.querySelectorAll('td.best'));
+    if (!cells.length) return;
+    const byKey = new Map(cells.map(c => [c.dataset.best, c]));
+    function fmt(s){ if (s == null || !isFinite(s) || s <= 0) return '\u2014';
+      s = Number(s); const m = Math.floor(s/60), r = s - m*60;
+      return m ? (m + ':' + (r < 10 ? '0' : '') + r.toFixed(2)) : r.toFixed(2); }
+    let rounds = 0;
+    async function fill(){
+      const want = cells.filter(c => !c.dataset.done).map(c => c.dataset.best);
+      if (!want.length || rounds > 12) return;
+      rounds++;
+      let any = false;
+      for (let i = 0; i < want.length; i += 25){
+        const batch = want.slice(i, i+25);
+        try {
+          const r = await fetch('/laps/summary?files=' + encodeURIComponent(batch.join(',')));
+          if (!r.ok) continue;
+          const j = await r.json();
+          for (const k of batch){
+            const c = byKey.get(k); if (!c || c.dataset.done) continue;
+            const d = (j.laps || {})[k];
+            if (!d) continue;                       // not computed yet: ask again
+            c.textContent = fmt(d.best_s);
+            c.title = (d.laps || 0) + ' laps' + (d.excluded ? ' (' + d.excluded + ' excluded)' : '')
+                      + (d.source ? ' \u00b7 ' + d.source : '')
+                      + (d.error ? ' \u00b7 ' + d.error : '');
+            c.dataset.done = '1';
+            c.dataset.secs = (d.best_s == null ? '' : d.best_s);
+            any = true;
+          }
+        } catch(e){}
+      }
+      if (!any){ cells.forEach(c => { if (!c.dataset.done){ c.dataset.done='1';
+        if (!c.textContent.trim() || c.textContent.trim() === '\u2026') c.textContent = '\u2014'; } }); }
+      else setTimeout(fill, 400);
+    }
+    fill();
+
+    // sort by best lap (click the header); un-timed sessions sort last
+    const head = document.querySelector('th.best');
+    if (head){
+      let dir = 1;
+      head.addEventListener('click', () => {
+        const tb = document.getElementById('rows');
+        const rows = Array.from(tb.querySelectorAll('tr'));
+        rows.sort((a, b) => {
+          const ka = a.querySelector('td.best'), kb = b.querySelector('td.best');
+          const va = parseFloat(ka?.dataset.secs || ''), vb = parseFloat(kb?.dataset.secs || '');
+          const na = isFinite(va), nb = isFinite(vb);
+          if (na !== nb) return na ? -1 : 1;
+          if (!na) return 0;
+          return dir * (va - vb);
+        });
+        dir = -dir;
+        rows.forEach(r => tb.appendChild(r));
+        head.querySelector('span').textContent = dir > 0 ? '\u25b4' : '\u25be';
+      });
+    }
+  })();
 
   function apiKey(){ return ($('apiKey')?.value || '').trim(); }
   function authHeaders(){ const k = apiKey(); return k ? {'X-API-Key': k} : {}; }
@@ -6317,12 +6559,18 @@ async def index(request: Request) -> Response:
                     f'data-user="{user_h}" data-file="{file_h}">delete</button>'
                     if dir_can_delete else ""
                 )
+                cached = _lap_summary_cached(user_dir.name, f)
+                best_str = (f'<span title="{cached.get("laps", 0)} laps">'
+                            f"{_fmt_lap_s(cached.get('best_s'))}</span>"
+                            if cached else "\u2026")
                 rows.append(
                     f'<tr><td><input type="checkbox" class="cmb" '
                     f'data-user="{user_h}" data-file="{file_h}"></td>'
                     f"<td>{user_h}</td>"
                     f"<td class=mono>{when_h}</td>"
                     f"<td>{track_h}</td>"
+                    f'<td class="num best" data-best="{user_h}/{file_h}">'
+                    f"{best_str}</td>"
                     f'<td class=mono><a href="/review/{user_h}/{file_h}">{file_h}</a></td>'
                     f"<td class=num>{size_str}</td>"
                     f'<td><div class="actions">'
@@ -6341,7 +6589,8 @@ async def index(request: Request) -> Response:
             'title="select 2+ sessions of the same user, oldest+newest are joined in time order">'
             'combine selected</button><span class="pill" id="vis"></span></div>'
             "<table><thead><tr><th></th><th>user</th><th>started (UTC)</th>"
-            "<th>track</th><th>filename</th><th>size</th><th>actions</th></tr></thead><tbody id=\"rows\">"
+            "<th>track</th><th>best lap <span>\u25b4\u25be</span></th>"
+            "<th>filename</th><th>size</th><th>actions</th></tr></thead><tbody id=\"rows\">"
             + "\n".join(rows)
             + "</tbody></table>"
             + '<div class="no-match" id="nomatch">no sessions match that filter.</div>'
@@ -7102,6 +7351,7 @@ _TRACK3D_HTML = (
   <div class="li"><span class="dot" style="background:#FF4D4D"></span>brake</div>
   <div class="li"><span class="dot" style="background:#FFB020"></span>apex</div>
   <div class="li"><span class="dot" style="background:#6CD07A"></span>throttle</div>
+  <div class="li" id="lg-corner" style="display:none"></div>
   <div class="li" id="lg-track" style="display:none"></div>
 </div>
 <canvas id="mini" width="200" height="200"></canvas>
@@ -7131,6 +7381,7 @@ _TRACK3D_HTML = (
   <label title="render scale: higher supersamples the view, which is what removes jagged/crawling edges. Pick 1x if the GPU struggles"><span class="meta">sharp</span>
     <select id="b-scale"><option value="1">1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
   <label><input type="checkbox" id="b-markers" checked>markers</label>
+  <label title="numbered brake boards (5 4 3 2 1 = hundreds of metres) before the corners that need them — tight corners get the full ladder, gentle bends get none"><input type="checkbox" id="b-brakes" checked>brake boards</label>
   <label><input type="checkbox" id="b-ghost">other laps</label>
   <label><input type="checkbox" id="b-loop" checked>loop</label>
   <label title="lean the camera into corners (computed from the path curvature)"><input type="checkbox" id="b-bank" checked>bank</label>
@@ -7720,6 +7971,98 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // Per-lap corner markers from the logged speed trace: apex = slowest point of
   // the lap, brake = where the deceleration into it began, throttle = where the
   // speed starts climbing again. Cheap and honest about what it is.
+  // ---- corners + brake boards -------------------------------------------
+  // Real circuits mark the braking zone of a corner with numbered boards (5 4 3
+  // 2 1 = hundreds of metres) and only bother where they are needed: a tight
+  // corner gets the lot, a gentle bend gets none. Severity is the TOTAL heading
+  // change through the corner, measured on the smoothed path, so it works on a
+  // driven line or on an OSM-traced one.
+  //
+  //   >= 80 deg  ->  5 4 3 2 1   (hairpin / near-90: the full ladder)
+  //   >= 62 deg  ->  3 2 1
+  //   >= 45 deg  ->  2 1
+  //   <  45 deg  ->  nothing (a kink needs no braking reference)
+  RC3D.MARKER_TIERS = [[80, [500, 400, 300, 200, 100]],
+                       [62, [300, 200, 100]],
+                       [45, [200, 100]]];
+
+  RC3D.corners = function (path, opt) {
+    opt = opt || {};
+    var d = path.dense, n = d.x.length, i;
+    var minDeg = opt.min_deg == null ? 45 : opt.min_deg;
+    var minRadius = opt.min_radius_m == null ? 260 : opt.min_radius_m;
+    var r = Math.max(2, Math.round((opt.smooth_m == null ? 12 : opt.smooth_m) / 2));
+    if (n < 8) return [];
+    // cumulative compass heading (0 = north, +ve = clockwise = turning right)
+    var a = new Float64Array(n), acc = 0, prev = Math.atan2(d.tan[0][0], -d.tan[0][1]);
+    a[0] = 0;
+    for (i = 1; i < n; i++) {
+      var cur = Math.atan2(d.tan[i][0], -d.tan[i][1]);
+      var diff = cur - prev;
+      while (diff > Math.PI) diff -= 2 * Math.PI;
+      while (diff < -Math.PI) diff += 2 * Math.PI;
+      acc += diff;
+      a[i] = acc;
+      prev = cur;
+    }
+    var sm = new Float64Array(n);
+    for (i = 0; i < n; i++) {
+      var p0 = Math.max(0, i - r), p1 = Math.min(n - 1, i + r);
+      sm[i] = (a[p1] - a[p0]) / Math.max(0.001, d.s[p1] - d.s[p0]);   // rad per metre
+    }
+    var kMax = 1 / minRadius, run = null, out = [];
+    var mergeM = opt.merge_m == null ? 22 : opt.merge_m;
+    for (i = 0; i < n; i++) {
+      var k = sm[i], on = Math.abs(k) > kMax;
+      if (on && !run) run = { i0: i, i1: i, sign: k > 0 ? 1 : -1, kbest: Math.abs(k), apex: i };
+      else if (on && run) {
+        run.i1 = i;
+        if (Math.abs(k) > run.kbest) { run.kbest = Math.abs(k); run.apex = i; run.sign = k > 0 ? 1 : -1; }
+      } else if (!on && run) {
+        var gap = 0, j = i;
+        while (j < n && Math.abs(sm[j]) <= kMax && d.s[j] - d.s[i] < mergeM) { j++; }
+        if (j < n - 1 && Math.abs(sm[j]) > kMax) continue;   // same corner, keep going
+        out.push(run);
+        run = null;
+      }
+    }
+    if (run) out.push(run);
+    var corners = [];
+    for (i = 0; i < out.length; i++) {
+      var c = out[i];
+      var deg = (a[c.i1] - a[c.i0]) * 180 / Math.PI;
+      if (Math.abs(deg) < minDeg) continue;
+      corners.push({ s0: d.s[c.i0], s1: d.s[c.i1], apex_s: d.s[c.apex],
+                     i0: c.i0, i1: c.i1, deg: deg, dir: deg > 0 ? 1 : -1,
+                     radius_m: Math.abs(deg) < 0.001 ? 1e6 : (d.s[c.i1] - d.s[c.i0]) /
+                               (Math.abs(deg) * Math.PI / 180) });
+    }
+    return corners;
+  };
+
+  RC3D.brakeMarkers = function (path, corners, opt) {
+    opt = opt || {};
+    var minGapM = opt.min_gap_m == null ? 30 : opt.min_gap_m;
+    var out = [], prevExit = -1e9, c, k, p;
+    for (c = 0; c < corners.length; c++) {
+      var C = corners[c], deg = Math.abs(C.deg), dists = null;
+      for (p = 0; p < RC3D.MARKER_TIERS.length; p++) {
+        if (deg >= RC3D.MARKER_TIERS[p][0]) { dists = RC3D.MARKER_TIERS[p][1]; break; }
+      }
+      if (dists) {
+        for (k = 0; k < dists.length; k++) {
+          var s = C.s0 - dists[k];
+          if (s < 5) continue;                       // before the start of this lap
+          if (s < prevExit + minGapM) continue;      // would sit inside the previous corner
+          out.push({ s: s, m: dists[k], label: String(Math.round(dists[k] / 100)),
+                     side: -C.dir, deg: deg });
+        }
+      }
+      prevExit = C.s1;
+    }
+    return out;
+  };
+
   RC3D.markers = function (path, laps, lapNo) {
     var out = [], t = path.t, i, lo = 0, hi = t.length - 1;
     if (laps && laps.length && lapNo) {
@@ -7789,12 +8132,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   var S = [], PATH = null, BASE = null, LAPS = [], LAPNO = 0;
   var TA = 0, TB = 0, NOW = 0, SMIN = 0, SMAX = 0, cur = null;
   var meshes = { road: null, kerbs: null, markers: null, ghost: null, ideal: null,
-                 gantry: null, ground: null };
+                 gantry: null, ground: null, signs: null };
   var ASSET = null, TEX = null, assetSample = null;   // prepared-track data
   var look = { yaw: 0, pitch: 0 };
   var realWidth = null;                                   // metres, from the asset
+  var CORNERS = [];                                       // detected corners
   var opts = { smooth: 5, eye: 1.15, road: 12, speedColour: true, markers: true,
-               ghost: false, ground: true };
+               ghost: false, ground: true, brakes: true };
 
   function tryRenderer() {
     try {
@@ -7920,6 +8264,69 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       map: TEX, side: THREE.DoubleSide
     }));
     scene.add(meshes.ground);
+  }
+
+  // Brake boards: the digit is drawn on a canvas (no font file, no glyph
+  // server), the board stands on a post at the edge of the road on the OUTSIDE
+  // of the corner, facing back at the oncoming car exactly like a real one.
+  function digitTexture(text, bg, fg) {
+    var c = document.createElement("canvas");
+    c.width = 160; c.height = 160;
+    var g = null;
+    try { g = c.getContext("2d"); } catch (e) { g = null; }
+    if (!g) return null;
+    g.fillStyle = bg;
+    g.fillRect(0, 0, 160, 160);
+    g.strokeStyle = fg;
+    g.lineWidth = 8;
+    g.strokeRect(4, 4, 152, 152);
+    g.fillStyle = fg;
+    g.font = "bold 108px Inter, Arial, sans-serif";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText(text, 80, 88);
+    var t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+
+  var signTex = null;
+  function signTextures() {
+    if (signTex) return signTex;
+    signTex = {};
+    ["1", "2", "3", "4", "5"].forEach(function (n) {
+      signTex[n] = digitTexture(n, n === "1" ? "#C0392B" : "#F0A32A",
+                                n === "1" ? "#FFFFFF" : "#101010");
+    });
+    return signTex;
+  }
+
+  function makeBrakeSigns(list, path, width) {
+    if (!list || !list.length) return null;
+    var tex = signTextures();
+    var grp = new THREE.Group();
+    var postMat = new THREE.MeshLambertMaterial({ color: 0x2A2F3A });
+    var boardGeo = new THREE.PlaneGeometry(1.5, 1.5);
+    var postGeo = new THREE.BoxGeometry(0.12, 1.5, 0.12);
+    for (var i = 0; i < list.length; i++) {
+      var mk = list[i];
+      var p = RC3D.pointAtS(path, mk.s);
+      var tx = p.tan[0], tz = p.tan[1];
+      // driver's left is (tz,-tx); mk.side = -1 puts the board on the left
+      var ox = (mk.side < 0) ? tz : -tz, oz = (mk.side < 0) ? -tx : tx;
+      var off = width / 2 + 1.9;
+      var x = p.x + ox * off, z = p.z + oz * off, y = p.y;
+      var post = new THREE.Mesh(postGeo, postMat);
+      post.position.set(x, y + 0.75, z);
+      grp.add(post);
+      var mat = new THREE.MeshBasicMaterial({ map: tex[mk.label] || null,
+                                              side: THREE.DoubleSide });
+      var board = new THREE.Mesh(boardGeo, mat);
+      board.position.set(x, y + 2.25, z);
+      board.rotation.y = Math.atan2(-tx, -tz);   // face the oncoming car
+      grp.add(board);
+    }
+    return grp;
   }
 
   function makeKerbs(path, width) {
@@ -8051,7 +8458,15 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       }
       meshes.road = makeRoad(base, opts.road, 0.03, opts.speedColour, null, 1, extra);
       scene.add(meshes.road);
-      meshes.kerbs = makeKerbs(base, extra && realWidth ? realWidth : opts.road);
+      var useW = extra && realWidth ? realWidth : opts.road;
+      meshes.kerbs = makeKerbs(base, useW);
+      if (opts.brakes) {
+        CORNERS = RC3D.corners(base, {});
+        meshes.signs = makeBrakeSigns(RC3D.brakeMarkers(base, CORNERS, {}), base, useW);
+        if (meshes.signs) scene.add(meshes.signs);
+      } else {
+        CORNERS = [];
+      }
       if (meshes.kerbs) scene.add(meshes.kerbs);
       if (opts.markers) {
         meshes.markers = makeMarkers(RC3D.markers(PATH, LAPS, LAPNO));
@@ -8118,6 +8533,16 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     el("h-alt").textContent = (cur && typeof cur.alt_m === "number")
       ? Math.round(cur.alt_m) + " m" : "—";
     el("h-bar").style.width = Math.min(100, (st.mph / 160) * 100) + "%";
+    if (el("lg-corner")) {
+      if (CORNERS.length) {
+        var tight = CORNERS.filter(function (c) { return Math.abs(c.deg) >= 45; }).length;
+        el("lg-corner").style.display = "flex";
+        el("lg-corner").textContent = CORNERS.length + " corners" +
+          (tight ? " · " + tight + " with brake boards" : " · none need boards");
+      } else {
+        el("lg-corner").style.display = "none";
+      }
+    }
     el("b-clock").textContent = fmtClock(NOW - TA) + " / " + fmtClock(TB - TA);
     el("b-scrub").value = String(TB > TA ? Math.round(1000 * (NOW - TA) / (TB - TA)) : 0);
     drawMini(st.s);
@@ -8290,6 +8715,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     });
     el("b-loop").addEventListener("change", function () { loopLap = el("b-loop").checked; });
     el("b-bank").addEventListener("change", function () { bank = el("b-bank").checked; });
+    if (el("b-brakes")) el("b-brakes").addEventListener("change", function () {
+      opts.brakes = el("b-brakes").checked; rebuild();
+    });
     if (el("b-ground")) el("b-ground").addEventListener("change", function () {
       opts.ground = el("b-ground").checked; rebuildGround();
     });
@@ -8372,8 +8800,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var attr = (asset.texture && asset.texture.attrib) || "";
     var src = (asset.source && asset.source.line) || "?";
     el("lg-track").style.display = "flex";
-    el("lg-track").textContent = asset.track + " — " +
-      (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide (" +
+    el("lg-track").textContent = asset.track +
+      (asset.length_m ? " (" + (asset.length_m / 1000).toFixed(2) + " km)" : "") +
+      " — " + (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide (" +
       (asset.width_source || "?") + "), line from " + src;
     var note = el("notice");
     if (note && asset.width_agreement === false) {

@@ -38,7 +38,42 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
 - **New network-module firmware/transport/ownership and service/update support are
   NOT implemented.** Do not add an OTA artifact or claim fast uploads from a render.
   Current v0.1.149 code still uses screen WiFi; its existing OTA path stays intact.
-- **Active revision for new builds is now D** (`hardware/teensy-integrated-revd/`):
+- **Active revision for new builds is Rev F** (`hardware/teensy-integrated-revf/`, forked
+  from the unbuilt Rev E at `hardware/teensy-integrated-reve/`): **4 copper layers**
+  (F.Cu signals, **In1.Cu continuous GND plane with no routing**, In2.Cu signals, B.Cu
+  signals), **1 oz outer copper**, **150 x 155 mm**, **193 footprints, 104 nets, 538
+  connected pads, 131 vias, 749 pin/geometry/calculation assertions; ERC/DRC/unconnected
+  all zero**. All EIGHT field screw terminals face ONE LEFT edge (**J3 TACH, J4 OIL,
+  J5 NTC, J6 AEM, J11 THROTTLE, J12 BRAKE, J1 POWER, J2 SCREEN**); the screen branch fuse
+  is **3 A** (`0451003.MRL`). Rev E added our own **TPS54560B 5 V/5 A buck (U2 — there is
+  NO Pololu module and NO socket)** with explicit P-channel reverse protection (Q3) and the
+  on-board **car input-voltage monitor** (180 k/20 k divider on A16/pin 40), plus
+  the Pi 5 video UART (J13) and the throttle/brake inputs (J11/J12).
+  **Rev F fixes CAN: the external SN65HVD230 module and its J7 header are DELETED** — on
+  the bench (2026-10-03) that module received but never DROVE the bus (TXD held at 0 V,
+  CANH-CANL stayed 0 V), so the logger never ACKed and the ECU retransmitted one frame
+  forever. It is replaced by a soldered **TI TCAN1042HGV-Q1 (`TCAN1042HGVDRQ1`), U21,
+  SOIC-8, AEC-Q100, +/-70 V bus fault, VIO = +3V3_MCU on pin 5**, with **STB (pin 8)
+  hard-tied to GND** — STB high is standby/receive-only with no ACK, the exact failure
+  being designed out, so there is no resistor/pull-up/jumper on it. **J14 (Phoenix
+  1729021) = 1 CANH / 2 CANL / 3 GND**, placed MID-BOARD where J7 was (the left edge
+  cannot take a 9th screw terminal with usable clearances, and U21 then sits within ~20 mm
+  of it). Switchable **split 120.8 ohm termination** = 2x 60.4 ohm 1% (R58/R59) + 4.7 nF
+  (C52), enabled by the **JP2 shunt ONLY at a bus end**; **NUP2105L** bus TVS (D25);
+  **TP6/TP7** CAN_TX/CAN_RX probes. Accepted U21 alternates, in order: `TCAN1042VDRQ1`,
+  then NXP `TJA1051T/3/1J` (pin 8 `S` also to GND). **Never an SN65HVD230, never a
+  non-VIO TJA1051T/TJA1050** (5 V RXD). **No firmware change** — 500 kbit/s, normal
+  ACKing mode; the TCAN1042's TXD dominant time-out will cut the `CANHOLD` diagnostic
+  short, which is expected. CAN needs the 5 V rail, so it is dead on Teensy-USB-only
+  power. Order day: `pcbway/Racecar-RevF-PCBWAY-GERBERS.zip` +
+  `Racecar-RevF-BOM-pcbway-assembly.csv` + `Racecar-RevF-CPL.csv` (regenerate all three
+  with `pcbway/make_package.py`); order settings in `pcbway/REVF-CHANGES-AND-ORDER.md`.
+  Re-export with `fabrication/export.py --engineering-prototype`. **No automotive
+  transient qualification, and no built, measured or independently reviewed board.**
+- Revision **E** (superseded by Rev F, retained at `hardware/teensy-integrated-reve/`):
+  first revision with the 5 V rail as our own **TPS54560BDDAR** buck and the car
+  input-voltage monitor; it still carried the external CAN-module header that Rev F deletes.
+- Revision **D** (superseded, retained at `hardware/teensy-integrated-revd/`):
   **4 copper layers** (F.Cu signals, **In1.Cu continuous GND plane with no routing**,
   In2.Cu signals, B.Cu signals), **1 oz outer copper**, **150 x 155 mm**, 158
   footprints, 88 nets, 456 connected pads, 110 vias, 531 assertions; ERC/DRC/
@@ -426,6 +461,103 @@ JS copy in the same commit** (parse rows → JSON → `const TRACKS = [...]` in 
 Workflow: user picks the line → pastes the generated row into chat → coords get baked into
 firmware (keep the existing facility centre/radius; only the sf endpoints change).
 
+### Map display: satellite / black, and the first-person 3D drive view (v-server)
+**Satellite ⇄ black.** A **Satellite view** checkbox sits DIRECTLY UNDER the map on the
+review page's Track Map card and on the lineview popout. Off = the tile layer is removed and
+the surface goes pure black (`#map.nosat`), which is what you want when the imagery fights
+the racing lines. Tiles are a purely ADDITIVE layer, so toggling never disturbs the trace
+polylines, lap markers, lasso polygon or the `.dotlegend`. The choice persists per browser
+(`localStorage` `rc5.sat`, shared by both pages); the strip hides itself when the server ships
+`RACECAR_MAP_TILES=none` (nothing to switch).
+
+**`/track3d/<user>/<file>` — "3D drive"** (review page header button, which passes the
+circled lasso polygon as `?pts=` when there is one). MapLibre GL (unpkg CDN) with the SAME
+keyless Esri imagery **draped over real terrain** from the keyless AWS `terrarium` DEM
+(`RACECAR_MAP_DEM`, `none` = flat; native data to ~z15), the driven line painted on the
+ground, per-lap brake/apex/throttle markers, an S/F line, and a canvas-drawn car arrow that
+rotates with the trace-derived bearing (GPS `heading_deg` is garbage at rest, so the direction
+of travel comes from neighbouring fixes). Chase camera = `jumpTo` at the point ~22 m AHEAD on
+the trace, pitch 74°, bearing = travel direction, on the review page's playback clock
+(play/pause, ¼×–8×, scrub, zoom slider); dragging the map releases the chase, the **follow**
+checkbox re-grabs it. HUD shows mph/RPM/lap/lap time/**altitude**. Satellite and terrain are
+layer toggles on ONE map (no refetch), remembered as `rc3.sat`/`rc3.ter`.
+**Phase-2 hook already wired:** with a `?pts=` polygon it POSTs the same
+`/sessions/<u>/<f>/lines` the lineview popout uses and draws the IDEAL line (green) + your
+session best (blue) over the ground — "what I drove vs what the data says is fastest", from
+the seat. Ground is raster imagery on a mesh, NOT photogrammetry (true 3D buildings need a
+keyed source like Google Photorealistic 3D Tiles). Same `gate_view_dir` + OAuth gate as
+`/review`. `_TRACK3D_HTML` renders client-side from `{data,laps,lines}` only.
+⚠️ The page's `render()` body is try/caught and the rAF is scheduled FIRST — a bad sample or a
+mid-toggle missing layer must never stop playback (a throw inside the old rAF chain killed the
+loop permanently).
+
+### Prepared tracks: real width, real terrain, satellite ground (v-server)
+`/track3d` drew a synthetic constant-width ribbon from our own GPS. Now a track can be
+**pre-rendered once** (`server/app/trackprep.py`) and every session on it renders properly:
+- **width measured from satellite imagery** (perpendicular colour profiles along the centreline find the
+  paved corridor); an OSM `width` tag, when the circuit has one, WINS and the imagery estimate is kept as a
+  cross-check (`width_source` / `width_imagery_m` / `width_osm_m` / `width_agreement` in the asset).
+  Real numbers: Summit Point Main 3001 m / 9.0 m (imagery, 72 % conf); Jefferson 1638 m / 10.5 m;
+  Shenandoah 3162 m / OSM tag 10 m (imagery says 12.5 m — it counts run-off).
+- **terrain** from the keyless AWS `terrarium` DEM: a 40×40 grid + per-station profile. The road and the
+  ground mesh read ONE bilinear field (`RC3D.demAt`) — per-station samples vs the coarse mesh disagreed by
+  2.7 m and the road visibly floated.
+- **the imagery itself**, baked to one JPEG per track, draped on the ground mesh and (via UVs through the
+  asset's bounds) on the road, so you see the real asphalt, kerbs, grass and run-off.
+- centreline = OUR driven line when a session has one, else the OSM `highway=raceway` way.
+⚠️ **Match OSM ways by SHAPE, never by name** (`osm_match_by_trace`): at Thompson, OSM calls the circuit
+ways "Road Course" while the session says "Thompson", and the bbox also holds Pit Lane / Short Course /
+Drifting Course fragments — name matching picked a 560 m fragment, the shape match picks the 1612 m circuit
+(mean 1.0 m from the driven line). `osm_best` keeps a 400 m length floor for the no-trace case.
+Endpoints: `/trackassets` (list), `/trackassets/<slug>/{asset,texture.jpg}`,
+`/sessions/<u>/<f>/track-asset` (404 + `{missing,slug}` when not prepared), `/track-prep` (background job)
++ `/track-prep/status`. Pillow + numpy are in `app/requirements.txt` (wheels, no compile).
+**Seed tracks ship in the image** (`server/app/seed-tracks/`, copied into `DATA_DIR/tracks` on startup when
+absent) so the payoff is visible without clicking anything: Summit Point, Jefferson, Shenandoah.
+CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
+(or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
+
+### Corner brake boards in the 3D view (v-server)
+Real circuits mark a braking zone with numbered boards (5 4 3 2 1 = hundreds of metres) and only bother where
+they are needed. `RC3D.corners()` measures the TOTAL heading change through each corner on the smoothed path
+(works on a driven line or an OSM trace):
+**≥80° → 5 4 3 2 1 · ≥62° → 3 2 1 · ≥45° → 2 1 · <45° → nothing** (a kink needs no brake reference).
+Boards stand ~1.9 m outside the road edge on the OUTSIDE of the corner, on a post, facing back at the
+oncoming car (canvas-drawn digits — no font, no glyph server); the "1" board is red/white, the rest amber.
+A board is dropped if it would fall inside a corner or the previous corner's braking zone, or before the
+start of the lap. Toggle: **brake boards** in the 3D bar; the legend reports `N corners · M with brake boards`.
+
+### Sessions list: wider, with best lap per session
+`main { max-width: 2400px }` on the index page and a **best lap** column (click the header to sort;
+un-timed sessions sort last). Lap detection reads whole session files, so it is **never** computed inline
+for the list: `_lap_summary()` caches per file in `DATA_DIR/lapcache/<user>/<name>.json` keyed on
+(mtime, size) — and in memory — the row renders whatever is cached (else "…") and the page fills the rest
+through `GET /laps/summary?files=u/f,…`, which computes at most 4 cold files per call, off the event loop.
+Values honour stored lap exclusions (`_apply_lap_meta`), so the list and the review page agree.
+
+### Every channel logged, and every channel displayed (v0.1.171 firmware + server)
+The Teensy sample writer now logs **everything the system holds**, not just the dash's display
+set. New optional keys (each emitted ONLY while a live source backs it, so old parsers see a
+byte-identical line and an absent key IS the diagnostic):
+- **`alt_m`** — GPS altitude above MSL (`getAltitudeMSL()`, metres), **null** until `fix>=2`.
+  The review page's Altitude tile always read `s.alt_m`, but the firmware never logged it, so
+  every session showed `—`; it is also what `/track3d` needs for real elevation.
+- **`map_kpa`, `iat_f`, `batt_v`** — MS3 CAN (IAT/battery fall back to the BLE dongle's
+  values, fresh ≤10 s).
+- **`afr_can`** — MS3 CAN AFR, deliberately SEPARATE from the AEM gauge's `afr`/`lambda` /
+  `afr_v`/`afr_status` (provenance is never ambiguous). This also closes a real hole: in
+  MegaSquirt mode with the AEM input OFF (the default) the dash displayed a CAN AFR that was
+  **never written to the log**.
+- **`oil_can_psi`** — RC35 bench CAN oil (0x701), separate from the direct-transducer
+  `oil_psi`. Bench oil expires on its own clock, so it disappears when the bench source stops.
+Together with the existing `speed_mph/rpm/heading_deg/ax..gz/tps_pct/spark_deg/oil_psi/
+coolant_f/afr/lambda/lap`, the sample carries every channel the car can produce. Server side:
+`_OPTIONAL_NUMERIC_FIELDS` validates the new keys (numeric **or null**), and the review page
+has an **All channels logged** table (bottom of the tile column, under the G-Meter) built from
+whatever the session actually contains: `n / min / avg / max` per numeric key with human names
+and units (`lambda` keeps 4 decimals — rounding it to 1 made every row read 1.0). A channel
+that is MISSING from the table had no live source — that is the intended signal.
+
 ### AI coach checklist (auto on upload) — server + dash (v0.1.137)
 Every successful session upload kicks a **background** AI review (daemon thread, so the dash's
 upload response is never delayed) that distils the session into **1-3 short actionable items**.
@@ -442,7 +574,10 @@ upload response is never delayed) that distils the session into **1-3 short acti
   `POST /coach/{u}/reopen`, `POST /coach/{u}/prefs {auto}`. Manual/back-fill:
   `POST /sessions/{u}/{f}/coach` (synchronous, **idempotent** — reports `already` instead of
   duplicating; `?force=1` overrides). Web page `GET /coach` + a **checklist** button on the review
-  page. `/caps` advertises `{"coach":true}`.
+  page. `/caps` advertises `{"coach":true}` — and `{"track3d":true}` since the 3D drive
+  view shipped, which is the one-curl way to prove the running image is new enough
+  (`curl <host>/caps`; the host watcher rebuilds in place, so a browser may still be
+  showing a cached page while the server is already updated).
 - **Dash**: NVS `coach` (bool, default ON, Settings → "Show coach checklist"); `PAGE_COACH` (17)
   lists open items, tap a row to tick (POSTs `by:display`, row vanishes); **COACH button under
   UPLOAD**, hidden while recording / when the list is empty / when the setting is off. All HTTP on
@@ -1588,6 +1723,22 @@ encoder/decoder (golden bytes + a pty cadence test) live in `tools/can_sim.py` +
   dash's per-item SOURCE can choose between the transducer and the CAN sender.
 
 MS3Pro CAN (MegaSquirt RPM / coolant / AFR)
+
+**Rev F: the transceiver is soldered on the board — there is no plug-in CAN module.**
+`U21` = TI `TCAN1042HGV-Q1` (`TCAN1042HGVDRQ1`), VIO = 3.3 V, ±70 V bus fault, **STB pin 8
+tied to GND** (standby = receive-only, no ACK); `J14` = **1 CANH / 2 CANL / 3 GND**; split
+**120.8 Ω** termination (R58/R59 = 2 × 60.4 Ω 1 %, C52 = 4.7 nF) enabled by the **JP2
+shunt ONLY at a bus end**; `D25` = `NUP2105L` bus TVS; `TP6`/`TP7` probe `CAN_TX`/`CAN_RX`.
+`TXD`/`RXD` land on Teensy **pin 22 / pin 23** (U1 pads 29 / 28). Wire only the three `J14`
+conductors to the MS3Pro CAN-H / CAN-L / signal ground. **No firmware change — 500 kbit/s,
+normal ACKing mode.** The TCAN1042's TXD dominant time-out (~1 ms) cuts the firmware's
+`CANHOLD` diagnostic short; that is expected.
+
+The paragraphs below describe the OLD bench arrangement (an external SN65HVD230 on a
+breakout, plugged into `J7` on Rev E and earlier). Its bit-rate and byte-offset contract is
+unchanged, but **Rev F deletes that module and header** — that module class received but
+never drove the bus, which is the failure Rev F designs out. Keep the description for bench
+testing with a bare transceiver:
 
 The Teensy reads the MS3Pro ECU over **CAN1 (TX 22, RX 23)** via an **SN65HVD230 ("VP230")**
 3.3 V transceiver — **NOT** an MCP2551 (that's 5 V and would damage the Teensy). The blue
