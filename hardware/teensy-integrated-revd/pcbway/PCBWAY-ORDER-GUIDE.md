@@ -23,15 +23,20 @@ Revision D · four-layer · 150.05 × 155.05 mm · 158 placements · 89 nets
 > bare `SS14` → onsemi `SS14`, and three Murata caps with no stock → Yageo/Samsung
 > X7R equivalents). The file to send to PCBWay is
 > **`Racecar-RevD-BOM-pcbway-assembly-REV1.csv`** — it is the corrected BOM with
-> **U1/U2 fitting instructions in its Comment column**: U2 (Pololu 4091) is for
-> PCBWay to source and fit (Digi-Key `2183-4091-ND`), U1 (Teensy 4.1) is customer
-> supplied with pins — PCBWay fits the two 1×24 sockets and we plug the Teensy in.
+> **U1/U2 fitting instructions in its Comment column**: for **U2** PCBWay fits only
+> a **2×6 0.1 in THT female socket** (`SSW-106-01-G-D`) — **we supply the Pololu 4091
+> module and plug it in** (they could not source it in two attempts); for **U1** the
+> Teensy 4.1 is customer supplied **with pins** — PCBWay fits the two 1×24 sockets
+> and we plug the Teensy in.
 > The canonical copy of the same BOM is
 > `Racecar-RevD-BOM-pcbway-assembly.csv`. Reply document:
 > **`PCBWAY-REPLY-2026-09-29.pdf`**. Background: `PARTS-AVAILABILITY-REVIEW.md`.
 
 The full engineering package (schematic PDF, editable CAD, reports, manifest) is
-the parent folder's `Racecar-RevD-GERBERS-ENGINEERING-PROTOTYPE.zip`.
+the parent folder's `Racecar-RevD-GERBERS-ENGINEERING-PROTOTYPE.zip`. Its documents
+(`FABRICATION.md`, `ASSEMBLY.md`, `DESIGN_NOTES.md`, `BRINGUP.md`) were regenerated
+for **Rev D** — but the fab file you upload is the gerber-only zip above, and every
+order setting still comes from **this** guide.
 
 ---
 
@@ -136,6 +141,21 @@ designators. Sourcing notes:
    labelled auxiliary **VBAT and GND pads**. The outer socket rows do not carry
    VBAT — do not hunt for it there.
 5. **Fit JP1's shunt only after bring-up.**
+6. **U1 — sockets, or nothing.** If PCBWay cannot source the two 1×24 sockets, tell
+   them to leave U1 **completely unpopulated**: do not substitute, and never solder a
+   Teensy down (the J9 RTC lead lands on the Teensy's *underside* VBAT/GND pads, so
+   the module must stay removable). Hand-fitting 2× 1×24 sockets is 48 pins on a
+   2.54 mm grid — the easiest joint on the board, and the planned fallback.
+7. **U2 — a socket, and the module only fits one way.** PCBWay fits a 2×6 0.1 in
+   female socket and the Pololu 4091 plugs into it. Insert it **TOP (labelled) face
+   up, with the VOUT column over U2 pad 1** — the only *rectangular* pad in that
+   footprint, at the north end of the block. The module's own key: the four
+   **square** plated holes are GND, and VOUT is **one column** in from them while
+   EN/PG is **three columns** from them. Mirrored, VIN meets the 5 V rail and VOUT
+   meets 10–20 V — that destroys the module. Confirm with the continuity check in
+   `../design/BRINGUP.md` step 3 before applying power. The carrier has **no U2
+   silkscreen labels**; adding them would be a silkscreen-only change (see
+   `PARTS-AVAILABILITY-REVIEW.md` §4b) and needs a re-export first.
 
 ---
 
@@ -191,6 +211,7 @@ Nothing further needs deciding.
 - [ ] NPTH drill file present so the 3.2 mm mounting holes are not plated
 - [ ] Antenna notch visible in the Edge.Cuts preview
 - [ ] Panelisation **off**
+- [ ] U1 instruction stated: **sockets only, else leave U1 unpopulated**
 - [ ] DFM report read — not just accepted
 
 ---

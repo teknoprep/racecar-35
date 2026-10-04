@@ -4,7 +4,12 @@ Wiring reference for the existing two-MCU system. **WiFi-only on the CrowPanel
 since v0.1.148: no Ethernet module or Internet-route setting.**
 The current **solder-it-yourself** build is a protoboard, not Rev C:
 [hardware/breadboard/](hardware/breadboard/) (terminals on the LEFT edge,
-Teensy on the right, Pi 5 video box on Serial1). Rev C Gerbers stay parked. v0.1.149 firmware supports ONLY an external AEM 30-0300 gauge's
+Teensy on the right, Pi 5 video box on Serial1). Rev C Gerbers stay parked.
+**For the wire-by-wire build sheet — power, hand-built PC817 tach opto, GPS, IMU,
+CAN, the passive netlist and the pre-power meter checks — use
+[hardware/breadboard/PINOUT.md](hardware/breadboard/PINOUT.md).** Sections 5/5b/5c
+and 9 below still describe the circuits, but the pinout sheet is the authoritative
+build order. v0.1.149 firmware supports ONLY an external AEM 30-0300 gauge's
 WHITE/BROWN analogue output through a reviewed scaled/protected input. No direct
 oxygen sensor, onboard heater/controller or source-selection jumper.
 See [CLAUDE.md](CLAUDE.md) and
@@ -46,7 +51,7 @@ Cabin (driver)                         Trunk (data + connectivity)
 | Pin 9          | **Tach input via FreqMeasureMulti** | Conditioned opto output only; plain FreqMeasure uses pin 22 and is WRONG here |
 | Pins 10–12     | Proposed NET CS / MOSI / MISO      | Reserved for local WiFi SPI; not yet driven |
 | Pin 13         | Current heartbeat / proposed SCK  | MUST disable heartbeat GPIO writes before SPI |
-| Pin 14         | Serial3 TX3 — to CrowPanel `RX`   | Dash telemetry out |
+| Pin 14         | Serial3 TX3 — to CrowPanel `RX`   | Dash telemetry out (921600 baud) |
 | Pin 15         | Serial3 RX3 — from CrowPanel `TX` | Dash commands in (REC, TRACK, TZ, SDFORMAT) |
 | Pin 16 / A2    | **Oil pressure ADC**              | 0.5–4.5 V transducer via 10 kΩ / 20 kΩ divider |
 | Pin 17 / A3    | **Coolant temp ADC**              | NTC thermistor with 150 Ω pullup to 3.3 V |
@@ -82,13 +87,16 @@ Teensy.
 
 Three wires total. **The TX/RX pair is crossed.**
 
-| Teensy 4.1     | Direction | CrowPanel ESP32-S3 |
+On the prototype carrier / protoboard this lands on the screen's **J10** (XH2.54)
+header, not bare GPIO pins:
+
+| Teensy 4.1     | Direction | CrowPanel J10      |
 |---------------:|:---------:|:-------------------|
-| Pin 14 (TX3)   | →         | GPIO 44 (RX0)      |
-| Pin 15 (RX3)   | ←         | GPIO 43 (TX0)      |
+| Pin 14 (TX3)   | →         | RXD0_H             |
+| Pin 15 (RX3)   | ←         | TXD0_H             |
 | GND            | —         | GND                |
 
-Baud: 115200 8N1, line-oriented with `\n` terminators. Wire format is
+Baud: **921600** 8N1 (not 115200 — both sides must agree), line-oriented with `\n` terminators. Wire format is
 documented in [CLAUDE.md](CLAUDE.md#wire-protocol-teensy--crowpanel-uart).
 
 ---
@@ -104,9 +112,11 @@ documented in [CLAUDE.md](CLAUDE.md#wire-protocol-teensy--crowpanel-uart).
 | `TX`              | **Pin 7** (RX2) | Module sends UBX/NMEA *to* Teensy |
 | `RX`              | **Pin 8** (TX2) | Optional — only used if you want to send config to the module |
 
-Bauds tried at boot: **38400** (SparkFun RTK default), then **9600** (bare
-module factory default). If neither handshakes the lib goes "raw bytes" mode
-and just observes incoming data on Serial2.
+Bauds tried at boot: **230400** (persisted by `saveConfiguration()` on a module we
+have already configured, and the target rate), **38400** (SparkFun RTK default),
+then **9600** (bare module factory default). The firmware then raises the link to
+230400 so 25 Hz UBX-NAV-PVT has headroom (38400 was ~65 % utilised → chronic STALE).
+If none handshakes the lib goes "raw bytes" mode and just observes Serial2.
 
 Antenna: external active GPS antenna recommended for moving vehicle. SMA
 connector on most modules.

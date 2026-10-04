@@ -114,15 +114,20 @@ was re-exported so its `BOM.csv` matches. Details and sourcing:
 | C11 | `GRM21BR71H225KA01L` | `CC0805KKX7R9BB225` (Yageo) | no stock; X7R (PCBWay's proposed X5R part is only rated to 85 °C) |
 | C18 | `GRM21BR71H102KA01L` | `CC0805KRX7R9BB102` (Yageo) | no stock; same 1 nF 50 V X7R 0805 |
 
-**U2 (Pololu D36V50F5) is sourced and fitted by PCBWay** — the reply letter gives
-them the Digi-Key part number (`2183-4091-ND`, 264 in stock) and the Pololu item
-(4091) and asks them to buy it like the other non-LCSC parts they already sourced
-for this quote (Amphenol 901-143, Keystone 1058); if they cannot, we consign it.
+**U2 (Pololu D36V50F5) — PCBWay fits only a 2×6 0.1 in female socket; we supply the
+module.** PCBWay could not source the 4091 in two attempts (not an LCSC part, Pololu
+direct is rationed), so the last sourcing blocker is gone: they fit a commodity
+socket (`SSW-106-01-G-D`) into the same 12 holes — no footprint change, no respin —
+and we buy the five modules and plug them in. Insert it **TOP face up with the VOUT
+column over U2 pad 1** (the single rectangular pad): the mirrored way round puts
+10–20 V on the 5 V rail and destroys the module. See `design/ASSEMBLY.md` step 3,
+`design/BRINGUP.md` step 3 (DMM check) and `pcbway/PARTS-AVAILABILITY-REVIEW.md` §4b.
 **U1 (Teensy 4.1) is customer supplied** and must be bought **with pins installed**
-— PCBWay fits the two 1×24 sockets and we plug the Teensy in, so no soldering is
-required. Everything else PCBWay sources and fits. Left to us, all hand/plug-in
-steps: the **CR2032 cell** (never reflowed), the **JP1 shunt** (after unloaded
-rail tests), plugging in the Teensy, and the 2-wire **J9 RTC lead**.
+— PCBWay fits the two 1×24 sockets and we plug the Teensy in. Everything else PCBWay
+sources and fits. Left to us, all hand/plug-in steps: the **CR2032 cell** (never
+reflowed), the **JP1 shunt** (after unloaded rail tests), plugging in the Teensy
+**and the Pololu module** (its pin strips are the only joints we make), and the
+2-wire **J9 RTC lead**.
 The file to send is `pcbway/Racecar-RevD-BOM-pcbway-assembly-REV1.csv` — same
 content as the canonical `pcbway/Racecar-RevD-BOM-pcbway-assembly.csv`, with the
 U1/U2 fitting instructions in its Comment column.

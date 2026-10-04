@@ -67,7 +67,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.166"
+#define FIRMWARE_VERSION "0.1.169"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -403,6 +403,7 @@ static void emitSessionStatus(bool active);   // SD,REC,<0|1>,... ack (used by t
 extern bool session_file_open;                // defined in the SD section (v0.1.147)
 static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float lat_deg, float lon_deg,
+                               float alt_m, bool alt_ok,
                                float mph, float hdg_deg,
                                uint16_t rpm, int16_t oil_x10, int16_t cool_x10,
                                float ax, float ay, float az,
@@ -429,6 +430,19 @@ static void handleQLaps(const char* args);        // lap-time summary for on-SD 
 // (the definition lives next to canDiagReport()).
 static void usbTele(const char* fmt, ...);
 static void canAckTest();
+// v0.1.167: runtime bit rate. A marginal bench link (ONE terminator, no common ground,
+// long untwisted jumpers) fails at 500k with CRC/framing errors and a climbing TX error
+// counter, which walks the controller into bus-off - reception then looks dead while the
+// other end thinks it is transmitting perfectly. 125k is far more tolerant, so this makes
+// the bench usable AND identifies the fault: if the errors vanish at 125k it is the
+// physical link, not the firmware. The car stays at 500k for the MS3.
+static uint32_t can_baud = 500000UL;      // CAN_BAUD default; set via USB CANBAUD,<bps>
+static void canBegin();   // defined with the rest of the CAN code; used by the USB CANBAUD command
+static void canProbe(bool drive);   // USB CANPROBE / CANDRIVE: pin-level TX/ACK proof
+static void canTxTest(uint32_t n);  // USB CANTX,<n>: transmit n frames, report the controller view
+static bool can_alt_pins = false;   // USB CANALT: CAN1 on its ALTERNATE pads (TX 11, RX 13)
+static void canUseAltPins();
+static void dashTele(const char* fmt, ...);   // variadic: declare it by hand
 static void openCanSniff();                       // CAN sniffer: open /cansniff/ file
 static void closeCanSniff();                      // CAN sniffer: flush + close
 static void cansniffLog(uint32_t id, bool ext, uint8_t len, const uint8_t* buf);
@@ -734,7 +748,7 @@ static void handleDashCommand(const String& line) {
         // Dash asked us to re-announce our firmware version. The dash's STATUS
         // page does this whenever it opens, so a freshly-booted dash that
         // missed our boot-time emit can catch up immediately.
-        DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
+        dashTele("VER,teensy,%s\n", FIRMWARE_VERSION);
         // Re-announce the reset cause too — the boot-time RST emit is easy for
         // a slower-booting dash to miss (both power up together; the dash takes
         // seconds longer through WiFi init). VER? is sent on STATUS-page open.
@@ -761,8 +775,166 @@ static void pumpDashCommands() {
 }
 
 static void handleUsbCommand(const String& line) {
-    if (line == "ACKTEST") {
+    if (line.startsWith("CANBAUD,")) {
+        const uint32_t b = (uint32_t)line.substring(8).toInt();
+        if (b >= 10000 && b <= 1000000) {
+            can_baud = b;
+            canBegin();                      // re-init at the new rate
+            usbTele("CANBAUD,now=%lu (re-initialised)\n", (unsigned long)can_baud);
+        } else {
+            usbTele("CANBAUD,ERR,restart_required_value=%lu\n", (unsigned long)b);
+        }
+    } else if (line == "CANBAUD?") {
+        usbTele("CANBAUD,now=%lu\n", (unsigned long)can_baud);
+    } else if (line == "ACKTEST") {
         canAckTest();
+    } else if (line == "CANPROBE") {
+        canProbe(false);
+    } else if (line == "CANDRIVE") {
+        canProbe(true);
+    } else if (line.startsWith("CANTX")) {
+        uint32_t n = 10;
+        if (line.length() > 6) n = (uint32_t)line.substring(6).toInt();
+        if (n < 1 || n > 1000) n = 10;
+        canTxTest(n);
+    } else if (line == "CANHOLDON") {
+        // Indefinite, NON-blocking hold: pin 22 becomes a GPIO output driven LOW (= CAN TXD
+        // dominant) and stays that way while the rest of the firmware keeps running, until
+        // CANHOLDOFF or a reboot. For multimeter work with no time limit.
+        GPIO6_DR_CLEAR = CORE_PIN22_BITMASK;
+        GPIO6_GDIR |= CORE_PIN22_BITMASK;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x15;
+        usbTele("CANHOLDON,pin 22 driven LOW until CANHOLDOFF (MUX22=%08lX GDIR=%08lX DR=%08lX)\n",
+                (unsigned long)IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08, (unsigned long)GPIO6_GDIR,
+                (unsigned long)GPIO6_DR);
+    } else if (line == "CANHOLDOFF") {
+        GPIO6_DR_SET = CORE_PIN22_BITMASK;
+        GPIO6_GDIR &= ~CORE_PIN22_BITMASK;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x12;
+        usbTele("CANHOLDOFF,pin 22 back to CAN TX\n");
+    } else if (line == "CANALT") {
+        // Move CAN1 to its alternate pins: TX = pin 11, RX = pin 13 (same FlexCAN1 controller,
+        // same config). Pins 22/23 become high-Z inputs. Runtime only - a reboot goes back.
+        canUseAltPins();
+        usbTele("CANALT,CAN1 now on TX=pin 11 RX=pin 13 (22/23 released, LED heartbeat off)\n");
+    } else if (line == "CANTIE") {
+        // Are pins 22 and 23 tied together? Drive / pull pin 22 every way and read pin 23 (and
+        // the reverse). A pin that is connected only to the transceiver's RXD output reads the
+        // RXD level (HIGH at bus idle) no matter what the other pin does.
+        auto rd23 = []() { delayMicroseconds(200); return (int)!!(GPIO6_PSR & CORE_PIN23_BITMASK); };
+        auto rd22 = []() { delayMicroseconds(200); return (int)!!(GPIO6_PSR & CORE_PIN22_BITMASK); };
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x15; IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x15;
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_09 = 0x10B0;   // 23: keeper only (no pull)
+        GPIO6_GDIR &= ~CORE_PIN23_BITMASK;
+        GPIO6_GDIR |= CORE_PIN22_BITMASK;
+        GPIO6_DR_SET = CORE_PIN22_BITMASK;   const int a = rd23();     // 22 driven HIGH
+        GPIO6_DR_CLEAR = CORE_PIN22_BITMASK; const int b = rd23();     // 22 driven LOW
+        GPIO6_DR_SET = CORE_PIN22_BITMASK;   const int b2 = rd23();    // 22 HIGH again
+        GPIO6_GDIR &= ~CORE_PIN22_BITMASK;
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_08 = 0xF0B0;  const int c = rd23();   // 22 input, 22k pull-UP
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_08 = 0x30B0;  const int d = rd23();   // 22 input, 100k pull-DOWN
+        // reverse: 22 floating (keeper), 23 pulled each way
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_08 = 0x10B0;
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_09 = 0xF0B0;  const int e = rd22(), e23 = rd23();
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_09 = 0x30B0;  const int f = rd22(), f23 = rd23();
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_09 = 0x10B0;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x12; IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x12;
+        usbTele("CANTIE,pin23 when pin22: driveHI=%d driveLO=%d driveHI=%d pullUP=%d pullDOWN=%d | "
+                "pin22/pin23 when pin23 pullUP=%d/%d pullDOWN=%d/%d\n", a, b, b2, c, d, e, e23, f, f23);
+    } else if (line == "CANPINS") {
+        // Both CAN pins as plain GPIO INPUTS (pin 22 with a 100k pull-DOWN), sampled 300 ms.
+        // Pin 22 should be wired to the transceiver's TXD (an INPUT) -> it can NEVER show bus
+        // traffic. If pin 22 toggles in step with pin 23 while the CANable transmits, pin 22
+        // is electrically on the RECEIVE net (RXD/CRX), not on CTX.
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_08 = 0x30B0;   // keeper->pull, 100k pull-down
+        GPIO6_GDIR &= ~(CORE_PIN22_BITMASK | CORE_PIN23_BITMASK);
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x15;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x15;
+        delayMicroseconds(50);
+        uint32_t n = 0, l22 = 0, l23 = 0, both = 0, e22 = 0, e23 = 0, p22 = 1, p23 = 1;
+        const uint32_t c0 = ARM_DWT_CYCCNT, span = F_CPU_ACTUAL / 10 * 3;
+        __disable_irq();
+        while (ARM_DWT_CYCCNT - c0 < span) {
+            const uint32_t v = GPIO6_PSR;
+            const uint32_t a22 = !!(v & CORE_PIN22_BITMASK), a23 = !!(v & CORE_PIN23_BITMASK);
+            n++; l22 += !a22; l23 += !a23; both += (!a22 && !a23);
+            e22 += (a22 != p22); e23 += (a23 != p23); p22 = a22; p23 = a23;
+        }
+        __enable_irq();
+        IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_08 = 0x10B0;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x12;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x12;
+        usbTele("CANPINS,GPR26=%08lX GPR27=%08lX GPIO1_PSR=%08lX GPIO6_PSR=%08lX GPIO6_GDIR=%08lX GPIO1_GDIR=%08lX\n",
+                (unsigned long)IOMUXC_GPR_GPR26, (unsigned long)IOMUXC_GPR_GPR27,
+                (unsigned long)GPIO1_PSR, (unsigned long)GPIO6_PSR,
+                (unsigned long)GPIO6_GDIR, (unsigned long)GPIO1_GDIR);
+        usbTele("CANPINS,samples=%lu pin22_low=%lu pin23_low=%lu both_low=%lu pin22_edges=%lu pin23_edges=%lu\n",
+                (unsigned long)n, (unsigned long)l22, (unsigned long)l23, (unsigned long)both,
+                (unsigned long)e22, (unsigned long)e23);
+    } else if (line.startsWith("CANSQUARE")) {
+        // CANSQUARE[,ms]: toggle the transceiver TXD (pin 22) at 10 kHz (50 us dominant / 50 us
+        // recessive) - short enough to beat any transceiver dominant time-out, so a DC meter
+        // reads the AVERAGE: CANH ~2.6-2.7 V, CANL ~1.6-1.7 V, CANH-CANL ~1 V when driving.
+        // Pin 23 is sampled as GPIO 25 us into each half: match = the transceiver's RXD follows.
+        uint32_t ms = 2000;
+        if (line.length() > 10) ms = (uint32_t)line.substring(10).toInt();
+        if (ms < 10 || ms > 30000) ms = 2000;
+        usbTele("CANSQUARE,start %lu ms\n", (unsigned long)ms);
+        Serial.flush();
+        GPIO6_DR_SET = CORE_PIN22_BITMASK;
+        GPIO6_GDIR |= CORE_PIN22_BITMASK;
+        GPIO6_GDIR &= ~CORE_PIN23_BITMASK;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x15;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x15;
+        uint32_t lo_ok = 0, hi_ok = 0, n = 0;
+        const uint32_t t0 = millis();
+        while (millis() - t0 < ms) {
+            GPIO6_DR_CLEAR = CORE_PIN22_BITMASK; delayMicroseconds(25);
+            lo_ok += !(GPIO6_PSR & CORE_PIN23_BITMASK); delayMicroseconds(25);
+            GPIO6_DR_SET = CORE_PIN22_BITMASK;   delayMicroseconds(25);
+            hi_ok += !!(GPIO6_PSR & CORE_PIN23_BITMASK); delayMicroseconds(25);
+            n++;
+        }
+        GPIO6_DR_SET = CORE_PIN22_BITMASK;
+        GPIO6_GDIR &= ~CORE_PIN22_BITMASK;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x12;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x12;
+        usbTele("CANSQUARE,done cycles=%lu rxd_low_when_txd_low=%lu rxd_high_when_txd_high=%lu\n",
+                (unsigned long)n, (unsigned long)lo_ok, (unsigned long)hi_ok);
+    } else if (line.startsWith("CANHOLD")) {
+        // CANHOLD[,ms] (default 2000, max 30000) - long enough to put a multimeter on it.
+        uint32_t hold_ms = 2000;
+        if (line.length() > 8) hold_ms = (uint32_t)line.substring(8).toInt();
+        if (hold_ms < 10 || hold_ms > 30000) hold_ms = 2000;
+        // Hold the bus DOMINANT for 2 s through the Teensy's own transceiver (pin 22 as GPIO).
+        // Every other node on a working bus sees a stuck-dominant bus and logs errors; a node
+        // that reports nothing is not electrically connected to what this transceiver drives.
+        GPIO6_DR_SET = CORE_PIN22_BITMASK;
+        GPIO6_GDIR |= CORE_PIN22_BITMASK;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x15;
+        usbTele("CANHOLD,start %lu ms - bus is being held DOMINANT now\n", (unsigned long)hold_ms);
+        Serial.flush();
+        GPIO6_GDIR &= ~CORE_PIN23_BITMASK;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x15;    // read the transceiver RXD as GPIO
+        const uint32_t h0 = micros();
+        GPIO6_DR_CLEAR = CORE_PIN22_BITMASK;
+        // RXD (pin 23) at fixed times into the hold: 1 = recessive, 0 = dominant.
+        // A transceiver with a DOMINANT TIME-OUT shows 0 early, then 1 (driver switched off).
+        static const uint32_t at_us[] = {5, 20, 100, 300, 600, 1000, 2000, 5000, 20000, 100000, 1000000};
+        char rx[16]; uint8_t k = 0;
+        for (uint32_t at : at_us) {
+            if (at > hold_ms * 1000UL) break;
+            while (micros() - h0 < at) { }
+            rx[k++] = (GPIO6_PSR & CORE_PIN23_BITMASK) ? '1' : '0';
+        }
+        rx[k] = 0;
+        while ((micros() - h0) < hold_ms * 1000UL) { }
+        GPIO6_DR_SET = CORE_PIN22_BITMASK;
+        GPIO6_GDIR &= ~CORE_PIN22_BITMASK;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x12;
+        IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x12;
+        usbTele("CANHOLD,rxd@5us,20,100,300,600us,1ms,2,5,20,100ms,1s=%s (0=dominant 1=recessive)\n", rx);
+        usbTele("CANHOLD,done (bus held dominant %lu ms)\n", (unsigned long)hold_ms);
     } else if (line == "VER?") {
         usbTele("VER,teensy,%s\n", FIRMWARE_VERSION);
     } else if (line == "SDRE") {
@@ -1172,6 +1344,7 @@ static uint16_t computeRpmAndReset() {
 // ---------------------------------------------------------------------------
 static FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
 
+
 static struct CanEcu {
     uint16_t rpm        = 0;
     int16_t  clt_f_x10  = -1;
@@ -1199,8 +1372,10 @@ static struct CanDiag {
     uint32_t dup_window    = 0;    // frames byte-identical to the previous one
     uint32_t ids_seen[8]   = {0};  // distinct IDs in this window (ring, dropped if >8)
     uint8_t  ids_count     = 0;
-    uint8_t  base_hits     = 0;    // frames matching CAN_BASE_ID+0..3 this window
-    uint8_t  bench_hits    = 0;    // RC35 bench frames (0x700/0x701) this window
+    uint32_t base_hits     = 0;    // frames matching CAN_BASE_ID+0..3 this window
+    uint32_t bench_hits    = 0;    // RC35 bench frames (0x700/0x701) this window
+    // v0.1.170: these were uint8_t and WRAPPED at 256 - a 3800 fps storm printed as
+    // "BENCH frames/s=225", which looked like a healthy 200 fps bench.
     uint32_t last_report_ms = 0;
     bool     storm_mode    = false;   // >600 frames/s: skip per-frame bookkeeping (v0.1.165)
     uint8_t  last_buf[8]   = {0};  // payload of previous frame (for dup detection)
@@ -1262,16 +1437,22 @@ static void canAckTest() {
             h0 ? e0.ACK_ERR : 0, h1 ? e1.ACK_ERR : 0, h1 ? (char*)e1.FLT_CONF : "?");
     // A frame that cannot be ACKed leaves TEC climbing and (past 256) a bus-off, which the
     // v0.1.162 recovery task then clears. TEC unchanged + mailbox empty == somebody ACKed us.
-    const bool acked = (h1 ? e1.TX_ERR_COUNTER : 0) == (h0 ? e0.TX_ERR_COUNTER : 0);
+    // v0.1.170: the old verdict ("TEC unchanged") said PASS for a frame that was NEVER ACKed:
+    // an error-passive transmitter's TEC does not move on ACK errors, it just retries forever.
+    // Truth = is the controller still transmitting / did it log an ACK error.
+    const uint32_t esr = FLEXCANb_ESR1(FLEXCAN1_BASE);
+    const bool acked = !(esr & (1UL << 6)) && !(esr & (1UL << 13)) &&
+                       (h1 ? e1.TX_ERR_COUNTER : 0) == (h0 ? e0.TX_ERR_COUNTER : 0);
     usbTele("ACKTEST,%s  (TEC must stay flat: a rising TEC means nobody ACKs our frames -\n"
             "          check transceiver TXD (pin 1/D) -> Teensy pin 22, and Rs (pin 8) -> GND)\n",
             acked ? "PASS - the bus ACKed our frame, so our transmit/ACK path IS alive"
                   : "FAIL - our frame was never ACKed");
+    if (!acked) { Can1.reset(); canBegin(); }   // abort the frame: never leave it retrying on the bus
 }
 
 static void canBegin() {
     Can1.begin();
-    Can1.setBaudRate(CAN_BAUD);   // normal mode -> FlexCAN auto-ACKs
+    Can1.setBaudRate(can_baud);   // normal mode -> FlexCAN auto-ACKs (runtime, v0.1.167)
     Can1.setMaxMB(16);
     Can1.enableFIFO();
     // v0.1.164: ASSERT normal (ACKing) mode — do not trust the library to have done it.
@@ -1296,6 +1477,118 @@ static void canBegin() {
         FLEXCANb_CTRL1(FLEXCAN1_BASE) &= ~FLEXCAN_CTRL_LOM;   // 0 = normal mode: ACKs frames
         if (frz_negate) *mcr &= ~FLEXCAN_MCR_FRZ;
     }
+}
+
+// CANPROBE: raw register dump + PIN-LEVEL proof of the transmit/ACK path, no theories.
+// The pad mux for pins 22/23 is ALT2|SION (0x12), so GPIO6_PSR reads the real pad level
+// of both pins while FlexCAN owns them:
+//   pin 22 = what the controller DRIVES (low = dominant: its ACK bit / its own frame)
+//   pin 23 = what the transceiver says the BUS is (low = dominant)
+// Sampled in a tight loop (~50 ns) for 200 ms of live traffic. A receiver in normal mode
+// drives pin 22 low for one bit (2 us at 500k) per frame = its ACK.
+//   tx_low == 0               -> controller is NOT ACKing (firmware/config)
+//   tx_low > 0, tx_low_bus_hi -> controller ACKs, the bus never sees it (wire/transceiver)
+// CANDRIVE additionally takes pin 22 as GPIO, holds it low 200 us and checks pin 23 -
+// a direct loopback through the transceiver - then restores the CAN mux.
+static void canProbe(bool drive) {
+    const uint32_t mcr = FLEXCANb_MCR(FLEXCAN1_BASE), c1 = FLEXCANb_CTRL1(FLEXCAN1_BASE);
+    const uint32_t c2 = FLEXCANb_CTRL2(FLEXCAN1_BASE), ecr = FLEXCANb_ECR(FLEXCAN1_BASE);
+    const uint32_t esr = FLEXCANb_ESR1(FLEXCAN1_BASE);
+    usbTele("CANPROBE,MCR=%08lX CTRL1=%08lX(LOM=%d LPB=%d PRESDIV=%lu) CTRL2=%08lX ECR=%08lX(TEC=%lu REC=%lu) ESR1=%08lX\n",
+            mcr, c1, (int)!!(c1 & FLEXCAN_CTRL_LOM), (int)!!(c1 & FLEXCAN_CTRL_LPB),
+            (c1 >> 24) & 0xFF, c2, ecr, ecr & 0xFF, (ecr >> 8) & 0xFF, esr);
+    usbTele("CANPROBE,MUX22=%08lX PAD22=%08lX MUX23=%08lX PAD23=%08lX RXSEL=%lu CSCMR2=%08lX\n",
+            (uint32_t)IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08, (uint32_t)IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_08,
+            (uint32_t)IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09, (uint32_t)IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_09,
+            (uint32_t)IOMUXC_FLEXCAN1_RX_SELECT_INPUT, (uint32_t)CCM_CSCMR2);
+    // SION feeds the pad into the STANDARD GPIO1 block; GPIO6 (Teensy's fast alias, selected
+    // by GPR26) can read 0 for a pad that is not in GPIO mode - sample both, trust GPIO1.
+    uint32_t n = 0, tx_low = 0, rx_low = 0, tx_low_bus_hi = 0, g6_tx_low = 0, g6_rx_low = 0;
+    const uint32_t c0 = ARM_DWT_CYCCNT, span = F_CPU_ACTUAL / 5;   // 200 ms in cycles
+    const uint32_t gpr26 = IOMUXC_GPR_GPR26;
+    IOMUXC_GPR_GPR26 = gpr26 & ~(CORE_PIN22_BITMASK | CORE_PIN23_BITMASK);  // route 22/23 to GPIO1
+    __disable_irq();                     // 200 ms, USB only, operator-initiated
+    while (ARM_DWT_CYCCNT - c0 < span) {
+        const uint32_t p = GPIO1_PSR, q = GPIO6_PSR;
+        const bool tx = !(p & CORE_PIN22_BITMASK), rx = !(p & CORE_PIN23_BITMASK);
+        n++; tx_low += tx; rx_low += rx; tx_low_bus_hi += (tx && !rx);
+        g6_tx_low += !(q & CORE_PIN22_BITMASK); g6_rx_low += !(q & CORE_PIN23_BITMASK);
+    }
+    __enable_irq();
+    IOMUXC_GPR_GPR26 = gpr26;
+    usbTele("CANPROBE,samples=%lu pin22_tx_low=%lu pin23_bus_low=%lu tx_low_but_bus_high=%lu (gpio6: %lu %lu)\n",
+            n, tx_low, rx_low, tx_low_bus_hi, g6_tx_low, g6_rx_low);
+    if (!drive) return;
+    // Active loopback: GPIO-drive pin 22 low, read the bus back on pin 23.
+    uint32_t hi_before = 0, lo_during = 0, samples = 0;
+    GPIO6_DR_SET = CORE_PIN22_BITMASK;
+    GPIO6_GDIR |= CORE_PIN22_BITMASK;
+    GPIO6_GDIR &= ~CORE_PIN23_BITMASK;
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x15;   // pin 23 -> plain GPIO input for the readback
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x15;   // ALT5 = GPIO, SION
+    delayMicroseconds(5);
+    for (int i = 0; i < 50; i++) hi_before += !!(GPIO6_PSR & CORE_PIN23_BITMASK);
+    // Loop delay = pin22 edge -> transceiver driver -> bus -> transceiver receiver -> pin23.
+    // A CAN node must see its OWN bit (and other nodes must see its ACK) well inside one bit
+    // time: 2 us at 500k, sampled at ~75-87%. SN65HVD230 at Rs=GND is ~100-150 ns.
+    __disable_irq();
+    const uint32_t f0 = ARM_DWT_CYCCNT;
+    GPIO6_DR_CLEAR = CORE_PIN22_BITMASK;          // dominant
+    uint32_t f1 = f0;
+    while ((GPIO6_PSR & CORE_PIN23_BITMASK) && (ARM_DWT_CYCCNT - f0 < 60000)) { }
+    f1 = ARM_DWT_CYCCNT;
+    __enable_irq();
+    const uint32_t t1 = micros();
+    while (micros() - t1 < 200) { samples++; lo_during += !(GPIO6_PSR & CORE_PIN23_BITMASK); }
+    __disable_irq();
+    const uint32_t r0 = ARM_DWT_CYCCNT;
+    GPIO6_DR_SET = CORE_PIN22_BITMASK;            // recessive
+    while (!(GPIO6_PSR & CORE_PIN23_BITMASK) && (ARM_DWT_CYCCNT - r0 < 60000)) { }
+    const uint32_t r1 = ARM_DWT_CYCCNT;
+    __enable_irq();
+    usbTele("CANDRIVE,loop_delay dominant=%lu ns recessive=%lu ns (bit=2000 ns @500k)\n",
+            (unsigned long)((uint64_t)(f1 - f0) * 1000000000ULL / F_CPU_ACTUAL),
+            (unsigned long)((uint64_t)(r1 - r0) * 1000000000ULL / F_CPU_ACTUAL));
+    delayMicroseconds(20);
+    uint32_t hi_after = 0;
+    for (int i = 0; i < 50; i++) hi_after += !!(GPIO6_PSR & CORE_PIN23_BITMASK);
+    GPIO6_GDIR &= ~CORE_PIN22_BITMASK;
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x12;   // back to FLEXCAN1_TX
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x12;   // back to FLEXCAN1_RX
+    usbTele("CANDRIVE,pin23_high_before=%lu/50 pin23_low_while_pin22_low=%lu/%lu pin23_high_after=%lu/50 -> %s\n",
+            hi_before, lo_during, samples, hi_after,
+            (lo_during * 10 > samples * 9) ? "TX PATH OK (pin22 -> transceiver -> bus -> pin23)"
+                                          : "TX PATH BROKEN (driving pin22 low does not reach the bus)");
+}
+
+static void canTxTest(uint32_t n) {
+    // CANTX[,n]: transmit n frames (id 0x6A0, byte0 = seq) through FlexCAN, ~10 ms apart,
+    // then report the controller's view. With a CANable listening this is the
+    // Teensy -> bus direction, captured from the other end.
+    const uint32_t ecr0 = FLEXCANb_ECR(FLEXCAN1_BASE);
+    uint32_t queued = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        CAN_message_t m{}; m.id = 0x6A0; m.len = 8;
+        m.buf[0] = (uint8_t)i; m.buf[1] = 0xC0; m.buf[2] = 0xDE; m.buf[7] = 0x55;
+        queued += Can1.write(m) ? 1 : 0;
+        const uint32_t t = millis(); while (millis() - t < 10) Can1.events();
+    }
+    const uint32_t t = millis(); while (millis() - t < 200) Can1.events();
+    const uint32_t ecr1 = FLEXCANb_ECR(FLEXCAN1_BASE), esr = FLEXCANb_ESR1(FLEXCAN1_BASE);
+    usbTele("CANTX,sent=%lu queued=%lu TEC %lu->%lu REC %lu->%lu ESR1=%08lX txq=%u still_transmitting=%d ACKERR=%d BIT0ERR=%d BIT1ERR=%d\n",
+            (unsigned long)n, (unsigned long)queued, ecr0 & 0xFF, ecr1 & 0xFF,
+            (ecr0 >> 8) & 0xFF, (ecr1 >> 8) & 0xFF, (unsigned long)esr,
+            (unsigned)Can1.getTXQueueCount(), (int)!!(esr & (1UL << 6)),
+            (int)!!(esr & (1UL << 13)), (int)!!(esr & (1UL << 14)), (int)!!(esr & (1UL << 15)));
+    Can1.reset(); canBegin();     // never leave an unACKed frame retrying on the bus
+}
+
+static void canUseAltPins() {
+    can_alt_pins = true;
+    Can1.setTX(ALT); Can1.setRX(ALT);
+    GPIO6_GDIR &= ~(CORE_PIN22_BITMASK | CORE_PIN23_BITMASK);
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_08 = 0x05;   // GPIO input, no CAN function
+    IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_09 = 0x05;
 }
 
 // One-shot TX/ACK self-test state. Proves whether the Teensy can actually put
@@ -1344,12 +1637,37 @@ static void canBusOffRecover(CAN_error_t& err, bool have_err) {
 // Dropping a debug line costs nothing: the DASH still gets everything on Serial3.
 static void usbTele(const char* fmt, ...) {
     if (!Serial) return;                              // no USB host configured at all
-    if (Serial.availableForWrite() < 160) return;     // host not draining: DROP, never block
-    char buf[300];
+    char buf[320];
     va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    Serial.write((const uint8_t*)buf, strlen(buf));
+    // v0.1.169: compare against the ACTUAL line length. Testing a fixed 160 first meant any
+    // moment the host was not draining instantly dropped the line - the USB TX buffer is
+    // smaller than that, so the longer diagnostics vanished while short ones got through.
+    const size_t n = strlen(buf);
+    if ((size_t)Serial.availableForWrite() < n) return;   // host backed up: DROP, never block
+    Serial.write((const uint8_t*)buf, n);
+}
+
+// v0.1.168: THE DASH LINK (Serial3) NEEDS THE SAME GUARD THE USB PATH GOT.
+// Every rate measurement so far counted USB lines, but the DASH is fed on Serial3 and those
+// writes are unguarded: DASH_SERIAL.write blocks once the 4 KB TX buffer fills, which throttles
+// the whole loop and starves the dash exactly like the USB mirrors did. dashTele() skips a line
+// instead of blocking and counts the skips, so the dash's real feed rate is visible.
+static uint32_t dash_sent = 0;      // lines actually written to the dash link
+static uint32_t dash_skip = 0;      // lines DROPPED because Serial3 was backed up
+static uint32_t emit_count = 0;     // emitToDash() calls (the real emit rate)
+
+static void dashTele(const char* fmt, ...) {
+    char buf[400];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    const size_t n = strlen(buf);
+    // v0.1.169: same fix as usbTele - measure the line, then compare.
+    if ((size_t)Serial3.availableForWrite() < n) { dash_skip++; return; }  // never block
+    Serial3.write((const uint8_t*)buf, n);
+    dash_sent++;
 }
 
 static void canDiagReport() {
@@ -1386,25 +1704,32 @@ static void canDiagReport() {
     (void)can_tx_test_state; (void)can_tx_test_result;
 
     const uint32_t dpct = can_diag.rx_window ? (can_diag.dup_window * 100UL / can_diag.rx_window) : 0;
-    usbTele("CANDIAG frames/s=%lu dup=%lu%% total=%lu base_hits=%u ids=[%s] "
-                  "state=%s ACK_ERR=%d CRC_ERR=%d FRM=%d STF=%d TXerr=%u RXerr=%u flt=%s\n",
+    // v0.1.170: TEC/REC straight from the ECR register. error() only returns true when NEW error
+    // info was captured, and the old line printed 0 otherwise - "TXerr=0 RXerr=0" was not data.
+    const uint32_t ecr = FLEXCANb_ECR(FLEXCAN1_BASE);
+    usbTele("CANERR TEC=%lu REC=%lu ESR1=%08lX\n", ecr & 0xFF, (ecr >> 8) & 0xFF,
+            (unsigned long)FLEXCANb_ESR1(FLEXCAN1_BASE));
+    usbTele("CANDIAG frames/s=%lu dup=%lu%% total=%lu base_hits=%lu ids=[%s] "
+                  "state=%s ACK_ERR=%d CRC_ERR=%d FRM=%d STF=%d TXerr=%u RXerr=%u flt=%s  dashw=%d dashsent=%lu dashskip=%lu emit=%lu\n",
                   (unsigned long)can_diag.rx_window, (unsigned long)dpct,
-                  (unsigned long)can_diag.rx_total, can_diag.base_hits, ids,
+                  (unsigned long)can_diag.rx_total, (unsigned long)can_diag.base_hits, ids,
                   have_err ? (char*)err.state : "?",
                   have_err ? err.ACK_ERR : 0, have_err ? err.CRC_ERR : 0,
                   have_err ? err.FRM_ERR : 0, have_err ? err.STF_ERR : 0,
                   have_err ? err.TX_ERR_COUNTER : 0, have_err ? err.RX_ERR_COUNTER : 0,
-                  have_err ? (char*)err.FLT_CONF : "?");
+                  have_err ? (char*)err.FLT_CONF : "?",
+                       (int)Serial3.availableForWrite(), (unsigned long)dash_sent,
+                       (unsigned long)dash_skip, (unsigned long)emit_count);
     // RC35 bench-frame visibility — USB ONLY. Deliberately NOT a CANDIAG field:
     // the dash parses that line's format.
-    usbTele("BENCH frames/s=%u oil=%d rpm=%u (RC35 0x%03lX/0x%03lX)\n",
-                  can_diag.bench_hits, can_ecu.oil_x10, can_ecu.rpm,
+    usbTele("BENCH frames/s=%lu oil=%d rpm=%u (RC35 0x%03lX/0x%03lX)\n",
+                  (unsigned long)can_diag.bench_hits, can_ecu.oil_x10, can_ecu.rpm,
                   (unsigned long)CAN_BENCH_CORE_ID, (unsigned long)CAN_BENCH_AUX_ID);
     // Also surface it on the dash link so it can be shown without a USB cable.
     // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>,<RXerr>,<txtest>
     DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u,%u,%u\n",
                        (unsigned long)can_diag.rx_window,
-                       (unsigned long)can_diag.rx_total, can_diag.base_hits,
+                       (unsigned long)can_diag.rx_total, (unsigned)min(can_diag.base_hits, 255UL),
                        (unsigned long)dpct, have_err ? err.ACK_ERR : 0,
                        have_err ? err.TX_ERR_COUNTER : 0,
                        have_err ? err.RX_ERR_COUNTER : 0,
@@ -1429,7 +1754,10 @@ static void pumpCAN() {
         // that matters is draining the FIFO and parsing the ids we know. The per-frame
         // duplicate/ID bookkeeping is pure overhead then, so skip it and count the storm
         // once per second in canDiagReport() instead.
+        // v0.1.170: always COUNT (two increments); only the dup/id bookkeeping is skipped in a
+        // storm. Skipping the count made frames/s alternate 3800 <-> 0 on successive reports.
         if (!can_diag.storm_mode) canDiagNote(msg.id, msg.len, msg.buf);
+        else { can_diag.rx_total++; can_diag.rx_window++; }
         if (msg.id >= CAN_BASE_ID && msg.id <= CAN_BASE_ID + 3) can_diag.base_hits++;
         if (msg.id == CAN_BENCH_CORE_ID || msg.id == CAN_BENCH_AUX_ID) can_diag.bench_hits++;
         // Sniffer: capture the raw frame (any ID) before our targeted parse.
@@ -1916,22 +2244,22 @@ static void detectSD(bool quick, bool force) {
 static void emitSdStatus() {
     switch (sd_card_status) {
         case SD_CARD_READY:
-            DASH_SERIAL.printf("SD,READY,%lu,%lu\n",
+            dashTele("SD,READY,%lu,%lu\n",
                                (unsigned long)sd_total_mb, (unsigned long)sd_free_mb);
             break;
         case SD_CARD_NEEDS_FMT:
-            DASH_SERIAL.printf("SD,FMT,%lu\n", (unsigned long)sd_total_mb);
+            dashTele("SD,FMT,%lu\n", (unsigned long)sd_total_mb);
             break;
         case SD_CARD_NONE:
             // Empty slot -> bare SD,NONE (dash shows "No card"). Card present but
             // init failed -> carry the SdFat error so the dash shows "err 0x..".
-            if (sd_slot_empty) DASH_SERIAL.printf("SD,NONE\n");
-            else DASH_SERIAL.printf("SD,NONE,%02X%02X\n", sd_last_err, sd_last_data);
+            if (sd_slot_empty) dashTele("SD,NONE\n");
+            else dashTele("SD,NONE,%02X%02X\n", sd_last_err, sd_last_data);
             break;
         case SD_CARD_ERROR:
-            DASH_SERIAL.printf("SD,ERR\n");    break;
+            dashTele("SD,ERR\n");    break;
         case SD_CARD_FORMATTING:
-            DASH_SERIAL.printf("SD,ACTIVE\n"); break;
+            dashTele("SD,ACTIVE\n"); break;
     }
     Serial.printf("[sd] %s  total=%luMB free=%luMB%s\n",
                   sd_card_status == SD_CARD_READY      ? "READY"        :
@@ -2242,7 +2570,7 @@ static void healthTick() {
     int16_t batt_x10 = can_ecu.bat_x10;   // -1 if no CAN
     if (batt_x10 < 0 && bt_last_ms != 0 && millis() - bt_last_ms <= 10000 && bt_volt_x10 > 0)
         batt_x10 = bt_volt_x10;
-    DASH_SERIAL.printf("HLTH,%d,%d,%d,%d\n", t_die_x10, t_mpu_x10, t_esp_x10, batt_x10);
+    dashTele("HLTH,%d,%d,%d,%d\n", t_die_x10, t_mpu_x10, t_esp_x10, batt_x10);
     Serial.printf("[health] die=%.1fC mpu=%.1fC esp=%.1fC batt_x10=%d%s\n",
                   t_die, imu_temp_c, dash_temp_c, (int)batt_x10,
                   (t_die > 85.0f) ? "  <-- TEENSY HOT" : "");
@@ -2266,7 +2594,7 @@ static void sanitizeName(const char* in, char* out, size_t outsize) {
 static void emitSessionStatus(bool active) {
     // SD,REC,<0|1>,<filename>,<samples>
     const char* fname = session_path[0] ? session_path : "";
-    DASH_SERIAL.printf("SD,REC,%u,%s,%lu\n",
+    dashTele("SD,REC,%u,%s,%lu\n",
                        active ? 1 : 0, fname, (unsigned long)session_samples);
     Serial.printf("[sd] SESSION %s  file=%s  samples=%lu\n",
                   active ? "OPEN" : "CLOSE", fname, (unsigned long)session_samples);
@@ -2387,6 +2715,7 @@ static void closeSession() {
 
 static void writeSessionSample(uint8_t fix, uint8_t sats,
                                float lat_deg, float lon_deg,
+                               float alt_m, bool alt_ok,
                                float mph, float hdg_deg,
                                uint16_t rpm, int16_t oil_x10, int16_t cool_x10,
                                float ax, float ay, float az,
@@ -2428,6 +2757,12 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
     }
     if (n < 0 || n >= (int)sizeof(buf)) return;
 
+    // Altitude above mean sea level (metres). null until the first PVT: 0 m is a
+    // REAL value at sea level, so "no fix" must never be recorded as 0 (the
+    // server's Altitude tile and the /track3d first-person view both read this).
+    if (alt_ok) append("\"alt_m\":%.1f,", alt_m);
+    else        append("\"alt_m\":null,");
+
     // Lap number (only when an S/F line is known, so the server can trust it).
     if (lap >= 0) append("\"lap\":%d,", lap);
 
@@ -2459,6 +2794,37 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
             append("\"tps_pct\":%.1f,", tps * 0.1f);
         if (bt_ok && bt_spark_x10 > -1000)
             append("\"spark_deg\":%.1f,", bt_spark_x10 * 0.1f);
+    }
+
+    // Everything else the system holds, logged so the server can display it
+    // ("record all the data"). Each key appears ONLY while a live source backs
+    // it, so an old parser sees a byte-identical line, and provenance is never
+    // ambiguous — hence afr_can / oil_can_psi rather than reusing afr / oil_psi:
+    //   map_kpa       MS3 CAN manifold pressure
+    //   iat_f         MS3 CAN IAT, BLE dongle fallback
+    //   batt_v        MS3 CAN battery, BLE dongle (ATRV) fallback
+    //   afr_can       MS3 CAN AFR (the AEM analogue gauge owns afr/lambda)
+    //   oil_can_psi   RC35 bench CAN oil (0x701) — a real MS3 dash frame
+    //                 carries no oil channel at all
+    {
+        const bool can_ok2 = (can_ecu.last_ms != 0)
+                             && (millis() - can_ecu.last_ms <= CAN_STALE_MS);
+        const bool bt_ok2  = (bt_last_ms != 0) && (millis() - bt_last_ms <= 10000);
+        if (can_ok2 && can_ecu.map_x10 > -1)
+            append("\"map_kpa\":%.1f,", can_ecu.map_x10 * 0.1f);
+        int16_t iat_x10 = -1;
+        if (can_ok2 && can_ecu.iat_f_x10 > -400)      iat_x10 = can_ecu.iat_f_x10;
+        else if (bt_ok2 && bt_iat_f_x10 > -400)       iat_x10 = bt_iat_f_x10;
+        if (iat_x10 > -400) append("\"iat_f\":%.1f,", iat_x10 * 0.1f);
+        int16_t bat_x10 = -1;
+        if (can_ok2 && can_ecu.bat_x10 > 0)           bat_x10 = can_ecu.bat_x10;
+        else if (bt_ok2 && bt_volt_x10 > 0)           bat_x10 = bt_volt_x10;
+        if (bat_x10 > 0) append("\"batt_v\":%.1f,", bat_x10 * 0.1f);
+        if (can_ok2 && can_ecu.afr_x10 > 0)
+            append("\"afr_can\":%.1f,", can_ecu.afr_x10 * 0.1f);
+        // Bench oil expires on its own clock (pumpCAN clears oil_x10/bench_ms).
+        if (can_ecu.oil_x10 >= 0)
+            append("\"oil_can_psi\":%.1f,", can_ecu.oil_x10 * 0.1f);
     }
 
     append(
@@ -2839,7 +3205,7 @@ static int cloudUploadFile(const char* path, size_t body_len, File32* f) {
 // removed (uploads are After Race, dash-driven); the field is kept for the
 // dash's existing CLD parser.
 static void emitCloudStatus() {
-    DASH_SERIAL.printf("CLD,%u,%lu\n",
+    dashTele("CLD,%u,%lu\n",
                        (unsigned)(live_status_last_ok ? 1 : 0),
                        (unsigned long)queue_depth);
 }
@@ -3604,7 +3970,7 @@ void setup() {
     Serial.println(F("FLASH_ID:" FLASH_ID));
     // Tell the dash what firmware we're running so it can show it in settings
     // and compare against GitHub's manifest.json when "Check for updates" runs.
-    DASH_SERIAL.printf("VER,teensy,%s\n", FIRMWARE_VERSION);
+    dashTele("VER,teensy,%s\n", FIRMWARE_VERSION);
 
     // Tach input on pin 9 via FreqMeasureMulti (FlexPWM2_2_B input capture).
     // Active in Direct sensor mode; CAN takes over in MegaSquirt mode.
@@ -3926,6 +4292,7 @@ static void applyGpsDriftFilter(bool have_pvt, uint8_t fix,
 }
 
 static void emitToDash() {
+    emit_count++;
     // Only read the SparkFun lib's PVT cache after we've confirmed at least
     // ONE fresh PVT arrived (gnss_last_fresh_ms != 0). Calling getFixType()
     // etc. before that returns uninitialized heap memory — at boot we saw
@@ -3937,6 +4304,12 @@ static void emitToDash() {
     float   lon_deg = have_pvt ? myGNSS.getLongitude()   * 1e-7f      : 0.0f;
     float   mph     = have_pvt ? myGNSS.getGroundSpeed() * 0.00223694f : 0.0f;
     float   hdg_deg = have_pvt ? myGNSS.getHeading()     * 1e-5f      : 0.0f;
+    // Altitude above mean sea level (metres) for the SD log + server Altitude
+    // tile + the /track3d 3D view. Cache is populated whenever have_pvt is true
+    // (the same guard the other getters use), so this never blocks. A fix of
+    // <2 means the altitude is meaningless — log null rather than a fake 0.
+    const bool  alt_ok  = have_pvt && fix >= 2;
+    const float alt_m   = alt_ok ? myGNSS.getAltitudeMSL() * 0.001f : 0.0f;
     uint8_t status  = gpsStatus();
     applyGpsDriftFilter(have_pvt, fix, &lat_deg, &lon_deg, &mph, &hdg_deg);
 
@@ -3994,30 +4367,41 @@ static void emitToDash() {
     DASH_SERIAL.printf("AFR,%u,%d,%d,%d\n", (unsigned)aem_reading.status,
                        aem_reading.afr_x100, aem_reading.lambda_x10000, aem_reading.mv);
 
-    DASH_SERIAL.printf("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u\n",
+    dashTele("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u\n",
                        fix, sats, lat_deg, lon_deg, mph, hdg_deg, status);
     usbTele("GPS,%u,%u,%.6f,%.6f,%.1f,%.1f,%u  (raw_bytes=%lu)\n",
                   fix, sats, lat_deg, lon_deg, mph, hdg_deg, status,
                   (unsigned long)gnss_raw_bytes);
 
-    // ENG line: RPM + oil PSI + coolant — all sourced per sensor_type above.
-    // The dash RPM bar always reads eng.rpm from this line.
-    DASH_SERIAL.printf("ENG,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10);
+    // ENG line. Fields 1-3 = RPM / oil / coolant per the GLOBAL sensor_type (with
+    // the auto-prefer-CAN above) — what the SD log records and what pre-0.1.170
+    // dashes display. Fields 4-5 (v0.1.170) = the PURE DIRECT sensors: opto-tach
+    // RPM and NTC coolant, never substituted by CAN or Bluetooth. The dash's
+    // per-item Source = DIRECT reads ONLY these, so "Direct" can never show a
+    // CAN value again (it did: field 1 silently became CAN RPM the moment any
+    // CAN frame arrived). Trailing fields: old dashes ignore them.
+    const uint16_t dRpm  = test_mode_active ? rpm        : directRpm;
+    const int16_t  dCool = test_mode_active ? cool_f_x10 : directCool;
+    dashTele("ENG,%u,%d,%d,%u,%d\n", rpm, oil_psi_x10, cool_f_x10, dRpm, dCool);
     usbTele("ENG,%u,%d,%d  [src=%s]\n", rpm, oil_psi_x10, cool_f_x10,
                   use_can ? (g_cfg.sensor_type == 1 ? "CAN" : "CAN(auto)") : "direct");
     // ECU line: full MS3Pro CAN dataset. Dash uses these when sensor_type==1
     // (MegaSquirt) for coolant temp, AFR, MAP, TPS, IAT, and battery.
     // 9th field (oil, psi x10) = RC35 bench CAN oil, -1 when bench frames are
     // not live. Appended LAST so old parsers (index-based, extra-tolerant) work.
-    DASH_SERIAL.printf("ECU,%u,%d,%d,%d,%d,%d,%d,%d\n",
-                       rpm, can_ecu.clt_f_x10, can_ecu.map_x10,
+    // ECU field 1 (v0.1.170) = PURE CAN RPM, -1 when no CAN frame is live. It used
+    // to carry the mixed `rpm` above, so with CAN dead the dash's "CANBUS" RPM was
+    // really the opto tach — the same leak in the other direction.
+    const int ecuRpm = test_mode_active ? (int)rpm : (can_live ? (int)can_ecu.rpm : -1);
+    dashTele("ECU,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                       ecuRpm, can_ecu.clt_f_x10, can_ecu.map_x10,
                        can_ecu.tps_x10, can_ecu.afr_x10,
                        can_ecu.iat_f_x10, can_ecu.bat_x10, can_ecu.oil_x10);
-    usbTele("ECU,%u,%d,%d,%d,%d,%d,%d,%d\n",
-                  rpm, can_ecu.clt_f_x10, can_ecu.map_x10,
+    usbTele("ECU,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                  ecuRpm, can_ecu.clt_f_x10, can_ecu.map_x10,
                   can_ecu.tps_x10, can_ecu.afr_x10,
                   can_ecu.iat_f_x10, can_ecu.bat_x10, can_ecu.oil_x10);
-    DASH_SERIAL.printf("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
+    dashTele("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                        ax, ay, az, gx, gy, gz);
     usbTele("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                   ax, ay, az, gx, gy, gz);
@@ -4027,7 +4411,9 @@ static void emitToDash() {
 
     // SD logging: append one NDJSON sample with all the fields we just emitted.
     if (recording_active && session_file_open) {
-        writeSessionSample(fix, sats, lat_deg, lon_deg, mph, hdg_deg,
+        writeSessionSample(fix, sats, lat_deg, lon_deg,
+                           alt_m, alt_ok,
+                           mph, hdg_deg,
                            rpm, oil_psi_x10, cool_f_x10,
                            ax, ay, az, gx, gy, gz,
                            sf_lap.has_line ? sf_lap.lap : -1);
@@ -4035,7 +4421,7 @@ static void emitToDash() {
 
     // Time of day from RTC — piggybacks on the 1 Hz GPS heartbeat so the dash
     // gets a fresh TIME line every emit without a separate periodic block.
-    DASH_SERIAL.printf("TIME,%lu\n", (unsigned long)now());
+    dashTele("TIME,%lu\n", (unsigned long)now());
 
     int16_t afr_x10 = -1;
     if (aem_reading.status == aemafr::VALID) afr_x10 = (int16_t)(aem_reading.afr_x100 / 10);
@@ -4055,7 +4441,7 @@ void loop() {
 
     // Heartbeat LED so we can see at a glance the Teensy is alive.
     static unsigned long lastBlink = 0;
-    if (millis() - lastBlink >= 500) {
+    if (!can_alt_pins && millis() - lastBlink >= 500) {   // pin 13 = CAN1 RX when CANALT
         lastBlink = millis();
         digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
     }

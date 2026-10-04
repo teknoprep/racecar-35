@@ -1,5 +1,5 @@
 Reference,Function,Value,Manufacturer,MPN,Footprint,Notes
-U2,U2,Pololu D36V50F5,Pololu,4091 / D36V50F5,RacecarC:Pololu_D36V50F5,2x6 header; raised module; both output/ground columns fitted. EN/PG unused.
+U2,U2,Pololu D36V50F5,Pololu,4091 / D36V50F5,RacecarC:Pololu_D36V50F5,Fitted as a 2x6 0.1in THT female SOCKET; the customer supplies the Pololu 4091 and plugs it in. Both output/ground columns carry current. EN/PG unused. See ASSEMBLY.md step 3 for the insertion orientation.
 U3,U3,TSR 1-2433,TRACO Power,TSR 1-2433,RacecarC:Converter_DCDC_TRACO_TSR-1_THT,"Separate 1A module fed by Pololu VRP (10-20V protected), NOT marginal 5V input."
 C3,C_U3I,100n,Murata,GRM21BR71H104KA01L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V
 C4,C_U3O,10u,Murata,GRM21BR61E106KA73L,RacecarC:C_0805_2012Metric,X7R 50V; 10uF is X5R 25V

@@ -5,7 +5,9 @@ This is the **build you solder**. Rev C Gerbers are parked. All car wires land o
 out for flashing.
 
 Open [BREADBOARD.svg](BREADBOARD.svg) in a browser for the picture. This file is
-the soldering notes + parts list.
+the soldering notes + parts list. **For the wire-by-wire pinout sheet see
+[PINOUT.md](PINOUT.md)**, and for the tach front end see
+[OPTO_WIRING.svg](OPTO_WIRING.svg) (PC817 pinout, schematic, bench check).
 
 **Pi 5 is a separate box.** Only three 3.3 V UART wires come here (J3). Cameras
 and the USB stick do **not** plug into this board.
@@ -38,6 +40,9 @@ Same idea as Rev C: one edge, labelled, nothing on the other three sides.
 ## Circuits you solder (values are firmware contracts)
 
 ### Tach — PC817 on the board (J4 → pin 9)
+
+Full diagram: **[OPTO_WIRING.svg](OPTO_WIRING.svg)**. The LED is inside the PC817
+(1 = anode, 2 = cathode); you never add one.
 
 ```
 J4 SIG ── 1 kΩ ── PC817 pin 1 (anode)

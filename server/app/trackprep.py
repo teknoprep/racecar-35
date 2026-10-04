@@ -797,6 +797,145 @@ def measure_width(img, bounds, line, opts=None):
 # ---------------------------------------------------------------------------
 # the asset
 # ---------------------------------------------------------------------------
+LANDCOVER_CODES = "pgwo"        # paved/built, grass, woods, other (dirt, water, gravel)
+
+
+def _rle(codes: str) -> str:
+    out, i, n = [], 0, len(codes)
+    while i < n:
+        j = i
+        while j < n and codes[j] == codes[i]:
+            j += 1
+        out.append(f"{j - i}{codes[i]}")
+        i = j
+    return "".join(out)
+
+
+def unrle(rle: str) -> str:
+    out, num = [], ""
+    for ch in rle:
+        if ch.isdigit():
+            num += ch
+        else:
+            out.append(ch * int(num or 1))
+            num = ""
+    return "".join(out)
+
+
+def land_cover(img, bounds: dict, cell_m: float = 4.0) -> dict:
+    """Classify the imagery into paved / grass / woods / other, on a cell grid.
+
+    Thresholds measured on real Esri imagery at Watkins Glen (spring, leafless):
+      woods  : saturated (>= 0.24), darker (V < 112) and TEXTURED (luminance std
+               >= 15 inside an 8 m cell) - canopy is rough, mowed grass is smooth
+      paved  : low saturation (< 0.17) or very bright (roofs, V > 175)
+      grass  : green above (R+B)/2 by > 8 and not the above
+    Woods is decided on 8 m cells (texture needs area) and cleaned with a
+    majority filter so single shadowed cells cannot plant a tree; paved and
+    grass use the finer cell. Row 0 is the NORTH edge (image order).
+    """
+    _require_deps()
+    A = np.asarray(img.convert("RGB"), dtype=np.float32)
+    H, W, _ = A.shape
+    lat_mid = (bounds["lat0"] + bounds["lat1"]) / 2.0
+    m_per_px = ((bounds["lon1"] - bounds["lon0"]) * 111320.0 *
+                math.cos(math.radians(lat_mid)) / W)
+    c = max(2, int(round(cell_m / m_per_px)))          # fine cell, px
+    gh, gw = H // c, W // c
+    if gh < 4 or gw < 4:
+        return None
+    X = A[:gh * c, :gw * c].reshape(gh, c, gw, c, 3).mean(axis=(1, 3))
+    r, g, b = X[..., 0], X[..., 1], X[..., 2]
+    v = X.max(axis=2)
+    mn = X.min(axis=2)
+    sat = np.where(v > 0, (v - mn) / np.maximum(v, 1.0), 0.0)
+    green = g - (r + b) / 2.0
+    paved = (sat < 0.17) | (v > 175)
+    grass = ~paved & (green > 8)
+
+    # woods on 2x2 fine cells (~8 m): mean colour + luminance texture
+    gh2, gw2 = gh // 2, gw // 2
+    c2 = c * 2
+    L = A[:gh2 * c2, :gw2 * c2].mean(axis=2).reshape(gh2, c2, gw2, c2)
+    tex = L.std(axis=(1, 3))
+    X2 = A[:gh2 * c2, :gw2 * c2].reshape(gh2, c2, gw2, c2, 3).mean(axis=(1, 3))
+    v2 = X2.max(axis=2)
+    sat2 = np.where(v2 > 0, (v2 - X2.min(axis=2)) / np.maximum(v2, 1.0), 0.0)
+    woods2 = (sat2 >= 0.24) & (v2 < 112) & (tex >= 15)
+    pad = np.pad(woods2.astype(np.int32), 1)
+    nb = sum(pad[1 + dy:1 + dy + gh2, 1 + dx:1 + dx + gw2]
+             for dy in (-1, 0, 1) for dx in (-1, 0, 1)) - woods2
+    woods2 = woods2 & (nb >= 4)
+    woods = np.zeros((gh, gw), dtype=bool)
+    woods[:gh2 * 2, :gw2 * 2] = np.repeat(np.repeat(woods2, 2, axis=0), 2, axis=1)
+    woods &= ~paved                      # a road through the trees stays a road
+
+    cls = np.full((gh, gw), 3, dtype=np.uint8)          # other
+    cls[grass] = 1
+    cls[woods] = 2
+    cls[paved] = 0
+    codes = "".join(LANDCOVER_CODES[k] for k in cls.ravel())
+    # bounds of the classified area (whole cells only)
+    lon_w = bounds["lon0"] + (bounds["lon1"] - bounds["lon0"]) * (gw * c / W)
+    lat_s = bounds["lat0"] + (bounds["lat1"] - bounds["lat0"]) * (gh * c / H)
+    return {"bounds": [float(lat_s), float(bounds["lon0"]),
+                       float(bounds["lat0"]), float(lon_w)],     # [S, W, N, E]
+            "cols": int(gw), "rows": int(gh), "cell_m": round(c * m_per_px, 2),
+            "codes": LANDCOVER_CODES, "row0": "north",
+            "rle": _rle(codes),
+            "share": {k: round(float((cls == i).mean()), 3)
+                      for i, k in enumerate(("paved", "grass", "woods", "other"))}}
+
+
+def landcover_at(lc: dict, codes: str, lat: float, lon: float):
+    s, w, n, e = lc["bounds"]
+    if not (s <= lat <= n and w <= lon <= e):
+        return None
+    col = min(lc["cols"] - 1, int((lon - w) / (e - w) * lc["cols"]))
+    row = min(lc["rows"] - 1, int((n - lat) / (n - s) * lc["rows"]))
+    return codes[row * lc["cols"] + col]
+
+
+def landcover_line_agreement(lc: dict, lats, lons) -> float:
+    """Share of the driven line that the imagery calls PAVED (within one cell).
+
+    The GPS says where the track is; the imagery has to agree. Imagery that is
+    tiled wallpaper, from the wrong place, or a placeholder from a blocked tile
+    server scores near zero and is refused - the test that would have stopped
+    the Watkins Glen 'wallpaper' bake reaching anyone."""
+    codes = unrle(lc["rle"])
+    cols, rows = lc["cols"], lc["rows"]
+    s, w, n, e = lc["bounds"]
+    hit = tot = 0
+    for lat, lon in zip(lats, lons):
+        if not (s <= lat <= n and w <= lon <= e):
+            continue
+        col = min(cols - 1, int((lon - w) / (e - w) * cols))
+        row = min(rows - 1, int((n - lat) / (n - s) * rows))
+        tot += 1
+        ok = False
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                rr, cc = row + dr, col + dc
+                if 0 <= rr < rows and 0 <= cc < cols and codes[rr * cols + cc] == "p":
+                    ok = True
+        hit += ok
+    return hit / tot if tot else 0.0
+
+
+def add_landcover(asset: dict, img, bounds: dict, log=print) -> dict:
+    lc = land_cover(img, bounds)
+    if not lc:
+        return asset
+    lats = [p[0] for p in asset["line"]]
+    lons = [p[1] for p in asset["line"]]
+    lc["line_paved"] = round(landcover_line_agreement(lc, lats, lons), 3)
+    asset["landcover"] = lc
+    log(f"[{asset.get('slug')}] land cover {lc['cols']}x{lc['rows']} @ {lc['cell_m']} m: "
+        f"{lc['share']}, line on paved {lc['line_paved'] * 100:.0f}%")
+    return asset
+
+
 def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
                 log=print, cache_dir: Optional[pathlib.Path] = None) -> dict:
     """Bake one track: centreline + measured width + elevation + ground texture."""
@@ -911,6 +1050,8 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
             "attrib": "Imagery \u00a9 Esri, Maxar, Earthstar Geographics",
         },
     }
+    if tex_name:
+        add_landcover(asset, img, bounds, log=log)
     problems = validate_asset(asset, line)
     if problems:
         raise RuntimeError("refusing to publish a broken track asset: " +
@@ -959,6 +1100,11 @@ def validate_asset(asset: dict, line: dict) -> list:
         res = max(span_w / px[0], span_h / px[1])
         if res > 6.0:
             bad.append("texture resolution is %.1f m/px (too coarse to see a track)" % res)
+    lc = asset.get("landcover")
+    if lc is not None and lc.get("line_paved", 1.0) < 0.6:
+        bad.append("imagery does not show a road where the GPS line is (only %.0f%% "
+                   "of the line is on paved pixels) - wrong place, tiled or placeholder "
+                   "imagery" % (100.0 * lc.get("line_paved", 0.0)))
     return bad
 
 

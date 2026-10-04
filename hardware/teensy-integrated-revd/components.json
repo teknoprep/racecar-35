@@ -51,7 +51,7 @@
     "x": 68,
     "y": 99,
     "angle": 0,
-    "notes": "2x6 header; raised module; both output/ground columns fitted. EN/PG unused.",
+    "notes": "Fitted as a 2x6 0.1in THT female SOCKET; the customer supplies the Pololu 4091 and plugs it in. Both output/ground columns carry current. EN/PG unused. See ASSEMBLY.md step 3 for the insertion orientation.",
     "alias": "U2"
   },
   {

@@ -79,7 +79,7 @@ def supplypins(vcc,p=14,g=7):return {p:vcc,g:'GND'}
 part('U2','Pololu D36V50F5',OLD_FP['U2'],68,99,
  {1:'+5V_MAIN',2:'+5V_MAIN',3:'GND',4:'GND',5:'GND',6:'GND',7:'VIN_FUSED',8:'VIN_FUSED',9:'VIN_PROTECTED',10:'VIN_PROTECTED'},
  '4091 / D36V50F5','Pololu','power',names=dict(zip(range(1,13),['VOUT','VOUT','GND','GND','GND','GND','VIN','VIN','VRP','VRP','EN','PG'])),
- types={1:'power_out',7:'power_in',9:'power_out'},notes='2x6 header; raised module; both output/ground columns fitted. EN/PG unused.')
+ types={1:'power_out',7:'power_in',9:'power_out'},notes='Fitted as a 2x6 0.1in THT female SOCKET; the customer supplies the Pololu 4091 and plugs it in. Both output/ground columns carry current. EN/PG unused. See ASSEMBLY.md step 3 for the insertion orientation.')
 for ref,x,y,out in [('U3',106,74,'+3V3_AUX'),('U_NET_PWR',120,111,'+3V3_NET')]:
  part(ref,'TSR 1-2433','Converter_DCDC:Converter_DCDC_TRACO_TSR-1_THT',x,y,{1:'VIN_PROTECTED',2:'GND',3:out},
       'TSR 1-2433','TRACO Power','power',names={1:'VIN',2:'GND',3:'VOUT'},types={1:'power_in',3:'power_out'},

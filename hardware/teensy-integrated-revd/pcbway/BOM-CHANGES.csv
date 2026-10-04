@@ -2,10 +2,10 @@ Item,Refs,Qty,Old Mfr,Old MPN,Issue,Action,New Mfr,New MPN,LCSC Part,LCSC Stock,
 48,F3 F4 F5,3,Littelfuse,1206L010/30YR,PN does not exist in the 1206L series (0.10 A is only made as /60),CHANGE,Littelfuse,1206L010/60WR,C2153714,6922,Digi-Key 4861 / Newark 10764
 28,D5,1,Nexperia,"PESD3V3U1UL,315",Out of stock everywhere (LCSC 2 / Digi-Key 0 / Newark 0 / TME 0),CHANGE,Nexperia,"PESD5V0F1BL,315",C45961,51874,Alt: PESD5V0U1UL315 (C85401 9875)
 11,D2,1,Diodes Incorporated,SS14,Bare MPN not orderable from Diodes Inc -> supplier had no match,CHANGE,onsemi,SS14,C83852,139581,Digi-Key onsemi SS14 200489 / Vishay SS14-E3/61T
-22,C11,1,Murata,GRM21BR71H225KA01L,No LCSC stock; PCBWay proposed X5R (85C) vs original X7R (125C),COUNTER-PROPOSE,Yageo,CC0805KKX7R9BB225,C125847,110671,Digi-Key 248725 / Samsung CL21B225KBYNNNE C2762602 83283
+22,C11,1,Murata,GRM21BR71H225KA01L,No LCSC stock; PCBWay proposed X5R (85C) vs original X7R (125C),COUNTER-PROPOSE (accepted in the 09-30 quote),Yageo,CC0805KKX7R9BB225,C125847,110671,Digi-Key 248725 / Samsung CL21B225KBYNNNE C2762602 83283
 21,C10,1,Murata,GRM21BR71H103KA01L,No LCSC stock,APPROVE PCBWay sub,Samsung,CL21B103KBANNNC,C1710,2295361,Digi-Key 2199767
 35,C18,1,Murata,GRM21BR71H102KA01L,No LCSC stock,APPROVE PCBWay sub,Yageo,CC0805KRX7R9BB102,C94121,1664836,Newark 52270
-1,U2,1,Pololu,4091 / D36V50F5,Not an LCSC part; Pololu direct is Rationed/backorder,WE SUPPLY / BUY OURSELVES,Pololu,4091,-,-,Digi-Key 2183-4091-ND 264 @ $39.95
-13,U1,1,PJRC,TEENSY41,Not an LCSC part,WE SUPPLY / BUY OURSELVES,PJRC,TEENSY41,-,-,Digi-Key 16771 / SparkFun DEV-16771 1169 @ $31.50
+1,U2,1,Pololu,4091 / D36V50F5,"Not an LCSC part; Pololu direct is Rationed/backorder and PCBWay could not source it in two attempts",FIT 2x6 0.1in THT FEMALE SOCKET ONLY - WE PLUG IN THE MODULE,Samtec,SSW-106-01-G-D,C3323352,17,"Need >=3A per pin (2 pins each carry VIN/VOUT). Primary LCSC C3323352 SSW-106-01-G-D 4.7A (17 pcs); fallback LCSC C2894967 HCTL PZ254-2-06-Z-8.5 3A (3446 pcs). We supply 5x Pololu 4091 ($36.75 ea at qty 5); consignment quote requested for fitting the module pin strips"
+13,U1,1,PJRC,TEENSY41,Not an LCSC part,PCBWay FITS THE SOCKETS - WE SUPPLY THE TEENSY (with pins) AND PLUG IT IN,Samtec,SSW-124-01-G-S,-,-,"Teensy 4.1: Digi-Key / SparkFun DEV-16771 1169 @ $31.50; PJRC direct"
 24,U8,1,u-blox,NEO-M9N-00B,Price volatility (PCBWay note); US distributors show 0,CONFIRM PRICE / MAY SUPPLY,u-blox,NEO-M9N-00B,C5119087,516,$16.31
 14,BT1,1,Keystone,1058,PCBWay query re description vs CR2032,CLARIFY (no change),Keystone,1058,C6969504 (0),-,Digi-Key 36-1058-ND 1610 / TME 458

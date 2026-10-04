@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1700" height="1750" viewBox="0 0 1700 1750">
+<rect width="1700" height="1750" fill="#f3efe6"/>
+<style>
+  text{font-family:DejaVu Sans,Liberation Sans,sans-serif;fill:#1b2420}
+  .t{font-size:34px;font-weight:700}
+  .h{font-size:23px;font-weight:700}
+  .s{font-size:17px}
+  .xs{font-size:14px}
+  .pin{font-family:DejaVu Sans Mono,monospace;font-size:17px;font-weight:700}
+  .v{font-family:DejaVu Sans Mono,monospace;font-size:15px}
+  .box{fill:#f7f4ee;stroke:#1b2420;stroke-width:2.5}
+  .wire{stroke:#1b2420;stroke-width:3;fill:none}
+  .dash{fill:none;stroke:#8a8a8a;stroke-width:2;stroke-dasharray:6 5}
+</style>
+
+<text x="48" y="50" class="t">Tach optocoupler — hand-wired PC817 (no pre-built module)</text>
+<rect x="48" y="74" width="1604" height="52" rx="6" fill="#f4d2c4" stroke="#a33" stroke-width="1.5"/>
+<text x="62" y="98" class="xs">ECU / instrument-cluster CONDITIONED tach signal ONLY — never coil negative, ignition lead, spark or injector drive.</text>
+<text x="62" y="118" class="xs">The LED is INSIDE the PC817: pins 1 (+ anode) and 2 (− cathode). You never add an LED, and a plain diode cannot replace it.</text>
+
+<!-- ================= 1. PHYSICAL PINOUT ================= -->
+<text x="48" y="176" class="h">1. PC817 physical pinout — DIP-4, TOP view, notch up. Pin 1 is left of the notch.</text>
+
+<rect x="250" y="210" width="340" height="210" rx="14" class="box"/>
+<path d="M 394 212 A 26 26 0 0 0 446 212" fill="#f3efe6" stroke="#1b2420" stroke-width="2.5"/>
+<text x="462" y="240" class="xs">notch</text>
+<line x1="140" y1="250" x2="250" y2="250" class="wire"/>
+<line x1="140" y1="380" x2="250" y2="380" class="wire"/>
+<line x1="590" y1="250" x2="700" y2="250" class="wire"/>
+<line x1="590" y1="380" x2="700" y2="380" class="wire"/>
+<text x="228" y="242" class="pin" text-anchor="end">1</text>
+<text x="228" y="372" class="pin" text-anchor="end">2</text>
+<text x="612" y="242" class="pin">4</text>
+<text x="612" y="372" class="pin">3</text>
+<rect x="272" y="282" width="104" height="110" rx="8" class="dash"/>
+<text x="324" y="345" class="xs" text-anchor="middle">LED</text>
+<rect x="452" y="282" width="104" height="110" rx="8" class="dash"/>
+<text x="504" y="332" class="xs" text-anchor="middle">photo-</text>
+<text x="504" y="352" class="xs" text-anchor="middle">transistor</text>
+<line x1="380" y1="330" x2="448" y2="330" stroke="#b8860b" stroke-width="3"/>
+<polygon points="448,330 436,323 436,337" fill="#b8860b"/>
+<text x="414" y="272" class="xs" text-anchor="middle">light</text>
+
+<g class="v">
+  <text x="750" y="252">pin 1   LED anode    (+)   ←  R1 1 kΩ  ←  J4 SIG</text>
+  <text x="750" y="288">pin 2   LED cathode  (−)   ←  J4 GND / board GND</text>
+  <text x="750" y="324">pin 4   collector          →  3.3 V via R2 4.7 kΩ  +  Teensy pin 9</text>
+  <text x="750" y="360">pin 3   emitter            →  board GND</text>
+  <text x="750" y="404" class="xs">A DIP-4 chip, not a module: nothing to configure, no polarity jumper.</text>
+</g>
+
+<!-- ================= 2. THE CIRCUIT ================= -->
+<text x="48" y="500" class="h">2. Solder exactly this — four wires, two resistors, one optional diode</text>
+
+<rect x="110" y="678" width="150" height="44" rx="6" class="box"/>
+<text x="185" y="706" class="s" text-anchor="middle">J4 SIG</text>
+<text x="185" y="748" class="xs" text-anchor="middle">car tach signal</text>
+<text x="185" y="770" class="xs" text-anchor="middle">(12 V pulses)</text>
+
+<rect x="110" y="818" width="150" height="44" rx="6" class="box"/>
+<text x="185" y="846" class="s" text-anchor="middle">J4 GND</text>
+<text x="185" y="888" class="xs" text-anchor="middle">signal return</text>
+
+<line x1="260" y1="700" x2="330" y2="700" class="wire"/>
+<rect x="330" y="682" width="140" height="36" rx="4" fill="#ffffff" stroke="#1b2420" stroke-width="2.5"/>
+<text x="400" y="668" class="xs" text-anchor="middle">R1  1 kΩ  ¼ W</text>
+<text x="400" y="748" class="xs" text-anchor="middle">≈11 mA at 12 V</text>
+<line x1="470" y1="700" x2="585" y2="700" class="wire"/>
+<circle cx="520" cy="700" r="6" fill="#1b2420"/>
+
+<line x1="260" y1="840" x2="585" y2="840" class="wire"/>
+<circle cx="520" cy="840" r="6" fill="#1b2420"/>
+<line x1="300" y1="840" x2="300" y2="1060" class="wire"/>
+<circle cx="300" cy="840" r="6" fill="#1b2420"/>
+
+<line x1="520" y1="700" x2="520" y2="752" class="wire"/>
+<line x1="498" y1="752" x2="542" y2="752" stroke="#1b2420" stroke-width="3"/>
+<polygon points="498,790 542,790 520,752" fill="#f7f4ee" stroke="#1b2420" stroke-width="2.5"/>
+<line x1="520" y1="790" x2="520" y2="840" class="wire"/>
+<text x="488" y="778" class="xs" text-anchor="end">D1  1N4148</text>
+<text x="488" y="798" class="xs" text-anchor="end">optional reverse clamp</text>
+<text x="488" y="818" class="xs" text-anchor="end">(cathode up, to pin 1)</text>
+
+<rect x="585" y="640" width="250" height="260" rx="10" class="box"/>
+<text x="710" y="678" class="h" text-anchor="middle">PC817</text>
+<text x="602" y="694" class="pin">1</text>
+<text x="602" y="834" class="pin">2</text>
+<text x="818" y="694" class="pin" text-anchor="end">4</text>
+<text x="818" y="834" class="pin" text-anchor="end">3</text>
+<rect x="615" y="720" width="80" height="120" rx="8" class="dash"/>
+<text x="655" y="788" class="xs" text-anchor="middle">LED</text>
+<rect x="725" y="720" width="80" height="120" rx="8" class="dash"/>
+<text x="765" y="770" class="xs" text-anchor="middle">photo-</text>
+<text x="765" y="790" class="xs" text-anchor="middle">tr</text>
+<line x1="699" y1="780" x2="721" y2="780" stroke="#b8860b" stroke-width="3"/>
+<polygon points="721,780 711,774 711,786" fill="#b8860b"/>
+
+<line x1="835" y1="700" x2="1400" y2="700" class="wire"/>
+<circle cx="1000" cy="700" r="6" fill="#1b2420"/>
+<line x1="1000" y1="700" x2="1000" y2="640" class="wire"/>
+<rect x="985" y="560" width="30" height="80" rx="4" fill="#ffffff" stroke="#1b2420" stroke-width="2.5"/>
+<text x="1030" y="600" class="xs">R2  4.7 kΩ</text>
+<text x="1030" y="620" class="xs">(10 kΩ is fine too)</text>
+<line x1="1000" y1="560" x2="1000" y2="522" class="wire"/>
+<circle cx="1000" cy="515" r="7" fill="#1b2420"/>
+<text x="1016" y="521" class="v">3.3 V  (Teensy 3.3 V rail)</text>
+<text x="1180" y="666" class="xs">idle: 3.3 V   ·   pulse: below 0.8 V</text>
+<rect x="1400" y="678" width="220" height="44" rx="6" class="box"/>
+<text x="1510" y="706" class="s" text-anchor="middle">Teensy 4.1  pin 9</text>
+<text x="1510" y="748" class="xs" text-anchor="middle">FreqMeasureMulti</text>
+
+<circle cx="1180" cy="700" r="6" fill="#1b2420"/>
+<line x1="1180" y1="700" x2="1180" y2="792" class="wire"/>
+<line x1="1155" y1="792" x2="1205" y2="792" stroke="#1b2420" stroke-width="4"/>
+<line x1="1155" y1="812" x2="1205" y2="812" stroke="#1b2420" stroke-width="4"/>
+<line x1="1180" y1="812" x2="1180" y2="1060" class="wire"/>
+<text x="1215" y="790" class="xs">C1  100 nF</text>
+<text x="1215" y="810" class="xs">(optional, at pin 9)</text>
+
+<line x1="835" y1="840" x2="900" y2="840" class="wire"/>
+<line x1="900" y1="840" x2="900" y2="1060" class="wire"/>
+<text x="915" y="884" class="xs">pin 3 emitter → GND</text>
+
+<line x1="110" y1="1060" x2="1500" y2="1060" stroke="#0a6" stroke-width="8"/>
+<text x="115" y="1094" class="s">GND rail — one star point, shared with J1 GND, Teensy GND and every sensor return</text>
+
+<!-- ================= 3. BENCH CHECK ================= -->
+<rect x="48" y="1120" width="1604" height="116" rx="8" fill="#fffbe8" stroke="#c9a227" stroke-width="2"/>
+<text x="70" y="1152" class="v">1)  Power OFF, ohmmeter: J4 SIG to J4 GND must NOT read 0 Ω — that would be a short across the LED.</text>
+<text x="70" y="1182" class="v">2)  Power ON, no pulses: pin 9 sits at ~3.3 V.  Feed 12 V pulses into J4 SIG: pin 9 must drop BELOW 0.8 V on every pulse.</text>
+<text x="70" y="1212" class="v">3)  A pin 9 that only dips to ~1.5 V is the classic "RPM = 0" fault: too little LED current, or no common ground.  8 000 RPM @ 2 ppr = 267 Hz.</text>
+
+<!-- ================= 4. SOLDER ORDER ================= -->
+<rect x="48" y="1256" width="1604" height="250" rx="8" fill="#ffffff" stroke="#1b2420" stroke-width="2"/>
+<text x="66" y="1288" class="h">Solder order — all four chip pins, both resistors, ground rail last</text>
+<text x="66" y="1322" class="v">1.  J4 SIG  →  R1 1 kΩ  →  PC817 pin 1  (anode, the top-left pin beside the notch).</text>
+<text x="66" y="1348" class="v">2.  J4 GND  →  PC817 pin 2  (cathode).  Same net as the GND rail.</text>
+<text x="66" y="1374" class="v">3.  PC817 pin 3  (emitter)  →  GND rail.</text>
+<text x="66" y="1400" class="v">4.  R2 4.7 kΩ  from the 3.3 V pin  →  PC817 pin 4  (collector).   ← the pull-up, do not omit</text>
+<text x="66" y="1426" class="v">5.  PC817 pin 4  →  Teensy pin 9.        (pin 4 is the top-right pin of the chip)</text>
+<text x="66" y="1452" class="v">6.  optional D1: cathode (bar) → pin 1,  anode → pin 2,  across the internal LED.</text>
+<text x="66" y="1478" class="v">7.  Power OFF check: J4 SIG to J4 GND must NOT be 0 Ω.  Pin 1 → pin 2 reads like a diode</text>
+<text x="66" y="1498" class="v">     (≈0.5 V one way, open the other).  R2 reads 4.7 kΩ between pin 4 and 3.3 V.</text>
+
+<!-- ================= 5. NOTES ================= -->
+<rect x="48" y="1516" width="792" height="176" rx="8" fill="#ffffff" stroke="#1b2420" stroke-width="2"/>
+<text x="66" y="1548" class="h">No separate LED to buy</text>
+<text x="66" y="1580" class="xs">The emitter half of a PC817 IS an LED, and it is inside the chip across pins 1–2.</text>
+<text x="66" y="1604" class="xs">That is the only part of this circuit that involves light — you never add one.</text>
+<text x="66" y="1628" class="xs">A plain silicon diode (1N4148, 1N4007, …) emits no light: it cannot be the input.</text>
+<text x="66" y="1658" class="xs">The only diode you add is D1, the optional reverse clamp across pins 1–2.</text>
+
+<rect x="864" y="1516" width="788" height="176" rx="8" fill="#ffffff" stroke="#1b2420" stroke-width="2"/>
+<text x="882" y="1548" class="h">Parts — everything that goes on the board</text>
+<text x="882" y="1580" class="v">PC817   DIP-4 optocoupler  ·  R1 1 kΩ ¼ W  ·  R2 4.7 kΩ ¼ W</text>
+<text x="882" y="1606" class="v">C1  100 nF (optional)  ·  D1  1N4148 (optional, the diode you have)</text>
+<text x="882" y="1636" class="xs">The chip does all the work: current in pins 1–2 lights it, pins 3–4 switch pin 9.</text>
+<text x="882" y="1660" class="xs">Load on the car's tach line: ≈11 mA at 12 V through R1 — under the PC817's 50 mA rating.</text>
+<text x="882" y="1684" class="xs">No transistor, no separate LED, no module, no polarity jumper to set.</text>
+</svg>

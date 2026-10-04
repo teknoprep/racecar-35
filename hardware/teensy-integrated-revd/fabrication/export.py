@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed export of the real Rev C electrical PCB.
+"""Fail-closed export of the real Rev D electrical PCB.
 Default: independently reviewed prototype release. --engineering-prototype:
 explicitly UNAPPROVED first-build engineering files, still gated on full CAD/net
 checks. No invented human approval. Never accepts the placement-only preview.
@@ -48,7 +48,7 @@ def preflight(root, engineering=False):
                   'purpose': 'UNAPPROVED ENGINEERING PROTOTYPE; independent review and physical tests still required'}
     else:
         review = json.loads((design / 'design-review.json').read_text())
-        require(review.get('revision') == 'D', 'Review must name revision C')
+        require(review.get('revision') == 'D', 'Review must name revision D')
         require(review.get('approved_for_prototype_fabrication') is True,
                 'Independent design review has not approved prototype fabrication')
         require(isinstance(review.get('reviewed_by'), str) and review['reviewed_by'].strip(),
@@ -89,7 +89,7 @@ def export(root=ROOT, engineering=False):
     pcb = design / (NAME + '.kicad_pcb')
     sch = design / (NAME + '.kicad_sch')
     board = k.LoadBoard(str(pcb))
-    require(str(board.GetTitleBlock().GetRevision()) == 'D', 'PCB title-block revision must be C')
+    require(str(board.GetTitleBlock().GetRevision()) == 'D', 'PCB title-block revision must be D')
     require(board.GetNetCount() > 5 and len(list(board.GetTracks())) > 0,
             'No genuine nets/routing: a placement-only PCB cannot be fabricated as this product')
     refs = {str(fp.GetReference()) for fp in board.GetFootprints()}
@@ -99,7 +99,7 @@ def export(root=ROOT, engineering=False):
     require({aliases[n] for n in required_aliases} <= refs,
             'Integrated GPS/IMU/WiFi/RTC/AFR missing; do not substitute the Rev A carrier')
     pads = connected_pads(board)
-    require(len(pads) > 50, 'Too few connected pads for an integrated Rev C')
+    require(len(pads) > 50, 'Too few connected pads for an integrated Rev D')
     layers = [str(board.GetLayerName(n)) for n in k.LSET.AllCuMask().Seq()
               if board.GetEnabledLayers().Contains(n)]
     layers += ['F.Mask', 'B.Mask', 'F.Silkscreen', 'B.Silkscreen', 'F.Paste', 'B.Paste', 'Edge.Cuts']
