@@ -3,7 +3,8 @@
 //
 // UART0 (Serial) listens for two line types from the Teensy 4.1, 115200 8N1:
 //   GPS,<fix>,<sats>,<lat_deg>,<lon_deg>,<speed_mph>,<heading_deg>,<gps_status>
-//   ENG,<rpm>[,<oil_psi_x10>,<coolant_f_x10>]   (3-field form, back-compat to 1)
+//   ENG,<rpm>,<oil>[,<coolant>[,<direct_rpm>,<direct_coolant>]]  (1/3/5 fields)
+//        fields 4-5 (v0.1.170) = PURE direct sensors (opto tach / NTC), never CAN/BT
 //
 // Two pages, swipeable:
 //   PAGE_DASH      — RPM bar + delta bar + huge speed; TEMP/PSI/VOLT bottom-left,
@@ -27,7 +28,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.169"
+#define FIRMWARE_VERSION "0.1.170"
 
 #include <Preferences.h>
 #include <time.h>
@@ -69,7 +70,8 @@ enum SettingId : uint8_t {
     // Engine source plus independent AEM-gauge AFR (legacy fallback: MS3 mode).
     // AFR has both a "too rich" (low) and "too lean" (high) warn threshold;
     // either fires the same colour.
-    ST_SENSOR_TYPE,
+    ST_SENSOR_TYPE,   // legacy GLOBAL source - now hidden; per-item Source is the control
+    ST_BT_PAIR,       // ACTION: Bluetooth OBD-II pairing/status page (was ST_SENSOR_TYPE's page)
     ST_AEM_AFR, ST_AEM_STATUS,  // independent AEM 30-0300 analog input (opt-in)
     ST_SHOW_AFR, ST_AFR_WARN_LO, ST_AFR_WARN_HI, ST_AFR_WARN_COL,
     ST_REC_SD, ST_REC_CLOUD,
@@ -436,10 +438,12 @@ struct GpsState {
 static GpsState g;
 
 struct EngState {
-    uint16_t rpm           = 0;
+    uint16_t rpm           = 0;    // RESOLVED display RPM (per mon_cfg.src[MON_RPM])
+    uint16_t direct_rpm    = 0;    // ENG field 4: PURE opto-tach RPM, never CAN/BT
     // x10 fixed-point: 0..30000 PSI*10, -1 on sensor fault. Stored as int16.
     int16_t  oil_psi_x10   = -1;
-    int16_t  coolant_f_x10 = -1;
+    int16_t  coolant_f_x10 = -1;   // mixed coolant (ENG field 3)
+    int16_t  direct_coolant_f_x10 = -1;  // ENG field 5: PURE NTC coolant
     uint32_t last_ms       = 0;
 };
 static EngState eng;
@@ -987,7 +991,6 @@ static void clampPidScanScroll() {
     if (pid_scan_scroll < 0)    pid_scan_scroll = 0;
     if (pid_scan_scroll > maxS) pid_scan_scroll = maxS;
 }
-static uint8_t  sensor_orig_type  = 0;   // snapshot for CANCEL on PAGE_SENSOR
 // Device health (heat/brownout diagnostics). Teensy temps + battery arrive via
 // the HLTH line; our own ESP32-S3 temp we read locally and report via DTEMP.
 static float    health_teensy_c   = NAN;
@@ -2174,27 +2177,42 @@ static bool parseGpsLine(const String& line) {
     }
     return true;
 }
+// v0.1.170: the RPM the dash DISPLAYS (bar, shift alerts, monitor row) follows the RPM
+// item's OWN source. DIRECT = the pure opto-tach value the Teensy appends to the ENG
+// line (field 4); CANBUS = the pure CAN value in ECU field 1. Before this, "DIRECT"
+// silently showed CAN RPM the moment any CAN frame arrived, because ENG field 1 is the
+// Teensy's auto-prefer-CAN value.
+static void resolveEngRpm() {
+    eng.rpm = (mon_cfg.src[MON_RPM] == MON_SRC_CAN) ? ecu.rpm : eng.direct_rpm;
+}
+
 static bool parseEngLine(const String& line) {
-    // ENG,<rpm>[,<oil_psi_x10>,<coolant_f_x10>] — 1 OR 3 fields.
-    // Older Teensy firmware (or boot before sensors stabilise) sends only
-    // the rpm field; the oil/coolant values stay at -1 in that case.
-    int idx[4], n = 0;
-    for (int i = 0; i < (int)line.length() && n < 4; ++i)
+    // ENG,<rpm>[,<oil_psi_x10>,<coolant_f_x10>[,<direct_rpm>,<direct_coolant_f_x10>]]
+    // Old firmware sends 1 or 3 fields; on a short line the pure-direct fields mirror the
+    // mixed ones (nothing else exists to read, and the dash must still show RPM).
+    int idx[7], n = 0;
+    for (int i = 0; i < (int)line.length() && n < 6; ++i)
         if (line[i] == ',') idx[n++] = i;
     if (n < 1) return false;
     idx[n] = line.length();
     auto field = [&](int k) { return line.substring(idx[k] + 1, idx[k + 1]); };
+    auto clampRpm = [](long v) -> uint16_t {
+        if (v < 0) return 0;
+        if (v > 65535) return 65535;
+        return (uint16_t)v;
+    };
 
-    long rpm = field(0).toInt();
-    if (rpm < 0)     rpm = 0;
-    if (rpm > 65535) rpm = 65535;
-    eng.rpm = (uint16_t)rpm;
-
+    eng.rpm = clampRpm(field(0).toInt());
     if (n >= 3) {
         eng.oil_psi_x10   = (int16_t)field(1).toInt();
         eng.coolant_f_x10 = (int16_t)field(2).toInt();
     }
+    // Fields 4-5 = the Teensy's PURE direct sensors. Fall back to the mixed fields so an
+    // old Teensy (3-field ENG) still has something to show for Source = DIRECT.
+    eng.direct_rpm           = (n >= 5) ? clampRpm(field(3).toInt()) : eng.rpm;
+    eng.direct_coolant_f_x10 = (n >= 5) ? (int16_t)field(4).toInt()  : eng.coolant_f_x10;
     eng.last_ms = millis();
+    resolveEngRpm();
     return true;
 }
 // Format ms into "M:SS.cs" (centiseconds), e.g. "1:23.45".
@@ -2458,6 +2476,7 @@ static bool parseEcuLine(const String& line) {
     // RESETS it to -1 so a stale value can never outlive the format that carried it.
     ecu.oil_x10 = (n >= 8) ? (int16_t)field(7).toInt() : (int16_t)-1;
     ecu.last_ms = millis();
+    resolveEngRpm();   // v0.1.170: the RPM the dash shows may be this CAN value
     return true;
 }
 
@@ -4752,7 +4771,7 @@ static void simTick() {
 
     char l[160];
     snprintf(l, sizeof(l), "GPS,3,14,%.6f,%.6f,%.1f,%.1f,2", lat, lon, sim_mph, hdg);  simInject(l);
-    snprintf(l, sizeof(l), "ENG,%u,%d,%d", rpm, psi_x10, clt_x10);                              simInject(l);
+    snprintf(l, sizeof(l), "ENG,%u,%d,%d,%u,%d", rpm, psi_x10, clt_x10, rpm, clt_x10);          simInject(l);
     snprintf(l, sizeof(l), "ECU,%u,%d,%d,%d,%d,%d,%d", rpm, clt_x10, map_x10, tps_x10, afr_x10, iat_x10, bat_x10); simInject(l);
     const aemafr::Reading ar = s.aem_afr
         ? aemafr::fromMillivolts(3000 + (int)(400.0f * sinf(t / 7.0f))) : aemafr::Reading{};
@@ -5419,14 +5438,16 @@ static void formatAemStatus(char* buf, size_t cap) {
 // data source (that is now only the acquisition/logging choice + the monDefaults seed).
 // SOURCE TABLE ("none" = no such source exists on this hardware -> invalid -> "---"/hidden):
 //   item  DIRECT                    BLUETOOTH (OBD2)            CANBUS (MS3, needs !ecuStale)
-//   TEMP  eng.coolant_f_x10         obd::coolantF_x10 (fresh)   ecu.coolant_f_x10
+//   TEMP  eng.direct_coolant_f_x10  obd::coolantF_x10 (fresh)   ecu.coolant_f_x10
 //   OIL   eng.oil_psi_x10           none (not an OBD PID here)  ecu.oil_x10 (RC35 bench frames only)
 //   VOLT  none (no battery ADC)     obd::voltX10 (fresh)        ecu.bat_x10     [engine-running gate]
 //   AFR   AEM 30-0300 (s.aem_afr)   none                        ecu.afr_x10
 //   IAT   none                      obd::iatF_x10 (fresh)       ecu.iat_f_x10
 //   MAP   none                      none (no MAP PID polled)    ecu.map_x10
 //   TPS   none                      obd::tpsX10 (fresh, PID 0111) ecu.tps_x10
-//   RPM   eng.rpm                   none (BLE far too slow)     ecu.rpm
+//   RPM   eng.direct_rpm            none (BLE far too slow)     ecu.rpm
+//   (v0.1.170: DIRECT reads the PURE sensor fields, so a CAN frame on the bus can no
+//    longer leak into a "Direct" reading; ECU field 1 / ENG fields 4-5 are pure.)
 // Adding a CAN bus type = one more branch on mon_cfg.can_bus[item] in the CAN column.
 // ---------------------------------------------------------------------------
 static bool monItemValueX10(uint8_t item, int32_t* outX10) {
@@ -5446,7 +5467,9 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
     bool    ok = false;
     switch (item) {
     case MON_TEMP:
-        v  = direct ? eng.coolant_f_x10 : fromBt ? obd::coolantF_x10() : fromCan ? ecu.coolant_f_x10 : -1;
+        // DIRECT reads the PURE NTC field (ENG field 5) - never the mixed field, which the
+        // Teensy auto-switches to CAN the moment a frame arrives (v0.1.170).
+        v  = direct ? eng.direct_coolant_f_x10 : fromBt ? obd::coolantF_x10() : fromCan ? ecu.coolant_f_x10 : -1;
         ok = (v >= 0) && (direct || btOk || canOk);
         break;
     case MON_OIL:
@@ -5498,7 +5521,7 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
         // block's content tag (and the 36 KB sprite push behind it) must key on the displayed
         // value, not the raw one — same rule that fixed the TEMP/PSI tearing. The RPM bar
         // still shows every revolution; this row is the coarse one.
-        if (direct)       { ok = true;   v = (int32_t)((eng.rpm + 5) / 10) * 100; }
+        if (direct)       { ok = true;   v = (int32_t)((eng.direct_rpm + 5) / 10) * 100; }
         else if (canOk)   { ok = true;   v = (int32_t)((ecu.rpm + 5) / 10) * 100; }
         break;
     default: break;
@@ -6748,14 +6771,15 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_COACH_SHOW,   "Show coach checklist",     SettingRow::TOGGLE  },
     { ST_VOLT_WARN,    "Voltage low-warn (x10)",   SettingRow::NUMERIC },
     { ST_VOLT_WARN_COL,"Voltage warn color",       SettingRow::COLOR   },
-    { ST_SENSOR_TYPE,  "Sensor data source",    SettingRow::ENUM    },
+    { ST_SENSOR_TYPE,  "Sensor data source",    SettingRow::ENUM    },  // hidden (v0.1.170)
+    { ST_BT_PAIR,      "Bluetooth OBD-II",      SettingRow::ACTION  },
     { ST_AEM_AFR,      "AEM 30-0300 AFR input", SettingRow::TOGGLE  },
     { ST_AEM_STATUS,   "AEM voltage / lambda", SettingRow::INFO    },
     { ST_SHOW_AFR,     "Show AFR",              SettingRow::TOGGLE  },
     { ST_AFR_WARN_LO,  "AFR rich-warn (x10)",   SettingRow::NUMERIC },
     { ST_AFR_WARN_HI,  "AFR lean-warn (x10)",   SettingRow::NUMERIC },
     { ST_AFR_WARN_COL, "AFR warn color",        SettingRow::COLOR   },
-    { ST_MON_ORDER,    "Sensor monitor order",  SettingRow::ACTION  },
+    { ST_MON_ORDER,    "Sensor monitoring",     SettingRow::ACTION  },
     { ST_REC_SD,        "Record to SD card",    SettingRow::TOGGLE  },
     { ST_REC_CLOUD,     "Record to cloud",      SettingRow::TOGGLE  },
     { ST_VIDEO_EN,      "Video interconnect",   SettingRow::TOGGLE  },
@@ -7595,31 +7619,26 @@ static void handleGpsPageTap(int x, int y) {
 }
 
 // ---------------------------------------------------------------------------
-// PAGE_SENSOR — Sensor Source picker (Direct / MegaSquirt / Bluetooth), modeled
-// on the GPS page. For Bluetooth it also shows the paired OBD-II dongle + its
-// live connection status and a SCAN button. DONE saves, CANCEL reverts.
+// PAGE_SENSOR — Bluetooth OBD-II pairing/status (v0.1.170). The GLOBAL source
+// picker is gone: each sensor's source is set per item on PAGE_MON_ITEM (Sensor
+// monitoring), and this page only pairs the BLE ELM327 dongle + maps its coolant
+// PID. Opening it brings BLE up (WiFi hard-off first — coex crash); leaving hands
+// the radio back unless a session is recording.
 // ---------------------------------------------------------------------------
 namespace {
-  constexpr int SS_BTN_W = 232, SS_BTN_H = 56, SS_BTN_X0 = 30, SS_BTN_DX = 246, SS_BTN_Y = 96;
   constexpr int SS_SCAN_X = 30,  SS_SCAN_Y = 300, SS_SCAN_W = 300, SS_SCAN_H = 54;
-  constexpr int SS_CANCEL_X = 60, SS_DONE_X = 440, SS_FOOT_Y = 410, SS_FOOT_W = 300, SS_FOOT_H = 54;
-}
-
-// Apply a sensor-source choice live: bring up / tear down the BLE OBD client.
-static void applySensorSource(uint8_t t) {
-    s.sensor_type = t % N_SENSOR_TYPE;
-    if (s.sensor_type == 2) {                 // Bluetooth OBD-II
-        obd::setBlocked(false);   // explicit user action -> allow the (re)try even after a prior crash
-        btAcquireRadio();         // WiFi hard-off BEFORE any BLE init (coex crash)
-        obd::begin();
-        if (s.bt_addr[0]) obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
-    } else {
-        btReleaseRadio();         // full BLE shutdown -> arbiter restores WiFi
-    }
+  constexpr int SS_BACK_X = 290, SS_FOOT_Y = 410, SS_FOOT_W = 220, SS_FOOT_H = 54;
 }
 
 static void openSensorPage() {
-    sensor_orig_type  = s.sensor_type;
+    // Bring BLE up so the page shows live status (never mid-recording — netOwnerTick
+    // owns the recording edges; a monitor item on BLUETOOTH already has it up).
+    if (!recording) {
+        obd::setBlocked(false);   // explicit user action -> allow the (re)try even after a prior crash
+        btAcquireRadio();         // WiFi hard-off BEFORE any BLE init (coex crash)
+        obd::begin();
+        if (s.bt_addr[0] && obd::isDown()) obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
+    }
     currentPage       = PAGE_SENSOR;
     pageJustEntered   = true;
     sensor_page_dirty = true;
@@ -7633,28 +7652,22 @@ static void drawSensorPage() {
     tft.setFont(&fonts::Font4); tft.setTextSize(1);
     tft.setTextDatum(textdatum_t::top_left);
     tft.setTextColor(TFT_CYAN, BG); tft.setTextPadding(500);
-    tft.drawString("SENSOR SOURCE", 20, 12);
+    tft.drawString("BLUETOOTH OBD-II", 20, 12);
     tft.setTextPadding(0);
 
     tft.setFont(&fonts::Font2); tft.setTextSize(1);
     tft.setTextColor(TFT_LIGHTGREY, BG);
-    tft.drawString("RPM always comes from the tach/CAN via the Teensy.", 30, 64);
-    // Show a prior BLE-init crash reason ALWAYS (source reverts off BT after a
-    // crash, so this can't live in the BT-only block or it'd never be seen).
     tft.setTextPadding(760);
+    tft.drawString("Set an item's Source to BLUETOOTH on Sensor monitoring to use this dongle.", 30, 56);
     if (ble_diag[0]) { tft.setTextColor(TFT_RED, BG); tft.drawString(ble_diag, 30, 82); }
     else             { tft.setTextColor(BG, BG);      tft.drawString(" ", 30, 82); }
     tft.setTextPadding(0);
 
-    // Three source buttons (one row)
-    for (int i = 0; i < N_SENSOR_TYPE; i++)
-        drawGpsSelBtn(SS_BTN_X0 + i * SS_BTN_DX, SS_BTN_Y, SENSOR_TYPE_NAMES[i], s.sensor_type == i);
-
-    // Bluetooth detail block (only when BT is the chosen source)
-    const int by = 250;
+    // Paired dongle + live status (always shown — this page is the dongle's home).
+    const int by = 130;
     tft.setFont(&fonts::Font2); tft.setTextSize(1);
     tft.setTextPadding(740);
-    if (s.sensor_type == 2) {
+    {
         char buf[128];
         tft.setTextColor(TFT_WHITE, BG);
         snprintf(buf, sizeof(buf), "Device: %s",
@@ -7711,49 +7724,28 @@ static void drawSensorPage() {
     }
     tft.setTextPadding(0);
 
-    // Footer: CANCEL / DONE
-    tft.fillRect(SS_CANCEL_X, SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_MAROON);
-    tft.drawRect(SS_CANCEL_X, SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_WHITE);
-    tft.fillRect(SS_DONE_X,   SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_DARKGREEN);
-    tft.drawRect(SS_DONE_X,   SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_WHITE);
+    // Footer: BACK (pairing saves as you go; nothing to cancel here).
+    tft.fillRect(SS_BACK_X, SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_DARKGREY);
+    tft.drawRect(SS_BACK_X, SS_FOOT_Y, SS_FOOT_W, SS_FOOT_H, TFT_WHITE);
     tft.setFont(&fonts::Font4); tft.setTextSize(1);
     tft.setTextDatum(textdatum_t::middle_center);
-    tft.setTextColor(TFT_WHITE, TFT_MAROON);
-    tft.drawString("CANCEL", SS_CANCEL_X + SS_FOOT_W / 2, SS_FOOT_Y + SS_FOOT_H / 2);
-    tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
-    tft.drawString("DONE", SS_DONE_X + SS_FOOT_W / 2, SS_FOOT_Y + SS_FOOT_H / 2);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawString("BACK", SS_BACK_X + SS_FOOT_W / 2, SS_FOOT_Y + SS_FOOT_H / 2);
     tft.setTextDatum(textdatum_t::top_left);
 }
 
 static void handleSensorPageTap(int x, int y) {
-    // Source buttons
-    if (y >= SS_BTN_Y && y <= SS_BTN_Y + SS_BTN_H) {
-        for (int i = 0; i < N_SENSOR_TYPE; i++) {
-            const int bx = SS_BTN_X0 + i * SS_BTN_DX;
-            if (x >= bx && x <= bx + SS_BTN_W) {
-                if (s.sensor_type != i) applySensorSource((uint8_t)i);
-                sensor_page_dirty = true; return;
-            }
-        }
+    // SCAN / COOLANT PID (always available — this page is the dongle's home).
+    if (y >= SS_SCAN_Y && y <= SS_SCAN_Y + SS_SCAN_H) {
+        if (x >= SS_SCAN_X && x <= SS_SCAN_X + SS_SCAN_W) { openBtScan(); return; }
+        if (x >= SS_SCAN_X + 330 && x <= SS_SCAN_X + 330 + SS_SCAN_W) { openPidScan(); return; }
     }
-    // SCAN (BT mode only)
-    if (s.sensor_type == 2 && y >= SS_SCAN_Y && y <= SS_SCAN_Y + SS_SCAN_H &&
-        x >= SS_SCAN_X && x <= SS_SCAN_X + SS_SCAN_W) { openBtScan(); return; }
-    // COOLANT PID mapper (BT mode only)
-    if (s.sensor_type == 2 && y >= SS_SCAN_Y && y <= SS_SCAN_Y + SS_SCAN_H &&
-        x >= SS_SCAN_X + 330 && x <= SS_SCAN_X + 330 + SS_SCAN_W) { openPidScan(); return; }
-    // Footer
-    if (y >= SS_FOOT_Y && y <= SS_FOOT_Y + SS_FOOT_H) {
-        if (x >= SS_CANCEL_X && x <= SS_CANCEL_X + SS_FOOT_W) {
-            if (s.sensor_type != sensor_orig_type) applySensorSource(sensor_orig_type);
-            if (!recording) btReleaseRadio();   // leaving pairing UI: WiFi gets the radio back
-            currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true; return;
-        }
-        if (x >= SS_DONE_X && x <= SS_DONE_X + SS_FOOT_W) {
-            saveSettings();   // persists sensor_type + bt_* and re-syncs CFG,srctyp to Teensy
-            if (!recording) btReleaseRadio();   // leaving pairing UI: WiFi gets the radio back
-            currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true; return;
-        }
+    // Footer: BACK
+    if (y >= SS_FOOT_Y && y <= SS_FOOT_Y + SS_FOOT_H &&
+        x >= SS_BACK_X && x <= SS_BACK_X + SS_FOOT_W) {
+        saveSettings();                       // persist bt_* (pairing already saved its own)
+        if (!recording) btReleaseRadio();     // leaving pairing UI: WiFi gets the radio back
+        currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true;
     }
 }
 
@@ -7782,7 +7774,6 @@ static void selectBtDevice(int i) {
     strncpy(s.bt_addr, it->addr, sizeof(s.bt_addr) - 1); s.bt_addr[sizeof(s.bt_addr) - 1] = 0;
     s.bt_atype = it->atype;
     strncpy(s.bt_name, it->name, sizeof(s.bt_name) - 1); s.bt_name[sizeof(s.bt_name) - 1] = 0;
-    s.sensor_type = 2;
     saveSettings();
     obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
     currentPage = PAGE_SENSOR; pageJustEntered = true; sensor_page_dirty = true;
@@ -8064,12 +8055,19 @@ static bool rowShouldShow(SettingId id) {
         case ST_WIFI_PASS:
         case ST_WIFI_STATUS: return true;
 
-        // Tach pulses/rev divider only applies to the Direct opto tach; in
-        // MegaSquirt mode RPM comes straight from CAN.
+        // Tach pulses/rev divider only applies to the Direct opto tach. The global
+        // source row is hidden (v0.1.170) and defaults to Direct, so this stays visible
+        // on a normal unit; the RPM item's own Source drives the DISPLAY separately.
         case ST_RPM_DIV:   return s.sensor_type == 0;
 
+        // v0.1.170: the global Sensor data source row is retired from the menu — every
+        // monitor item carries its OWN Source on PAGE_MON_ITEM. Its enum member, Settings
+        // field, NVS key and value-string case stay (monDefaults seed / rollback path);
+        // its page is now reached through "Bluetooth OBD-II" pairing instead.
+        case ST_SENSOR_TYPE: return false;
+
         // v0.1.154: display of the sensor rows is now per item on the sensor
-        // monitor page (ALWAYS / WARN ONLY / HIDDEN) — "Sensor monitor order" in
+        // monitor page (ALWAYS / WARN ONLY / HIDDEN) — "Sensor monitoring" in
         // SG_SENSORS. These four legacy on/off rows still load/save their old NVS
         // keys (they seed mon_cfg on a unit that has no "mon" blob yet, keeping the
         // migration faithful) and the warn THRESHOLDS below are untouched, but the
@@ -8094,8 +8092,6 @@ static bool rowShouldShow(SettingId id) {
         // rows are HIDDEN here, but their enum members, Settings fields, NVS keys and
         // load/save/value-string cases are deliberately KEPT: they are the migration
         // seed for mon_cfg (monDefaults) and the rollback path for older firmware.
-        // ST_SENSOR_TYPE stays visible - it is a GLOBAL source choice (Direct / MS3 /
-        // Bluetooth), not a per-item setting. ST_AEM_STATUS (info) may stay.
         case ST_AEM_AFR:
         case ST_TEMP_WARN_F:
         case ST_TEMP_WARN_COL:
@@ -8137,6 +8133,7 @@ static int rowGroup(SettingId id) {
         case ST_A1_RPM: case ST_A1_COL: case ST_A1_HZ:
         case ST_AM_RPM: case ST_AM_COL: case ST_AM_HZ: return SG_RPM;
         case ST_SENSOR_TYPE:
+        case ST_BT_PAIR:
         case ST_SHOW_TEMP: case ST_TEMP_WARN_F: case ST_TEMP_WARN_COL:
         case ST_SHOW_PSI:  case ST_PSI_WARN_PSI: case ST_PSI_WARN_COL:
         case ST_AEM_AFR: case ST_AEM_STATUS:
@@ -8374,6 +8371,15 @@ static void drawSettingsPage() {
                     strncpy(buf, "-- not set --", sizeof(buf));
                 }
                 tft.drawString(buf, ACT_X + ACT_W / 2, y + SETTINGS_ROW_HEIGHT / 2);
+            } else if (r.id == ST_BT_PAIR) {
+                // Bluetooth OBD-II pairing/status. Summary only; the page has the detail.
+                tft.fillRect(ACT_X, y, ACT_W, SETTINGS_ROW_HEIGHT, TFT_NAVY);
+                tft.drawRect(ACT_X, y, ACT_W, SETTINGS_ROW_HEIGHT, TFT_WHITE);
+                tft.setTextColor(TFT_WHITE, TFT_NAVY);
+                char bbuf[32];
+                if (!s.bt_addr[0]) snprintf(bbuf, sizeof(bbuf), "pair a device  >");
+                else snprintf(bbuf, sizeof(bbuf), "%.14s  >", s.bt_name[0] ? s.bt_name : s.bt_addr);
+                tft.drawString(bbuf, ACT_X + ACT_W / 2, y + SETTINGS_ROW_HEIGHT / 2);
             } else if (r.id == ST_MON_ORDER) {
                 // Summary of the bottom-left block: how many monitors are not HIDDEN.
                 tft.fillRect(ACT_X, y, ACT_W, SETTINGS_ROW_HEIGHT, TFT_NAVY);
@@ -8619,6 +8625,7 @@ static void handleSettingsTap(int x, int y) {
                     pageJustEntered = true;
                     return;
                 }
+                if (r.id == ST_BT_PAIR)   { openSensorPage(); return; }  // v0.1.170: BT OBD-II pairing
                 if (r.id == ST_MON_ORDER) { openMonCfg(); return; }   // v0.1.154: sensor monitor page
                 // (Check for updates + Format SD have moved to PAGE_TOOLS.
                 //  Tap dispatch for those lives in handleToolsTap.)
@@ -9165,6 +9172,7 @@ static void cancelMonCfg() {
 static void saveMonCfg() {
     if (!monCfgValid(mon_cfg)) monDefaults();    // belt and braces; the UI can't break it
     saveSettings();                              // NVS + CFG re-sync to the Teensy
+    resolveEngRpm();                             // v0.1.170: the RPM source may have changed
     ld.sens_tag = 0;                             // dash block must repaint with the new order
     currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true;
 }
@@ -9436,6 +9444,7 @@ static void handleMonItemTap(int x, int y) {
         if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
             mon_cfg.src[item] = (uint8_t)((mon_cfg.src[item] + 1) % MON_SRC_COUNT);   // DIRECT -> BLUETOOTH -> CANBUS
             if (item == MON_AFR) monAfrSyncAem();
+            if (item == MON_RPM) resolveEngRpm();   // v0.1.170: re-resolve the displayed RPM now
             ld.sens_tag = 0;                      // the block must re-resolve with the new source
             moni.dirty = true;
         }
@@ -9479,7 +9488,7 @@ static void drawMonCfg() {
         tft.fillScreen(TFT_BLACK);
         tft.setFont(&fonts::Font4); tft.setTextSize(1);
         tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextDatum(textdatum_t::top_left);
-        tft.drawString("SENSOR MONITOR", 20, 18);
+        tft.drawString("SENSOR MONITORING", 20, 18);
         tft.setFont(&fonts::Font2); tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.drawString("tap name for warnings  -  tap mode to change  -  arrows reorder", 20, 46);
         pageJustEntered = false; monp.dirty = true;
@@ -9540,7 +9549,7 @@ static void drawMonCfg() {
 static void handleMonCfgTap(int x, int y) {
     if (y >= MON_FOOT_Y) {
         if (x < 240)       cancelMonCfg();
-        else if (x < 510) { monDefaults(); monp.dirty = true; }   // legacy show flags kept
+        else if (x < 510) { monDefaults(); resolveEngRpm(); monp.dirty = true; }   // legacy show flags kept
         else               saveMonCfg();
         return;
     }

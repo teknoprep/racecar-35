@@ -960,8 +960,15 @@ Note: the live baud is **921600** (not 115200) for telemetry + file uploads — 
 Up to 25 Hz when GPS PVT is fresh; 1 Hz heartbeat fallback when not.
 ```
 GPS,<fix>,<sats>,<lat_deg>,<lon_deg>,<speed_mph>,<heading_deg>,<gps_status>
-ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>
+ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>[,<direct_rpm>,<direct_coolant_f_x10>]
+                   # v0.1.170: fields 4-5 are the PURE direct sensors (opto-tach RPM, NTC
+                   # coolant) — never substituted by CAN or Bluetooth. The dash's per-item
+                   # Source = DIRECT reads ONLY these, so choosing Direct can no longer show
+                   # a CAN value (field 1 auto-prefers CAN whenever a frame is live). Old
+                   # dashes ignore the trailing fields.
 ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>[,<oil_x10>]
+                   # v0.1.170: field 1 is PURE CAN RPM (-1 when no CAN frame is live); it used
+                   # to carry the mixed value, so "CANBUS" could really be the opto tach.
                    # v0.1.159: the 9th field is BENCH OIL (PSI x10) from the RC35 bench frames,
                    # -1 unless those are live. Deliberately NOT folded into ENG's oil: the dash's
                    # per-item SOURCE picks DIRECT (the A2 transducer) vs CANBUS, so the two must
@@ -1277,7 +1284,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `s_temp` / `t_warn` / `t_col` | bool/uint16/uint8 | Coolant show / warn-°F / warn-colour |
 | `s_psi` / `p_warn` / `p_col` | bool/uint16/uint8 | Oil-PSI show / warn-PSI / warn-colour |
 | `s_volt` / `v_warn` / `v_col` | bool/uint16/uint8 | **Voltage show / low-warn (V×10, default 128=12.8 V) / warn-colour (v0.1.110).** Source: BT ATRV (srctyp==2) or MS3 CAN bat (==1). Display AND warning are gated on `eng.rpm >= ENGINE_RUNNING_RPM` (500) — parked ignition-on reads ~12.4 V, which is normal, not a dying alternator. The VOLT line shares the AFR dash row (renders only when the AFR line doesn't). |
-| `srctyp` | uint8 | **Sensor source: 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN), 2=Bluetooth (BLE OBD-II dongle for slow readings)** |
+| `srctyp` | uint8 | **Legacy global sensor source: 0=Direct, 1=MegaSquirt, 2=Bluetooth.** **Hidden from the Settings menu since v0.1.170** (each monitor item carries its own Source). Still loaded/saved and sent to the Teensy (`CFG,srctyp`) as the *acquisition/logging* choice and the `monDefaults()` seed. Never repurpose. |
 | `bt_addr` / `bt_atype` / `bt_name` | string/uint8/string | **Paired BLE OBD-II (ELM327) dongle**: address `"aa:bb:.."`, BLE address type, friendly name. Used when `srctyp==2` to auto-reconnect on boot. Set from PAGE_BT_SCAN. |
 | `btpid` | uint8 | **Mode-01 PID mapped to the COOLANT function** (default 0x05 = standard ECT). Set from PAGE_PID_SCAN (Sensor page → COOLANT PID button); decoded as A−40 °C. |
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
@@ -1291,7 +1298,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `atime` | bool | **Auto time** (v0.1.152, default **ON**). Settings → "Auto time". When ON: the panel RTC / NTP / the Teensy's GPS-derived `TIME,` may set the clock, and the panel writes NTP to its own coin-cell RTC and re-broadcasts `SETTIME` to the Teensy when they disagree. OFF freezes the clock — only Settings → "Set time" moves it. |
 | `atz` | bool | **Auto timezone** (v0.1.152, default **ON**). Settings → "Auto timezone". When ON the zone is derived from GPS at START: the venue's own `TRACKS[].tz` when the fix identifies the track, else a coordinate estimate (longitude → nearest whole-hour zone, DST-observing variant preferred). A manual pick in the timezone picker sets this OFF. |
 | `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
-| `mon` | blob | **The whole sensor monitor config** (v0.1.154, extended v0.1.155) — `MonCfg` = `order[MON_COUNT]` (MonItem ids, top of the stack first — **which is also the warning-flash priority**), `mode[MON_COUNT]` (0 ALWAYS / 1 WARN ONLY / 2 HIDDEN), `warn_lo`/`warn_hi[MON_COUNT]` (int32, ×10 of the item's natural unit; `MON_WARN_OFF` = disabled) and `warn_col[MON_COUNT]` (PALETTE index), `src[MON_COUNT]` (v0.1.156: MonSrc — DIRECT / BLUETOOTH / CANBUS **per item**) and `can_bus[MON_COUNT]` (MonCanBus; only MegaSquirt exists today). THE control for what the bottom-left block shows and when it warns; edited on PAGE_MON_CFG and PAGE_MON_ITEM (Settings → "Sensor monitor order"). The load is length-guarded **and content-validated**; a size change (struct grew) or a damaged blob falls back to `monDefaults()`, which seeds modes AND thresholds/colours from the legacy `s_temp`/`s_psi`/`s_volt`/`s_afr`, `t_warn`/`p_warn`/`v_warn`/`afr_lo`/`afr_hi` and `*_col` keys — so an upgrading unit keeps the behaviour it had. The legacy **Show/warn** rows are no longer displayed (their keys, struct fields and load/save remain as the migration seed and the rollback path). |
+| `mon` | blob | **The whole sensor monitor config** (v0.1.154, extended v0.1.155) — `MonCfg` = `order[MON_COUNT]` (MonItem ids, top of the stack first — **which is also the warning-flash priority**), `mode[MON_COUNT]` (0 ALWAYS / 1 WARN ONLY / 2 HIDDEN), `warn_lo`/`warn_hi[MON_COUNT]` (int32, ×10 of the item's natural unit; `MON_WARN_OFF` = disabled) and `warn_col[MON_COUNT]` (PALETTE index), `src[MON_COUNT]` (v0.1.156: MonSrc — DIRECT / BLUETOOTH / CANBUS **per item**) and `can_bus[MON_COUNT]` (MonCanBus; only MegaSquirt exists today). THE control for what the bottom-left block shows and when it warns; edited on PAGE_MON_CFG and PAGE_MON_ITEM (Settings → "Sensor monitoring"). The load is length-guarded **and content-validated**; a size change (struct grew) or a damaged blob falls back to `monDefaults()`, which seeds modes AND thresholds/colours from the legacy `s_temp`/`s_psi`/`s_volt`/`s_afr`, `t_warn`/`p_warn`/`v_warn`/`afr_lo`/`afr_hi` and `*_col` keys — so an upgrading unit keeps the behaviour it had. The legacy **Show/warn** rows are no longer displayed (their keys, struct fields and load/save remain as the migration seed and the rollback path). |
 | `viden` | bool | **Video interconnect** (v0.1.150, default OFF). Settings → "Video interconnect". `CFG,viden,0\|1`. When ON, Teensy Serial1 (pins 0/1, 115200) talks to a **separate Raspberry Pi 5** video box: forwards `REC`/`TRACK`/`HUD` for 1080p front + rear PIP + overlay. Does not block START if the Pi is missing. See `hardware/video-recorder/` and `hardware/breadboard/`. |
 | `sf_unk` | blob | **UNKNOWN-track S/F** (one `SfOverride`, v0.1.129) — the ONLY on-car S/F capture left. SET S/F (STATUS page / dash TRACK button while recording) works ONLY when `lapTrackIdx() < 0`; lap timing + Teensy `CFG,sf` stamping run against it at unmapped tracks. DELETE S/F clears it. |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **⚠️ IGNORED since v0.1.129 for KNOWN tracks** — the baked S/F (web-managed via `/tools/sfpicker`) is the ONLY source; a stale on-device capture used to silently beat a freshly baked line and kill lap timing (the Summit Point incident). Blob still loaded/saved for back-compat, never consulted. On-car capture now exists ONLY for UNKNOWN tracks (`sf_unk` above). The dash LAP row shows a CYAN `SF <dist>` countdown (pre-arm, while recording) so a misplaced S/F is visible on lap 1. Historical: struct size changed in 0.1.82 (pre-0.1.82 blobs ignored once).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. **v0.1.112: a capture below 5 mph stores a POINT (radius method) — GPS heading is garbage at rest, so the old parked capture built a line pointing anywhere and silently killed lap detection for the whole track (the Thompson incident). Rolling capture (≥5 mph) builds the perpendicular line. The STATUS button label now shows live distance to the effective S/F (`custom`/`default`, meters); a maroon **CLR S/F** sub-button (only when an override exists) wipes a bad override trackside; `updateLapTimer()` emits a 20 s `DBG,lap trk=… ovr=… d_sf=…m armed=… laps=…` breadcrumb.** Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
@@ -1326,27 +1333,34 @@ and modes live in the `mon` NVS blob, edited on `PAGE_MON_CFG`.
 ### Per-item SOURCE: Direct / Bluetooth / CANBUS (v0.1.156)
 Each monitor item carries its own `src[]` + `can_bus[]`, so the bottom-left block can mix
 sources — e.g. coolant off the MS3 while oil pressure stays on the direct transducer.
-`monDefaults()` seeds every item from the **global** `Sensor data source` (which stays in
-Settings because it still decides what the Teensy *samples and logs*), but changing the global
-row afterwards does NOT rewrite per-item sources.
+`monDefaults()` seeds every item from the legacy **global** `Sensor data source` (`srctyp`),
+but that row is **HIDDEN since v0.1.170** — the per-item Source is the only control. The global
+field, NVS key and CFG line are kept (monDefaults seed + rollback); its old page (PAGE_SENSOR) is
+now the **Bluetooth OBD-II** pairing page reached from Settings.
 
 | Item | DIRECT | BLUETOOTH | CANBUS (MegaSquirt) |
 | --- | --- | --- | --- |
-| TEMP | `eng.coolant_f_x10` (NTC ADC) | `obd::coolantF_x10()` | `ecu.coolant_f_x10` |
+| TEMP | `eng.direct_coolant_f_x10` (NTC ADC) | `obd::coolantF_x10()` | `ecu.coolant_f_x10` |
 | OIL  | `eng.oil_psi_x10` (A2) | — | `ecu.oil_x10` — RC35 bench frames ONLY |
 | VOLT | — (this board has no battery ADC) | `obd::voltX10()` (ATRV) | `ecu.bat_x10` |
 | AFR  | the AEM analogue input | — | `ecu.afr_x10` |
 | IAT  | — | `obd::iatF_x10()` | `ecu.iat_f_x10` |
 | MAP  | — | — (no MAP PID is polled) | `ecu.map_x10` |
 | TPS  | — | `obd::tpsX10()` (PID 0111) | `ecu.tps_x10` |
-| RPM  | `eng.rpm` | — (BLE is far too slow) | `ecu.rpm` |
+| RPM  | `eng.direct_rpm` | — (BLE is far too slow) | `ecu.rpm` |
 
 - A combination with **no data** is still selectable (uniform UI) but its pill is **maroon and
   reads "(no data)"** — an obvious dead choice instead of a mystery `---`.
 - A **future CAN type** added to `MonCanBus` without a decode branch reads as *no data*, never
   as garbage: `monItemValueX10()` requires `can_bus == MON_CAN_MS3` before it decodes.
-- The global `Sensor data source` still turns the **Teensy's** acquisition on; the per-item
-  source only picks which already-received stream the *display* uses.
+- **v0.1.170 — the per-item source is authoritative for the DISPLAY.** `resolveEngRpm()` sets
+the RPM the bar / shift alerts / monitor row show from `mon_cfg.src[MON_RPM]` (DIRECT = the pure
+`eng.direct_rpm`, CANBUS = `ecu.rpm`), and TEMP DIRECT reads `eng.direct_coolant_f_x10`. Before
+this, "Direct" silently displayed CAN the moment frames arrived, because the mixed ENG/ECU fields
+were the only ones on the wire. The global `srctyp` still tells the Teensy what to *sample and
+log*.
+- The legacy global `Sensor data source` row is **hidden**; PAGE_SENSOR is now the **Bluetooth
+  OBD-II** pairing page (Settings → "Bluetooth OBD-II").
 - **v0.1.158 — "I selected VOLT and see nothing".** Two causes, both fixed: (1) the seeding
   fallback was "global source, else DIRECT", and DIRECT has **no battery ADC on this board**, so
   a Direct-mode unit got a VOLT row that could never hold a value — the fallback now picks a
@@ -1377,9 +1391,9 @@ Every sensor **display and alert** setting moved onto the monitor pages; the old
 (`Coolant warn (°F)`, `Oil low-warn`, `Voltage low-warn`, `AFR rich/lean-warn`, all four warn
 **colours**, and the AEM enable) are **hidden from Settings** via `rowShouldShow()`. Their enum
 members, struct fields, NVS keys and load/save are kept deliberately — they are what
-`monDefaults()` migrates from, and they are the rollback path. What is left in Settings is
-`Sensor data source` (Direct/MegaSquirt/Bluetooth), which is a **global acquisition/logging**
-choice — it still decides what the Teensy samples and writes to the SD log.
+`monDefaults()` migrates from, and they are the rollback path. Since v0.1.170 the global `Sensor
+data source` row is **also hidden** (the per-item Source owns the display); what remains in
+Settings is the "Sensor monitoring" entry point and the RPM shift alerts.
 - **Per-item thresholds:** `warn_lo` / `warn_hi`, stored ×10 of the item's natural unit (°F /
   psi / V / AFR / kPa / % / rpm), `MON_WARN_OFF` = disabled, so `v <= lo` or `v >= hi` warns.
   Strictly more capable than the old fixed polarity — coolant can now also have a LOW warn,
@@ -1520,11 +1534,11 @@ Remaining levers if it ever returns: `DASH_FREQ_WRITE` 15 → 13–14 MHz (panel
 | `PAGE_NUM_KB` | tap on cloud port value | Numeric keypad (3 cols × 4 rows + DONE/CANCEL) |
 | `PAGE_TEXT_KB` | tap on cloud host / auth user / auth pass | Full lowercase keyboard (10 × 4 letters/digits + .-_/ + BACK/SPACE/DONE/CANCEL) |
 | `PAGE_TRACK_PICKER` | tap START button (when not auto-confirming) | Modal list of tracks; closest GPS match auto-bumped to top with distance label |
-| `PAGE_SENSOR` | tap the **Sensor data source** settings row | Dedicated picker: Direct / MegaSquirt / **Bluetooth** buttons (like the GPS page). In Bluetooth mode shows the paired OBD-II dongle + live BLE status + a SCAN button. DONE saves, CANCEL reverts. |
+| `PAGE_SENSOR` | Settings → **Bluetooth OBD-II** | **Bluetooth OBD-II pairing/status (v0.1.170)** — the global source picker is gone. Shows the paired dongle + live BLE status + SCAN + COOLANT PID; BACK saves and releases the radio. Set an item's Source to BLUETOOTH on Sensor monitoring to actually use it. |
 | `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). Drag-scrollable. RESCAN / BACK. |
 | `PAGE_PID_SCAN` | tap COOLANT PID on PAGE_SENSOR | Mode-01 PID scan (needs connected dongle + ignition); tap a row to map it as COOLANT (`btpid`). Drag-scrollable. RESCAN / BACK. |
 | `PAGE_MON_ITEM` | tap an item's **name** on PAGE_MON_CFG | **Per-item editor** (v0.1.155, sources v0.1.156): Display (ALWAYS/WARN ONLY/HIDDEN), **Source** (DIRECT / BLUETOOTH / CANBUS), **CAN bus** (only when the source is CANBUS — "MegaSquirt"), **AEM input** (AFR only, v0.1.157 — writes `s.aem_afr`; switching it on also points the AFR row at DIRECT so the pill can never read ON while the row shows a CAN number), Warn low, Warn high, Colour. The ▲▼ on the list page still reorder. A tap on a pill/button never opens this page — only the name area does. The row pitch shrinks for the 7-row AFR list (7 × 48 = 336 = the body height). |
-| `PAGE_MON_CFG` | Settings → **Sensor monitor order** | **Order + display editor for the bottom-left monitor block** (v0.1.154): one row per item (TEMP/OIL/VOLT/AFR/IAT/MAP/TPS) with ▲▼ reordering and a tappable mode cell cycling **ALWAYS → WARN ONLY → HIDDEN**. Footer CANCEL (restores the snapshot taken on entry) / RESET (defaults) / DONE (saves the `mon` blob). Warnings still fire for every item that isn't HIDDEN. |
+| `PAGE_MON_CFG` | Settings → **Sensor monitoring** | **Order + display editor for the bottom-left monitor block** (v0.1.154): one row per item (TEMP/OIL/VOLT/AFR/IAT/MAP/TPS) with ▲▼ reordering and a tappable mode cell cycling **ALWAYS → WARN ONLY → HIDDEN**. Footer CANCEL (restores the snapshot taken on entry) / RESET (defaults) / DONE (saves the `mon` blob). Warnings still fire for every item that isn't HIDDEN. |
 | `PAGE_TZ_PICKER` | Settings → **Time zone** row | **Scrollable standard-timezone list** (v0.1.152): drag to scroll, tap a row to highlight, footer **CANCEL / AUTO / DONE**. AUTO (green while GPS owns the zone) re-derives immediately and sets `atz` ON; DONE saves + sends `TZ,<id>` to the Teensy and sets `atz` OFF. Replaced the old "tap the row to cycle" enum. |
 | `PAGE_TEST_SRC` | Tools → **Start test mode** (when idle) | **"TEST DATA SOURCE"** (v0.1.147): **TEENSY** = existing `TESTSTART` (Teensy synthesizes + RECORDS a real SD session; exercises SD + upload) / **SCREEN** = dash-local simulator, **no Teensy needed** / CANCEL. Tap-only modal, returns to Tools. |
 
@@ -1907,8 +1921,10 @@ resets fields to `-1` if the bus goes silent. **FreqMeasureMulti (opto tach) is 
 — both RPM sources are always running; `emitToDash()` picks one based on `sensor_type`.
 
 ### sensor_type switch (Direct / MegaSquirt / Bluetooth)
-`Settings → Sensor data source` opens **PAGE_SENSOR** (NVS key `srctyp`, synced to Teensy via
-`CFG,srctyp,<0|1|2>` in `sendCfgToTeensy()`):
+**Hidden from the Settings menu since v0.1.170** — each monitor item carries its OWN Source
+(PAGE_MON_ITEM), and this global NVS key `srctyp` (synced to the Teensy via `CFG,srctyp,<0|1|2>`
+in `sendCfgToTeensy()`) is now only the acquisition/logging choice + the `monDefaults()` seed.
+Its old page is now **Bluetooth OBD-II** pairing (Settings → "Bluetooth OBD-II"):
 - **0 = Direct**: RPM from opto tach (pin 9), coolant from A3 NTC. Oil PSI always from A2.
 - **1 = MegaSquirt**: RPM + coolant + AFR + MAP + TPS + IAT + battery from CAN. AFR is only
   shown in MS3 mode. Oil PSI still from A2 (MS3Pro typically has no oil-pressure input).
@@ -2274,12 +2290,13 @@ again"*: not a parse fault, a controller that quietly stopped listening.
   can help. `uart_tele_lines_s` counts telemetry lines per second (~6 per 50 Hz emit).
 
 ### Which sensor shows, and why "I don't see OIL/AFR/VOLT" happens (v0.1.163)
-Each item's SOURCE defaults from the **global** `Sensor data source`, so on a Direct-mode unit
+Each item's SOURCE defaults from the legacy **global** `srctyp`, so on a Direct-mode unit
 TEMP/OIL/AFR seed to DIRECT — their real sensors (NTC, A2 transducer, AEM gauge) — and on a bench
 with none of those wired they correctly show `---` or hide. IAT/MAP/TPS fall back to CAN (their
 masks have no DIRECT bit), which is why those three are the ones that "just work" on a bench with
-a CAN emulator. To see the CAN values for everything: **Settings → Sensor data source =
-MegaSquirt, then RESET on the Sensor monitor page** (RESET re-seeds every source AND mode from the
-global setting), or set each item's Source to CANBUS individually. VOLT now defaults to ALWAYS
-(it was seeded HIDDEN from the old `show_volt` flag, and it has no direct source to fall back to).
+a CAN emulator. To see the CAN values for everything: **RESET on the Sensor monitoring page**
+(re-seeds every source AND mode) or set each item's Source to CANBUS individually. VOLT defaults
+to ALWAYS (it was seeded HIDDEN from the old `show_volt` flag, and it has no direct source to fall
+back to). **v0.1.170:** DIRECT now reads the pure direct fields, so "I'm on DIRECT but see CAN"
+is fixed.
 
