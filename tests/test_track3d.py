@@ -337,7 +337,7 @@ R.asset = (function () {
   }
   // 4. terrain: the road must sit ON the DEM mesh, sharing the reference
   var yref = RC3D.applyAssetElevation(p, ASSET.dem, p.o);
-  var mesh = RC3D.demMesh(ASSET.dem, p.o, yref);
+  var mesh = RC3D.demMesh(ASSET.dem, p.o, yref, ASSET.texture.bounds);
   var mv = mesh.position, roadMax = -1e9, roadMin = 1e9;
   for (var m = 1; m < p.dense.y.length; m++) {
     if (p.dense.y[m] > roadMax) roadMax = p.dense.y[m];
@@ -376,6 +376,21 @@ R.asset = (function () {
     uvBad: uvBad, uvMin: uvMin, uvMax: uvMax,
     roadMin: roadMin, roadMax: roadMax, meshMin: meshMin, meshMax: meshMax,
     worstGap: worstGap, worstOnField: worstOnField,
+    uvAligned: (function () {
+      // ground imagery must line up with the road: the mesh UV at a node has to
+      // agree with the ribbon's own UV convention for the same lat/lon
+      var g = ASSET.dem, tb = ASSET.texture.bounds, worst = 0, k;
+      for (k = 0; k < g.values.length; k += 37) {
+        var r = Math.floor(k / g.cols), c = k % g.cols;
+        var lat = g.bounds[0] + (g.bounds[2] - g.bounds[0]) * (r / (g.rows - 1));
+        var lon = g.bounds[1] + (g.bounds[3] - g.bounds[1]) * (c / (g.cols - 1));
+        var want = [(lon - tb.west) / (tb.east - tb.west),
+                    (lat - tb.south) / (tb.north - tb.south)];
+        worst = Math.max(worst, Math.abs(mesh.uv[k * 2] - want[0]),
+                                Math.abs(mesh.uv[k * 2 + 1] - want[1]));
+      }
+      return worst;
+    })(),
     demRelief: Math.max.apply(null, ASSET.dem.values) -
                                   Math.min.apply(null, ASSET.dem.values),
     densify: mesh.position.length / 3
@@ -693,6 +708,10 @@ class Track3DMathTests(unittest.TestCase):
         self.assertLess(a["worstOnField"], 1e-6,
                         "road is not on the terrain field the mesh uses")
         self.assertLess(a["worstGap"], 4.0, "road floats off the DEM mesh vertices")
+        # tolerance is float32 storage precision (the UVs live in a
+        # Float32Array), not sloppiness: a real misalignment would be ~0.05
+        self.assertLess(a["uvAligned"], 1e-6,
+                        "ground imagery is not aligned with the road's UV frame")
         self.assertGreater(a["densify"], 1000, "DEM mesh is too coarse to be a ground")
 
         # 10d. brake boards: the ladder depends on corner severity, and a gentle

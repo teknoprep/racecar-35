@@ -276,20 +276,53 @@ def dem_grid(bbox, cols: int, rows: int, cache_dir: pathlib.Path, z: int = 14,
 # ---------------------------------------------------------------------------
 # OpenStreetMap raceways
 # ---------------------------------------------------------------------------
-def osm_raceways(bbox, timeout: float = 90.0, log=print):
-    """`highway=raceway` ways inside bbox -> [{name, width_m, points[(lat,lon)]}]."""
+OSM_CACHE_DIR = pathlib.Path(os.environ.get("RACECAR_OSM_CACHE")
+                              or (pathlib.Path.home() / ".cache" / "racecar-osm"))
+OSM_CACHE_DAYS = 45
+
+
+def _osm_cache_path(bbox, key_extra: str = "") -> pathlib.Path:
+    import hashlib
+    k = ",".join("%.4f" % float(x) for x in bbox) + "|" + key_extra
+    h = hashlib.sha1(k.encode()).hexdigest()[:20]
+    return OSM_CACHE_DIR / (h + ".json")
+
+
+def osm_raceways(bbox, timeout: float = 90.0, log=print, use_cache: bool = True):
+    """`highway=raceway` ways inside bbox -> [{name, width_m, points[(lat,lon)]}].
+
+    Cached on disk (45 days) and PREFERRED when the API is unreachable: Overpass
+    is a shared community service that rate-limits, and a stale cache beats
+    failing a track preparation. Also, mirrors are only tried with backoff so a
+    busy day does not turn into a hammering loop.
+    """
     min_lat, min_lon, max_lat, max_lon = bbox
     q = (f'[out:json][timeout:{int(timeout)-5}];'
          f'way["highway"="raceway"]({min_lat},{min_lon},{max_lat},{max_lon});'
          f'out geom;')
+    cp = _osm_cache_path(bbox, "raceway")
+    fresh = None
+    if use_cache:
+        try:
+            if cp.is_file():
+                age_days = (time.time() - cp.stat().st_mtime) / 86400.0
+                if age_days <= OSM_CACHE_DAYS:
+                    fresh = json.loads(cp.read_text("utf-8"))
+                    log("[osm] cache hit (%.1f days old)" % age_days)
+        except Exception:
+            fresh = None
+    if fresh is not None:
+        return fresh
     body = urllib.parse.urlencode({"data": q}).encode()
+    errs = 0
     for ep in OVERPASS:
-        for _ in range(2):
+        for attempt in (1, 2):
             try:
                 d = json.loads(_get(ep, timeout=timeout, data=body))
             except Exception as e:
+                errs += 1
                 log(f"[osm] {ep}: {type(e).__name__}")
-                time.sleep(2)
+                time.sleep(min(8, 2 * errs))
                 continue
             out = []
             for e in d.get("elements", []):
@@ -305,7 +338,24 @@ def osm_raceways(bbox, timeout: float = 90.0, log=print):
                             "width_m": w, "surface": tags.get("surface"),
                             "sport": tags.get("sport"),
                             "points": [(p["lat"], p["lon"]) for p in g]})
+            if out and use_cache:
+                try:
+                    cp.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = cp.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(out), "utf-8")
+                    tmp.replace(cp)
+                except OSError:
+                    pass
             return out
+    if use_cache:
+        try:                                   # last resort: any stale copy
+            if cp.is_file():
+                stale = json.loads(cp.read_text("utf-8"))
+                log("[osm] all mirrors down; using a STALE cache copy")
+                return stale
+        except Exception:
+            pass
+    log("[osm] all mirrors failed (%d attempts)" % errs)
     return []
 
 
@@ -371,6 +421,140 @@ def osm_match_by_trace(points, ways, max_dist_m: float = 35.0, log=print):
     log("[osm] trace match: way %s %r %.0f m, mean %.1f m from the driven line"
         % (best["id"], best.get("name"), way_length_m(best["points"]), best_d))
     return best, best_d
+
+
+def _seg_dir_m(points, at_end: bool):
+    """Unit direction (east, north) of a segment's first/last stretch."""
+    if len(points) < 2:
+        return (0.0, 0.0)
+    a, b = (points[-2], points[-1]) if at_end else (points[0], points[1])
+    x = (b[1] - a[1]) * M_PER_DEG_LAT * math.cos(math.radians((a[0] + b[0]) / 2))
+    y = (b[0] - a[0]) * M_PER_DEG_LAT
+    n = math.hypot(x, y) or 1.0
+    return (x / n, y / n)
+
+
+def _dist_m(a, b) -> float:
+    x = (b[1] - a[1]) * M_PER_DEG_LAT * math.cos(math.radians((a[0] + b[0]) / 2))
+    y = (b[0] - a[0]) * M_PER_DEG_LAT
+    return math.hypot(x, y)
+
+
+def stitch_circuit(ways, min_len_m: float = 800.0, close_tol_m: float = 60.0,
+                   max_gap_m: float = 150.0, log=print):
+    """Join OSM raceway ways into ONE closed circuit.
+
+    A circuit is usually mapped as many short ways sharing endpoints: at Watkins
+    Glen the longest single way is 924 m while the real 5.5 km lap is split
+    across 'The Esses', 'The Boot', 'The Ninety', 'The Toe', ... (23 ways, with
+    4 junction nodes carrying pit-lane / short-course branches and exactly two
+    loose ends). So no single way is the track and no name matching is needed -
+    the shape is the answer.
+
+    Walk: start on a way, and at every step continue through the unused way that
+    (a) touches the current end and (b) keeps the heading - the STRAIGHTEST
+    continuation, which is what a racing circuit does and what a pit-lane branch
+    does not. If nothing touches, bridge a gap (<= max_gap_m) to the nearest free
+    endpoint, because real mappings have small gaps. Stop when the walk returns
+    to where it started; keep the longest ring found.
+
+    Returns {"points", "len", "ways", "closed", "gaps"} or None.
+    """
+    segs = []
+    for w in ways:
+        pts = [(float(a), float(b)) for a, b in (w.get("points") or [])]
+        if len(pts) >= 2:
+            segs.append({"id": w.get("id"), "name": w.get("name"),
+                         "pts": pts, "len": way_length_m(pts)})
+    if not segs:
+        return None
+    segs.sort(key=lambda s: -s["len"])
+
+    def key(p):
+        return (round(p[0], 6), round(p[1], 6))
+
+    best = None
+    starts = segs[:12]                       # the longest few are enough to seed
+    for start in starts:
+        for rev in (False, True):
+            path = list(reversed(start["pts"])) if rev else list(start["pts"])
+            used = {start["id"]}
+            total = start["len"]
+            gaps = 0
+            closed = False
+            for _ in range(len(segs) + 4):
+                if total >= min_len_m and (
+                        key(path[0]) == key(path[-1]) or
+                        _dist_m(path[-1], path[0]) <= close_tol_m):
+                    closed = True
+                    break
+                head = _seg_dir_m(path[-2:], True)      # heading at the current end
+                end = key(path[-1])
+                cands = []
+                for s2 in segs:
+                    if s2["id"] in used:
+                        continue
+                    if key(s2["pts"][0]) == end:
+                        cands.append((s2, False))
+                    elif key(s2["pts"][-1]) == end:
+                        cands.append((s2, True))
+                if cands:
+                    # straightest continuation wins; a pit-lane branch turns hard
+                    def score(c):
+                        s2, flip = c
+                        pts2 = list(reversed(s2["pts"])) if flip else s2["pts"]
+                        d = _seg_dir_m(pts2, False)
+                        return head[0] * d[0] + head[1] * d[1]
+                    s2, flip = max(cands, key=score)
+                else:
+                    # gap: jump to the nearest free endpoint within max_gap_m
+                    near = None
+                    for s2 in segs:
+                        if s2["id"] in used:
+                            continue
+                        for at_end in (False, True):
+                            p = s2["pts"][-1] if at_end else s2["pts"][0]
+                            d = _dist_m(path[-1], p)
+                            if d <= max_gap_m and (near is None or d < near[0]):
+                                near = (d, s2, at_end)
+                    if near is None:
+                        break
+                    gaps += 1
+                    s2, flip = near[1], near[2]
+                pts2 = list(reversed(s2["pts"])) if flip else s2["pts"]
+                used.add(s2["id"])
+                path.extend(pts2[1:] if _dist_m(path[-1], pts2[0]) < 1 else pts2)
+                total += s2["len"]
+            if closed and total >= min_len_m:
+                # rank by FEWEST gap jumps first, then longest: the real circuit
+                # usually stitches with no jumps, while a dead end (pit lane,
+                # access road) can only be closed by jumping back - so it loses
+                # even though the detour makes it longer.
+                cand = {"points": path, "len": total, "ways": sorted(used),
+                        "closed": True, "gaps": gaps}
+                if (best is None or gaps < best["gaps"] or
+                        (gaps == best["gaps"] and total > best["len"])):
+                    best = cand
+    if best is None:
+        log("[osm] no closed raceway ring found (%d ways considered)" % len(segs))
+        return None
+    log("[osm] stitched a %.0f m circuit from %d ways (%d nodes, %d gap jumps)"
+        % (best["len"], len(best["ways"]), len(best["points"]), best["gaps"]))
+    return best
+
+
+def osm_circuit(bbox, log=print, min_len_m: float = 800.0):
+    """The best STITCHED circuit in a bbox (motor-sport ways preferred)."""
+    ways = osm_raceways(bbox, log=log)
+    if not ways:
+        return None
+    motor = [w for w in ways if (w.get("sport") or "").lower() == "motor"]
+    for pool in (motor, ways):
+        if pool:
+            c = stitch_circuit(pool, min_len_m=min_len_m, log=log)
+            if c:
+                return c
+    return None
 
 
 def osm_best(track: str, bbox, min_len_m: float = 400.0, log=print):
@@ -463,20 +647,31 @@ def _paved(rgb, opts) -> bool:
     sat = 0.0 if v == 0 else (v - mn) / float(v)
     if v < float(opts.get("dark_max") or 25):
         return False                     # deep shade / tree canopy
-    if (g - max(r, b)) > float(opts.get("green_max") or 6):
-        return False                     # vegetation: grass, trees, moss
-    if sat > float(opts.get("sat_max") or 0.30):
-        return False                     # strongly tinted: dry grass / dirt
+    # SATURATION is the discriminator that actually separates them. Measured on
+    # real Esri imagery at Watkins Glen, the asphalt reads as a light green-tinted
+    # grey (131,137,123 / 145,146,132 - G only 4-9 above R) while the grass is
+    # 96,101,69 / 124,135,92. So a greenness test alone throws away half the
+    # track; saturation is 0.04-0.20 on asphalt and 0.25-0.37 on grass.
+    if sat > float(opts.get("sat_max") or 0.22):
+        return False                     # grass / trees / tinted dirt
+    if (g - max(r, b)) > float(opts.get("green_max") or 10):
+        return False                     # bright, still unmistakably green
     return True                          # neutral, mid/dark or bleached asphalt
 
 
 def measure_width(img, bounds, line, opts=None):
     """Per-station left/right half-widths (m) of the paved corridor.
 
-    Walks a perpendicular profile at every station, classifies each sample with
-    `_paved`, and takes the contiguous paved run that contains the centreline.
-    Returns dict with left[], right[], width[], ok[] (per station) and a
-    confidence = fraction of stations that produced a usable run.
+    The classifier is SELF-CALIBRATING. A fixed colour rule cannot fit every
+    circuit's imagery: at Watkins Glen the asphalt is a light green-tinted grey
+    (131,137,123) while at Shenandoah it is a warm grey, and a single saturation
+    threshold that works for one is wrong for the other (measured: 7.5 m on an
+    11 m track). But the centreline is LABELLED asphalt - the car drove there -
+    and 25 m out is labelled background (grass/gravel/trees). So: sample both,
+    and classify each profile sample by which mean it is closer to, falling back
+    to the fixed rules only when the two clusters are too similar to separate.
+
+    Returns left[], right[], width[], ok[], confidence, and the classifier used.
     """
     _require_deps()
     opts = opts or {}
@@ -486,21 +681,51 @@ def measure_width(img, bounds, line, opts=None):
     max_w = float(opts.get("max_width_m") or 30.0)
     n = len(line["lat"])
     offs = np.arange(-reach, reach + 1e-9, step)
+    coslat = math.cos(math.radians(float(np.mean(line["lat"]))))
+
+    def rgb_at(i, o):
+        la, lo = float(line["lat"][i]), float(line["lon"][i])
+        nx, ny = float(line["normal"][i][0]), float(line["normal"][i][1])
+        dlat = (o * ny) / M_PER_DEG_LAT
+        dlon = (o * nx) / (M_PER_DEG_LAT * coslat)
+        return sample_px(img, *mosaic_px(bounds, la + dlat, lo + dlon))
+
+    # ---- learn the two clusters -----------------------------------------
+    asph, back = [], []
+    for i in range(0, n, max(1, n // 250)):
+        for o in (-0.8, 0.0, 0.8):
+            c = rgb_at(i, o)
+            if c:
+                asph.append(c)
+        for o in (-reach, reach):
+            c = rgb_at(i, o)
+            if c:
+                back.append(c)
+    learned = None
+    if len(asph) >= 20 and len(back) >= 20:
+        ca = np.mean(np.array(asph, dtype=float), axis=0)
+        cb = np.mean(np.array(back, dtype=float), axis=0)
+        if float(np.linalg.norm(ca - cb)) >= float(opts.get("min_contrast") or 22.0):
+            learned = (ca, cb)
+
+    def paved(rgb):
+        r, g, b = rgb
+        if max(rgb) < 22:
+            return False                       # deep shade / canopy
+        if learned is not None:
+            da = (r - learned[0][0]) ** 2 + (g - learned[0][1]) ** 2 + (b - learned[0][2]) ** 2
+            db = (r - learned[1][0]) ** 2 + (g - learned[1][1]) ** 2 + (b - learned[1][2]) ** 2
+            return da <= db
+        return _paved(rgb, opts)
+
     left = np.zeros(n)
     right = np.zeros(n)
     ok = np.zeros(n, dtype=bool)
     for i in range(n):
-        la, lo = float(line["lat"][i]), float(line["lon"][i])
-        # unit perpendicular in metres (east, north)
-        nx, ny = float(line["normal"][i][0]), float(line["normal"][i][1])
         run = []
         for o in offs:
-            dlat = (o * ny) / M_PER_DEG_LAT
-            dlon = (o * nx) / (M_PER_DEG_LAT * math.cos(math.radians(la)))
-            px, py = mosaic_px(bounds, la + dlat, lo + dlon)
-            rgb = sample_px(img, px, py)
-            run.append(True if rgb is None else _paved(rgb, opts))
-        # contiguous run containing offset 0
+            rgb = rgb_at(i, o)
+            run.append(True if rgb is None else paved(rgb))
         zero = int(np.argmin(np.abs(offs)))
         if not run[zero]:
             continue
@@ -518,38 +743,40 @@ def measure_width(img, bounds, line, opts=None):
             continue
         left[i], right[i], ok[i] = lw, rw, True
     conf = float(ok.mean()) if n else 0.0
-    if ok.sum() >= 3:
+    used = "learned" if learned is not None else "colour"
+    if ok.sum() >= 3 and conf >= float(opts.get("min_confidence") or 0.25):
         det = left[ok] + right[ok]
         med = float(np.median(det))
-        # MODE in 1 m bins: where the paved-width measurements cluster. A few
-        # stations over a gravel paddock cannot drag the answer away from the
-        # actual circuit the way a median can.
-        hist, edges = np.histogram(det, bins=np.arange(2, 34, 1.0))
-        if hist.sum() >= 3:
-            k = int(np.argmax(hist))
-            near = det[(det >= edges[k] - 1.5) & (det <= edges[k + 1] + 1.5)]
-            rep = float(np.median(near)) if len(near) else med
-        else:
-            rep = med
+        # Robust representative: median + MAD, dropping the strays. Measured
+        # across real circuits, pixel width is only good to ~+-30% (a run of
+        # shadow reads narrow, a gravel trap reads wide), so the scatter has to
+        # be trimmed before it is averaged - otherwise one paddock station drags
+        # a 10 m circuit to 19.5 m.
+        mad = float(np.median(np.abs(det - med))) * 1.4826
+        if mad > 0.2:
+            keep = det[np.abs(det - med) <= 2.5 * mad]
+            if len(keep) >= 3:
+                med = float(np.median(keep))
+        rep = med
         total = np.where(ok, left + right, rep)
-        # median-of-9 then a 7-tap mean: a detected edge is a pixel noisy, and a
-        # single misclassified shadow must not become a 10 m wide bulge
-        k = 9
-        pad = np.pad(total, k // 2, mode="edge")
-        total = np.array([np.median(pad[i:i + k]) for i in range(len(total))])
+        k2 = 9
+        pad = np.pad(total, k2 // 2, mode="edge")
+        total = np.array([np.median(pad[i:i + k2]) for i in range(len(total))])
         total = np.convolve(np.pad(total, 3, mode="edge"), np.ones(7) / 7, "valid")
-        # asymmetry (how far off-centre the driven line sits) is kept, faded
-        # toward 50/50 where detection was weak
         ratio = np.where(ok, left / np.maximum(1e-6, left + right), 0.5)
         ratio = np.clip(0.5 + (ratio - 0.5) * 0.7, 0.15, 0.85)
         return {"left": (total * ratio).tolist(),
                 "right": (total * (1.0 - ratio)).tolist(),
                 "width": total.tolist(), "ok": ok.tolist(), "confidence": conf,
-                "median_width_m": round(rep, 2), "mode_width_m": round(rep, 2)}
+                "median_width_m": round(rep, 2), "mode_width_m": round(rep, 2),
+                "classifier": used,
+                "asphalt_rgb": None if learned is None else [round(float(x), 1) for x in learned[0]],
+                "background_rgb": None if learned is None else [round(float(x), 1) for x in learned[1]]}
     fallback = float(opts.get("width_fallback_m") or 12.0)
     return {"left": [fallback / 2] * n, "right": [fallback / 2] * n,
             "width": [fallback] * n, "ok": ok.tolist(), "confidence": conf,
-            "median_width_m": fallback}
+            "median_width_m": fallback, "mode_width_m": fallback,
+            "classifier": used, "asphalt_rgb": None, "background_rgb": None}
 
 
 # ---------------------------------------------------------------------------
@@ -581,17 +808,34 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
     w = measure_width(img, bounds, line, opts)
     osm_w = opts.get("osm_width_m")
     imagery_w = float(w["median_width_m"])
+    # A circuit's racing surface is 8-15 m; a pixel estimate outside that is the
+    # measurement being wrong (shadow reads narrow, gravel reads wide), not an
+    # unusual circuit. Clamp the value we DRAW and keep the raw number in the
+    # asset, so nothing is hidden.
+    lo_w = float(opts.get("plausible_min_m") or 8.0)
+    hi_w = float(opts.get("plausible_max_m") or 15.0)
+    clamped = None
+    if imagery_w < lo_w:
+        clamped, imagery_w = imagery_w, lo_w
+    elif imagery_w > hi_w:
+        clamped, imagery_w = imagery_w, hi_w
     if osm_w and 3 <= osm_w <= 30:
         # A surveyed tag beats anything inferred from pixels; the imagery
         # estimate is kept as a cross-check.
         width_profile = [float(osm_w)] * len(line["lat"])
         width_source = "osm-tag"
-        agreement = abs(imagery_w - float(osm_w)) / float(osm_w) <= 0.4
+        agreement = (clamped is None and
+                     abs(imagery_w - float(osm_w)) / float(osm_w) <= 0.4)
     else:
         width_profile = [float(x) for x in w["width"]]
         width_source = "imagery"
         agreement = None
-    log(f"[{slug}] width: imagery {imagery_w:.1f} m (conf {w['confidence']*100:.0f}%), "
+    if clamped is not None:
+        log(f"[{slug}] width: imagery measured {clamped:.1f} m, outside the "
+            f"{lo_w:.0f}-{hi_w:.0f} m a circuit can be -> clamped to {imagery_w:.1f} m "
+            f"(raw value kept in the asset)")
+    log(f"[{slug}] width: imagery {imagery_w:.1f} m (conf {w['confidence']*100:.0f}%, "
+        f"{w.get('classifier')} classifier, asphalt {w.get('asphalt_rgb')} vs bg {w.get('background_rgb')}), "
         f"osm tag {osm_w}, using {width_source}"
         + ("" if agreement is None else f", agreement={agreement}"))
 
@@ -620,6 +864,7 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
 
     asset = {
         "track": track, "slug": slug, "generated": int(time.time()),
+        "prep_version": int(opts.get("prep_version") or 1),
         "source": {"line": opts.get("line_source") or "session",
                    "imagery": f"Esri World Imagery z{z}",
                    "dem": "AWS terrarium z14",
@@ -632,9 +877,14 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
         "width_m": [round(float(x), 2) for x in width_profile],
         "width_source": width_source,
         "width_imagery_m": round(imagery_w, 2),
+        "width_imagery_raw_m": round(clamped if clamped is not None else imagery_w, 2),
+        "width_clamped": clamped is not None,
         "width_osm_m": osm_w,
         "width_agreement": agreement,
         "width_confidence": round(w["confidence"], 3),
+        "width_classifier": w.get("classifier"),
+        "width_asphalt_rgb": w.get("asphalt_rgb"),
+        "width_background_rgb": w.get("background_rgb"),
         "lateral_reference": "centreline from the driven line",
         "dem": grid,
         "step_m": step,

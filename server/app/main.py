@@ -2421,6 +2421,7 @@ async def known_tracks(request: Request) -> JSONResponse:
 # and every later session on that track gets the better render for free.
 # ---------------------------------------------------------------------------
 TRACKS_DIR = DATA_DIR / "tracks"
+PREP_VERSION = 2          # bump to invalidate every prepared asset (see below)
 _PREP: dict = {}                      # slug -> {state, log[], started, ...}
 _PREP_LOCK = threading.Lock()
 _PREP_KEEP = 40                       # log lines kept per run
@@ -2527,12 +2528,60 @@ def _track_asset_for(track: str) -> Optional[dict]:
     try:
         asset = json.loads(_track_asset_path(chosen).read_text("utf-8"))
         asset["slug"] = chosen
+        if int(asset.get("prep_version") or 0) < PREP_VERSION:
+            # Built by an older, wrong method (e.g. from a whole multi-lap
+            # session, where seven laps superimposed read as a 31 km "circuit").
+            # Treated as missing so the page re-prepares it.
+            log.info("track asset %s is prep_version %s < %s: re-prepare",
+                     chosen, asset.get("prep_version"), PREP_VERSION)
+            return None
         if chosen != slug:
             log.info("track %r resolved to prepared asset %r", track, chosen)
         return asset
     except Exception as e:
         log.warning("track asset %s unreadable: %s", chosen, e)
         return None
+
+
+def _session_lap_centreline(p: pathlib.Path, target: int = 4000):
+    """The GPS line of ONE lap — the fastest logged lap when we can find it.
+
+    Using the whole session is wrong: seven laps of a circuit are seven
+    superimposed traces, so the "track" came out 31.8 km long on a 5.5 km course,
+    the measured width averaged across all of them (8.5 m), and the imagery
+    mosaic was smeared over the union of every line ever driven. One lap IS the
+    circuit.
+    """
+    samples = _read_ndjson_samples(p)
+    if len(samples) < 10:
+        raise ValueError("session has no usable GPS fixes")
+    rel, _basis = _relative_seconds(samples)
+    win = None
+    try:
+        laps = _detect_laps(samples).get("laps") or []
+        good = [lp for lp in laps if float(lp.get("seconds") or 0) > 20]
+        if good:
+            best = min(good, key=lambda lp: float(lp["seconds"]))
+            win = (float(best["t_start"]), float(best["t_end"]))
+    except Exception as e:
+        log.warning("lap detection failed for %s: %s", p.name, e)
+    rows = []
+    for i, s in enumerate(samples):
+        lat, lon = s.get("lat"), s.get("lon")
+        if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+                and (lat or lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        if win and not (win[0] <= rel[i] <= win[1]):
+            continue
+        rows.append((float(lat), float(lon)))
+    if len(rows) < 20:                       # no usable lap window: take everything
+        rows = [(float(s["lat"]), float(s["lon"])) for s in samples
+                if isinstance(s.get("lat"), (int, float))
+                and isinstance(s.get("lon"), (int, float)) and (s.get("lat") or s.get("lon"))]
+    if len(rows) < 10:
+        raise ValueError("no usable GPS line in this session")
+    step = max(1, len(rows) // target)
+    return rows[::step]
 
 
 def _prep_log(slug: str, msg: str) -> None:
@@ -2562,7 +2611,8 @@ def _prep_run(slug: str, track: str, params: dict) -> None:
         asset = tp.build_asset(
             track, points, DATA_DIR,
             {"zoom": params.get("zoom", 18), "line_source": source,
-             "osm_id": osm_id, "osm_width_m": osm_w},
+             "osm_id": osm_id, "osm_width_m": osm_w,
+             "prep_version": PREP_VERSION},
             log=lambda m: _prep_log(slug, m),
         )
         with _PREP_LOCK:
@@ -2658,7 +2708,8 @@ async def session_track_prep(request: Request, user: str, filename: str) -> JSON
         _PREP[slug] = {"state": "queued", "track": track, "started": int(time.time()),
                        "log": []}
     try:
-        points = tp.session_centreline(p)
+        points = _session_lap_centreline(p)
+        _prep_log(slug, "centreline from the fastest logged lap: %d points" % len(points))
         source, osm_id, osm_w = "session", None, None
         # Borrow OSM's surveyed width when we can identify which way we drove.
         # Matched by SHAPE (a session says "Thompson", OSM says "Road Course"),
@@ -2916,9 +2967,14 @@ async def caps() -> dict:
     6 = road colour is the DRIVER'S INPUT (green accelerating / grey neither /
     red braking, scaled by longitudinal g), a plan view with a scale bar and a
     car arrow for the whole circuit, forgiving track-name lookup, and
-    auto-prepare on first view of a track."""
+    auto-prepare on first view of a track.
+    7 = prepared tracks done right: OSM circuits STITCHED from many ways,
+    centreline from the fastest single lap (not the whole session),
+    self-calibrating imagery width (median+MAD, clamped to 8-15 m with the raw
+    value kept), ground imagery sharing the road's uv frame, and a
+    PREP_VERSION that invalidates wrongly-built assets."""
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 6}
+            "track3d_v": 7}
 
 
 
@@ -7846,7 +7902,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 
   // The asset's own terrain grid: a DEM mesh for the ground, so the road does
   // not float over a flat quad on a circuit with real relief.
-  RC3D.demMesh = function (grid, proj_o, ref) {
+  RC3D.demMesh = function (grid, proj_o, ref, texBounds) {
     if (!grid || !grid.values || grid.cols < 2 || grid.rows < 2) return null;
     var b = grid.bounds;                      // [south, west, north, east]
     var pos = [], uv = [], idx = [];
@@ -7863,7 +7919,15 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         var lon = b[1] + (b[3] - b[1]) * (c / (cols - 1));
         var p = RC3D.project(lat, lon, proj_o);
         pos.push(p.x, vals[r * cols + c] - y0, p.z);
-        uv.push(c / (cols - 1), r / (rows - 1));
+        if (texBounds) {
+          // UV through the TEXTURE's own bounds, not 0..1 over the grid: the
+          // mosaic extends past the DEM bbox (whole tiles), so stretching the
+          // image across the grid would shift the ground imagery off the road.
+          uv.push((lon - texBounds.west) / (texBounds.east - texBounds.west),
+                  (lat - texBounds.south) / (texBounds.north - texBounds.south));
+        } else {
+          uv.push(c / (cols - 1), r / (rows - 1));
+        }
       }
     }
     for (r = 0; r < rows - 1; r++) {
@@ -8369,7 +8433,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       meshes.ground = null;
     }
     if (!opts.ground || !ASSET || !ASSET.dem || !TEX) return;
-    var m = RC3D.demMesh(ASSET.dem, PATH.o, PATH.yRef);
+    var m = RC3D.demMesh(ASSET.dem, PATH.o, PATH.yRef,
+                         (ASSET.texture && ASSET.texture.bounds) || null);
     if (!m) return;
     var g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(m.position, 3));

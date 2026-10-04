@@ -517,6 +517,34 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
+### Prepared tracks: the three bugs that made them look wrong (v-server)
+1. **A circuit is many OSM ways, not one.** Watkins Glen's 5.5 km lap is mapped as 23 ways ("The Esses",
+   "The Boot", "The Ninety"…), the longest only 924 m, with 4 junction nodes carrying pit-lane / short-course
+   branches and exactly 2 loose ends. `stitch_circuit()` walks the ways and follows the **straightest
+   continuation** (what a circuit does, what a pit lane does not), bridging <=150 m gaps, then ranks the rings
+   by **fewest gap jumps first, longest second** — a dead end can only be closed by a jump, so it loses.
+   Result: 5479 m stitched, 0 jumps, pit lane and short course dropped, vs a 5552 m real lap.
+2. **Never trace a whole session.** Seven laps are seven superimposed traces: the "track" came out 31.8 km on a
+   5.5 km course, the measured width averaged across all of them (8.5 m) and the mosaic smeared over every line
+   ever driven. `_session_lap_centreline()` now uses **the fastest logged lap** (via `_detect_laps`).
+3. **A fixed colour rule cannot fit every circuit's imagery.** At Watkins Glen the asphalt is a light
+   green-tinted grey (131,137,123 — G only +4…+9 over R) so a greenness test threw half the track away
+   (measured 7.5 m on an 11 m circuit). `measure_width()` is now **self-calibrating**: the centreline is
+   labelled asphalt (the car drove there) and 25 m out is labelled background, so the two clusters are learned
+   per track and each profile sample goes to the nearer one (fixed colour rules only when the clusters are too
+   similar to separate). Then median+MAD trims the strays, and the value drawn is clamped to the **8–15 m a
+   racing surface can be** — the raw measurement is kept as `width_imagery_raw_m` with `width_clamped`, so a
+   23 m reading on a 10 m circuit is *visible*, not silently averaged away.
+   Results: Summit Point 3001 m/9.0 m, Shenandoah 3162 m/OSM tag 10 m, Watkins Glen 5184 m/10.5 m (73 % conf),
+   Jefferson 1638 m/15 m (CLAMPED, raw 23 m).
+- Ground imagery and the road must share ONE uv frame: `demMesh` maps its grid through the TEXTURE's bounds,
+  not 0..1 over the grid (the mosaic is whole tiles, so it is bigger than the DEM bbox and the imagery would
+  otherwise sit a tile off the road).
+- `PREP_VERSION` (2) is stamped into every asset; an older one is treated as MISSING so the page re-prepares
+  it. That is how a bad asset heals without anyone deleting files.
+- The prepared-track seeds now include **Watkins Glen Grand Prix** (2048x4608 texture of the real circuit,
+  pit buildings, Esses, Boot, paddock) alongside the Summit Point family.
+
 ### 3D road colour = the driver's INPUT, not the speed (v-server)
 The ribbon is coloured by what the driver is doing, computed per station from the **speed trace** (gear
 independent — an rpm rate cannot compare 1st with 4th, and gear is not logged): `path.accel[i]` = dv/dt in g,

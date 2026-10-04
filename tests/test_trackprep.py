@@ -76,7 +76,9 @@ class WidthDetectionTests(unittest.TestCase):
             yc = h / 2 + 40 * math.sin(x / 260.0)
             for y in range(h):
                 dy = y - yc
-                if abs(dy) <= half_px:
+                if kind == "bare":                      # uniform, no track
+                    px[x, y] = (150, 150, 148)
+                elif abs(dy) <= half_px:
                     px[x, y] = (120, 120, 118)              # asphalt, 10 m wide
                 elif kind == "flat":
                     px[x, y] = (150, 150, 148)
@@ -101,6 +103,17 @@ class WidthDetectionTests(unittest.TestCase):
             pts.append((lat, lon))
         return tp.resample(pts, 2.0)
 
+    def test_band_on_a_light_uniform_surface_is_still_found(self):
+        # the old fixed colour rules called the light background "paved" too, so
+        # every run was unbounded and nothing was measured; learning the two
+        # clusters from the corridor itself separates them
+        tp = _tp()
+        img, bounds, _, mpp = self._scene("flat")
+        line = self._line(bounds, img, mpp)
+        got = tp.measure_width(img, bounds, line, {"width_fallback_m": 12})
+        self.assertEqual(got["classifier"], "learned")
+        self.assertAlmostEqual(got["median_width_m"], 10.0, delta=1.2)
+
     def test_grass_bounded_asphalt_measures_exactly(self):
         tp = _tp()
         img, bounds, _, mpp = self._scene("grass")
@@ -120,9 +133,9 @@ class WidthDetectionTests(unittest.TestCase):
         self.assertGreaterEqual(got["median_width_m"], 9.0)
         self.assertGreater(got["confidence"], 0.5)
 
-    def test_no_track_falls_back_instead_of_inventing_one(self):
+    def test_uniform_surface_has_no_track_and_must_not_invent_one(self):
         tp = _tp()
-        img, bounds, _, mpp = self._scene("flat")
+        img, bounds, _, mpp = self._scene("bare")
         line = self._line(bounds, img, mpp)
         got = tp.measure_width(img, bounds, line, {"width_fallback_m": 12,
                                                    "reach_m": 20})
@@ -139,6 +152,15 @@ class WidthDetectionTests(unittest.TestCase):
         self.assertFalse(tp._paved((5, 20, 3), {}))           # deep shade
         self.assertFalse(tp._paved((120, 150, 70), {}))       # green-tinged dirt
         self.assertFalse(tp._paved((150, 90, 70), {}))        # red dirt / clay
+        # measured off real Esri imagery: Watkins Glen's asphalt is a light
+        # green-tinted grey (G only +4..+9 above R) and MUST read as paved, while
+        # the grass beside it is (96,101,69) / (124,135,92)
+        self.assertTrue(tp._paved((131, 137, 123), {}))
+        self.assertTrue(tp._paved((145, 146, 132), {}))
+        self.assertTrue(tp._paved((129, 133, 118), {}))
+        self.assertFalse(tp._paved((96, 101, 69), {}))
+        self.assertFalse(tp._paved((124, 135, 92), {}))
+        self.assertFalse(tp._paved((105, 114, 69), {}))
 
 
 @unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
@@ -256,6 +278,51 @@ class OsmTraceMatchTests(unittest.TestCase):
         self.assertAlmostEqual(tp.way_length_m([(39.0, -77.0)]), 0.0)
 
 
+class StitchTests(unittest.TestCase):
+    """A circuit is mapped as many short ways plus branches. Picking ONE way (by
+    name or length) cannot work - at Watkins Glen the longest is 506 m of a
+    5552 m lap - so the ways must be stitched into a ring."""
+
+    def _ways(self):
+        """A square-ish ring in 4 ways + a pit-lane branch off one corner."""
+        def seg(a, b, n=8):
+            return [(a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n)
+                    for i in range(n + 1)]
+        A, B, C, D = (39.000, -77.000), (39.000, -76.980), (39.010, -76.980), (39.010, -77.000)
+        ring = [{"id": 1, "name": "Main Straight", "points": seg(A, B), "sport": "motor"},
+                {"id": 2, "name": "The Esses", "points": seg(B, C), "sport": "motor"},
+                {"id": 3, "name": "The Boot", "points": seg(C, D), "sport": "motor"},
+                {"id": 4, "name": "The Ninety", "points": seg(D, A), "sport": "motor"}]
+        # a pit lane: a dead end (and a hard turn) hanging off corner A
+        pit = [{"id": 9, "name": "Pit Lane", "sport": "motor",
+                "points": seg(A, (39.0005, -76.9995))}]
+        return ring + pit
+
+    def test_stitches_the_ring_and_drops_the_pit_lane(self):
+        tp = _tp()
+        c = tp.stitch_circuit(self._ways(), min_len_m=200, log=lambda *_: None)
+        self.assertIsNotNone(c, "a closed ring exists but was not found")
+        self.assertNotIn(9, c["ways"], "the pit lane must not be part of the circuit")
+        self.assertEqual(sorted(c["ways"]), [1, 2, 3, 4])
+        self.assertTrue(c["closed"])
+        # the ring is ~0.02 deg per side: 2 sides E-W (~1.7 km) + 2 N-S (~2.2 km)
+        self.assertGreater(c["len"], 5000)
+        self.assertLess(c["len"], 7000)
+
+    def test_osm_circuit_prefers_motor_ways(self):
+        tp = _tp()
+        with mock.patch.object(tp, "osm_raceways", return_value=self._ways()):
+            c = tp.osm_circuit((38.99, -77.01, 39.02, -76.97), log=lambda *_: None,
+                               min_len_m=200)
+        self.assertIsNotNone(c)
+        self.assertEqual(sorted(c["ways"]), [1, 2, 3, 4])
+
+    def test_no_ring_returns_none(self):
+        tp = _tp()
+        ways = [{"id": 1, "name": "x", "points": [(39.0, -77.0), (39.001, -77.0)]}]
+        self.assertIsNone(tp.stitch_circuit(ways, min_len_m=100, log=lambda *_: None))
+
+
 class SeedTrackTests(unittest.TestCase):
     """The prepared tracks that ship with the server, so the 3D view is worth
     looking at before anyone has clicked 'prepare track'."""
@@ -263,10 +330,14 @@ class SeedTrackTests(unittest.TestCase):
     def test_seeds_are_valid_assets_of_real_circuits(self):
         d = ROOT / "server/app/seed-tracks"
         seeds = sorted(d.glob("*.json"))
-        self.assertGreaterEqual(len(seeds), 3, "expected the Summit Point family")
+        self.assertGreaterEqual(len(seeds), 4)
+        # length is how we know the OSM geometry really is that circuit (a bad
+        # match - a 100 m pit fragment - cannot be mistaken for a 3 km lap), and
+        # width is the measured/surveyed value that gets DRAWN
         expect = {"summit-point": (2900, 3200, 8.0, 11.0),
-                  "summit-point-jefferson": (1500, 1750, 9.0, 12.0),
-                  "summit-point-shenandoah": (3000, 3300, 9.0, 11.0)}
+                  "summit-point-jefferson": (1500, 1750, 13.0, 16.0),
+                  "summit-point-shenandoah": (3000, 3300, 9.0, 11.0),
+                  "watkins-glen-grand-prix": (4900, 5500, 9.0, 13.0)}
         for f in seeds:
             a = json.loads(f.read_text())
             self.assertIn(a["slug"], expect, a["slug"])
@@ -279,7 +350,18 @@ class SeedTrackTests(unittest.TestCase):
             self.assertGreater(w, wlo)
             self.assertLess(w, whi)
             self.assertGreaterEqual(a["width_confidence"], 0.5)
+            if a["width_clamped"]:
+                # a clamped width must carry the raw measurement, so the
+                # disagreement is visible instead of hidden
+                self.assertIsNotNone(a.get("width_imagery_raw_m"))
+                self.assertNotAlmostEqual(a["width_imagery_raw_m"],
+                                          a["width_imagery_m"], delta=0.01)
+            self.assertIn("Esri", a["texture"]["attrib"])
+            self.assertTrue((d / a["texture"]["file"]).is_file())
             self.assertEqual(len(a["line"]), len(a["width_m"]))
+            self.assertEqual(a.get("prep_version"), 2,
+                             "seeds must be current-schema, else the server "
+                             "treats them as stale and re-prepares")
             self.assertTrue((d / a["texture"]["file"]).is_file(), a["texture"]["file"])
             self.assertIn("Esri", a["texture"]["attrib"])
 
