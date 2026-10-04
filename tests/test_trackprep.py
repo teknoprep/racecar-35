@@ -172,6 +172,10 @@ class AssetTests(unittest.TestCase):
         import numpy as np
         line_pts = [(39.0 + i * 0.00004, -77.0) for i in range(400)]
         fake_img = Image.new("RGB", (512, 512), (70, 118, 52))
+        # the imagery must actually show the circuit: a grey road down
+        # lon -77.0 (x=256), from the line's start (lat 39.0, y=256) north
+        from PIL import ImageDraw
+        ImageDraw.Draw(fake_img).rectangle([252, 0, 260, 256], fill=(96, 97, 100))
         bounds = {"z": 18, "x0": 0, "y0": 0, "lon0": -77.01, "lat0": 39.01,
                   "lon1": -76.99, "lat1": 38.99}
         grid = {"cols": 3, "rows": 3, "bounds": [38.99, -77.01, 39.01, -76.99],
@@ -199,11 +203,101 @@ class AssetTests(unittest.TestCase):
                 written = json.loads((pathlib.Path(td) / "tracks/test-track.json").read_text())
                 self.assertEqual(written["slug"], "test-track")
 
+                # land cover rides along, and the imagery agrees with the line
+                lc = asset["landcover"]
+                self.assertGreater(lc["line_paved"], 0.9)
+                self.assertEqual(len(tp.unrle(lc["rle"])), lc["cols"] * lc["rows"])
+
                 # without a tag the imagery estimate IS the width
                 asset2 = tp.build_asset("Test Track", line_pts, pathlib.Path(td),
                                         {"line_source": "session"})
                 self.assertEqual(asset2["width_source"], "imagery")
                 self.assertAlmostEqual(asset2["width_m"][0], 12.5, delta=0.01)
+
+    def test_imagery_that_does_not_show_the_track_is_refused(self):
+        """Uniform grass where the GPS says the circuit is = wallpaper /
+        placeholder / wrong place: the bake must fail, not publish."""
+        tp = _tp()
+        line_pts = [(39.0 + i * 0.00004, -77.0) for i in range(400)]
+        fake_img = Image.new("RGB", (512, 512), (70, 118, 52))
+        bounds = {"z": 18, "x0": 0, "y0": 0, "lon0": -77.01, "lat0": 39.01,
+                  "lon1": -76.99, "lat1": 38.99}
+        grid = {"cols": 3, "rows": 3, "bounds": [38.99, -77.01, 39.01, -76.99],
+                "values": [180.0] * 9}
+        with mock.patch.object(tp, "imagery_mosaic", return_value=(fake_img, bounds)), \
+             mock.patch.object(tp, "measure_width",
+                               return_value={"width": [12.5] * 800, "left": [6.0] * 800,
+                                             "right": [6.5] * 800, "ok": [True] * 800,
+                                             "confidence": 0.8, "median_width_m": 12.5,
+                                             "mode_width_m": 12.5}), \
+             mock.patch.object(tp, "dem_elevations", return_value=[181.0] * 800), \
+             mock.patch.object(tp, "dem_grid", return_value=grid):
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                with self.assertRaises(RuntimeError) as cm:
+                    tp.build_asset("Test Track", line_pts, pathlib.Path(td), {})
+                self.assertIn("paved", str(cm.exception))
+
+    def test_misregistered_imagery_still_counts_as_the_track(self):
+        """A circuit 10 m off its imagery is still that circuit (the shipped
+        Summit Point Jefferson line sits ~15 m off the Esri mosaic)."""
+        tp = _tp()
+        cols = rows = 40
+        codes = ["g"] * (cols * rows)
+        for r in range(rows):
+            codes[r * cols + 23] = "p"                 # road 3 cells east of the line
+        lc = {"cols": cols, "rows": rows, "bounds": [0.0, 0.0, 1.0, 1.0],
+              "rle": tp._rle("".join(codes))}
+        lats = [0.01 + i * 0.0245 for i in range(40)]
+        lons = [20.5 / 40.0] * 40                     # column 20
+        self.assertEqual(tp.landcover_line_agreement(lc, lats, lons, radius=1), 0.0)
+        self.assertEqual(tp.landcover_line_agreement(lc, lats, lons), 1.0)
+
+    def test_old_assets_gain_land_cover_from_their_own_texture(self):
+        """ensure_landcover() heals an asset baked before land cover existed,
+        offline, from the texture already on disk - and is a no-op after."""
+        tp = _tp()
+        import tempfile
+        from PIL import ImageDraw
+        with tempfile.TemporaryDirectory() as td:
+            d = pathlib.Path(td)
+            img = Image.new("RGB", (600, 600), (84, 130, 60))          # grass
+            dr = ImageDraw.Draw(img)
+            dr.rectangle([0, 0, 200, 600], fill=(34, 62, 28))          # dark band
+            # canopy texture: woods are rough, not flat
+            import random
+            rnd = random.Random(3)
+            for _ in range(9000):
+                x, y = rnd.randrange(0, 200), rnd.randrange(0, 600)
+                v = rnd.choice([(16, 40, 14), (58, 96, 40)])
+                dr.rectangle([x, y, x + 2, y + 2], fill=v)
+            dr.rectangle([290, 0, 310, 600], fill=(100, 100, 104))    # road
+            img.save(d / "t.jpg", quality=92)
+            line = [[39.0 + i * 0.00002, -77.0, 100.0] for i in range(200)]
+            asset = {"slug": "t", "line": line,
+                     "texture": {"file": "t.jpg", "px": [600, 600],
+                                 "bounds": {"south": 38.998, "north": 39.006,
+                                            "west": -77.0052, "east": -76.9948}}}
+            (d / "t.json").write_text(json.dumps(asset))
+            healed = tp.ensure_landcover(d / "t.json", log=lambda *_: None)
+            self.assertIsNotNone(healed)
+            lc = healed["landcover"]
+            self.assertGreater(lc["share"]["woods"], 0.1, lc["share"])
+            self.assertGreater(lc["line_paved"], 0.8)
+            on_disk = json.loads((d / "t.json").read_text())
+            self.assertIn("landcover", on_disk)
+            self.assertIsNone(tp.ensure_landcover(d / "t.json", log=lambda *_: None))
+            self.assertEqual([p.name for p in d.glob("*.tmp")], [])
+
+            # imagery that does not show the circuit: recorded as rejected (no
+            # rle, so the viewer ignores it) and never re-classified
+            Image.new("RGB", (600, 600), (84, 130, 60)).save(d / "g.jpg")
+            asset["texture"]["file"] = "g.jpg"
+            (d / "g.json").write_text(json.dumps(asset))
+            rej = tp.ensure_landcover(d / "g.json", log=lambda *_: None)
+            self.assertIn("rejected", rej["landcover"])
+            self.assertNotIn("rle", rej["landcover"])
+            self.assertIsNone(tp.ensure_landcover(d / "g.json", log=lambda *_: None))
 
     def test_resample_is_even_and_monotone(self):
         tp = _tp()

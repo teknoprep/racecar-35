@@ -533,31 +533,63 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
-### Simulated track dressing (v-server) — the look of the 3D view
-A satellite drape is 1 m per pixel at best and reads as mush at driving height, so the 3D view now draws
-its OWN surfaces, procedurally, from canvas noise (deterministic, seeded): **tarmac** (UV in WORLD METRES,
-one tile per 6 m, so it never stretches with track width/length), **grass**, **gravel**, **Armco**. What gets
-placed comes from what we KNOW about the circuit:
-- **kerbs** red/white alternating on both edges, following the measured width;
-- **Armco barriers** on the OUTSIDE of every detected corner (the corner's turn direction says which side),
-  ~2.5 m out, rails + posts, extended 8 stations either side;
-- **trees** scattered 18-55 m from the line, height from the asset's DEM grid, deterministic per track
-  (`seededRandom(slug)`), never on the surface;
-- **corner labels** T1, T2 ... as sprites at each apex, shown in PLAN view only;
-- **the driven line** drawn on the tarmac as a thin (0.45 m) amber ribbon at +0.11 m — where the car has
-  been and, ahead of it, where it is going;
-- **the brake/accel wash**: a SEPARATE translucent unlit ribbon at +0.07 m (`opacity 0.62`,
-  `depthWrite:false`) whose BRIGHTNESS carries the intensity — harder braking glows brighter red, harder
-  acceleration brighter green, and neither leaves the tarmac clean. (The tarmac itself is now untinted; the
-  old approach dimmed the imagery instead of glowing.)
-- **No giant ground plane.** An 80 km 2-triangle plane showed its own edges as faceted shapes on the horizon —
-  that was the "dark ceiling" in the chase view. The world now stands on a 4 km simulated grass disc whose rim
-  fog hides.
-Ground mode is a choice in the bar: **simulated / satellite / none** (simulated default; satellite uses the
-prepared imagery and is only offered when the asset passes validation). `demCoversTrack()` refuses to draw the
-satellite ground mesh unless its bounds actually contain the circuit — a bad asset used to float its terrain
-ABOVE the track, which appeared as a dark faceted ceiling in chase and as wallpaper in plan. The view now
-OPENS IN CHASE (the driving view was never the problem; plan is the one that had to earn its place).
+### Simulated track dressing (v-server, `track3d_v` 10) — the look of the 3D view
+A satellite drape is 1 m per pixel at best and reads as mush at driving height, so the 3D view draws its OWN
+world, procedurally (canvas noise, deterministic, tileable), placed from what we KNOW about the circuit.
+**v10 was the "trees in the middle of the road / it looks like shit" fix.** The old tree placer offset each
+tree ALONG the tangent (`(tx·d, −tz·d)` instead of the perpendicular), so on any N/S or E/W stretch trees
+landed on the road ahead; it only cleared the section a tree was generated from, so a circuit that folds back
+put trees on the other straight; and the grass was a FLAT disc while the road followed the DEM, so on a hilly
+track the road floated metres above the ground. Now:
+- **One world model per rebuild** (`buildWorld()`): `RC3D.roadField()` = a 4 m raster of the nearest
+  centreline station (feature propagation, two passes) whose `nearest()` is exact (3×3 cells + refine);
+  `RC3D.groundField()` = terrain (DEM `demAt − yRef`, else `RC3D.pathTerrain()` through the logged altitude)
+  FLATTENED to just under the road (`−0.06 m`) across the width + 3 m shoulder, eased back over 30 m.
+  Gravel, Armco, posts, boards and trees stand on `W.groundY` = the height of the ground MESH's own
+  triangles (not the ideal field), so nothing pokes through or floats.
+- **Ground** = a terrain mesh, 6 m cells across the circuit growing ×1.2 out to ~6 km of fogged horizon,
+  shaded by a splat of the asset's **land cover** (grass / woods floor / paved = paddocks + other circuits /
+  dirt) with macro variation; land cover is ignored within ~12 m of the road edge so a misregistered image
+  cannot paint a ghost road. Satellite mode = the same mesh with the imagery inside the texture bounds.
+- **Trees** (`RC3D.treeSpots()`): only in cells the imagery calls **woods** (else smooth-noise clumps), and the
+  canopy edge must be ≥ **14 m** clear of the road edge of the NEAREST section of the whole circuit. Two
+  instanced species in 320 m chunks (frustum + shadow culling), ≤ 9000.
+- **Daylight**: equirect canvas sky (gradient, sun glow, clouds), ACES tone mapping, hemisphere + sun with a
+  PCF-soft shadow box that follows the car (whole circuit in plan), fog = horizon haze (pushed out in plan).
+- **Road furniture**: tarmac (world-metre UVs), white edge lines, continuous striped kerbs through every bend
+  tighter than ~600 m, gravel traps + Armco (W-beam texture, instanced posts) on the OUTSIDE of corners
+  ≥ 60°, never laid across another section (`ownSection()`), brake boards, S/F gantry + chequered line (at the
+  lap start when the laps carry no S/F geometry — logger-stamped laps never do).
+- **The driver's input**: chase view = a soft chevron line (green throttle / red brake, brighter with g / pale
+  neither) that fades out under the camera; plan view = the full-width wash (transparent when neither).
+  Brake/apex/throttle markers are painted on the road with a post at the INSIDE edge — never a pole in the line.
+- **Land cover** (`trackprep.land_cover`, RLE in the asset as `landcover`): computed at bake time; an asset
+  baked before it existed is healed the first time it is served (`ensure_landcover()`, offline from its own
+  JPEG, < 1 s). Seeds ship with it. `validate_asset()` refuses imagery where < 35 % of the line is on paved
+  pixels within ±3 cells (~12 m) — wallpaper/wrong-place scores ~0; misregistration is tolerated (Summit
+  Point Jefferson's line is ~15 m off the Esri mosaic: 24 % at ±1 cell, 52 % at ±3).
+- **Units**: `RC3D.corners`/`brakeMarkers`/ribbons speak DENSE (spline) arc length, `pointAtS`/`accelAtS`
+  take SAMPLE arc length — they differ by a fraction of a percent (tens of metres over a session). Convert
+  with `denseToCum()`; `slicePath()` converts its window instead of comparing across them.
+- The world is built ONCE at startup, after the asset fetch resolves (it used to build procedurally, then
+  again with the asset, so every tree jumped); the console logs `world built in N ms` (~100-350 ms).
+- Host tests (`tests/test_track3d.py` §12) pin: road field = brute force, no tree within 14 m of ANY section
+  (a hairpin that doubles back), no woods → no trees, ground never above / never far below the road, and
+  the no-DEM terrain is CONTINUOUS (a 2 m step never jumps; its kernel weight is exactly 0 at the edge of
+  its search window, and far from the road it eases into a coarse sigma-260 m regional surface — the old
+  "jump to the session mean" drew cliffs).
+- Review fixes that are easy to regress: the **ideal line** (`?pts=` lasso) is NOT in `meshes` — a rebuild
+  used to delete it for good — so `placeIdeal()` re-seats it on the ground after every rebuild, in the
+  SESSION's local frame (`buildPath(..., {o: PATH.o})`), drawn as a thin cyan line (green = throttle).
+  Tree clearance uses the DRAWN canopy radius and `gap: 17` (clear of the gravel/Armco run-off).
+  `ownSection` treats a parallel neighbouring lap as the same section (whole-session view). The road
+  field's cell grows with the extent (a 20 km drive must not allocate a 4 m raster over the county).
+  Measured per-station widths are smoothed (~30 m) — raw, they drew saw-tooth edges and kerbs.
+  `ensure_landcover()` is locked, writes via a unique temp + `os.replace`, runs off the event loop, and
+  records imagery that doesn't show the circuit as `{"rejected": ...}` so it is never retried per request.
+Ground mode is a choice in the bar: **simulated / satellite / none** (simulated default; satellite is only
+offered when the asset passes validation). `demCoversTrack()` refuses DEM terrain unless its bounds contain the
+circuit. The view OPENS IN CHASE.
 
 ### Prepared tracks: a bad bake must FAIL, never publish (v-server)
 The failure that survived the three bugs above: the ground rendered as a few texels of imagery stretched

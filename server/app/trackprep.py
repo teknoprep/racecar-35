@@ -35,6 +35,8 @@ import math
 import os
 import pathlib
 import re
+import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -896,13 +898,22 @@ def landcover_at(lc: dict, codes: str, lat: float, lon: float):
     return codes[row * lc["cols"] + col]
 
 
-def landcover_line_agreement(lc: dict, lats, lons) -> float:
-    """Share of the driven line that the imagery calls PAVED (within one cell).
+LINE_PAVED_RADIUS = 3       # cells (~12 m): GPS/OSM vs imagery registration slack
+LINE_PAVED_MIN = 0.35       # below this the imagery does not show the circuit at all
+
+
+def landcover_line_agreement(lc: dict, lats, lons, radius: int = LINE_PAVED_RADIUS) -> float:
+    """Share of the driven line that the imagery calls PAVED (within `radius` cells).
 
     The GPS says where the track is; the imagery has to agree. Imagery that is
     tiled wallpaper, from the wrong place, or a placeholder from a blocked tile
     server scores near zero and is refused - the test that would have stopped
-    the Watkins Glen 'wallpaper' bake reaching anyone."""
+    the Watkins Glen 'wallpaper' bake reaching anyone.
+
+    The slack matters: a real, correctly placed circuit can still sit 10-15 m
+    off its imagery (the shipped Summit Point Jefferson line is ~15 m off the
+    Esri mosaic: 24 % within one cell, 52 % within three). Misregistration
+    lowers this score a little; wallpaper drives it to ~0."""
     codes = unrle(lc["rle"])
     cols, rows = lc["cols"], lc["rows"]
     s, w, n, e = lc["bounds"]
@@ -914,13 +925,73 @@ def landcover_line_agreement(lc: dict, lats, lons) -> float:
         row = min(rows - 1, int((n - lat) / (n - s) * rows))
         tot += 1
         ok = False
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                rr, cc = row + dr, col + dc
-                if 0 <= rr < rows and 0 <= cc < cols and codes[rr * cols + cc] == "p":
+        for dr in range(-radius, radius + 1):
+            rr = row + dr
+            if not 0 <= rr < rows:
+                continue
+            for dc in range(-radius, radius + 1):
+                cc = col + dc
+                if 0 <= cc < cols and codes[rr * cols + cc] == "p":
                     ok = True
+                    break
+            if ok:
+                break
         hit += ok
     return hit / tot if tot else 0.0
+
+
+_LANDCOVER_LOCK = threading.Lock()
+
+
+def ensure_landcover(asset_path: pathlib.Path, log=print) -> Optional[dict]:
+    """Give an already-published asset its land cover, from the texture it
+    already has on disk (no network). Assets baked before land cover existed
+    heal themselves the first time they are served: the 3D view then plants
+    trees only where the imagery shows woods. Returns the updated asset, or
+    None when there is nothing to do / nothing to do it with.
+
+    Imagery that does not show the circuit (line_paved < LINE_PAVED_MIN) is
+    recorded as {"rejected": ...} instead: the viewer then ignores it (no rle)
+    and the next request does not re-classify it (no retry storm). One writer
+    at a time, unique temp file, atomic replace - a concurrent reader never
+    sees half an asset."""
+    with _LANDCOVER_LOCK:
+        try:
+            asset = json.loads(asset_path.read_text("utf-8"))
+        except Exception:
+            return None
+        if asset.get("landcover") or not asset.get("texture"):
+            return None
+        tex = asset["texture"]
+        img_path = asset_path.parent / tex.get("file", "")
+        if not tex.get("file") or not img_path.is_file():
+            return None
+        _require_deps()
+        b = tex["bounds"]
+        with Image.open(img_path) as img:
+            add_landcover(asset, img, {"lat0": b["north"], "lat1": b["south"],
+                                       "lon0": b["west"], "lon1": b["east"]}, log=log)
+        lc = asset.get("landcover")
+        if not lc:
+            asset["landcover"] = {"rejected": "imagery too small to classify"}
+        elif lc.get("line_paved", 0.0) < LINE_PAVED_MIN:
+            asset["landcover"] = {"rejected": "imagery does not show the circuit",
+                                  "line_paved": lc.get("line_paved")}
+            log(f"[{asset.get('slug')}] land cover rejected: only "
+                f"{100 * lc.get('line_paved', 0):.0f}% of the line on paved pixels")
+        fd, tmp = tempfile.mkstemp(prefix=asset_path.stem + ".", suffix=".tmp",
+                                   dir=str(asset_path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(asset, f)
+            os.replace(tmp, asset_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return asset
 
 
 def add_landcover(asset: dict, img, bounds: dict, log=print) -> dict:
@@ -1101,7 +1172,7 @@ def validate_asset(asset: dict, line: dict) -> list:
         if res > 6.0:
             bad.append("texture resolution is %.1f m/px (too coarse to see a track)" % res)
     lc = asset.get("landcover")
-    if lc is not None and lc.get("line_paved", 1.0) < 0.6:
+    if lc is not None and lc.get("line_paved", 1.0) < LINE_PAVED_MIN:
         bad.append("imagery does not show a road where the GPS line is (only %.0f%% "
                    "of the line is on paved pixels) - wrong place, tiled or placeholder "
                    "imagery" % (100.0 * lc.get("line_paved", 0.0)))

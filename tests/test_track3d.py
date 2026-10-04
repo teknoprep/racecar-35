@@ -580,6 +580,108 @@ R.wash = (function () {
                        RC3D.driveIntensity(-0.4), RC3D.driveIntensity(-0.9)] };
 })();
 
+// ---- trackside: the road distance field, ground, and NO TREES ON THE ROAD --
+R.world = (function () {
+  // a hairpin that folds back on itself: two straights 46 m apart joined by a
+  // 180 deg bend - the infield between them is exactly where a tree placed
+  // "18-55 m from the section it was generated from" lands on the OTHER straight
+  var pts = [], lat0 = 39.0, lon0 = -77.0, heading = 0, step = 2.0;
+  function push(dist, turnPerM) {
+    var n = Math.max(1, Math.round(dist / step));
+    for (var k = 0; k < n; k++) {
+      heading += turnPerM * step * 180 / Math.PI;
+      var r = heading * Math.PI / 180;
+      lat0 += (Math.cos(r) * step) / 111320;
+      lon0 += (Math.sin(r) * step) / (111320 * Math.cos(lat0 * Math.PI / 180));
+      pts.push({ lat: lat0, lon: lon0, speed_mph: 60, alt_m: 100 + k * 0.02 });
+    }
+  }
+  push(600, 0);
+  push(Math.PI * 23, 1 / 23);            // 180 deg, radius 23 m -> straights 46 m apart
+  push(600, 0);
+  var p = RC3D.buildPath(pts, { smooth: 3, denseStep: 1 });
+  var d = p.dense, hwM = 5;
+  var hw = function () { return hwM; };
+  var box = RC3D.denseBox(d, 400);
+  var field = RC3D.roadField(d, box, 4);
+  function brute(x, z) {
+    var best = 1e18, bi = -1;
+    for (var i = 0; i < d.x.length; i++) {
+      var dx = d.x[i] - x, dz = d.z[i] - z, dd = dx * dx + dz * dz;
+      if (dd < best) { best = dd; bi = i; }
+    }
+    return { i: bi, d: Math.sqrt(best) };
+  }
+  // 1. the distance field agrees with brute force (exact near the road)
+  var worstNear = 0, worstApprox = 0, probes = 0;
+  var rnd = (function (s) { return function () { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; }; })(5);
+  for (var k = 0; k < 3000; k++) {
+    var x = box.minX + rnd() * (box.maxX - box.minX), z = box.minZ + rnd() * (box.maxZ - box.minZ);
+    var b = brute(x, z), q = field.nearest(x, z), a = field.approx(x, z);
+    if (b.d < 80) { worstNear = Math.max(worstNear, Math.abs(q.d - b.d)); probes++; }
+    worstApprox = Math.max(worstApprox, Math.abs(a - b.d));
+  }
+  // 2. trees: procedural AND land-cover driven (woods EVERYWHERE, road included)
+  function clearance(spots) {
+    var worst = 1e9;
+    for (var i = 0; i < spots.length; i++) {
+      var t = spots[i], b2 = brute(t.x, t.z);
+      worst = Math.min(worst, b2.d - hwM - t.canopy);
+    }
+    return worst;
+  }
+  var proc = RC3D.treeSpots(d, field, { rnd: Math.random, halfWidth: hw, gap: 14, seed: "x", max: 4000 });
+  var S0 = p.o.lat - 0.01, N0 = p.o.lat + 0.01, W0 = p.o.lon - 0.012, E0 = p.o.lon + 0.012;
+  var cols = 300, rows = 300, codes = new Array(cols * rows + 1).join("w");
+  var lcSpots = RC3D.treeSpots(d, field, { rnd: Math.random, halfWidth: hw, gap: 14, max: 6000,
+    landcover: { codes: codes, cols: cols, rows: rows, bounds: [S0, W0, N0, E0] }, o: p.o });
+  // a land cover with NO woods plants nothing
+  var none = RC3D.treeSpots(d, field, { rnd: Math.random, halfWidth: hw, gap: 14,
+    landcover: { codes: new Array(cols * rows + 1).join("g"), cols: cols, rows: rows,
+                 bounds: [S0, W0, N0, E0] }, o: p.o });
+  // 3. ground: flat just under the road across its width, the terrain far away
+  var terrain = function (x, z) { return 7 + 0.02 * x; };
+  var gy = RC3D.groundField(d, field, { halfWidth: hw, terrain: terrain, drop: 0.06 });
+  var worstUnder = 0, worstAbove = -1e9;
+  for (var i = 0; i < d.x.length; i += 7) {
+    var tx = d.tan[i][0], tz = d.tan[i][1];
+    for (var o = -hwM; o <= hwM; o += 2.5) {
+      var gx = d.x[i] + tz * o, gz = d.z[i] - tx * o;
+      var dy = gy(gx, gz) - d.y[i];          // ground minus road
+      worstAbove = Math.max(worstAbove, dy);
+      worstUnder = Math.max(worstUnder, -dy);
+    }
+  }
+  // no-DEM terrain through the logged altitude: two straights 46 m apart at
+  // 100 m and 108 m (a steep 17 % between them) must meet in a SLOPE - no
+  // step anywhere, and ease out to a regional surface far away
+  var pts2 = pts.map(function (q2, k2) {
+    var f = Math.max(0, Math.min(1, (k2 - 300) / (pts.length - 600)));
+    return { lat: q2.lat, lon: q2.lon, speed_mph: 60, alt_m: 100 + 8 * f };
+  });
+  var p2 = RC3D.buildPath(pts2, { smooth: 3, denseStep: 1 });
+  var pt = RC3D.pathTerrain(p2.dense), worstStep = 0, prevY = null;
+  var mid = p2.dense.x.length >> 2;
+  for (var m2 = -400; m2 <= 400; m2 += 2) {                // across both straights
+    var ty = pt(p2.dense.x[mid] + m2, p2.dense.z[mid]);
+    if (prevY !== null) worstStep = Math.max(worstStep, Math.abs(ty - prevY));
+    prevY = ty;
+  }
+  prevY = null;
+  for (var m3 = 0; m3 <= 600; m3 += 2) {                   // along, out past the end
+    var ty2 = pt(p2.dense.x[mid], p2.dense.z[mid] + m3);
+    if (prevY !== null) worstStep = Math.max(worstStep, Math.abs(ty2 - prevY));
+    prevY = ty2;
+  }
+  var farX = box.maxX - 5, farZ = box.maxZ - 5;
+  return { worstNear: worstNear, worstApprox: worstApprox, probes: probes,
+           proc: proc.length, procClear: clearance(proc),
+           lc: lcSpots.length, lcClear: clearance(lcSpots), none: none.length,
+           terrainStep: worstStep, aboveRoad: worstAbove, underRoad: worstUnder,
+           far: Math.abs(gy(farX, farZ) - terrain(farX, farZ)),
+           unrle: RC3D.unrle("3p2w1g") };
+})();
+
 console.log(JSON.stringify(R));
 """
 
@@ -825,6 +927,33 @@ class Track3DMathTests(unittest.TestCase):
         self.assertAlmostEqual(rc["heldYaw"], 0.4, places=6)     # held while dragging
         self.assertLess(abs(rc["yaw"]), 0.02, "free look did not recentre")
         self.assertLess(abs(rc["pitch"]), 0.02)
+
+        # 12. trackside dressing. The bug this pins: trees were offset ALONG the
+        #     tangent (onto the road ahead), and only checked against the section
+        #     they were generated from - so on a circuit that folds back they
+        #     stood on the other straight.
+        w = res["world"]
+        self.assertGreater(w["probes"], 100)
+        self.assertLess(w["worstNear"], 0.01, "road field must be exact near the road")
+        self.assertLess(w["worstApprox"], 4.0, "raster distance is off by more than a cell")
+        self.assertGreater(w["proc"], 50, "procedural woods planted nothing")
+        self.assertGreater(w["lc"], 200, "land-cover woods planted nothing")
+        self.assertEqual(w["none"], 0, "trees where the imagery shows no woods")
+        # canopy edge >= 14 m clear of the road edge of ANY section - measured
+        # by brute force against every station, so the other straight of the
+        # hairpin counts too (tiny slack for the station spacing)
+        self.assertGreaterEqual(w["procClear"], 13.4, w)
+        self.assertGreaterEqual(w["lcClear"], 13.4, w)
+        # the ground is flat JUST under the road everywhere across it (never
+        # poking through, never a gap you can see), and is the terrain far away
+        self.assertLess(w["aboveRoad"], -0.03, "ground pokes through the road")
+        self.assertLess(w["underRoad"], 0.12, "road floats above the ground")
+        self.assertLess(w["far"], 1e-6)
+        # no-DEM terrain is continuous: a 2 m step never changes it by more
+        # than the road's own steepest grade would (it used to jump to the
+        # session mean at the edge of the search window)
+        self.assertLess(w["terrainStep"], 0.5, w["terrainStep"])
+        self.assertEqual(w["unrle"], "pppwwg")
 
         # 11. altitude referenced to the session minimum so the ribbon sits on
         #     the ground plane instead of floating at MSL
