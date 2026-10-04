@@ -5077,26 +5077,45 @@ async def review(request: Request, user: str, filename: str) -> Response:
                        .replace("__MAP_MAXZOOM__", str(MAP_MAXZOOM))
 
 
-@app.get("/track3d/{user}/{filename}", response_class=HTMLResponse)
-async def track3d(request: Request, user: str, filename: str) -> Response:
-    """First-person 3D drive view: satellite imagery draped over real terrain
-    (RACECAR_MAP_DEM), the driven line painted on the ground, corner markers,
-    and a chase camera on the review page's playback clock. Same view gate as
-    /review, so access can never be widened by this page.
+@app.get("/map3d/{user}/{filename}", response_class=HTMLResponse)
+async def map3d(request: Request, user: str, filename: str) -> Response:
+    """The session in 3D the "map" way: satellite imagery draped over real
+    terrain (RACECAR_MAP_DEM) with the driven line painted on the ground, a
+    chase camera on the review page's playback clock, and a ?pts= ideal line.
 
-    Rendered entirely client-side from /sessions/<u>/<f>/{data,laps} (plus
-    /lines when a lasso polygon is handed over via ?pts=)."""
+    This is the imagery variant. The DATA-ONLY driver's view is /track3d, which
+    is what the review page links to; this one stays reachable because seeing
+    the same corner over real ground is occasionally what you want."""
     if oauth_enabled() and not current_user(request):
         return login_redirect(request)
     gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
-    return _TRACK3D_HTML.replace("__USER__", safe_name(user)) \
+    return _TRACK3DMAP_HTML.replace("__USER__", safe_name(user)) \
                         .replace("__FILE__", p.name) \
                         .replace("__MAP_TILES__", json.dumps(MAP_TILES)) \
                         .replace("__MAP_ATTRIB__", json.dumps(MAP_ATTRIB)) \
                         .replace("__MAP_MAXZOOM__", str(MAP_MAXZOOM)) \
                         .replace("__MAP_DEM__", json.dumps(MAP_DEM)) \
                         .replace("__MAP_DEM_MAXZOOM__", str(MAP_DEM_MAXZOOM))
+
+
+@app.get("/track3d/{user}/{filename}", response_class=HTMLResponse)
+async def track3d(request: Request, user: str, filename: str) -> Response:
+    """First-person DRIVING view built from the data alone — no imagery, no map
+    tiles, no terrain service: a road ribbon drawn around the line the car
+    actually drove, on the logged altitude, with speed colouring, corner kerbs,
+    brake/apex/throttle markers, an S/F gantry and a chase camera at eye height.
+    The 25 Hz samples are smoothed and arc-length interpolated so it plays at
+    60 fps. Same view gate as /review.
+
+    Client-side only, from /sessions/<u>/<f>/{data,laps} (+ /lines when a lasso
+    polygon arrives as ?pts=)."""
+    if oauth_enabled() and not current_user(request):
+        return login_redirect(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    return _TRACK3D_HTML.replace("__USER__", safe_name(user)) \
+                        .replace("__FILE__", p.name)
 
 
 # ---------------------------------------------------------------------------
@@ -6203,7 +6222,7 @@ _CANBUS_HTML = (
 # in blue over the ground — "what we did" vs "what the data says is fastest",
 # in the driver's view.
 # ---------------------------------------------------------------------------
-_TRACK3D_HTML = (
+_TRACK3DMAP_HTML = (
     """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -6776,6 +6795,1012 @@ _TRACK3D_HTML = (
 </body></html>"""
 )
 
+_TRACK3D_HTML = (
+    """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D drive · __FILE__</title>
+<style>
+  :root { --bg:#0E1014; --surface:#181B22; --line:#2A2F3A; --text:#E6E8EE;
+          --muted:#8A92A3; --good:#6CD07A; --warn:#FFB020; --bad:#FF4D4D; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font:13px/1.4 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow:hidden; }
+  #view { position:absolute; inset:0 0 52px 0; display:block; width:100%; height:calc(100% - 52px); }
+  #hud { position:absolute; left:14px; bottom:64px; z-index:10; pointer-events:none;
+    background:rgba(14,16,20,0.62); border:1px solid var(--line); border-radius:10px;
+    padding:10px 16px; min-width:228px; }
+  #hud .spd { display:flex; align-items:flex-end; gap:6px; }
+  #hud .spd .v { font:700 52px/0.9 ui-monospace, Menlo, Consolas, monospace; letter-spacing:-3px; }
+  #hud .spd .u { color:var(--muted); font:600 12px Inter,sans-serif; padding-bottom:6px; }
+  #hud .bar { height:5px; border-radius:3px; background:#252A33; margin:9px 0 7px; overflow:hidden; }
+  #hud .bar i { display:block; height:100%; width:0%; background:var(--warn); }
+  #hud .row { display:flex; justify-content:space-between; gap:14px;
+    font:600 12px ui-monospace, Menlo, Consolas, monospace; margin-top:3px; }
+  #hud .row .k { color:var(--muted); font-weight:400; }
+  #legend { position:absolute; right:14px; top:14px; z-index:10; pointer-events:none;
+    background:rgba(14,16,20,0.62); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+  #legend .li { display:flex; align-items:center; gap:7px; margin:3px 0;
+    font:500 11px Inter,sans-serif; white-space:nowrap; }
+  #legend .dot { width:10px; height:10px; border-radius:50%; flex:0 0 auto; border:1.5px solid #000; }
+  #legend .sw { width:22px; height:4px; border-radius:2px; flex:0 0 auto; }
+  #notice { position:absolute; left:50%; top:16px; transform:translateX(-50%); z-index:20;
+    background:rgba(14,16,20,0.94); border:1px solid var(--line); border-radius:6px;
+    padding:9px 15px; font:600 12px Inter,sans-serif; max-width:78vw; }
+  #notice.err { border-color:var(--bad); color:#FFB0B0; }
+  #bar { position:absolute; left:0; right:0; bottom:0; height:52px; z-index:15;
+    display:flex; align-items:center; gap:9px; padding:0 12px; overflow-x:auto;
+    background:var(--surface); border-top:1px solid var(--line); }
+  #bar button { background:#20242E; color:var(--text); border:1px solid var(--line);
+    border-radius:4px; padding:8px 13px; cursor:pointer; font:600 12px Inter,sans-serif;
+    white-space:nowrap; }
+  #bar button.on { background:var(--warn); border-color:transparent; color:#1A1300; }
+  #bar input[type=range] { accent-color:var(--warn); }
+  #bar select { background:#20242E; color:var(--text); border:1px solid var(--line);
+    border-radius:4px; padding:7px 8px; font:600 12px Inter,sans-serif; }
+  #bar label { display:flex; align-items:center; gap:6px; white-space:nowrap; cursor:pointer;
+    font:600 12px Inter,sans-serif; }
+  #bar input[type=checkbox] { width:15px; height:15px; margin:0; accent-color:var(--warn); cursor:pointer; }
+  #bar .meta { color:var(--muted); font:500 12px ui-monospace, Menlo, Consolas, monospace;
+    white-space:nowrap; }
+  #bar a { color:var(--muted); text-decoration:none; border:1px solid var(--line);
+    border-radius:4px; padding:8px 10px; font:600 12px Inter,sans-serif; white-space:nowrap; }
+  #bar a:hover { color:var(--text); }
+  #bar .sep { width:1px; height:26px; background:var(--line); flex:0 0 auto; }
+</style></head><body>
+<canvas id="view"></canvas>
+<div id="notice">loading session…</div>
+<div id="hud" style="display:none">
+  <div class="spd"><span class="v" id="h-mph">0</span><span class="u">mph</span></div>
+  <div class="bar"><i id="h-bar"></i></div>
+  <div class="row"><span class="k">rpm</span><span id="h-rpm">—</span></div>
+  <div class="row"><span class="k">lap</span><span id="h-lap">—</span></div>
+  <div class="row"><span class="k">lap time</span><span id="h-lapt">—</span></div>
+  <div class="row"><span class="k">best</span><span id="h-best">—</span></div>
+  <div class="row"><span class="k">altitude</span><span id="h-alt">—</span></div>
+</div>
+<div id="legend">
+  <div class="li"><span class="sw" style="background:#266FE6"></span>slowest</div>
+  <div class="li"><span class="sw" style="background:#59D98C"></span>slow</div>
+  <div class="li"><span class="sw" style="background:#FFD24A"></span>fast</div>
+  <div class="li"><span class="sw" style="background:#FF4D4D"></span>fastest</div>
+  <div class="li" id="lg-ideal" style="display:none"><span class="sw" style="background:#6CD07A"></span>ideal line (fastest real lap)</div>
+  <div class="li"><span class="dot" style="background:#FF4D4D"></span>brake</div>
+  <div class="li"><span class="dot" style="background:#FFB020"></span>apex</div>
+  <div class="li"><span class="dot" style="background:#6CD07A"></span>throttle</div>
+</div>
+<div id="bar">
+  <button id="b-play">▶ drive</button>
+  <input id="b-scrub" type="range" min="0" max="1000" value="0" step="1" style="flex:1 1 150px;min-width:100px">
+  <span class="meta" id="b-clock">0:00.0</span>
+  <select id="b-rate" title="playback speed">
+    <option value="1">1×</option><option value="2">2×</option><option value="4">4×</option>
+    <option value="0.25">¼×</option><option value="0.5">½×</option>
+  </select>
+  <select id="b-lap" title="which lap to drive"></select>
+  <span class="sep"></span>
+  <label title="smoothing window over the 25 Hz GPS — higher is smoother but rounds off real detail">
+    <span class="meta">smooth</span>
+    <input id="b-smooth" type="range" min="1" max="15" step="2" value="5" style="width:74px"></label>
+  <label title="eye height above the track surface (scroll wheel too)">
+    <span class="meta">eye</span>
+    <input id="b-eye" type="range" min="0.5" max="4" step="0.05" value="1.15" style="width:74px"></label>
+  <label title="width of the ribbon drawn around your line">
+    <span class="meta">road</span>
+    <input id="b-road" type="range" min="6" max="24" step="1" value="12" style="width:74px"></label>
+  <span class="sep"></span>
+  <label><input type="checkbox" id="b-speedcol" checked>speed colour</label>
+  <label><input type="checkbox" id="b-markers" checked>markers</label>
+  <label><input type="checkbox" id="b-ghost">other laps</label>
+  <label><input type="checkbox" id="b-loop" checked>loop</label>
+  <label title="lean the camera into corners (computed from the path curvature)"><input type="checkbox" id="b-bank" checked>bank</label>
+  <span class="sep"></span>
+  <a href="/review/__USER__/__FILE__">← pit wall</a>
+  <a href="/map3d/__USER__/__FILE__" title="the same session on satellite imagery with 3D terrain">satellite map</a>
+</div>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+/* ===========================================================================
+   /track3d — first-person DRIVING view, rendered from DATA ONLY.
+
+   No imagery, no map tiles, no DEM. The road is a ribbon built from the line
+   the car actually drove, laid on the elevation the log recorded (`alt_m`;
+   flat for sessions that predate altitude logging). Everything on screen is
+   derived from the session: the ribbon, its speed colouring, the corner kerbs,
+   the brake/apex/throttle markers and the start/finish gantry.
+
+   ⚠️ The track WIDTH is synthetic (a constant-width ribbon around the driven
+   line) because we do not log track edges. The line, its shape, its corners,
+   its elevation and its speeds are all real; the asphalt either side of it is
+   a drawing. A "satellite map" variant of the same session lives at /map3d.
+
+   The 25 Hz samples become a continuous path once, up front:
+     moving average (GPS lateral noise is 1-2 m) -> centripetal Catmull-Rom
+     -> arc-length table (with enough LUT divisions that the table is fine
+     relative to the path, which is what makes the spacing even).
+   At render time the playback clock maps to arc length with a monotonic
+   Catmull-Rom IN TIME, clamped to the bracketing samples so the speed can
+   neither stall nor overshoot; 60 fps motion out of 40 ms data.
+   =========================================================================== */
+
+(function () {
+  "use strict";
+  // Signals the (non-module) watchdog below that the CDN import succeeded: if
+  // this never runs, the page shows a way out instead of a stuck "loading".
+  window.__track3dReady = true;
+  var USER = "__USER__", FILE = "__FILE__";
+  var q = new URLSearchParams(location.search);
+  var pts = (q.get("pts") || "").split("|").map(function (s) {
+    return s.split(",").map(Number);
+  }).filter(function (a) { return a.length === 2 && isFinite(a[0]) && isFinite(a[1]); });
+
+  function el(id) { return document.getElementById(id); }
+  function notice(msg, err) {
+    var n = el("notice");
+    n.style.display = "block";
+    n.textContent = msg;
+    n.className = err ? "err" : "";
+  }
+  function hideNotice() { el("notice").style.display = "none"; }
+  function fmtClock(s) {
+    if (!isFinite(s)) return "0:00.0";
+    s = Math.max(0, s);
+    var m = Math.floor(s / 60), r = s - m * 60;
+    return m + ":" + (r < 10 ? "0" : "") + r.toFixed(1);
+  }
+  function fmtLap(s) {
+    if (!isFinite(s) || s <= 0) return "—";
+    var m = Math.floor(s / 60), r = s - m * 60;
+    return (m ? m + ":" + (r < 10 ? "0" : "") : "") + r.toFixed(2);
+  }
+
+  /* =======================================================================
+     1. PURE LAYER — data in, geometry out. No DOM, no GL. Exposed as RC3D so
+        the host test (tests/) can drive it with real sessions and synthetic
+        arcs; that is the only way to check this maths without a browser.
+     ======================================================================= */
+  var RC3D = {};
+  var M_LAT = 111320;
+
+  // WGS84 -> local metres. +x = east, -z = north, +y = up.
+  RC3D.project = function (lat, lon, o) {
+    return {
+      x: (lon - o.lon) * M_LAT * Math.cos(o.lat * Math.PI / 180),
+      y: 0,
+      z: -(lat - o.lat) * M_LAT
+    };
+  };
+
+  // Centred moving average, edge-clamped, one pass (no drift, no phase shift).
+  RC3D.smooth = function (arr, win) {
+    var r = Math.max(0, Math.floor((win - 1) / 2)), out, i, j, a, b, s, n;
+    if (!r) return arr.slice();
+    out = new Array(arr.length);
+    for (i = 0; i < arr.length; i++) {
+      a = Math.max(0, i - r); b = Math.min(arr.length - 1, i + r);
+      s = 0; n = 0;
+      for (j = a; j <= b; j++) { s += arr[j]; n++; }
+      out[i] = s / n;
+    }
+    return out;
+  };
+
+  // Nulls (no fix / no altitude) carry the nearest real value, so a dropout
+  // never becomes a 0 m cliff. Nothing real => `fallback` everywhere.
+  RC3D.fillNulls = function (arr, fallback) {
+    var out = new Array(arr.length), i, last = null, first = null;
+    for (i = 0; i < arr.length; i++) if (first === null && isFinite(arr[i])) first = arr[i];
+    if (first === null) first = fallback || 0;
+    for (i = 0; i < arr.length; i++) {
+      if (isFinite(arr[i])) { last = arr[i]; out[i] = arr[i]; }
+      else out[i] = (last === null ? first : last);
+    }
+    return out;
+  };
+
+  // Epoch `t`, else relative `t_ms`, else synthetic 25 Hz; always shifted so
+  // the first sample is 0 (the server's lap times use the same base).
+  RC3D.timeline = function (samples) {
+    var first = null, i, s, v;
+    var raw = new Array(samples.length);
+    for (i = 0; i < samples.length; i++) {
+      s = samples[i]; v = null;
+      if (typeof s.t === "number" && isFinite(s.t)) v = s.t;
+      else if (typeof s.t_ms === "number" && isFinite(s.t_ms)) v = s.t_ms / 1000;
+      if (v !== null && first === null) first = v;
+      raw[i] = v;
+    }
+    if (first === null) { for (i = 0; i < samples.length; i++) raw[i] = i / 25; return raw; }
+    var last = first;
+    for (i = 0; i < raw.length; i++) {
+      if (raw[i] === null) { raw[i] = last; } else { last = raw[i]; raw[i] -= first; }
+    }
+    return raw;
+  };
+
+  // The drivable path: smoothed positions, cumulative arc length, and a dense
+  // (~denseStep m) centreline with its own arc-length table + XZ tangents.
+  RC3D.buildPath = function (samples, opts) {
+    opts = opts || {};
+    var win = opts.smooth == null ? 5 : opts.smooth;
+    var step = opts.denseStep || 1.0;
+    var maxCp = opts.maxCurvePoints || 2400;
+    var i, n = samples.length;
+    var lat = new Array(n), lon = new Array(n), alt = new Array(n), mph = new Array(n);
+    for (i = 0; i < n; i++) {
+      var s = samples[i];
+      lat[i] = (typeof s.lat === "number") ? s.lat : NaN;
+      lon[i] = (typeof s.lon === "number") ? s.lon : NaN;
+      alt[i] = (typeof s.alt_m === "number" && isFinite(s.alt_m)) ? s.alt_m : NaN;
+      mph[i] = (typeof s.speed_mph === "number" && isFinite(s.speed_mph)) ? s.speed_mph : 0;
+    }
+    // origin = mean of the valid fixes (keeps the local projection tight)
+    var sla = 0, slo = 0, na = 0;
+    for (i = 0; i < n; i++)
+      if (isFinite(lat[i]) && isFinite(lon[i]) && (lat[i] || lon[i])) { sla += lat[i]; slo += lon[i]; na++; }
+    var o = na ? { lat: sla / na, lon: slo / na } : { lat: 0, lon: 0 };
+
+    var X = new Array(n), Z = new Array(n);
+    for (i = 0; i < n; i++) {
+      var p = RC3D.project(isFinite(lat[i]) ? lat[i] : o.lat,
+                           isFinite(lon[i]) ? lon[i] : o.lon, o);
+      X[i] = p.x; Z[i] = p.z;
+    }
+    // Altitude is logged in metres MSL: reference it to the session minimum so
+    // a mountain track is not floating at its real elevation above the ground
+    // plane (and so float precision stays usable).
+    var Y = RC3D.smooth(RC3D.fillNulls(alt, 0), Math.max(3, win + 4));
+    var yMin = Infinity;
+    for (i = 0; i < n; i++) if (Y[i] < yMin) yMin = Y[i];
+    if (!isFinite(yMin)) yMin = 0;
+    for (i = 0; i < n; i++) Y[i] -= yMin;
+    // lateral smoothing is the whole point: GPS noise is 1-2 m at 25 Hz
+    X = RC3D.smooth(X, win);
+    Z = RC3D.smooth(Z, win);
+    mph = RC3D.smooth(RC3D.fillNulls(mph, 0), Math.max(3, win));
+
+    var t = RC3D.timeline(samples);
+    var cum = new Array(n);
+    cum[0] = 0;
+    for (i = 1; i < n; i++) {
+      var dx = X[i] - X[i - 1], dz = Z[i] - Z[i - 1];
+      cum[i] = cum[i - 1] + Math.sqrt(dx * dx + dz * dz);
+    }
+    var total = cum[n - 1] || 1;
+
+    // ---- dense centreline ------------------------------------------------
+    // Control points are decimated (≤maxCurvePoints) so a 50 km session does
+    // not build an enormous spline; the smoothing above already removed the
+    // noise that decimation would otherwise expose. Guarded on THREE so a
+    // partial/missing library degrades to the smoothed polyline below instead
+    // of throwing.
+    var canCurve = typeof THREE.Vector3 === "function" &&
+                   typeof THREE.CatmullRomCurve3 === "function";
+    var cp = [], every = Math.max(1, Math.ceil(n / maxCp));
+    if (canCurve) {
+      for (i = 0; i < n; i += every) cp.push(new THREE.Vector3(X[i], Y[i], Z[i]));
+      if (cp.length > 1 && n > 1) cp.push(new THREE.Vector3(X[n - 1], Y[n - 1], Z[n - 1]));
+    }
+
+    var dx2 = [], dy2 = [], dz2 = [], ds2 = [], dTotal = 0;
+    if (canCurve && cp.length > 1) {
+      var curve = new THREE.CatmullRomCurve3(cp, false, "centripetal", 0.5);
+      // getSpacedPoints() is arc-length parameterised through a LUT. The three
+      // default (200 divisions for the WHOLE curve) would sample a 50 km path
+      // every 250 m and return visibly uneven spacing, so scale it with the
+      // control-point count.
+      curve.arcLengthDivisions = Math.min(400000, Math.max(400, cp.length * 3));
+      var count = Math.max(2, Math.min(200000, Math.ceil(total / step)));
+      var spaced = curve.getSpacedPoints(count);
+      for (i = 0; i < spaced.length; i++) {
+        var v = spaced[i];
+        dx2.push(v.x); dy2.push(v.y); dz2.push(v.z);
+        if (i) {
+          var ax = v.x - spaced[i - 1].x, ay = v.y - spaced[i - 1].y, az = v.z - spaced[i - 1].z;
+          dTotal += Math.sqrt(ax * ax + ay * ay + az * az);
+        }
+        ds2.push(dTotal);
+      }
+    } else {
+      for (i = 0; i < n; i++) { dx2.push(X[i]); dy2.push(Y[i]); dz2.push(Z[i]); ds2.push(cum[i]); }
+      dTotal = total;
+    }
+
+    var tan = new Array(dx2.length);
+    for (i = 0; i < dx2.length; i++) {
+      var a = Math.max(0, i - 1), b = Math.min(dx2.length - 1, i + 1);
+      var tx = dx2[b] - dx2[a], tz = dz2[b] - dz2[a];
+      var L = Math.sqrt(tx * tx + tz * tz) || 1;
+      tan[i] = [tx / L, tz / L];
+    }
+    return {
+      o: o, n: n, x: X, y: Y, z: Z, t: t, speed: mph, cum: cum, total: total,
+      yRef: yMin, dense: { x: dx2, y: dy2, z: dz2, s: ds2, total: dTotal, tan: tan }
+    };
+  };
+
+  // Arc length at a time: a MONOTONE cubic (Fritsch-Carlson / PCHIP) through the
+  // samples. A plain Catmull-Rom is C1 but not monotone - on real GPS, where the
+  // per-sample spacing wobbles, its cubic can dip backwards mid-segment, which
+  // shows up as a tiny stutter every 40 ms. The limiter forces the interpolant
+  // to stay between its bracketing samples, so speed can neither stall nor
+  // overshoot, and it is still C1 (no visible kinks).
+  function _secant(t, cum, k) {
+    var dt = t[k + 1] - t[k];
+    return dt > 0 ? (cum[k + 1] - cum[k]) / dt : 0;
+  }
+  function _pchip(dA, dB, dtA, dtB) {
+    if (!(dA > 0) && !(dA < 0)) return 0;      // 0 / NaN
+    if (!(dB > 0) && !(dB < 0)) return 0;
+    if (dA * dB <= 0) return 0;                // a turning point: slope 0 there
+    var w1 = 2 * dtB + dtA, w2 = dtB + 2 * dtA;
+    return (w1 + w2) / (w1 / dA + w2 / dB);
+  }
+  RC3D.sAtTime = function (path, tt) {
+    var t = path.t, cum = path.cum, n = t.length, lo, hi, mid, i, dt, f, s;
+    var dPrev, dSeg, dNext, dtPrev, dtNext, m0, m1, f2, f3;
+    if (!n) return 0;
+    if (tt <= t[0]) return 0;
+    if (tt >= t[n - 1]) return path.total;
+    lo = 0; hi = n - 1;
+    while (lo < hi) { mid = (lo + hi + 1) >> 1; if (t[mid] <= tt) lo = mid; else hi = mid - 1; }
+    i = Math.min(lo, n - 2);
+    dt = t[i + 1] - t[i];
+    if (!(dt > 0)) return cum[i];
+    f = (tt - t[i]) / dt;
+    dSeg = _secant(t, cum, i);
+    dtPrev = i > 0 ? t[i] - t[i - 1] : dt;
+    dPrev = i > 0 ? _secant(t, cum, i - 1) : dSeg;
+    dtNext = i + 2 <= n - 1 ? t[i + 2] - t[i + 1] : dt;
+    dNext = i + 2 <= n - 1 ? _secant(t, cum, i + 1) : dSeg;
+    m0 = _pchip(dPrev, dSeg, dtPrev, dt);
+    m1 = _pchip(dSeg, dNext, dt, dtNext);
+    f2 = f * f; f3 = f2 * f;
+    s = (2 * f3 - 3 * f2 + 1) * cum[i] + (f3 - 2 * f2 + f) * dt * m0 +
+        (-2 * f3 + 3 * f2) * cum[i + 1] + (f3 - f2) * dt * m1;
+    if (s < cum[i]) s = cum[i];          // belt-and-braces: the limiter already
+    if (s > cum[i + 1]) s = cum[i + 1];  // guarantees this
+    return s;
+  };
+
+  // Arc length -> point + tangent on the dense centreline.
+  RC3D.pointAtS = function (path, s) {
+    var d = path.dense, n = d.s.length, lo, hi, mid, i, seg, f, scale, target;
+    if (!n) return { x: 0, y: 0, z: 0, tan: [0, -1], s: 0 };
+    scale = path.total > 0 ? d.total / path.total : 1;
+    target = Math.max(0, Math.min(d.total, s * scale));
+    lo = 0; hi = n - 1;
+    while (lo < hi) { mid = (lo + hi + 1) >> 1; if (d.s[mid] <= target) lo = mid; else hi = mid - 1; }
+    i = Math.min(lo, n - 2);
+    seg = d.s[i + 1] - d.s[i];
+    f = seg > 0 ? (target - d.s[i]) / seg : 0;
+    var t0 = d.tan[i], t1 = d.tan[i + 1];
+    var tx = t0[0] + (t1[0] - t0[0]) * f, tz = t0[1] + (t1[1] - t0[1]) * f;
+    var L = Math.sqrt(tx * tx + tz * tz) || 1;
+    return {
+      x: d.x[i] + (d.x[i + 1] - d.x[i]) * f,
+      y: d.y[i] + (d.y[i + 1] - d.y[i]) * f,
+      z: d.z[i] + (d.z[i + 1] - d.z[i]) * f,
+      tan: [tx / L, tz / L], s: target, i: i
+    };
+  };
+
+  // Speed at arc length s (nearest sample) — ribbon colour + HUD.
+  RC3D.mphAtS = function (path, s) {
+    var cum = path.cum, n = cum.length, lo, hi, mid;
+    if (!n) return 0;
+    lo = 0; hi = n - 1;
+    while (lo < hi) { mid = (lo + hi + 1) >> 1; if (cum[mid] <= s) lo = mid; else hi = mid - 1; }
+    return path.speed[lo] || 0;
+  };
+
+  // Blue -> green -> yellow -> red across [lo, hi] mph.
+  RC3D.speedColour = function (mph, lo, hi) {
+    var stops = [[0.15, 0.44, 0.90], [0.35, 0.85, 0.55], [1.0, 0.82, 0.29], [1.0, 0.30, 0.30]];
+    var t = Math.max(0, Math.min(1, (mph - lo) / Math.max(1, hi - lo)));
+    var f = t * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(f)), u = f - i;
+    return [stops[i][0] + (stops[i + 1][0] - stops[i][0]) * u,
+            stops[i][1] + (stops[i + 1][1] - stops[i][1]) * u,
+            stops[i][2] + (stops[i + 1][2] - stops[i][2]) * u];
+  };
+
+  // Road ribbon: two vertices per centreline point, ±width/2 along the normal.
+  // (nx,nz) = (-tz, tx) is the RIGHT-hand normal for +x east / -z north.
+  RC3D.ribbon = function (path, width, lift) {
+    var d = path.dense, n = d.x.length, i;
+    var pos = new Float32Array(n * 6), sArr = new Float32Array(n * 2);
+    var hw = width / 2, lf = lift || 0;
+    for (i = 0; i < n; i++) {
+      var tx = d.tan[i][0], tz = d.tan[i][1];
+      var nx = -tz, nz = tx;
+      var x = d.x[i], y = d.y[i] + lf, z = d.z[i];
+      pos[i * 6] = x + nx * hw; pos[i * 6 + 1] = y; pos[i * 6 + 2] = z + nz * hw;
+      pos[i * 6 + 3] = x - nx * hw; pos[i * 6 + 4] = y; pos[i * 6 + 5] = z - nz * hw;
+      sArr[i * 2] = d.s[i]; sArr[i * 2 + 1] = d.s[i];
+    }
+    var idx = new Uint32Array(Math.max(0, (n - 1) * 6));
+    for (i = 0; i < n - 1; i++) {
+      var a = i * 2, b = i * 2 + 1, c = (i + 1) * 2, e = (i + 1) * 2 + 1;
+      idx[i * 6] = a; idx[i * 6 + 1] = b; idx[i * 6 + 2] = c;
+      idx[i * 6 + 3] = b; idx[i * 6 + 4] = e; idx[i * 6 + 5] = c;
+    }
+    return { position: pos, index: idx, s: sArr, count: n };
+  };
+
+  // Kerb blocks on both edges where the path curves, alternating red/white —
+  // this is what makes a data-only track read as a track.
+  RC3D.kerbs = function (path, width, blockM) {
+    var d = path.dense, n = d.x.length, i, side, e;
+    var pos = [], col = [], red = [0.85, 0.22, 0.22], white = [0.88, 0.90, 0.93];
+    var hw = width / 2, kw = 0.55, block = blockM || 3, half = 1.4;
+    for (i = 1; i < n - 1; i++) {
+      var t0 = d.tan[i - 1], t1 = d.tan[i + 1];
+      if (Math.abs(t0[0] * t1[1] - t0[1] * t1[0]) < 0.0015) continue;   // straights clean
+      var tx = d.tan[i][0], tz = d.tan[i][1], nx = -tz, nz = tx;
+      var x = d.x[i], y = d.y[i] + 0.05, z = d.z[i];
+      var c = (Math.floor(d.s[i] / block) % 2) ? red : white;
+      for (side = -1; side <= 1; side += 2) {
+        var bx = x + nx * side * hw, bz = z + nz * side * hw;              // inner edge
+        var ix = x + nx * side * (hw + kw), iz = z + nz * side * (hw + kw); // outer edge
+        for (e = -1; e <= 1; e += 2) {
+          var ax = (e < 0 ? bx : ix), az = (e < 0 ? bz : iz);
+          pos.push(ax, y, az,
+                   bx + tx * half * e, y, bz + tz * half * e,
+                   ix + tx * half * e, y, iz + tz * half * e);
+          col.push(c[0], c[1], c[2], c[0], c[1], c[2], c[0], c[1], c[2]);
+        }
+      }
+    }
+    return { position: new Float32Array(pos), colour: new Float32Array(col), count: pos.length / 3 };
+  };
+
+  RC3D.indexOfTime = function (t, target) {
+    var lo = 0, hi = t.length - 1, mid;
+    if (!t.length) return 0;
+    if (target <= t[0]) return 0;
+    if (target >= t[hi]) return hi;
+    while (lo < hi) { mid = (lo + hi + 1) >> 1; if (t[mid] <= target) lo = mid; else hi = mid - 1; }
+    return lo;
+  };
+
+  // Per-lap corner markers from the logged speed trace: apex = slowest point of
+  // the lap, brake = where the deceleration into it began, throttle = where the
+  // speed starts climbing again. Cheap and honest about what it is.
+  RC3D.markers = function (path, laps, lapNo) {
+    var out = [], t = path.t, i, lo = 0, hi = t.length - 1;
+    if (laps && laps.length && lapNo) {
+      var L = null;
+      for (i = 0; i < laps.length; i++) if (laps[i].lap === lapNo) L = laps[i];
+      if (L) { lo = RC3D.indexOfTime(t, L.t_start); hi = RC3D.indexOfTime(t, L.t_end); }
+    }
+    var best = -1, bestMph = Infinity;
+    for (i = lo; i <= hi; i++) if (path.speed[i] < bestMph) { bestMph = path.speed[i]; best = i; }
+    if (best < 0) return out;
+    var put = function (i2, kind) {
+      var p = RC3D.pointAtS(path, path.cum[i2]);
+      out.push({ kind: kind, x: p.x, y: p.y, z: p.z, mph: path.speed[i2] });
+    };
+    put(best, "apex");
+    var brake = -1;
+    for (i = best; i > lo; i--) if (path.speed[i - 1] <= path.speed[i]) { brake = i; break; }
+    if (brake > 0) put(brake, "brake");
+    var thr = -1;
+    for (i = best + 1; i <= hi; i++) if (path.speed[i] > bestMph + 3) { thr = i; break; }
+    if (thr > 0) put(thr, "throttle");
+    return out;
+  };
+
+  // Signed lateral acceleration (g) at arc length s: +ve = turning RIGHT.
+  // (+x east / -z north means a right turn rotates the tangent with a positive
+  // cross product, which is what the sign test in the host test pins down.)
+  RC3D.latAccel = function (path, s, mph) {
+    var a = RC3D.pointAtS(path, Math.max(0, s - 6));
+    var b = RC3D.pointAtS(path, s + 6);
+    var cross = a.tan[0] * b.tan[1] - a.tan[1] * b.tan[0];
+    var dot = a.tan[0] * b.tan[0] + a.tan[1] * b.tan[1];
+    var dTheta = Math.atan2(cross, dot);                 // +ve = turning right
+    var radius = Math.abs(dTheta) < 1e-6 ? 1e6 : Math.abs(12 / dTheta) + 1;
+    var v = mph * 0.44704;
+    var g = (v * v / radius) / 9.80665;
+    return (dTheta >= 0 ? 1 : -1) * Math.min(1.6, g);
+  };
+
+  // Eye + aim + roll for one instant. The look-ahead distance and the FOV both
+  // grow with speed (that is most of the "this feels fast" cue); `latG` banks
+  // the camera a little. `look` is whatever the user dragged in.
+  RC3D.cameraPose = function (path, s, mph, opt) {
+    opt = opt || {};
+    var eyeH = opt.eye == null ? 1.15 : opt.eye;
+    var lead = opt.lead == null ? Math.max(16, mph * 0.42) : opt.lead;
+    var here = RC3D.pointAtS(path, s);
+    var ahead = RC3D.pointAtS(path, s + lead);
+    var roll = opt.bank === false ? 0
+      : Math.max(-0.055, Math.min(0.055, (opt.latG || 0) * 0.03));
+    return {
+      eye: { x: here.x, y: here.y + eyeH, z: here.z },
+      target: { x: ahead.x, y: ahead.y + eyeH * 0.72, z: ahead.z },
+      roll: roll, tan: here.tan, lead: lead
+    };
+  };
+
+  globalThis.RC3D = RC3D;
+  if (globalThis.RC3D_NO_MAIN) return;      // host-test seam (tests/test_track3d.py)
+
+  /* =======================================================================
+     2. RENDER LAYER (three.js)
+     ======================================================================= */
+  var renderer, scene, camera, canvas, ground;
+  var playing = false, rate = 1, loopLap = true, bank = true;
+  var S = [], PATH = null, LAPS = [], LAPNO = 0;
+  var TA = 0, TB = 0, NOW = 0, SMIN = 0, SMAX = 0, cur = null;
+  var meshes = { road: null, kerbs: null, markers: null, ghost: null, ideal: null, gantry: null };
+  var look = { yaw: 0, pitch: 0 };
+  var opts = { smooth: 5, eye: 1.15, road: 12, speedColour: true, markers: true, ghost: false };
+
+  function tryRenderer() {
+    try {
+      canvas = el("view");
+      renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true,
+        logarithmicDepthBuffer: true });
+      return true;
+    } catch (e) {
+      notice("this browser cannot do WebGL — the 3D drive view needs it", true);
+      return false;
+    }
+  }
+
+  function skyTexture() {
+    var c = document.createElement("canvas");
+    c.width = 8; c.height = 256;
+    var g = null;
+    try { g = c.getContext("2d"); } catch (e) { g = null; }
+    if (!g) return null;
+    var grad = g.createLinearGradient(0, 0, 0, 256);
+    grad.addColorStop(0.00, "#04060A");
+    grad.addColorStop(0.46, "#0A1220");
+    grad.addColorStop(0.80, "#1E2C3A");
+    grad.addColorStop(1.00, "#3C4D5B");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 8, 256);
+    var tex = new THREE.CanvasTexture(c);
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    return tex;
+  }
+
+  function buildScene() {
+    scene = new THREE.Scene();
+    var sky = skyTexture();
+    scene.background = sky || new THREE.Color(0x0A1220);
+    scene.fog = new THREE.Fog(0x1E2C3A, 220, 1400);
+    camera = new THREE.PerspectiveCamera(68, 1, 0.3, 6000);
+    scene.add(new THREE.HemisphereLight(0xC3D6E8, 0x191C21, 1.1));
+    var sun = new THREE.DirectionalLight(0xFFFFFF, 0.7);
+    sun.position.set(-1, 2.4, 0.6);
+    scene.add(sun);
+    ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(80000, 80000),
+      new THREE.MeshBasicMaterial({ color: 0x121519 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -2;
+    scene.add(ground);
+  }
+
+  function disposeMeshes() {
+    Object.keys(meshes).forEach(function (k) {
+      var m = meshes[k];
+      if (!m) return;
+      scene.remove(m);
+      if (m.traverse) m.traverse(function (o) {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) o.material.dispose();
+      });
+      meshes[k] = null;
+    });
+  }
+
+  function makeRoad(path, width, lift, colourBySpeed, solidColour, alpha) {
+    var r = RC3D.ribbon(path, width, lift);
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(r.position, 3));
+    var cols = new Float32Array(r.position.length);
+    var lo = 1e9, hi = -1e9, i, mph, c;
+    for (i = 0; i < r.s.length; i++) {
+      mph = RC3D.mphAtS(path, r.s[i]);
+      if (mph < lo) lo = mph;
+      if (mph > hi) hi = mph;
+    }
+    for (i = 0; i < r.s.length; i++) {
+      c = colourBySpeed
+        ? RC3D.speedColour(RC3D.mphAtS(path, r.s[i]), lo, Math.max(hi, lo + 20))
+        : (solidColour || [0.135, 0.145, 0.165]);
+      cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
+    }
+    geo.setAttribute("color", new THREE.BufferAttribute(cols, 3));
+    geo.setIndex(new THREE.BufferAttribute(r.index, 1));
+    geo.computeVertexNormals();
+    var mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    if (alpha != null && alpha < 1) { mat.transparent = true; mat.opacity = alpha; }
+    return new THREE.Mesh(geo, mat);
+  }
+
+  function makeKerbs(path, width) {
+    var k = RC3D.kerbs(path, width, 3);
+    if (!k.count) return null;
+    var geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(k.position, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(k.colour, 3));
+    geo.computeVertexNormals();
+    return new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+      vertexColors: true, side: THREE.DoubleSide
+    }));
+  }
+
+  function makeMarkers(list) {
+    if (!list.length) return null;
+    var grp = new THREE.Group();
+    var colours = { brake: 0xFF4D4D, apex: 0xFFB020, throttle: 0x6CD07A };
+    list.forEach(function (mk) {
+      var c = colours[mk.kind] || 0xFFFFFF;
+      var cone = new THREE.Mesh(new THREE.ConeGeometry(0.6, 1.6, 12),
+                                new THREE.MeshLambertMaterial({ color: c }));
+      cone.position.set(mk.x, mk.y + 0.8, mk.z);
+      grp.add(cone);
+      var pole = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 8, 8),
+                                new THREE.MeshBasicMaterial({ color: c }));
+      pole.position.set(mk.x, mk.y + 4, mk.z);
+      grp.add(pole);
+    });
+    return grp;
+  }
+
+  function makeGantry(sf) {
+    if (!sf || typeof sf.lat1 !== "number" || typeof sf.lat2 !== "number") return null;
+    var a = RC3D.project(sf.lat1, sf.lon1, PATH.o);
+    var b = RC3D.project(sf.lat2, sf.lon2, PATH.o);
+    var mx = (a.x + b.x) / 2, mz = (a.z + b.z) / 2;
+    var dx = b.x - a.x, dz = b.z - a.z;
+    var L = Math.sqrt(dx * dx + dz * dz) || 1;
+    var half = Math.max(6, L / 2);
+    var y0 = PATH.y.length ? PATH.y[PATH.y.length >> 1] : 0;
+    var grp = new THREE.Group();
+    var white = new THREE.MeshLambertMaterial({ color: 0xE6E8EE });
+    var red = new THREE.MeshLambertMaterial({ color: 0xD23B3B });
+    [-1, 1].forEach(function (side) {
+      var post = new THREE.Mesh(new THREE.BoxGeometry(0.35, 7, 0.35), red);
+      post.position.set(mx + (dx / L) * half * side, y0 + 3.5, mz + (dz / L) * half * side);
+      grp.add(post);
+    });
+    var beam = new THREE.Mesh(new THREE.BoxGeometry(half * 2, 0.9, 0.6), white);
+    beam.position.set(mx, y0 + 6.6, mz);
+    beam.rotation.y = Math.atan2(dz / L, dx / L);
+    grp.add(beam);
+    return grp;
+  }
+
+  // Sub-path for one lap window, sharing the dense centreline of the session
+  // path. Used for the road (so overlapping laps cannot z-fight) and ghosts.
+  function slicePath(path, t0, t1) {
+    var sA = RC3D.sAtTime(path, t0), sB = RC3D.sAtTime(path, t1);
+    if (!(sB > sA + 5)) return null;
+    var d = path.dense, i, cum = 0, prev = null;
+    var out = { o: path.o, x: [], y: [], z: [], cum: [], speed: [], t: [], total: 0,
+                dense: { x: [], y: [], z: [], s: [], tan: [], total: 0 } };
+    for (i = 0; i < d.s.length; i++) {
+      if (d.s[i] < sA || d.s[i] > sB) continue;
+      if (prev) {
+        var dx = d.x[i] - prev[0], dy = d.y[i] - prev[1], dz = d.z[i] - prev[2];
+        cum += Math.sqrt(dx * dx + dy * dy + dz * dz);
+      }
+      out.dense.x.push(d.x[i]); out.dense.y.push(d.y[i]); out.dense.z.push(d.z[i]);
+      out.dense.s.push(cum); out.dense.tan.push(d.tan[i]);
+      prev = [d.x[i], d.y[i], d.z[i]];
+    }
+    if (out.dense.x.length < 3) return null;
+    out.dense.total = cum;
+    out.total = cum;
+    for (i = 0; i < path.cum.length; i++) {
+      if (path.cum[i] < sA || path.cum[i] > sB) continue;
+      out.cum.push(path.cum[i] - sA);
+      out.speed.push(path.speed[i]);
+      out.t.push(path.t[i]);
+      out.x.push(path.x[i]); out.y.push(path.y[i]); out.z.push(path.z[i]);
+    }
+    if (out.cum.length < 2) return null;
+    return out;
+  }
+
+  function lapObj(lapNo) {
+    var i, L = null;
+    for (i = 0; i < LAPS.length; i++) if (LAPS[i].lap === lapNo) L = LAPS[i];
+    return L;
+  }
+
+  function rebuild() {
+    try {
+      disposeMeshes();
+      if (!PATH) return;
+      var L = lapObj(LAPNO), base = PATH, sub = null;
+      if (L) { sub = slicePath(PATH, L.t_start, L.t_end); if (sub) base = sub; }
+      meshes.road = makeRoad(base, opts.road, 0.03, opts.speedColour, null, 1);
+      scene.add(meshes.road);
+      meshes.kerbs = makeKerbs(base, opts.road);
+      if (meshes.kerbs) scene.add(meshes.kerbs);
+      if (opts.markers) {
+        meshes.markers = makeMarkers(RC3D.markers(PATH, LAPS, LAPNO));
+        if (meshes.markers) scene.add(meshes.markers);
+      }
+      if (opts.ghost && LAPS.length > 1) {
+        var grp = new THREE.Group();
+        LAPS.forEach(function (LL) {
+          if (LL.lap === LAPNO) return;
+          var g = slicePath(PATH, LL.t_start, LL.t_end);
+          if (g) grp.add(makeRoad(g, 1.8, 0.05, false, [0.32, 0.34, 0.38], 0.65));
+        });
+        meshes.ghost = grp;
+        scene.add(grp);
+      }
+      if (!meshes.gantry && LAPS.sf) {
+        meshes.gantry = makeGantry(LAPS.sf);
+        if (meshes.gantry) scene.add(meshes.gantry);
+      }
+    } catch (e) {
+      console.warn("[track3d] rebuild:", e && e.message ? e.message : e);
+    }
+  }
+
+  function resize() {
+    var w = canvas.clientWidth || window.innerWidth;
+    var h = canvas.clientHeight || (window.innerHeight - 52);
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setSize(w, h, false);
+    camera.aspect = w / Math.max(1, h);
+    camera.updateProjectionMatrix();
+  }
+
+  function render() {
+    if (!PATH) return;
+    var s = Math.max(SMIN, Math.min(SMAX, RC3D.sAtTime(PATH, NOW)));
+    var mph = RC3D.mphAtS(PATH, s);
+    var pose = RC3D.cameraPose(PATH, s, mph, {
+      eye: opts.eye, latG: bank ? RC3D.latAccel(PATH, s, mph) : 0, bank: bank
+    });
+    var eye = new THREE.Vector3(pose.eye.x, pose.eye.y, pose.eye.z);
+    var tgt = new THREE.Vector3(pose.target.x, pose.target.y, pose.target.z);
+    if (look.yaw || look.pitch) {
+      var dir = tgt.clone().sub(eye).normalize();
+      dir.applyEuler(new THREE.Euler(0, look.yaw, 0));
+      dir.y += look.pitch;
+      tgt = eye.clone().add(dir.normalize().multiplyScalar(pose.lead));
+    }
+    camera.position.copy(eye);
+    camera.up.set(0, 1, 0);
+    camera.lookAt(tgt);
+    if (pose.roll) camera.rotateZ(pose.roll);
+    camera.fov = Math.max(60, Math.min(84, 66 + mph * 0.09));
+    camera.updateProjectionMatrix();
+    renderer.render(scene, camera);
+
+    var L = lapObj(LAPNO);
+    el("h-mph").textContent = Math.round(mph);
+    el("h-rpm").textContent = (cur && typeof cur.rpm === "number") ? cur.rpm : "—";
+    el("h-lap").textContent = LAPNO ? LAPNO : "whole session";
+    el("h-lapt").textContent = L ? fmtLap(NOW - L.t_start) : fmtLap(NOW);
+    el("h-best").textContent = L && L.seconds ? fmtLap(L.seconds) : "—";
+    el("h-alt").textContent = (cur && typeof cur.alt_m === "number")
+      ? Math.round(cur.alt_m) + " m" : "—";
+    el("h-bar").style.width = Math.min(100, (mph / 160) * 100) + "%";
+    el("b-clock").textContent = fmtClock(NOW - TA) + " / " + fmtClock(TB - TA);
+    el("b-scrub").value = String(TB > TA ? Math.round(1000 * (NOW - TA) / (TB - TA)) : 0);
+  }
+
+  function advance(dt) {
+    NOW += dt * rate;
+    if (NOW >= TB) {
+      if (loopLap) NOW = TA + ((NOW - TA) % Math.max(0.05, TB - TA));
+      else { NOW = TB; playing = false; syncPlay(); }
+    }
+    if (NOW < TA) NOW = TA;
+    cur = S[RC3D.indexOfTime(PATH.t, NOW)] || null;
+  }
+
+  function syncPlay() {
+    el("b-play").textContent = playing ? "❚❚ pause" : "▶ drive";
+    el("b-play").className = playing ? "on" : "";
+  }
+
+  var lastTs = 0;
+  function frame(ts) {
+    requestAnimationFrame(frame);            // scheduled FIRST: nothing below can stop it
+    if (!lastTs) lastTs = ts;
+    var dt = Math.min(0.12, (ts - lastTs) / 1000);   // a stalled tab must not teleport
+    lastTs = ts;
+    if (!PATH) return;
+    if (playing) advance(dt);
+    try { render(); }
+    catch (e) {
+      if (!frame.warned) { frame.warned = true; console.warn("[track3d] render:", e && e.message ? e.message : e); }
+    }
+  }
+
+  function setLap(lapNo) {
+    LAPNO = lapNo || 0;
+    var L = lapObj(LAPNO);
+    TA = L ? L.t_start : (PATH.t[0] || 0);
+    TB = L ? L.t_end : (PATH.t[PATH.t.length - 1] || 0);
+    if (!(TB > TA)) TB = TA + 1;
+    NOW = TA;
+    rebuild();
+    render();
+  }
+
+  function fillLapSelect() {
+    var sel = el("b-lap"), i;
+    sel.innerHTML = "";
+    if (!LAPS.length) {
+      var o0 = document.createElement("option");
+      o0.value = "0"; o0.textContent = "whole session";
+      sel.appendChild(o0);
+      sel.disabled = true;
+      return;
+    }
+    var best = null;
+    for (i = 0; i < LAPS.length; i++)
+      if (LAPS[i].seconds && (best === null || LAPS[i].seconds < best)) best = LAPS[i].seconds;
+    for (i = 0; i < LAPS.length; i++) {
+      var o = document.createElement("option");
+      o.value = String(LAPS[i].lap);
+      o.textContent = "lap " + LAPS[i].lap + "  " + fmtLap(LAPS[i].seconds) +
+        (LAPS[i].seconds === best ? "  ★" : "");
+      sel.appendChild(o);
+    }
+    sel.value = String(LAPS[0].lap);
+    for (i = 0; i < LAPS.length; i++) if (LAPS[i].seconds === best) sel.value = String(LAPS[i].lap);
+  }
+
+  function wire() {
+    el("b-play").addEventListener("click", function () {
+      playing = !playing;
+      if (playing && NOW >= TB) NOW = TA;
+      syncPlay();
+    });
+    el("b-scrub").addEventListener("input", function () {
+      playing = false; syncPlay();
+      NOW = TA + (TB - TA) * (Number(el("b-scrub").value) / 1000);
+      cur = S[RC3D.indexOfTime(PATH.t, NOW)] || null;
+    });
+    el("b-rate").addEventListener("change", function () { rate = Number(el("b-rate").value) || 1; });
+    el("b-lap").addEventListener("change", function () {
+      setLap(Number(el("b-lap").value));
+      playing = true; syncPlay();
+    });
+    el("b-smooth").addEventListener("change", function () {
+      opts.smooth = Number(el("b-smooth").value);
+      PATH = RC3D.buildPath(S, { smooth: opts.smooth, denseStep: 1 });
+      TA = PATH.t[0]; TB = PATH.t[PATH.t.length - 1];
+      setLap(LAPNO);
+    });
+    el("b-eye").addEventListener("input", function () { opts.eye = Number(el("b-eye").value); });
+    el("b-road").addEventListener("input", function () {
+      opts.road = Number(el("b-road").value); rebuild();
+    });
+    el("b-speedcol").addEventListener("change", function () {
+      opts.speedColour = el("b-speedcol").checked; rebuild();
+    });
+    el("b-markers").addEventListener("change", function () {
+      opts.markers = el("b-markers").checked; rebuild();
+    });
+    el("b-ghost").addEventListener("change", function () {
+      opts.ghost = el("b-ghost").checked; rebuild();
+    });
+    el("b-loop").addEventListener("change", function () { loopLap = el("b-loop").checked; });
+    el("b-bank").addEventListener("change", function () { bank = el("b-bank").checked; });
+
+    var dragging = false, lx = 0, ly = 0;
+    canvas.addEventListener("mousedown", function (e) { dragging = true; lx = e.clientX; ly = e.clientY; });
+    window.addEventListener("mouseup", function () { dragging = false; });
+    window.addEventListener("mousemove", function (e) {
+      if (!dragging) return;
+      look.yaw -= (e.clientX - lx) * 0.004;
+      look.pitch = Math.max(-0.5, Math.min(0.5, look.pitch + (e.clientY - ly) * 0.02));
+      lx = e.clientX; ly = e.clientY;
+    });
+    canvas.addEventListener("wheel", function (e) {
+      e.preventDefault();
+      opts.eye = Math.max(0.5, Math.min(6, opts.eye + (e.deltaY > 0 ? 0.15 : -0.15)));
+      el("b-eye").value = String(opts.eye);
+    }, { passive: false });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === " ") { e.preventDefault(); el("b-play").click(); }
+      else if (e.key === "ArrowRight") { playing = false; syncPlay(); NOW = Math.min(TB, NOW + 1); advance(0); }
+      else if (e.key === "ArrowLeft") { playing = false; syncPlay(); NOW = Math.max(TA, NOW - 1); advance(0); }
+      else if (e.key === "ArrowUp") { opts.eye = Math.min(6, opts.eye + 0.2); el("b-eye").value = String(opts.eye); }
+      else if (e.key === "ArrowDown") { opts.eye = Math.max(0.5, opts.eye - 0.2); el("b-eye").value = String(opts.eye); }
+    });
+    window.addEventListener("resize", resize);
+  }
+
+  // The AI/lineview ideal line, when a lasso polygon came in: the fastest REAL
+  // traverses of that section, drawn as a slim ribbon on the ground.
+  function addIdeal() {
+    if (pts.length < 3) return;
+    fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) + "/lines", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ region: { points: pts } })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (!j || !j.ok || !j.ideal || !j.ideal.trace || j.ideal.trace.length < 3) return;
+      var samples = j.ideal.trace.map(function (p) {
+        return { lat: p[0], lon: p[1], speed_mph: p[2] || 0 };
+      });
+      var sub = RC3D.buildPath(samples, { smooth: 7, denseStep: 1.5 });
+      var mesh = makeRoad(sub, 0.6, 0.14, false, [0.42, 0.82, 0.48], 1);
+      meshes.ideal = mesh;
+      scene.add(mesh);
+      el("lg-ideal").style.display = "flex";
+      notice("ideal line loaded — fastest real lap through the circled section");
+      setTimeout(hideNotice, 3500);
+    }).catch(function () {});
+  }
+
+  function start() {
+    if (!tryRenderer()) return;
+    buildScene();
+    resize();
+    wire();
+    fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) +
+          "/data?target=30000")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        S = (d.samples || []).filter(function (s) {
+          return typeof s.lat === "number" && typeof s.lon === "number" &&
+                 (s.lat || s.lon) && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180;
+        });
+        if (S.length < 20) { notice("no GPS fixes in this session", true); return; }
+        return fetch("/sessions/" + encodeURIComponent(USER) + "/" +
+                     encodeURIComponent(FILE) + "/laps")
+          .then(function (r) { return r.json(); })
+          .catch(function () { return {}; })
+          .then(function (lj) {
+            LAPS = (lj && lj.laps) || [];
+            PATH = RC3D.buildPath(S, { smooth: opts.smooth, denseStep: 1 });
+            fillLapSelect();
+            hideNotice();
+            el("hud").style.display = "block";
+            setLap(Number(el("b-lap").value) || 0);
+            addIdeal();
+            playing = true;
+            syncPlay();
+            requestAnimationFrame(frame);
+          });
+      })
+      .catch(function (e) { notice("could not load session: " + e.message, true); });
+  }
+
+  start();
+})();
+</script>
+<script>
+// Classic script, so it runs even when the module's CDN import fails outright
+// (no ES module = nothing inside it executes at all). Without this, a blocked
+// unpkg.com leaves the viewer staring at "loading session…" forever.
+setTimeout(function () {
+  if (window.__track3dReady) return;
+  var n = document.getElementById('notice');
+  if (!n) return;
+  n.className = 'err';
+  n.style.display = 'block';
+  n.innerHTML = '3D engine failed to load (unpkg.com blocked?) — ' +
+    '<a href="/map3d/__USER__/__FILE__">satellite map view</a> · ' +
+    '<a href="/review/__USER__/__FILE__">pit wall</a>';
+}, 7000);
+</script>
+</body></html>
+"""
+)
+
+
 _CAN_REVIEW_HTML = (
     """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>CAN \u00b7 __FILE__</title>
@@ -6985,11 +8010,16 @@ _REVIEW_HTML = (
     accent-color: var(--primary); }
   .mapopts .hint { color: var(--muted); font-weight: 400; font-size: 11px; }
   .mapopts .sep { width: 1px; height: 20px; background: var(--line); flex: 0 0 auto; }
-  a.mapbtn { display: inline-flex; align-items: center; gap: 6px;
-    background: var(--primary, #3B82F6); color: #fff; text-decoration: none;
-    border-radius: var(--r-md); padding: 7px 12px;
-    font: 600 12px var(--ff-ui); white-space: nowrap; cursor: pointer; }
-  a.mapbtn:hover { filter: brightness(1.08); }
+  a.mapbtn, button.mapbtn { display:inline-flex; align-items:center; gap:6px;
+    background: var(--primary, #3B82F6); color:#fff; text-decoration:none;
+    border:1px solid transparent; border-radius: var(--r-md); padding:7px 12px;
+    font:600 12px var(--ff-ui); white-space:nowrap; cursor:pointer; }
+  a.mapbtn:hover, button.mapbtn:hover { filter: brightness(1.08); }
+  button.mapbtn.ghost { background: transparent; color: var(--text); border-color: var(--line); }
+  button.mapbtn.ghost:hover { border-color: var(--muted); filter:none; }
+  button.mapbtn.ghost.active { background: var(--primary, #3B82F6); color:#fff;
+    border-color: transparent; }
+  button.mapbtn:disabled { opacity:.5; cursor:default; }
   /* On-map key for the two cars: amber = the lap being viewed, red = the
      comparison lap (its ghost LINE + its dot). Sits inside #map, which Leaflet
      makes position:relative, so it overlays the tiles. */
@@ -7117,27 +8147,63 @@ _REVIEW_HTML = (
   .cmp-sub { color: var(--bad); font: 600 12px/1 var(--ff-mono);
     margin-top: 5px; min-height: 13px; }
   /* ---- AI corner analysis ---------------------------------------- */
-  .ai-row { display:flex; align-items:center; gap: var(--sp-sm); margin: 0 0 var(--sp-sm); }
-  .ai-presets { display:flex; flex-wrap:wrap; gap: 6px; margin: 0 0 var(--sp-sm); }
+  /* Composer layout: section tools on one line, the model picker as a
+     labelled field (it is a setting, not an action), the quick-ask chips on
+     their own row, then the prompt + ask button as one unit. */
+  .ai-tool { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+    margin: 0 0 var(--sp-sm); }
+  .ai-tool .btn { padding: 7px 11px; }
+  .ai-tool-seg { display:flex; align-items:center; gap:6px;
+    padding-right:8px; border-right:1px solid var(--line); }
+  .ai-tool-seg:last-of-type { padding-right:0; border-right:0; }
+  .ai-tool .spacer { flex:1 1 auto; }
+  .ai-field { display:flex; align-items:center; gap:7px; color: var(--muted);
+    font: 600 11px var(--ff-ui); letter-spacing:0.06em; text-transform:uppercase; }
+  .ai-quick { display:flex; flex-wrap:wrap; align-items:center; gap:6px;
+    margin: 0 0 var(--sp-sm); }
+  .ai-quick .lab { color: var(--muted); font: 600 11px var(--ff-ui);
+    letter-spacing:0.06em; text-transform:uppercase; margin-right:2px; }
   .ai-preset { padding: 6px 10px; }
-  .ai-prompt { width:100%; background: var(--surface); color: var(--text);
-    border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 12px;
-    font: 14px var(--ff-ui); outline: none; resize: vertical; margin: 0 0 var(--sp-sm); }
+  .ai-compose { display:flex; align-items:flex-end; gap:8px; margin: 0 0 6px; }
+  .ai-prompt { flex:1; background: var(--surface); color: var(--text);
+    border: 1px solid var(--line); border-radius: var(--r-sm); padding: 9px 12px;
+    font: 14px var(--ff-ui); outline: none; resize: vertical; }
   .ai-prompt:focus { border-color: var(--primary); }
+  .ai-compose .btn { padding: 10px 16px; white-space:nowrap; }
+  .ai-statusline { min-height: 15px; color: var(--muted);
+    font: 500 11px var(--ff-mono); margin: 0 0 var(--sp-sm); }
   .ai-answer { margin-top: var(--sp-sm); padding: var(--sp-md); background: var(--surface);
     border: 1px solid var(--line); border-radius: var(--r-sm); white-space: pre-wrap;
     line-height: 1.5; max-height: 460px; overflow-y: auto; }
   .ai-answer h1,.ai-answer h2,.ai-answer h3 { font-size: 15px; margin: 10px 0 4px; color: var(--primary); }
   .ai-answer code { font-family: var(--ff-mono); color: var(--primary); }
   .ai-answer strong { color: var(--text); }
-  .ai-history { margin-top: var(--sp-sm); display:flex; flex-direction:column; gap: var(--sp-sm); }
-  .ai-hist-item { border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); overflow:hidden; }
-  .ai-hist-head { display:flex; align-items:center; gap: var(--sp-sm); padding: 10px 12px; cursor:pointer; }
+  .ai-history { margin-top: var(--sp-sm); display:flex; flex-direction:column; gap:10px; }
+  /* One card per Q&A, with a left accent rail so consecutive answers read as
+     separate objects instead of one long scroll. */
+  .ai-hist-item { border:1px solid var(--line); border-left:3px solid var(--primary);
+    border-radius: var(--r-sm); background: var(--surface); overflow:hidden; }
+  .ai-hist-head { display:flex; align-items:flex-start; gap:10px; padding:11px 13px;
+    cursor:pointer; }
   .ai-hist-head:hover { background: var(--surface-2); }
-  .ai-hist-q { flex:1; color: var(--text); font-weight:600; }
-  .ai-hist-meta { color: var(--muted); font: 400 11px var(--ff-mono); white-space:nowrap; }
-  .ai-hist-body { display:none; padding: 4px 12px 12px; white-space:normal; line-height:1.55; }
+  .ai-hist-caret { flex:0 0 auto; color: var(--muted); font: 700 11px var(--ff-mono);
+    line-height:1.7; transition: transform 120ms ease; }
+  .ai-hist-item.open .ai-hist-caret { transform: rotate(90deg); color: var(--primary); }
+  .ai-hist-txt { display:flex; flex-direction:column; gap:3px; min-width:0; flex:1; }
+  .ai-hist-q { color: var(--text); font-weight:600; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .ai-hist-item.open .ai-hist-q { white-space:normal; }
+  .ai-hist-meta { display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    color: var(--muted); font: 400 11px var(--ff-mono); }
+  .ai-hist-qn { color: var(--primary); font-weight:700; }
+  .ai-hist-body { display:none; padding: 12px 13px 14px;
+    border-top:1px solid var(--line); white-space:normal; line-height:1.55; }
   .ai-hist-item.open .ai-hist-body { display:block; }
+  .ai-hist-foot { display:none; gap:8px; padding: 9px 13px;
+    border-top:1px solid var(--line); background: var(--bg); }
+  .ai-hist-item.open .ai-hist-foot { display:flex; }
+  .ai-hist-foot .btn { padding: 5px 10px; font-size: 12px; }
+  .ai-hist-foot .ai-del-btn { margin-left:auto; color: #FFB0B0; }
   .ai-hist-body code { font-family: var(--ff-mono); color: var(--primary); }
   .ai-hist-body strong { color: var(--text); }
   /* Rendered-markdown building blocks (AI answers) */
@@ -7157,9 +8223,6 @@ _REVIEW_HTML = (
   .ai-hist-body td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .ai-hist-body tbody tr:nth-child(even) td { background: rgba(255,255,255,0.03); }
   .ai-hist-body tbody tr:hover td { background: rgba(255,176,32,0.07); }
-  .ai-hist-actions { display:flex; gap:6px; padding: 0 12px 10px; }
-  .ai-hist-actions .btn { padding: 4px 8px; }
-  .ai-hist-x { color: var(--bad); }
   /* ---- filterable combobox (admin reassign) ---------------------- */
   .combo { position: relative; display: inline-block; }
   .combo-list { position: absolute; top: calc(100% + 4px); left: 0; z-index: 1000;
@@ -7223,8 +8286,12 @@ _REVIEW_HTML = (
           </label>
           <span class="sep"></span>
           <a id="map3d" class="mapbtn" target="_blank" href="/track3d/__USER__/__FILE__"
-             title="first-person 3D drive view — satellite imagery draped over real terrain, your driving line painted on the ground, brake/apex/throttle markers, chase camera">\u25b6 3D drive view</a>
-          <span class="hint">uncheck satellite for a plain black map \u00b7 3D follows the car from the seat</span>
+             title="first-person driving view built from the data alone: your line as a road ribbon on the logged elevation, speed-coloured, with brake/apex/throttle markers">\u25b6 3D drive view</a>
+          <button id="map-circle" class="mapbtn ghost" type="button"
+                  title="drag on the map to mark a corner or section — it feeds the 3D view and the ideal line">\u25cb circle a section</button>
+          <span class="sep"></span>
+          <span class="hint" id="map-region">no region selected</span>
+          <span class="hint">\u00b7 uncheck satellite for a plain black map</span>
         </div>
       </div>
       <div class="tiles">
@@ -7342,29 +8409,34 @@ _REVIEW_HTML = (
       <div class="card-head"><span class="t-label">AI Corner Analysis</span>
         <span class="t-label" id="ai-region">no region selected</span></div>
       <div class="card-body">
-        <div class="ai-row">
-          <button id="ai-draw" class="btn">circle a section</button>
-          <button id="ai-clear" class="btn">clear</button>
-          <button id="ai-line" class="btn" title="popout: fastest real line through this section vs yours, with brake/apex/throttle markers and speed labels">ideal line ↗</button>
-          <button id="ai-coach" class="btn" title="run the whole-session review that normally happens automatically on upload, and file 1-3 checklist items">checklist</button>
-          <span style="flex:1"></span>
-          <label class="t-label" style="display:flex;align-items:center;gap:6px">model
-            <select id="ai-model" class="cmp-input" style="width:auto;min-width:160px"></select>
+        <div class="ai-tool">
+          <span class="ai-tool-seg">
+            <button id="ai-draw" class="btn" type="button">○ circle a section</button>
+            <button id="ai-clear" class="btn" type="button">clear</button>
+          </span>
+          <span class="ai-tool-seg">
+            <button id="ai-line" class="btn" type="button" title="popout: fastest real line through this section vs yours, with brake/apex/throttle markers and speed labels">ideal line ↗</button>
+            <button id="ai-coach" class="btn" type="button" title="run the whole-session review that normally happens automatically on upload, and file 1-3 checklist items">checklist</button>
+          </span>
+          <span class="spacer"></span>
+          <label class="ai-field">model
+            <select id="ai-model" class="cmp-input" style="width:auto;min-width:150px"></select>
           </label>
         </div>
-        <div class="ai-presets">
-          <button class="btn ai-preset" data-q="Analyze the braking zone for this section: where should I brake, how hard, and how consistent am I lap to lap?">brake zones</button>
-          <button class="btn ai-preset" data-q="How is my corner entry speed through this section, and where can I carry more speed in?">entry speed</button>
-          <button class="btn ai-preset" data-q="How is my corner exit and throttle application through this section? Where am I losing exit speed?">exit speed</button>
-          <button class="btn ai-preset" data-q="What is the fastest line through this section and how does my best lap compare to the others here?">best line</button>
-          <button class="btn ai-preset" data-q="How consistent am I through this section lap to lap, and which lap was best and why?">consistency</button>
+        <div class="ai-quick">
+          <span class="lab">quick asks</span>
+          <button class="btn ai-preset" type="button" data-q="Analyze the braking zone for this section: where should I brake, how hard, and how consistent am I lap to lap?">brake zones</button>
+          <button class="btn ai-preset" type="button" data-q="How is my corner entry speed through this section, and where can I carry more speed in?">entry speed</button>
+          <button class="btn ai-preset" type="button" data-q="How is my corner exit and throttle application through this section? Where am I losing exit speed?">exit speed</button>
+          <button class="btn ai-preset" type="button" data-q="What is the fastest line through this section and how does my best lap compare to the others here?">best line</button>
+          <button class="btn ai-preset" type="button" data-q="How consistent am I through this section lap to lap, and which lap was best and why?">consistency</button>
         </div>
-        <textarea id="ai-prompt" class="ai-prompt" rows="2"
-          placeholder="Ask about the section you circled — entry/exit speed, brake points, best line, consistency…"></textarea>
-        <div class="ai-row">
-          <button id="ai-ask" class="btn primary">ask ai</button>
-          <span id="ai-status" class="t-label" style="color:var(--muted)"></span>
+        <div class="ai-compose">
+          <textarea id="ai-prompt" class="ai-prompt" rows="2"
+            placeholder="Ask about the section you circled — entry/exit speed, brake points, best line, consistency…"></textarea>
+          <button id="ai-ask" class="btn primary" type="button">ask ai</button>
         </div>
+        <div class="ai-statusline"><span id="ai-status"></span></div>
         <div id="ai-history" class="ai-history"></div>
       </div>
     </div>
@@ -8191,7 +9263,12 @@ _REVIEW_HTML = (
   (function(){
     const card = el('aicard'); if (!card) return;
     let poly = null, pts = [], drawing = false;
-    const drawBtn = el('ai-draw'), clearBtn = el('ai-clear'),
+    // The lasso is a MAP feature (it feeds the ideal line AND the 3D drive
+    // view), so it is driven from two places: the strip under the map and the
+    // AI card. Both buttons mirror the same state, and the AI card can be
+    // hidden entirely (no AI key on the server) without killing the lasso.
+    const drawBtn = el('ai-draw'), mapDraw = el('map-circle'),
+          mapInfo = el('map-region'), clearBtn = el('ai-clear'),
           info = el('ai-region'), status = el('ai-status'),
           histEl = el('ai-history'), modelSel = el('ai-model');
 
@@ -8205,24 +9282,34 @@ _REVIEW_HTML = (
       return inside;
     }
     function regionInfo(){
-      if (pts.length<3){ info.textContent='no region selected'; return; }
-      let n=0;
-      for (const s of S){
-        if (typeof s.lat==='number' && typeof s.lon==='number' && (s.lat||s.lon)
-            && inPoly(s.lat, s.lon, pts)) n++;
+      let txt;
+      if (pts.length<3){ txt = 'no region selected'; }
+      else {
+        let n=0;
+        for (const s of S){
+          if (typeof s.lat==='number' && typeof s.lon==='number' && (s.lat||s.lon)
+              && inPoly(s.lat, s.lon, pts)) n++;
+        }
+        txt = n+' points in region';
       }
-      info.textContent = n+' points in region';
+      info.textContent = txt;
+      if (mapInfo) mapInfo.textContent = txt;
     }
     function setDraw(on){
       drawing=on;
-      drawBtn.classList.toggle('primary', on);
-      drawBtn.textContent = on ? 'drag on the map…' : 'circle a section';
+      [drawBtn, mapDraw].forEach(b=>{
+        if (!b) return;
+        b.classList.toggle('primary', on);
+        b.classList.toggle('active', on);
+        b.textContent = on ? 'drag on the map…' : '○ circle a section';
+      });
       const c = map.getContainer();
       if (on){ map.dragging.disable(); c.classList.add('leaflet-crosshair'); }
       else   { map.dragging.enable();  c.classList.remove('leaflet-crosshair'); }
     }
     function onMove(e){ pts.push([e.latlng.lat, e.latlng.lng]); if(poly) poly.setLatLngs(pts); }
     drawBtn.addEventListener('click', ()=> setDraw(!drawing));
+    if (mapDraw) mapDraw.addEventListener('click', ()=> setDraw(!drawing));
     clearBtn.addEventListener('click', ()=>{
       if (poly){ map.removeLayer(poly); poly=null; } pts=[]; regionInfo();
     });
@@ -8331,8 +9418,12 @@ _REVIEW_HTML = (
       try { return new Date(ts*1000).toLocaleString(); } catch(e){ return ''; }
     }
     // Render the persistent Q&A list, newest first; first item expanded.
+    // One card each, with a numbered badge, a caret, the answer in its own
+    // bordered block and the actions on a footer bar — consecutive answers used
+    // to run together because the action row had no styling at all.
     function renderHistory(list){
       const items = (list||[]).slice().reverse();
+      const total = items.length;
       histEl.innerHTML = '';
       items.forEach((e, k)=>{
         const div = document.createElement('div');
@@ -8344,14 +9435,23 @@ _REVIEW_HTML = (
           if (e.usage.cost_usd != null) cost += '$' + (+e.usage.cost_usd).toFixed(4);
           if (e.usage.total_tokens) cost += (cost?' · ':'') + e.usage.total_tokens + ' tok';
         }
-        const meta = esc((e.model||'') + ' · ' + (e.laps||0) + ' laps' + (cost?(' · '+cost):'') + ' · ' + fmtWhen(e.ts));
+        const meta = [
+          esc(e.model||''), (e.laps||0)+' laps', cost, fmtWhen(e.ts)
+        ].filter(Boolean).join(' · ');
         div.innerHTML =
-          '<div class="ai-hist-head"><span class="ai-hist-q">'+q+'</span>'+
-          '<span class="ai-hist-meta">'+meta+'</span></div>'+
+          '<div class="ai-hist-head">'+
+            '<span class="ai-hist-caret">▶</span>'+
+            '<span class="ai-hist-txt">'+
+              '<span class="ai-hist-q">'+q+'</span>'+
+              '<span class="ai-hist-meta"><span class="ai-hist-qn">Q'+(total-k)+'</span>'+
+                '<span>'+meta+'</span></span>'+
+            '</span>'+
+          '</div>'+
           '<div class="ai-hist-body">'+md(e.answer||'')+'</div>'+
-          '<div class="ai-hist-actions">'+
-            '<button class="btn ai-region-btn">show region</button>'+
-            '<button class="btn ai-hist-x ai-del-btn">delete</button></div>';
+          '<div class="ai-hist-foot">'+
+            '<button class="btn ai-region-btn" type="button">show region</button>'+
+            '<button class="btn ai-del-btn" type="button">delete</button>'+
+          '</div>';
         div.querySelector('.ai-hist-head').addEventListener('click', ()=> div.classList.toggle('open'));
         div.querySelector('.ai-region-btn').addEventListener('click', ()=> showRegion(e.region && e.region.points));
         div.querySelector('.ai-del-btn').addEventListener('click', ()=> delEntry(e.id));
@@ -8450,15 +9550,19 @@ _REVIEW_HTML = (
 
     // ---- session tools: change TRACK + this session's coach checklist ----
     (function(){
-      var row=document.createElement('div'); row.className='ai-row';
-      row.innerHTML='<label class="t-label">track '+
+      // Sits as its own toolbar row directly under the AI toolbar (the AI card's
+      // structure is tool rows on top, quick asks + composer + history below).
+      var row=document.createElement('div'); row.className='ai-tool';
+      row.innerHTML='<label class="ai-field">track '+
         '<select id="trk-sel" class="cmp-input" style="width:auto;min-width:170px"></select></label>'+
         '<input id="trk-custom" class="cmp-input" style="display:none;width:170px" placeholder="custom track name">'+
-        '<button id="trk-save" class="btn">rename session</button>'+
+        '<button id="trk-save" class="btn" type="button">rename session</button>'+
         '<span class="t-label" id="trk-msg"></span>';
-      var host=el('ai-draw').parentNode; host.parentNode.insertBefore(row, host.nextSibling);
+      var tool=el('ai-draw').closest('.ai-tool');
+      var anchor = tool && tool.parentNode ? tool : el('ai-draw').parentNode;
+      anchor.parentNode.insertBefore(row, anchor.nextSibling);
       var chd=document.createElement('div'); chd.id='sess-coach';
-      host.parentNode.insertBefore(chd, row.nextSibling);
+      anchor.parentNode.insertBefore(chd, row.nextSibling);
       var sel=document.getElementById('trk-sel'), cus=document.getElementById('trk-custom'),
           msg=document.getElementById('trk-msg');
       fetch('/tracks').then(function(r){return r.json();}).then(function(j){

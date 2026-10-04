@@ -1,0 +1,386 @@
+"""Host tests for the /track3d data-only driving view (server/app/main.py).
+
+The view is pure geometry + time maths wrapped in a thin three.js drawing layer,
+so the maths is extracted from the served page and driven here with synthetic and
+realistic inputs. That is the only way to check this without a browser: a wrong
+spline LUT, a non-monotonic time->distance map or a flipped bank sign all render
+"fine" and are invisible in a screenshot review.
+
+Skipped when node is unavailable. The spline branch additionally needs three.js
+(installed by the test only if it can be found); without it the smoothing/no-spline
+path is still fully exercised, which is the fallback the page itself uses.
+"""
+import ast
+import json
+import pathlib
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+NODE = shutil.which("node")
+# Optional: a real three.js so the spline branch is exercised too. Install with
+#   mkdir -p /home/chris/racecar-tools/threejs-test && cd $_ && npm i three@0.160.0
+THREE_CANDIDATES = [
+    ROOT / "node_modules/three/build/three.module.js",
+    pathlib.Path("/home/chris/racecar-tools/threejs-test/node_modules/three/build/three.module.js"),
+]
+
+
+def _page_html() -> str:
+    """The real _TRACK3D_HTML constant, evaluated out of the server module."""
+    tree = ast.parse((ROOT / "server/app/main.py").read_text())
+
+    def ev(node, ns):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return ev(node.left, ns) + ev(node.right, ns)
+        if isinstance(node, ast.Name):
+            return ns[node.id]
+        raise ValueError(ast.dump(node))
+
+    ns = {}
+    for _ in range(6):
+        for n in tree.body:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                try:
+                    ns[n.targets[0].id] = ev(n.value, ns)
+                except Exception:
+                    pass
+    return ns["_TRACK3D_HTML"]
+
+
+DRIVER = r"""
+// ---- host driver: synthetic inputs through the real RC3D layer ------------
+function circle(n, radius, opts) {
+  opts = opts || {};
+  var out = [], lat0 = 39.0, lon0 = -77.0, mph = opts.mph || 60;
+  for (var i = 0; i < n; i++) {
+    var a = (i / n) * Math.PI * 2 * (opts.dir || 1);       // dir +1 = right-hand (CW seen from above)
+    var lat = lat0 + (radius * Math.cos(a)) / 111320;
+    var lon = lon0 + (radius * Math.sin(a)) / (111320 * Math.cos(lat0 * Math.PI / 180));
+    var jit = opts.jitter || 0;
+    if (jit) { lat += ((i % 2) ? jit : -jit) / 111320; }
+    out.push({ t: 1700000000 + i / 25, lat: lat, lon: lon, speed_mph: mph,
+               alt_m: opts.alt ? 300 + 10 * Math.sin(a) : null, rpm: 5000 });
+  }
+  return out;
+}
+function straight(n, mph) {
+  var out = [], lat0 = 39.0, lon0 = -77.0;
+  for (var i = 0; i < n; i++) {
+    out.push({ t: 1700000000 + i / 25, lat: lat0 + (i * 6) / 111320, lon: lon0,
+               speed_mph: mph, alt_m: null });
+  }
+  return out;
+}
+
+var R = {}, THREE_OK = typeof THREE !== "undefined" && typeof THREE.CatmullRomCurve3 === "function";
+R.three = THREE_OK;
+
+// --- the ring the car drove (jittery GPS) --------------------------------
+var samples = circle(900, 120, { jitter: 2.2, alt: true, mph: 70 });
+var path = RC3D.buildPath(samples, { smooth: 5 });
+
+// 1. a path with no NaN, monotonic arc length, sane total
+var nan = 0, mono = true;
+for (var i = 0; i < path.cum.length; i++) {
+  if (!isFinite(path.cum[i])) nan++;
+  if (i && path.cum[i] < path.cum[i - 1] - 1e-9) mono = false;
+}
+R.path = { nan: nan, mono: mono, total: path.total,
+           circumference: 2 * Math.PI * 120, dense: path.dense.s.length,
+           denseMono: true, denseTotal: path.dense.total };
+
+// the dense centreline must be evenly spaced (~1 m) if the spline LUT is right
+var worstGap = 0, minGap = 1e9, avgGap = 0, gaps = 0;
+for (i = 1; i < path.dense.s.length; i++) {
+  var g = path.dense.s[i] - path.dense.s[i - 1];
+  if (g > worstGap) worstGap = g;
+  if (g < minGap) minGap = g;
+  avgGap += g; gaps++;
+}
+R.spacing = { avg: avgGap / gaps, min: minGap, max: worstGap };
+
+// 1b. accuracy on a CLEAN ring (projection + spline + arc length together),
+//     and how much of the noisy ring's length inflation smoothing removes.
+var cleanRing = RC3D.buildPath(circle(900, 120, {}), { smooth: 5 });
+R.accuracy = (function () {
+  var rawNoisy = RC3D.buildPath(samples, { smooth: 1 });
+  return { clean: cleanRing.total, circ: 2 * Math.PI * 120,
+           noisySmoothed: path.total, noisyRaw: rawNoisy.total };
+})();
+
+// 2. smoothing actually smooths: heading change per sample, raw vs smoothed
+function roughness(p) {
+  var worst = 0;
+  for (var i = 2; i < p.dense.x.length - 2; i++) {
+    var a = Math.atan2(p.dense.tan[i][1], p.dense.tan[i][0]);
+    var b = Math.atan2(p.dense.tan[i + 2][1], p.dense.tan[i + 2][0]);
+    var d = Math.abs(((b - a + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+    if (d > worst) worst = d;
+  }
+  return worst;
+}
+var rNo = roughness(RC3D.buildPath(samples, { smooth: 1, denseStep: 0.6 }));
+var rSmooth = roughness(RC3D.buildPath(samples, { smooth: 11, denseStep: 0.6 }));
+R.smoothing = { raw: rNo, smoothed: rSmooth };
+// where the driver really is, per sample, vs the smoothed line
+R.smoothing.accuracy = (function () {
+  var worst = 0;
+  for (var i = 0; i < samples.length; i += 20) {
+    var p = RC3D.pointAtS(path, path.cum[i]);
+    var e = Math.abs(p.x - path.x[i]) + Math.abs(p.z - path.z[i]);
+    if (e > worst) worst = e;
+  }
+  return worst;
+})();
+
+// 3. time -> arc length: monotonic, continuous, matched to the samples
+R.timeMap = (function () {
+  var bad = 0, worstJump = 0, worstClamp = 0, prev = -1;
+  for (var k = 0; k <= 4000; k++) {
+    var t = path.t[0] + (path.t[path.t.length - 1] - path.t[0]) * (k / 4000);
+    var s = RC3D.sAtTime(path, t);
+    if (!isFinite(s) || s < 0 || s > path.total + 1e-6) bad++;
+    if (prev >= 0 && s < prev - 1e-9) bad++;
+    if (prev >= 0) worstJump = Math.max(worstJump, s - prev);
+    prev = s;
+  }
+  // bracketing: s(t) must sit inside the samples that straddle t
+  for (var i = 0; i < path.t.length - 1; i++) {
+    var mid = (path.t[i] + path.t[i + 1]) / 2;
+    var sm = RC3D.sAtTime(path, mid);
+    if (sm < path.cum[i] - 1e-6 || sm > path.cum[i + 1] + 1e-6) worstClamp++;
+  }
+  return { bad: bad, worstJump: worstJump, worstClamp: worstClamp };
+})();
+
+// 4. 60 fps out of 25 Hz data: no jumps, no stalls
+function stepStats(p, mph) {
+  var dt = 1 / 60, steps = [], stalls = 0, prev = null, t0 = p.t[0];
+  for (var k = 0; k < 3000; k++) {
+    var t = t0 + 5 + k * dt;
+    if (t >= p.t[p.t.length - 1]) break;
+    var pt = RC3D.pointAtS(p, RC3D.sAtTime(p, t));
+    if (prev) {
+      var d = Math.hypot(pt.x - prev[0], pt.y - prev[1], pt.z - prev[2]);
+      steps.push(d);
+      if (d < 1e-9) stalls++;
+    }
+    prev = [pt.x, pt.y, pt.z];
+  }
+  steps.sort(function (a, b) { return a - b; });
+  return { max: steps[steps.length - 1], median: steps[Math.floor(steps.length / 2)],
+           perFrame: (mph || 70) * 0.44704 * dt, n: steps.length, stalls: stalls };
+}
+R.interp = { clean: stepStats(cleanRing, 70), noisy: stepStats(path, 70) };
+
+// 5. ribbon geometry
+R.ribbon = (function () {
+  var width = 12, r = RC3D.ribbon(path, width, 0);
+  var n = path.dense.x.length;
+  var perpWorst = 0, halfWorst = 0, yWorst = 0;
+  for (var i = 0; i < n; i += 7) {
+    var lx = r.position[i * 6], ly = r.position[i * 6 + 1], lz = r.position[i * 6 + 2];
+    var rx = r.position[i * 6 + 3], rz = r.position[i * 6 + 5];
+    var cx = path.dense.x[i], cz = path.dense.z[i];
+    var tx = path.dense.tan[i][0], tz = path.dense.tan[i][1];
+    perpWorst = Math.max(perpWorst, Math.abs((lx - cx) * tx + (lz - cz) * tz));
+    halfWorst = Math.max(halfWorst, Math.abs(Math.hypot(lx - cx, lz - cz) - width / 2));
+    yWorst = Math.max(yWorst, Math.abs(ly - path.dense.y[i]));
+  }
+  return { verts: r.position.length / 3, expectVerts: n * 2,
+           tris: r.index.length / 3, expectTris: (n - 1) * 2,
+           perpWorst: perpWorst, halfWorst: halfWorst, yWorst: yWorst };
+})();
+
+// 6. kerbs exist on the ring, not on a straight
+R.kerbs = (function () {
+  var k = RC3D.kerbs(path, 12, 3);
+  var st = RC3D.buildPath(straight(300, 90), { smooth: 5 });
+  var ks = RC3D.kerbs(st, 12, 3);
+  return { ring: k.count, straight: ks.count };
+})();
+
+// 7. bank sign: a right-hand ring (dir +1) must read +ve lateral g
+R.bank = (function () {
+  var right = RC3D.buildPath(circle(600, 120, { dir: 1, mph: 80 }), { smooth: 3 });
+  var left = RC3D.buildPath(circle(600, 120, { dir: -1, mph: 80 }), { smooth: 3 });
+  var gR = RC3D.latAccel(right, right.total * 0.25, 80);
+  var gL = RC3D.latAccel(left, left.total * 0.25, 80);
+  var pose = RC3D.cameraPose(right, right.total * 0.25, 80, { eye: 1.15, latG: gR });
+  var poseFlat = RC3D.cameraPose(right, right.total * 0.25, 80, { eye: 1.15, latG: gR, bank: false });
+  return { right: gR, left: gL, roll: pose.roll, rollOff: poseFlat.roll };
+})();
+
+// 8. camera: eye height above the surface, aiming forwards, FOV/lead vs speed
+R.camera = (function () {
+  var s = path.total * 0.3, mph = 90;
+  var p = RC3D.pointAtS(path, s);
+  var pose = RC3D.cameraPose(path, s, mph, { eye: 1.15 });
+  var ahead = RC3D.pointAtS(path, s + pose.lead);
+  var fwd = (ahead.x - p.x) * p.tan[0] + (ahead.z - p.z) * p.tan[1];
+  var slow = RC3D.cameraPose(path, s, 20, {});
+  var fast = RC3D.cameraPose(path, s, 130, {});
+  return { eyeAbove: pose.eye.y - p.y, forward: fwd,
+           leadSlow: slow.lead, leadFast: fast.lead, leadMin: RC3D.cameraPose(path, s, 0, {}).lead };
+})();
+
+// 9. markers from a speed trace: slowest point = apex, brake before it
+R.markers = (function () {
+  var n = 600, out = [], lat0 = 39.0, lon0 = -77.0;
+  for (var i = 0; i < n; i++) {
+    var a = (i / n) * Math.PI * 2;
+    var lat = lat0 + (150 * Math.cos(a)) / 111320;
+    var lon = lon0 + (150 * Math.sin(a)) / (111320 * Math.cos(lat0 * Math.PI / 180));
+    var mph = 40 + 60 * Math.abs(Math.sin(a));           // min at a = 0/pi
+    out.push({ t: 1700000000 + i / 25, lat: lat, lon: lon, speed_mph: mph, alt_m: null });
+  }
+  var p = RC3D.buildPath(out, { smooth: 2 });
+  var laps = [{ lap: 1, t_start: 0, t_end: 23.96, seconds: 23.96 }];
+  var mk = RC3D.markers(p, laps, 1);
+  var kinds = mk.map(function (m) { return m.kind; });
+  return { kinds: kinds.join(","), n: mk.length,
+           y: mk.map(function (m) { return +m.y.toFixed(4); }).join(",") };
+})();
+
+// 10. altitude is referenced to the session minimum (no floating track)
+R.alt = (function () {
+  var s = circle(400, 100, { alt: true });
+  var p = RC3D.buildPath(s, { smooth: 5 });
+  var mn = Math.min.apply(null, p.y), mx = Math.max.apply(null, p.y);
+  return { min: mn, max: mx, yRef: p.yRef };
+})();
+
+console.log(JSON.stringify(R));
+"""
+
+# The page touches location/document before the RC3D_NO_MAIN early return, so
+# the harness provides the minimum it can reach; nothing past the early return
+# runs (no DOM, no WebGL).
+PRELUDE = (
+    "globalThis.RC3D_NO_MAIN = 1;"
+    "globalThis.location = { search: '' };"
+    "globalThis.document = { getElementById: () => null };"
+    "globalThis.window = { addEventListener() {}, devicePixelRatio: 1 };\n"
+)
+
+
+class Track3DMathTests(unittest.TestCase):
+    @unittest.skipIf(NODE is None, "node not available")
+    def test_data_only_page_and_geometry_maths(self):
+        html = _page_html()
+
+        # --- the page itself: data only, no imagery/tiles/terrain ------------
+        self.assertIn("three@0.160.0", html)
+        self.assertIn("first-person DRIVING view, rendered from DATA ONLY", html)
+        for banned in ("World_Imagery", "tileLayer", "maplibre", "raster-dem", "arcgisonline"):
+            self.assertNotIn(banned, html, f"/track3d must not pull {banned}")
+
+        # --- extract the module and drive the real RC3D layer ----------------
+        import re
+        m = re.search(r"<script type=\"module\">(.*?)</script>", html, re.S)
+        self.assertIsNotNone(m, "module script missing")
+        # Drop the page's own CDN import: the test supplies THREE (local, or an
+        # empty stub when it cannot be found so the no-spline path is exercised).
+        body = re.sub(r"^\s*import .*$", "", m.group(1), count=1, flags=re.M)
+        three = next((p for p in THREE_CANDIDATES if p.exists()), None)
+        header = (("import * as THREE from '%s';\n" % three.as_uri()) if three
+                  else "const THREE = {};\n")
+        src = PRELUDE + header + body + "\n" + DRIVER
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "rc3d_test.mjs"
+            f.write_text(src)
+            proc = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=180)
+            self.assertEqual(proc.returncode, 0, proc.stderr[-4000:])
+            res = json.loads(proc.stdout.strip().splitlines()[-1])
+
+        # 1. path sanity (a 120 m radius ring is ~754 m around)
+        self.assertEqual(res["path"]["nan"], 0)
+        self.assertTrue(res["path"]["mono"], "arc length must be monotonic")
+        self.assertGreater(res["path"]["dense"], 100)
+        self.assertGreater(res["path"]["denseTotal"], 0)
+        circ = res["path"]["circumference"]
+        # a CLEAN ring must come out within 2% of the true circumference: that is
+        # projection + centripetal spline + the arc-length table agreeing.
+        acc = res["accuracy"]
+        self.assertLess(abs(acc["clean"] - acc["circ"]) / acc["circ"], 0.02, acc)
+        # The noisy ring (worst-case alternating +/-2.2 m GPS jitter) is longer
+        # than the truth no matter what; the point is that smoothing removes most
+        # of that inflation rather than following the zig-zag.
+        self.assertLess(acc["noisySmoothed"], acc["noisyRaw"] * 0.4, acc)
+        self.assertLess(acc["noisySmoothed"], acc["circ"] * 1.6, acc)
+        # evenly spaced dense points = the spline arc-length LUT is fine enough
+        self.assertLess(res["spacing"]["max"], 3.0, res["spacing"])
+        self.assertGreater(res["spacing"]["min"], 0.2, res["spacing"])
+
+        # 2. smoothing removes GPS jitter without moving the line
+        self.assertLess(res["smoothing"]["smoothed"], res["smoothing"]["raw"])
+        self.assertLess(res["smoothing"]["accuracy"], 3.0, "smoothed line drifted off the trace")
+
+        # 3. time -> arc length: monotonic (a stutter here is visible at 60 fps),
+        #    brackets the samples it sits between, and never teleports
+        self.assertEqual(res["timeMap"]["bad"], 0, "time -> distance must be monotonic")
+        self.assertEqual(res["timeMap"]["worstClamp"], 0)
+        self.assertLess(res["timeMap"]["worstJump"], 1.0, "jump between adjacent probe steps")
+
+        # 4. 60 fps motion out of 25 Hz data. On the clean ring the interpolated
+        #    speed must match the real speed (70 mph) to within 15% on EVERY
+        #    frame; on the noisy ring (where the geometry's own local speed
+        #    wobbles) the requirement is that no frame jumps relative to the
+        #    typical frame - that is the stutter/jump guard.
+        ci, ni = res["interp"]["clean"], res["interp"]["noisy"]
+        self.assertGreater(ci["n"], 1000)
+        # uniform motion: no frame may deviate from the typical frame
+        self.assertLess(ci["max"] / ci["median"], 1.15, "clean-ring motion is not uniform")
+        # and the typical frame must be the GEOMETRY's speed. The synthetic ring
+        # walks 0.838 m per 40 ms sample = 46.9 mph; if a scaling bug ever
+        # appeared in the dense/segment arc-length mapping this drifts.
+        mph = ci["median"] * 60 / 0.44704
+        self.assertLess(abs(mph - 46.9) / 46.9, 0.05, f"interpolated speed {mph:.1f} mph")
+        self.assertLess(ni["max"], ni["median"] * 3.0, "a frame jumped the median step")
+        self.assertEqual(ci["stalls"] + ni["stalls"], 0, "interpolation must never freeze")
+
+        # 5. ribbon geometry
+        self.assertEqual(res["ribbon"]["verts"], res["ribbon"]["expectVerts"])
+        self.assertEqual(res["ribbon"]["tris"], res["ribbon"]["expectTris"])
+        self.assertLess(res["ribbon"]["perpWorst"], 1e-3, "edges must be perpendicular to the tangent")
+        self.assertLess(res["ribbon"]["halfWorst"], 1e-3, "edges must sit at +/- width/2")
+        self.assertLess(res["ribbon"]["yWorst"], 1e-3, "ribbon must follow the surface")
+
+        # 6. kerbs only where the track turns
+        self.assertGreater(res["kerbs"]["ring"], 0)
+        self.assertEqual(res["kerbs"]["straight"], 0)
+
+        # 7. the bank sign: right-hand turn = positive lateral g = positive roll
+        #    (camera.rotateZ(+roll) lifts the camera's right side = body rolls
+        #    out of a right-hander; flip the sign in latAccel if this ever reads
+        #    backwards on screen).
+        self.assertGreater(res["bank"]["right"], 0.3)
+        self.assertLess(res["bank"]["left"], -0.3)
+        self.assertGreater(res["bank"]["roll"], 0)
+        self.assertLess(res["bank"]["roll"], 0.06)
+        self.assertEqual(res["bank"]["rollOff"], 0)
+
+        # 8. camera is at eye height, looking forwards, and looks further ahead
+        #    the faster you go
+        self.assertAlmostEqual(res["camera"]["eyeAbove"], 1.15, places=2)
+        self.assertGreater(res["camera"]["forward"], 0)
+        self.assertGreater(res["camera"]["leadFast"], res["camera"]["leadSlow"])
+        self.assertAlmostEqual(res["camera"]["leadMin"], 16.0, places=2)
+
+        # 9. markers: apex + throttle at least, all on the surface
+        self.assertIn("apex", res["markers"]["kinds"])
+        self.assertGreaterEqual(res["markers"]["n"], 2)
+
+        # 10. altitude referenced to the session minimum so the ribbon sits on
+        #     the ground plane instead of floating at MSL
+        self.assertAlmostEqual(res["alt"]["min"], 0.0, places=3)
+        self.assertGreater(res["alt"]["max"], 5)
+
+
+if __name__ == "__main__":
+    unittest.main()
