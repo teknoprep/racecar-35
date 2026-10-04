@@ -517,6 +517,32 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
+### Simulated track dressing (v-server) — the look of the 3D view
+A satellite drape is 1 m per pixel at best and reads as mush at driving height, so the 3D view now draws
+its OWN surfaces, procedurally, from canvas noise (deterministic, seeded): **tarmac** (UV in WORLD METRES,
+one tile per 6 m, so it never stretches with track width/length), **grass**, **gravel**, **Armco**. What gets
+placed comes from what we KNOW about the circuit:
+- **kerbs** red/white alternating on both edges, following the measured width;
+- **Armco barriers** on the OUTSIDE of every detected corner (the corner's turn direction says which side),
+  ~2.5 m out, rails + posts, extended 8 stations either side;
+- **trees** scattered 18-55 m from the line, height from the asset's DEM grid, deterministic per track
+  (`seededRandom(slug)`), never on the surface;
+- **corner labels** T1, T2 ... as sprites at each apex, shown in PLAN view only;
+- **the driven line** drawn on the tarmac as a thin (0.45 m) amber ribbon at +0.11 m — where the car has
+  been and, ahead of it, where it is going;
+- **the brake/accel wash**: a SEPARATE translucent unlit ribbon at +0.07 m (`opacity 0.62`,
+  `depthWrite:false`) whose BRIGHTNESS carries the intensity — harder braking glows brighter red, harder
+  acceleration brighter green, and neither leaves the tarmac clean. (The tarmac itself is now untinted; the
+  old approach dimmed the imagery instead of glowing.)
+- **No giant ground plane.** An 80 km 2-triangle plane showed its own edges as faceted shapes on the horizon —
+  that was the "dark ceiling" in the chase view. The world now stands on a 4 km simulated grass disc whose rim
+  fog hides.
+Ground mode is a choice in the bar: **simulated / satellite / none** (simulated default; satellite uses the
+prepared imagery and is only offered when the asset passes validation). `demCoversTrack()` refuses to draw the
+satellite ground mesh unless its bounds actually contain the circuit — a bad asset used to float its terrain
+ABOVE the track, which appeared as a dark faceted ceiling in chase and as wallpaper in plan. The view now
+OPENS IN CHASE (the driving view was never the problem; plan is the one that had to earn its place).
+
 ### Prepared tracks: a bad bake must FAIL, never publish (v-server)
 The failure that survived the three bugs above: the ground rendered as a few texels of imagery stretched
 over the whole screen (a wallpaper-like grid with dashed paint markings magnified). Reproduced the correct

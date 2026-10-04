@@ -547,6 +547,39 @@ R.plan = (function () {
            fits: visible / 2 > worst, aspect: spanX / spanZ, planZoomable: true };
 })();
 
+// ---- translucent wash + the driven line -----------------------------------
+R.wash = (function () {
+  var o = { lat: ASSET.centre[0], lon: ASSET.centre[1] };
+  var line = ASSET.line.map(function (p) { return { lat: p[0], lon: p[1] }; });
+  var p = RC3D.buildPath(line, { smooth: 5, denseStep: 4 });
+  var road = RC3D.ribbon(p, 12, 0.03, { worldUV: 6 });
+  var wash = RC3D.ribbon(p, 12, 0.07, { worldUV: 6 });
+  var drv = RC3D.ribbon(p, 0.45, 0.11, { worldUV: 6 });
+  // v across the ribbon must span exactly width/6, u must advance with arc length
+  var uMono = true, uPrev = -1, vMax = 0, vMin = 9;
+  for (var i = 0; i < road.uv.length; i += 2) {
+    if (road.uv[i] < uPrev - 1e-9) uMono = false;
+    uPrev = road.uv[i];
+    vMax = Math.max(vMax, road.uv[i + 1]);
+    vMin = Math.min(vMin, road.uv[i + 1]);
+  }
+  // the line ribbon is thin: its two edges are 0.45 m apart
+  var thin = 0;
+  for (var k = 0; k < p.dense.x.length; k += 40) {
+    thin = Math.max(thin, Math.hypot(drv.position[k * 6] - drv.position[k * 6 + 3],
+                                     drv.position[k * 6 + 2] - drv.position[k * 6 + 5]));
+  }
+  // and the wash must sit ABOVE the tarmac (it is drawn over it)
+  var lift = wash.position[1] - road.position[1];
+  return { uMono: uMono, vSpan: vMax - vMin, wantVSpan: 12 / 6,
+           lineWidth: thin, lift: lift,
+           brightness: [RC3D.driveColour(-0.2)[0], RC3D.driveColour(-0.45)[0],
+                        RC3D.driveColour(-0.7)[0]],
+           greenB: [RC3D.driveColour(0.1)[1], RC3D.driveColour(0.3)[1]],
+           intensity: [RC3D.driveIntensity(0), RC3D.driveIntensity(-0.1),
+                       RC3D.driveIntensity(-0.4), RC3D.driveIntensity(-0.9)] };
+})();
+
 console.log(JSON.stringify(R));
 """
 
@@ -769,6 +802,23 @@ class Track3DMathTests(unittest.TestCase):
         self.assertTrue(pl["fits"], pl)
         self.assertGreater(pl["spanM"], 500)
         self.assertLess(pl["visibleM"] / pl["spanM"], 1.4, "plan view is not wasteful")
+
+        # 10g. the wash is translucent and gets BRIGHTER with harder braking,
+        #      the tarmac texture is in world metres, and the driven line is thin
+        w = res["wash"]
+        self.assertTrue(w["uMono"], "tarmac u must advance with arc length")
+        self.assertAlmostEqual(w["vSpan"], w["wantVSpan"], delta=0.01)
+        self.assertAlmostEqual(w["lineWidth"], 0.45, delta=0.02)
+        self.assertGreater(w["lift"], 0.01, "the wash must sit above the tarmac")
+        b = w["brightness"]
+        self.assertLess(b[0], b[1], "harder braking must be brighter")
+        self.assertLess(b[1], b[2], "harder braking must be brighter")
+        self.assertLess(w["greenB"][0], w["greenB"][1],
+                        "harder acceleration must be brighter")
+        it = w["intensity"]
+        self.assertEqual(it[0], 0.0, "no input = no wash")
+        self.assertLess(it[1], it[2])
+        self.assertLess(it[2], it[3])
 
         # 10b. look-around eases back so the view can never be left behind
         rc = res["recentre"]

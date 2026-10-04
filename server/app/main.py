@@ -2990,6 +2990,13 @@ async def caps() -> dict:
     self-calibrating imagery width (median+MAD, clamped to 8-15 m with the raw
     value kept), ground imagery sharing the road's uv frame, and a
     PREP_VERSION that invalidates wrongly-built assets.
+    9 = simulated (procedural) track dressing: canvas-generated tarmac /
+    grass / gravel / Armco textures, Armco barriers outside every corner, trees
+    scattered from the terrain grid, corner labels (T1, T2...) in plan view, the
+    driven line drawn on the tarmac, and the brake/accel shading as a separate
+    TRANSLUCENT wash that gets brighter with harder braking. The ground mode is
+    now a choice: simulated / satellite / none. No giant ground plane (its own
+    edges were the faceted 'ceiling' on the horizon).
     8 = a bake that would produce wallpaper now FAILS instead of publishing:
     duplicate-tile detection (a blocked/proxied tile source answers every URL
     with the same image), an asset validator (texture must cover the track, be
@@ -2998,7 +3005,7 @@ async def caps() -> dict:
     crisp ground, and seeds replace a STALE asset (so a broken baked track is
     healed by the shipped one)."""
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 8}
+            "track3d_v": 9}
 
 
 
@@ -7479,10 +7486,10 @@ _TRACK3D_HTML = (
   <div class="row"><span class="k">long g</span><span id="h-g">—</span></div>
 </div>
 <div id="legend">
-  <div class="li"><span class="sw" style="background:#5CE07F"></span>accelerating</div>
-  <div class="li"><span class="sw" style="background:#767A85"></span>neither (steady / coasting)</div>
-  <div class="li"><span class="sw" style="background:#FF4D4D"></span>braking</div>
-  <div class="li" id="lg-g" style="color:var(--muted)">red deepens with g, green with rate</div>
+  <div class="li"><span class="sw" style="background:#5CE07F"></span>accelerating (brighter = harder)</div>
+  <div class="li"><span class="sw" style="background:#FF4D4D"></span>braking (brighter with the g)</div>
+  <div class="li"><span class="sw" style="background:#FFDB59"></span>the line the car drove</div>
+  <div class="li" id="lg-g" style="color:var(--muted)">no colour = neither</div>
   <div class="li" id="lg-ideal" style="display:none"><span class="sw" style="background:#6CD07A"></span>ideal line (fastest real lap)</div>
   <div class="li"><span class="dot" style="background:#FF4D4D"></span>brake</div>
   <div class="li"><span class="dot" style="background:#FFB020"></span>apex</div>
@@ -7516,7 +7523,8 @@ _TRACK3D_HTML = (
     <option value="chase">chase</option>
     <option value="plan">plan</option>
   </select>
-  <label id="b-ground-lab" style="display:none" title="drape the prepared satellite imagery on the ground: real asphalt, kerbs, grass and run-off"><input type="checkbox" id="b-ground" checked>imagery ground</label>
+  <label id="b-ground-lab" title="ground surface: simulated asphalt/grass/kerbs drawn procedurally, the prepared satellite imagery, or nothing"><span class="meta">ground</span>
+    <select id="b-groundsel"><option value="sim">simulated</option><option value="satellite">satellite</option><option value="none">none</option></select></label>
   <button id="b-prep" style="display:none" type="button" title="pre-render this track from satellite imagery + OpenStreetMap on the server (once per track)">prepare track</button>
   <label title="road colour = your inputs, not your speed: green accelerating, grey neither, red braking (deeper with the g)"><input type="checkbox" id="b-speedcol" checked>accel / brake</label>
   <label title="render scale: higher supersamples the view, which is what removes jagged/crawling edges. Pick 1x if the GPU struggles"><span class="meta">sharp</span>
@@ -7857,17 +7865,29 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // measurable from 25 Hz speed (nor comparable between gears), so we claim
   // "accelerating" and scale only mildly, rather than inventing a percentage.
   RC3D.NEUTRAL_GREY = [0.46, 0.48, 0.52];
+  // The wash is TRANSLUCENT and its BRIGHTNESS carries the intensity, so harder
+  // braking glows brighter red and harder acceleration brighter green.
   RC3D.driveColour = function (aG) {
-    var thr = 0.035, accelFull = 0.28, brakeFull = 0.6;
+    var thr = 0.03, accelFull = 0.30, brakeFull = 0.7;
+    var t, k;
     if (aG > thr) {
-      var t = Math.max(0.40, Math.min(1, (aG - thr) / (accelFull - thr)));
-      return [0.20 + 0.06 * (1 - t), 0.42 + 0.52 * t, 0.24 + 0.08 * (1 - t)];
+      t = Math.max(0.18, Math.min(1, (aG - thr) / (accelFull - thr)));
+      k = 0.45 + 0.55 * t;                      // 0.45 -> 1.0
+      return [0.10 * k, k, 0.18 * k];
     }
     if (aG < -thr) {
-      var u = Math.max(0.32, Math.min(1, (-aG - thr) / (brakeFull - thr)));
-      return [0.38 + 0.58 * u, 0.13 + 0.12 * (1 - u), 0.13 + 0.08 * (1 - u)];
+      t = Math.max(0.18, Math.min(1, (-aG - thr) / (brakeFull - thr)));
+      k = 0.45 + 0.55 * t;
+      return [k, 0.08 * k, 0.10 * k];
     }
     return RC3D.NEUTRAL_GREY.slice();
+  };
+  RC3D.driveIntensity = function (aG) {
+    // 0 = neither, 1 = maximum brake/accel: drives the wash's opacity
+    var thr = 0.03, full = aG < 0 ? 0.7 : 0.30;
+    var a = Math.abs(aG);
+    if (a < thr) return 0;
+    return Math.min(1, (a - thr) / (full - thr));
   };
 
   // Blue -> green -> yellow -> red across [lo, hi] mph.
@@ -7885,7 +7905,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   RC3D.ribbon = function (path, width, lift, opt) {
     var d = path.dense, n = d.x.length, i;
     var pos = new Float32Array(n * 6), sArr = new Float32Array(n * 2);
-    var uv = opt && opt.uv ? new Float32Array(n * 4) : null;
+    var uv = (opt && (opt.uv || opt.worldUV)) ? new Float32Array(n * 4) : null;
     var hw = width / 2, lf = lift || 0;
     var half = (opt && opt.half) || null;      // per-station [left,right] metres
     for (i = 0; i < n; i++) {
@@ -7900,6 +7920,15 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       pos[i * 6] = x + tz * hl; pos[i * 6 + 1] = y; pos[i * 6 + 2] = z - tx * hl;
       pos[i * 6 + 3] = x - tz * hr; pos[i * 6 + 4] = y; pos[i * 6 + 5] = z + tx * hr;
       sArr[i * 2] = d.s[i]; sArr[i * 2 + 1] = d.s[i];
+      if (uv && opt.worldUV) {
+        // procedural-surface UVs in WORLD METRES: u along the ribbon, v across.
+        // A tarmac texture must not stretch with track width or length.
+        uv[i * 4] = d.s[i] / opt.worldUV;
+        uv[i * 4 + 1] = 0;
+        uv[i * 4 + 2] = d.s[i] / opt.worldUV;
+        uv[i * 4 + 3] = (hl + hr) / opt.worldUV;
+        continue;
+      }
       if (uv) {
         // real-imagery UVs: metres -> lat/lon -> the asset texture's bounds
         var ll = RC3D.localToLatLon(x + tz * hl, z - tx * hl, opt.o);
@@ -8324,15 +8353,18 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   var S = [], PATH = null, BASE = null, LAPS = [], LAPNO = 0;
   var TA = 0, TB = 0, NOW = 0, SMIN = 0, SMAX = 0, cur = null;
   var meshes = { road: null, kerbs: null, markers: null, ghost: null, ideal: null,
-                 gantry: null, ground: null, signs: null, car: null };
+                 gantry: null, ground: null, signs: null, car: null,
+                 barriers: null, trees: null, labels: null, wash: null,
+                 line: null };
   var ASSET = null, TEX = null, assetSample = null;   // prepared-track data
   var look = { yaw: 0, pitch: 0 };
   var view = "chase";                                     // "chase" | "plan"
   var planZoom = 1;                                       // wheel zoom in plan view
   var realWidth = null;                                   // metres, from the asset
   var CORNERS = [];                                       // detected corners
+  var TRACK_SEED = "track";                               // stable per-track scatter
   var opts = { smooth: 5, eye: 1.15, road: 12, speedColour: true, markers: true,
-               ghost: false, ground: true, brakes: true };
+               ghost: false, ground: "sim", brakes: true, dressing: true };
 
   function tryRenderer() {
     try {
@@ -8377,13 +8409,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var sun = new THREE.DirectionalLight(0xFFFFFF, 0.7);
     sun.position.set(-1, 2.4, 0.6);
     scene.add(sun);
-    ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(80000, 80000),
-      new THREE.MeshBasicMaterial({ color: 0x121519 })
-    );
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.y = -2;
-    scene.add(ground);
+    // No giant ground plane: a 2-triangle plane 80 km wide shows its own edges as
+    // faceted shapes on the horizon. The simulated grass disc in rebuildGround()
+    // is what the world stands on, and fog hides its rim.
   }
 
   function disposeMeshes() {
@@ -8399,13 +8427,226 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     });
   }
 
+  /* ---- procedural textures ------------------------------------------------
+     Simulated surfaces instead of a photographic drape: real circuits are
+     asphalt + painted kerbs + grass + Armco + trees, and every one of those is
+     cheaper and sharper drawn from noise than from a satellite pixel that is
+     1 m wide at best. All deterministic (seeded), all made on a canvas. */
+  function noiseCanvas(px, base, grain, blob, seed) {
+    var c = document.createElement("canvas");
+    c.width = c.height = px;
+    var g = null;
+    try { g = c.getContext("2d"); } catch (e) { g = null; }
+    if (!g) return null;
+    var rnd = (function (s) {
+      return function () { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+    })(seed || 7);
+    g.fillStyle = "rgb(" + base.join(",") + ")";
+    g.fillRect(0, 0, px, px);
+    var i;
+    for (i = 0; i < blob; i++) {                     // soft patches
+      var x = rnd() * px, y = rnd() * px, r = px * (0.03 + rnd() * 0.12);
+      var grd = g.createRadialGradient(x, y, 0, x, y, r);
+      var d = Math.round((rnd() - 0.5) * 22);
+      grd.addColorStop(0, "rgba(" + (base[0] + d) + "," + (base[1] + d) + "," +
+                          (base[2] + d) + ",0.55)");
+      grd.addColorStop(1, "rgba(0,0,0,0)");
+      g.fillStyle = grd;
+      g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
+    }
+    for (i = 0; i < grain; i++) {                    // aggregate / blades
+      var x2 = rnd() * px, y2 = rnd() * px;
+      var v = Math.round((rnd() - 0.5) * 46);
+      g.fillStyle = "rgba(" + Math.max(0, base[0] + v) + "," +
+                    Math.max(0, base[1] + v) + "," + Math.max(0, base[2] + v) + ",0.5)";
+      g.fillRect(x2, y2, 1, 1);
+    }
+    return c;
+  }
+
+  function surfaceTexture(kind) {
+    var c = null, wx = 6, wy = 6, aniso = true;
+    if (kind === "asphalt") {
+      c = noiseCanvas(256, [64, 64, 66], 5200, 26, 11);
+      wx = wy = 6;                      // one tile per 6 m
+    } else if (kind === "grass") {
+      c = noiseCanvas(256, [58, 88, 44], 7000, 30, 23);
+      wx = wy = 4;
+    } else if (kind === "gravel") {
+      c = noiseCanvas(256, [122, 116, 104], 9000, 14, 31);
+      wx = wy = 3;
+    } else if (kind === "armco") {
+      c = noiseCanvas(64, [150, 152, 156], 400, 4, 41);
+      wx = 8; wy = 1;
+    }
+    if (!c) return null;
+    var t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.colorSpace = THREE.SRGBColorSpace;
+    try { if (aniso) t.anisotropy = renderer.capabilities.getMaxAnisotropy(); } catch (e) {}
+    t.userData.metresPerTile = [wx, wy];
+    return t;
+  }
+
+  var TEXS = null;
+  function surfaces() {
+    if (!TEXS) {
+      TEXS = { asphalt: surfaceTexture("asphalt"), grass: surfaceTexture("grass"),
+               gravel: surfaceTexture("gravel"), armco: surfaceTexture("armco") };
+    }
+    return TEXS;
+  }
+
+  /* ---- trackside furniture ------------------------------------------------
+     Everything below is placed from what we KNOW about the circuit: the driven
+     line's real width, the detected corners (with their turn direction, so the
+     outside is known), the start/finish and the terrain grid. */
+  function buildBarriers(path, base, width, corners) {
+    // Armco on the OUTSIDE of every corner: two rails + posts, 2.5 m out.
+    var d = base.dense, grp = new THREE.Group();
+    if (!corners || !corners.length) return grp;
+    var tex = surfaces().armco;
+    var mat = tex ? new THREE.MeshLambertMaterial({ map: tex })
+                  : new THREE.MeshLambertMaterial({ color: 0x9AA0A8 });
+    var postMat = new THREE.MeshLambertMaterial({ color: 0x5A6068 });
+    var off = width / 2 + 2.5, half = 0.16;
+    for (var c = 0; c < corners.length; c++) {
+      var C = corners[c], a, b, mid;
+      // find the station indices of this corner
+      while (a < b) { mid = (a + b + 1) >> 1; if (d.s[mid] <= C.s0) a = mid; else b = mid - 1; }
+      var iA = a;
+      a = 0; b = d.s.length - 1;
+      while (a < b) { mid = (a + b + 1) >> 1; if (d.s[mid] <= C.s1) a = mid; else b = mid - 1; }
+      var iB = a;
+      // extend a little either side: barriers start before the corner
+      iA = Math.max(0, iA - 8);
+      iB = Math.min(d.s.length - 1, iB + 8);
+      var pos = [], uv = [], idx = [], n = 0;
+      for (var i = iA; i <= iB; i++) {
+        var tx = d.tan[i][0], tz = d.tan[i][1];
+        // driver's left is (tz,-tx); the outside of a right-hander is the left
+        var ox = (C.dir > 0) ? tz : -tz, oz = (C.dir > 0) ? -tx : tx;
+        var x = d.x[i] + ox * off, z = d.z[i] + oz * off, y = d.y[i];
+        pos.push(x, y + 0.45, z, x, y + 1.05, z);
+        uv.push(d.s[i] / 8, 0, d.s[i] / 8, 1);
+        n++;
+      }
+      for (i = 0; i < n - 1; i++) {
+        var p0 = i * 2, p1 = i * 2 + 1, p2 = (i + 1) * 2, p3 = (i + 1) * 2 + 1;
+        idx.push(p0, p2, p1, p1, p2, p3);
+      }
+      var geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+      geo.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+      geo.setIndex(idx);
+      geo.computeVertexNormals();
+      grp.add(new THREE.Mesh(geo, mat));
+      // posts every ~4 m
+      for (i = iA; i <= iB; i += 2) {
+        var tx2 = d.tan[i][0], tz2 = d.tan[i][1];
+        var ox2 = (C.dir > 0) ? tz2 : -tz2, oz2 = (C.dir > 0) ? -tx2 : tx2;
+        var p = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.95, 0.12), postMat);
+        p.position.set(d.x[i] + ox2 * off, d.y[i] + 0.48, d.z[i] + oz2 * off);
+        grp.add(p);
+      }
+    }
+    return grp;
+  }
+
+  function seededRandom(seedStr) {
+    var h = 2166136261, i;
+    for (i = 0; i < seedStr.length; i++) {
+      h ^= seedStr.charCodeAt(i);
+      h = (h * 16777619) >>> 0;
+    }
+    return function () {
+      h = (h * 1664525 + 1013904223) >>> 0;
+      return h / 4294967296;
+    };
+  }
+
+  function buildTrees(path, base, width, seedStr) {
+    // Trees are placed from the terrain + the track's own footprint: outside the
+    // run-off (18-55 m from the line), never on the surface, height from the DEM
+    // grid we already have, deterministic per track (seeded by the slug).
+    var d = base.dense, rnd = seededRandom(seedStr || "track");
+    var grp = new THREE.Group();
+    var trunkMat = new THREE.MeshLambertMaterial({ color: 0x5A4632 });
+    var leafMat = new THREE.MeshLambertMaterial({ color: 0x2F5A2A });
+    var n = Math.min(240, Math.floor(d.s[d.s.length - 1] / 22));
+    var step = Math.max(1, Math.floor(d.s.length / Math.max(1, n)));
+    var placed = 0;
+    for (var i = 0; i < d.s.length && placed < n * 2; i += step) {
+      for (var side = -1; side <= 1; side += 2) {
+        if (rnd() > 0.55) continue;
+        var lat = (18 + rnd() * 37) * side;          // metres, outside the run-off
+        var tx = d.tan[i][0], tz = d.tan[i][1];
+        var ox = tx * lat, oz = -tz * lat;           // lateral offset
+        var x = d.x[i] + ox, z = d.z[i] + oz;
+        var y = d.y[i];
+        if (assetSample) {
+          var e = assetSample(x, z);
+          if (e && e.elev_m != null) y = e.elev_m - (PATH.yRef || 0);
+        }
+        var hgt = 4 + rnd() * 7;
+        var trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.22, hgt * 0.32, 6),
+                                   trunkMat);
+        trunk.position.set(x, y + hgt * 0.16, z);
+        grp.add(trunk);
+        var canopy = new THREE.Mesh(new THREE.ConeGeometry(1.5 + rnd() * 1.3, hgt * 0.85, 7),
+                                    leafMat);
+        canopy.position.set(x, y + hgt * 0.32 + hgt * 0.42, z);
+        canopy.rotation.y = rnd() * 3.14;
+        grp.add(canopy);
+        placed++;
+      }
+    }
+    return grp;
+  }
+
+  function buildCornerLabels(base, corners) {
+    var grp = new THREE.Group();
+    var tex = {};
+    for (var i = 0; i < corners.length; i++) {
+      var label = "T" + (i + 1);
+      if (!tex[label]) {
+        var c = document.createElement("canvas");
+        c.width = c.height = 128;
+        var g = null;
+        try { g = c.getContext("2d"); } catch (e) { g = null; }
+        if (!g) continue;
+        g.fillStyle = "rgba(14,16,20,0.72)";
+        g.fillRect(0, 0, 128, 128);
+        g.strokeStyle = "#E6E8EE";
+        g.lineWidth = 6;
+        g.strokeRect(4, 4, 120, 120);
+        g.fillStyle = "#E6E8EE";
+        g.font = "bold 72px Inter, Arial, sans-serif";
+        g.textAlign = "center"; g.textBaseline = "middle";
+        g.fillText(label, 64, 70);
+        var t = new THREE.CanvasTexture(c);
+        t.colorSpace = THREE.SRGBColorSpace;
+        tex[label] = t;
+      }
+      var p = RC3D.pointAtS(base, corners[i].apex_s);
+      var spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex[label],
+                                                            depthTest: false }));
+      spr.scale.set(26, 26, 1);
+      spr.position.set(p.x, p.y + 14, p.z);
+      grp.add(spr);
+    }
+    return grp;
+  }
+
   function makeRoad(path, width, lift, colourBySpeed, solidColour, alpha, extra) {
     extra = extra || {};
     var r = RC3D.ribbon(path, width, lift, {
       half: extra.half || null,
       uv: extra.uvBounds || null,
+      worldUV: extra.asphalt ? 6 : 0,       // one tarmac tile per 6 m
       o: extra.o || (PATH && PATH.o)
     });
+
     var geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(r.position, 3));
     var cols = new Float32Array(r.position.length);
@@ -8417,15 +8658,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     }
     for (i = 0; i < r.s.length; i++) {
       if (colourBySpeed) {
-        // accel / brake / neither — the driver's input, not the speed
         c = RC3D.driveColour(RC3D.accelAtS(path, r.s[i]));
-        if (extra.tex) {
-          // over satellite imagery, blend toward the state colour instead of
-          // replacing it, so the real surface stays visible underneath
-          var mix = 0.62;
-          c = [c[0] * mix + 0.42 * (1 - mix), c[1] * mix + 0.42 * (1 - mix),
-               c[2] * mix + 0.42 * (1 - mix)];
-        }
       } else {
         c = solidColour || [0.135, 0.145, 0.165];
       }
@@ -8436,6 +8669,28 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     geo.setIndex(new THREE.BufferAttribute(r.index, 1));
     geo.computeVertexNormals();
     var mo = { vertexColors: true, side: THREE.DoubleSide };
+    if (extra.asphalt) {
+      var at = surfaces().asphalt;
+      if (at) { mo.map = at; mo.vertexColors = false; }   // plain tarmac
+    }
+    if (extra.wash) {
+      // the brake/accel shading, laid OVER the tarmac: unlit, translucent, so
+      // brightness is intensity rather than a dimming multiply
+      var wm = new THREE.MeshBasicMaterial({
+        vertexColors: true, transparent: true, opacity: 0.62,
+        depthWrite: false, side: THREE.DoubleSide
+      });
+      var mesh = new THREE.Mesh(geo, wm);
+      return mesh;
+    }
+    if (extra.line) {
+      var lm = new THREE.MeshBasicMaterial({
+        color: new THREE.Color(extra.line[0], extra.line[1], extra.line[2]),
+        transparent: true, opacity: 0.95, depthWrite: false,
+        side: THREE.DoubleSide
+      });
+      return new THREE.Mesh(geo, lm);
+    }
     if (extra.tex) {
       // satellite imagery of the ACTUAL track surface, sampled through the
       // asset's bounds; vertex colours tint it by speed
@@ -8449,6 +8704,19 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // The prepared track's own terrain, textured with its imagery. This is the
   // "how big is the track" view: real asphalt, real kerbs, real grass, real
   // run-off, from the same imagery the width was measured off.
+  function demCoversTrack() {
+    // The ground mesh must actually cover the circuit. Without this check a bad
+    // asset drew its terrain ABOVE the track, which appeared as a dark faceted
+    // ceiling in the driving view and as wallpaper from above.
+    if (!ASSET || !ASSET.dem || !ASSET.dem.bounds) return false;
+    var b = ASSET.dem.bounds, d = PATH.dense, i;
+    for (i = 0; i < d.x.length; i += 7) {
+      var ll = RC3D.localToLatLon(d.x[i], d.z[i], PATH.o);
+      if (ll[0] < b[0] || ll[0] > b[2] || ll[1] < b[1] || ll[1] > b[3]) return false;
+    }
+    return true;
+  }
+
   function rebuildGround() {
     if (meshes.ground) {
       scene.remove(meshes.ground);
@@ -8456,19 +8724,44 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       meshes.ground.material.dispose();
       meshes.ground = null;
     }
-    if (!opts.ground || !ASSET || !ASSET.dem || !TEX) return;
-    var m = RC3D.demMesh(ASSET.dem, PATH.o, PATH.yRef,
-                         (ASSET.texture && ASSET.texture.bounds) || null);
-    if (!m) return;
+    if (opts.ground === "none") return;
+    if (opts.ground === "satellite") {
+      if (!ASSET || !ASSET.dem || !TEX || !demCoversTrack()) return;
+      var m = RC3D.demMesh(ASSET.dem, PATH.o, PATH.yRef,
+                           (ASSET.texture && ASSET.texture.bounds) || null);
+      if (!m) return;
     var g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(m.position, 3));
     g.setAttribute("uv", new THREE.BufferAttribute(m.uv, 1));
     g.setIndex(new THREE.BufferAttribute(m.index, 1));
     g.computeVertexNormals();
-    meshes.ground = new THREE.Mesh(g, new THREE.MeshLambertMaterial({
-      map: TEX, side: THREE.DoubleSide
-    }));
-    scene.add(meshes.ground);
+      meshes.ground = new THREE.Mesh(g, new THREE.MeshLambertMaterial({
+        map: TEX, side: THREE.DoubleSide
+      }));
+      scene.add(meshes.ground);
+      return;
+    }
+    // simulated ground: one big grass disc under the whole circuit, tiled in
+    // world units so it reads as grass at any zoom, fading into the fog
+    var gt = surfaces().grass;
+    var y0 = PATH.yRef == null ? 0 : 0;
+    var disc = new THREE.Mesh(new THREE.CircleGeometry(4000, 48),
+                              new THREE.MeshLambertMaterial({
+                                map: gt || null, color: gt ? 0xFFFFFF : 0x3C5A32,
+                                side: THREE.DoubleSide
+                              }));
+    if (gt) {
+      var rep = 8000 / 4;                    // 4 m per tile
+      var uv2 = disc.geometry.attributes.uv;
+      for (var q = 0; q < uv2.count; q++) {
+        uv2.setXY(q, uv2.getX(q) * rep, uv2.getY(q) * rep);
+      }
+      uv2.needsUpdate = true;
+    }
+    disc.rotation.x = -Math.PI / 2;
+    disc.position.set(PATH.dense.x[0], y0 - 0.08, PATH.dense.z[0]);
+    meshes.ground = disc;
+    scene.add(disc);
   }
 
   // Brake boards: the digit is drawn on a canvas (no font file, no glyph
@@ -8687,12 +8980,37 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
             (realWidth ? realWidth.toFixed(1) : "?") + " m)";
         }
       }
-      meshes.road = makeRoad(base, opts.road, 0.03, opts.speedColour, null, 1, extra);
-      scene.add(meshes.road);
-      var useW = extra && realWidth ? realWidth : opts.road;
+      var useAsphalt = (opts.ground !== "satellite");
+      var half = extra ? extra.half : null;
+      var tex = extra ? extra.tex : null;
+      var uvB = extra ? extra.uvBounds : null;
+      if (useAsphalt) {
+        // 1. the tarmac itself (neutral, procedural)
+        meshes.road = makeRoad(base, useW, 0.03, false, null, 1,
+                               { asphalt: true, half: half, o: PATH.o });
+        scene.add(meshes.road);
+        // 2. the brake/accel WASH over it: translucent, brighter with intensity
+        meshes.wash = makeRoad(base, useW, 0.07, true, null, 1,
+                               { wash: true, half: half, o: PATH.o });
+        scene.add(meshes.wash);
+        // 3. the line the car drove — where it is going, and where it is
+        meshes.line = makeRoad(base, 0.45, 0.11, false, null, 1,
+                               { line: [1.0, 0.86, 0.35] });
+        scene.add(meshes.line);
+      } else {
+        meshes.road = makeRoad(base, useW, 0.03, false, null, 1,
+                               { half: half, uvBounds: uvB, tex: tex, o: PATH.o });
+        scene.add(meshes.road);
+        meshes.wash = makeRoad(base, useW, 0.07, true, null, 1,
+                               { wash: true, half: half, o: PATH.o });
+        scene.add(meshes.wash);
+        meshes.line = makeRoad(base, 0.45, 0.11, false, null, 1,
+                               { line: [1.0, 0.86, 0.35] });
+        scene.add(meshes.line);
+      }
+      var useW = realWidth ? realWidth : opts.road;
       meshes.kerbs = makeKerbs(base, useW);
       if (opts.brakes) {
-        CORNERS = RC3D.corners(base, {});
         meshes.signs = makeBrakeSigns(RC3D.brakeMarkers(base, CORNERS, {}), base, useW);
         if (meshes.signs) scene.add(meshes.signs);
       } else {
@@ -8718,6 +9036,17 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         if (meshes.gantry) scene.add(meshes.gantry);
       }
       rebuildGround();
+      // trackside: Armco outside the corners, trees beyond the run-off, corner
+      // labels for the plan view. All from the circuit's own known geometry.
+      CORNERS = RC3D.corners(base, {});
+      if (opts.dressing) {
+        meshes.barriers = buildBarriers(PATH, base, useW, CORNERS);
+        scene.add(meshes.barriers);
+        meshes.trees = buildTrees(PATH, base, useW, TRACK_SEED);
+        scene.add(meshes.trees);
+        meshes.labels = buildCornerLabels(base, CORNERS);
+        scene.add(meshes.labels);
+      }
       if (!meshes.car) {
         meshes.car = makeCarMarker();
         if (meshes.car) scene.add(meshes.car);
@@ -8829,6 +9158,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     el("h-best").textContent = L && L.seconds ? fmtLap(L.seconds) : "—";
     el("h-alt").textContent = (cur && typeof cur.alt_m === "number")
       ? Math.round(cur.alt_m) + " m" : "—";
+    if (meshes.labels) meshes.labels.visible = (view === "plan");
     if (meshes.car) {
       meshes.car.visible = (view === "plan");
       if (view === "plan") placeCar(st.s);
@@ -9030,9 +9360,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     if (el("b-brakes")) el("b-brakes").addEventListener("change", function () {
       opts.brakes = el("b-brakes").checked; rebuild();
     });
-    if (el("b-ground")) el("b-ground").addEventListener("change", function () {
-      opts.ground = el("b-ground").checked; rebuildGround();
-    });
+    if (el("b-groundsel")) {
+      el("b-groundsel").value = opts.ground;
+      el("b-groundsel").addEventListener("change", function () {
+        opts.ground = el("b-groundsel").value;
+        rebuild();                      // the road surface follows the ground mode
+      });
+    }
     if (el("b-prep")) el("b-prep").addEventListener("click", prepareTrack);
     if (el("b-scale")) {
       el("b-scale").value = String(scale);
@@ -9155,14 +9489,17 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     // the real imagery (that is the "how big is the track" view), one click from
     // the driving view. Without imagery there is nothing to see from above, so
     // stay in the car.
-    if (asset.texture && view === "chase" && !applyAsset.choseView) {
-      applyAsset.choseView = true;
-      view = "plan";
-      if (el("b-view")) el("b-view").value = "plan";
-      notice("plan view: whole circuit over the real imagery (" +
-             (asset.length_m ? (asset.length_m / 1000).toFixed(2) + " km" : "?") +
-             ") — switch view to \u201cchase\u201d to drive it");
-      setTimeout(hideNotice, 6000);
+    TRACK_SEED = asset.slug || "track";
+    if (el("b-groundsel") && opts.ground === "sim") {
+      // a prepared track with validated imagery: offer it, but the SIMULATED
+      // surface stays the default (it is sharper than a 1 m satellite pixel)
+      el("b-groundsel").title += " (satellite imagery is available for this track)";
+    }
+    if (asset.length_m) {
+      notice("prepared track: " + asset.track + " " +
+             (asset.length_m / 1000).toFixed(2) + " km, " +
+             (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide");
+      setTimeout(hideNotice, 4500);
     }
     var attr = (asset.texture && asset.texture.attrib) || "";
     var src = (asset.source && asset.source.line) || "?";
