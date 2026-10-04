@@ -143,6 +143,25 @@ try:
 except ValueError:
     MAP_MAXZOOM = 19
 
+# ---------------------------------------------------------------------------
+# Elevation for /track3d (the first-person 3D drive view).
+#
+# KEYLESS by design, like the imagery above: AWS's open "terrarium" terrain
+# tiles (Mapzen/Amazon terrain, SRTM + others), PNG-encoded, no key, CORS-open.
+# MapLibre decodes them with encoding="terrarium". Blank => the default;
+# `none` => no 3D terrain at all (flat ground, the imagery still works).
+#   RACECAR_MAP_DEM=https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png
+#   RACECAR_MAP_DEM=none
+# NOTE native data only goes to ~z15, so do not raise the maxzoom much beyond
+# that — above it the tiles are upsampled (blocks below z13 are 2x2 pooled).
+# ---------------------------------------------------------------------------
+_DEFAULT_MAP_DEM = (
+    "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+)
+_dem_env = os.environ.get("RACECAR_MAP_DEM", "").strip()
+MAP_DEM = "" if _dem_env.lower() == "none" else (_dem_env or _DEFAULT_MAP_DEM)
+MAP_DEM_MAXZOOM = 15
+
 
 def ai_enabled() -> bool:
     return bool(AI_API_KEY)
@@ -785,6 +804,10 @@ _OPTIONAL_NUMERIC_FIELDS = {
     "fix", "sats", "alt_m", "speed_mph", "heading_deg", "rpm",
     "oil_psi", "coolant_f", "oil_psi_x10", "cool_f_x10",
     "ax", "ay", "az", "gx", "gy", "gz",
+    # v: every remaining channel the system can hold (see the firmware sample
+    # writer). Null is still accepted (sensor absent/faulted); present = finite.
+    "map_kpa", "iat_f", "batt_v", "afr_can", "oil_can_psi",
+    "tps_pct", "spark_deg", "lap",
 }
 
 
@@ -2562,8 +2585,13 @@ async def caps() -> dict:
     """Server capability probe for the dash (public, static). The dash asks
     once per boot before its first upload; 'zblocks' advertises that /upload,
     /stream and /nettest decode the compressed body framing (v0.1.127).
-    An old dash never asks; an old server 404s and the dash sends raw."""
-    return {"ok": True, "zblocks": True, "coach": True}
+    An old dash never asks; an old server 404s and the dash sends raw.
+
+    'track3d' is a WEB-side marker, not a dash one: it tells you at a glance
+    whether the running image is new enough to serve the 3D drive view
+    (`curl <host>/caps`). Handy because the host watcher rebuilds in place and
+    the browser may still be showing a cached page."""
+    return {"ok": True, "zblocks": True, "coach": True, "track3d": True}
 
 
 def _zb_decode(data: bytes) -> bytes:
@@ -4728,7 +4756,22 @@ _LINEVIEW_HTML = """<!doctype html>
   *{box-sizing:border-box} html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
     font:14px/1.45 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
   #wrap{display:grid;grid-template-columns:1fr 340px;height:100vh}
-  #map{height:100vh}
+  #mcol{display:flex;flex-direction:column;height:100vh;min-width:0}
+  #map{flex:1 1 auto;min-height:0}
+  /* basemap switch — checkbox strip under the map; off = plain black */
+  #map.nosat{background:#000}
+  #map.nosat .leaflet-control-attribution{display:none}
+  .mapopts{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:6px 10px;
+    border-top:1px solid var(--line);background:var(--surface)}
+  .mapchk{display:flex;align-items:center;gap:8px;cursor:pointer;
+    font:600 12px Inter,sans-serif;color:var(--text);white-space:nowrap;user-select:none}
+  .mapchk input{width:15px;height:15px;margin:0;cursor:pointer;accent-color:var(--warn)}
+  .mapchk .hint{color:var(--muted);font-weight:400;font-size:11px}
+  .mapopts .sep{width:1px;height:20px;background:var(--line);flex:0 0 auto}
+  a.mapbtn{display:inline-flex;align-items:center;background:var(--warn);color:#1A1300;
+    text-decoration:none;border-radius:4px;padding:7px 12px;
+    font:700 12px Inter,sans-serif;white-space:nowrap;cursor:pointer}
+  a.mapbtn:hover{filter:brightness(1.08)}
   aside{padding:14px;overflow-y:auto;border-left:1px solid var(--line);background:var(--surface)}
   h1{font-size:15px;margin:0 0 8px} .muted{color:var(--muted);font-size:12px}
   .leg{display:flex;align-items:center;gap:8px;margin:6px 0;font-size:13px}
@@ -4760,7 +4803,18 @@ _LINEVIEW_HTML = """<!doctype html>
   #aiCost{color:var(--muted);font-size:11px;margin-top:4px}
 </style></head><body>
 <div id="wrap">
-  <div id="map"></div>
+  <div id="mcol">
+    <div id="map"></div>
+    <div id="mapopts" class="mapopts">
+      <label class="mapchk" for="opt-sat">
+        <input type="checkbox" id="opt-sat">
+        <span>Satellite view</span>
+      </label>
+      <span class="sep"></span>
+      <a id="map3d" class="mapbtn" target="_blank" href="#"
+         title="first-person 3D drive view of this section over real terrain">\u25b6 3D drive view</a>
+    </div>
+  </div>
   <aside>
     <h1>Racing line — circled section</h1>
     <div class="muted" id="status">loading…</div>
@@ -4794,8 +4848,34 @@ _LINEVIEW_HTML = """<!doctype html>
   const q=new URLSearchParams(location.search);
   const pts=(q.get('pts')||'').split('|').map(s=>s.split(',').map(Number)).filter(a=>a.length===2&&isFinite(a[0])&&isFinite(a[1]));
   const map=L.map('map');
-  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    {maxZoom:20, attribution:'Imagery © Esri'}).addTo(map);
+  // ---- basemap on/off: satellite tiles, or nothing but black. ------------
+  // The checkbox sits directly under the map and the choice is remembered per
+  // browser (same localStorage key as the review page). Tiles are additive, so
+  // toggling never disturbs the ideal-line / reference / marker overlays.
+  const map_el=document.getElementById('map');
+  const sat_chk=document.getElementById('opt-sat');
+  // "3D drive view" keeps the circled section: carry ?pts= straight through.
+  (function(){
+    var m3=document.getElementById('map3d');
+    if(!m3) return;
+    var raw=q.get('pts');
+    m3.href='/track3d/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+
+            (raw?('?pts='+encodeURIComponent(raw)):'');
+  })();
+  let sat_layer=null;
+  function applySat(on){
+    if(on&&!sat_layer){
+      sat_layer=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        {maxZoom:20, attribution:'Imagery \u00a9 Esri'}).addTo(map);
+    } else if(!on&&sat_layer){ map.removeLayer(sat_layer); sat_layer=null; }
+    map_el.classList.toggle('nosat',!on);
+    if(sat_chk) sat_chk.checked=!!on;
+    try{ localStorage.setItem('rc5.sat', on?'1':'0'); }catch(e){}
+  }
+  let sat_on=true;
+  try{ sat_on=localStorage.getItem('rc5.sat')!=='0'; }catch(e){}
+  if(sat_chk) sat_chk.addEventListener('change',function(){ applySat(sat_chk.checked); });
+  applySat(sat_on);
   const status=document.getElementById('status');
   if(pts.length<3){ status.textContent='no region — open this from the review page (circle a section → ideal line)'; map.setView([39,-77],5); return; }
   L.polygon(pts,{color:'#6CD07A',weight:1,fillOpacity:0.06,dashArray:'4 4'}).addTo(map);
@@ -4995,6 +5075,28 @@ async def review(request: Request, user: str, filename: str) -> Response:
                        .replace("__MAP_TILES__", json.dumps(MAP_TILES)) \
                        .replace("__MAP_ATTRIB__", json.dumps(MAP_ATTRIB)) \
                        .replace("__MAP_MAXZOOM__", str(MAP_MAXZOOM))
+
+
+@app.get("/track3d/{user}/{filename}", response_class=HTMLResponse)
+async def track3d(request: Request, user: str, filename: str) -> Response:
+    """First-person 3D drive view: satellite imagery draped over real terrain
+    (RACECAR_MAP_DEM), the driven line painted on the ground, corner markers,
+    and a chase camera on the review page's playback clock. Same view gate as
+    /review, so access can never be widened by this page.
+
+    Rendered entirely client-side from /sessions/<u>/<f>/{data,laps} (plus
+    /lines when a lasso polygon is handed over via ?pts=)."""
+    if oauth_enabled() and not current_user(request):
+        return login_redirect(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    return _TRACK3D_HTML.replace("__USER__", safe_name(user)) \
+                        .replace("__FILE__", p.name) \
+                        .replace("__MAP_TILES__", json.dumps(MAP_TILES)) \
+                        .replace("__MAP_ATTRIB__", json.dumps(MAP_ATTRIB)) \
+                        .replace("__MAP_MAXZOOM__", str(MAP_MAXZOOM)) \
+                        .replace("__MAP_DEM__", json.dumps(MAP_DEM)) \
+                        .replace("__MAP_DEM_MAXZOOM__", str(MAP_DEM_MAXZOOM))
 
 
 # ---------------------------------------------------------------------------
@@ -6075,6 +6177,605 @@ _CANBUS_HTML = (
 </body></html>"""
 )
 
+# ---------------------------------------------------------------------------
+# /track3d — first-person 3D drive view
+#
+# The 2D Leaflet map answers "where on the track". This answers "what does it
+# look like from the seat": satellite imagery DRAPED over real terrain, the
+# driven line painted on the ground, brake/apex/throttle markers, and a chase
+# camera that drives the trace at eye height driven by the same playback clock
+# as the review page.
+#
+# Ground = the SAME keyless Esri World Imagery the 2D map uses (a raster draped
+# on the surface — this is not photogrammetry; true 3D buildings/trees would
+# need a keyed source such as Google Photorealistic 3D Tiles). Elevation = the
+# keyless AWS terrarium DEM (RACECAR_MAP_DEM, `none` to disable).
+#
+# ⚠️ Everything is a layer toggle on ONE map, so switching imagery/terrain on
+# and off never rebuilds the camera or re-fetches the session:
+#   imagery off + terrain on  = black ground with real hills (the lines read
+#                               like a light table)
+#   imagery on  + terrain off = flat satellite view (classic map in 3D)
+#
+# Phase 2 hook (already wired): a `?pts=` lasso polygon makes the page POST the
+# SAME /sessions/<u>/<f>/lines endpoint the lineview popout uses and draw the
+# IDEAL line (fastest real traverse on record) in green plus your session best
+# in blue over the ground — "what we did" vs "what the data says is fastest",
+# in the driver's view.
+# ---------------------------------------------------------------------------
+_TRACK3D_HTML = (
+    """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D drive \u00b7 __FILE__</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  :root { --bg:#0E1014; --surface:#181B22; --line:#2A2F3A; --text:#E6E8EE;
+          --muted:#8A92A3; --good:#6CD07A; --warn:#FFB020; --bad:#FF4D4D;
+          --you:#4EA1FF; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font: 13px/1.4 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden; }
+  #map { position:absolute; inset:0 0 46px 0; background:#000; }
+  #notice { position:absolute; left:50%; top:14px; transform:translateX(-50%);
+    z-index:20; background:rgba(14,16,20,0.92); border:1px solid var(--line);
+    border-radius:6px; padding:8px 14px; font:600 12px Inter,sans-serif;
+    max-width:80vw; }
+  #notice.err { border-color:var(--bad); color:#FFB0B0; }
+  #hud { position:absolute; left:12px; top:12px; z-index:15; pointer-events:none;
+    background:rgba(14,16,20,0.72); border:1px solid var(--line); border-radius:8px;
+    padding:10px 14px; min-width:190px; }
+  #hud .big { font:700 40px/1 ui-monospace, Menlo, monospace; letter-spacing:-1px; }
+  #hud .unit { color:var(--muted); font:600 12px Inter,sans-serif; margin-left:4px; }
+  #hud .row { display:flex; justify-content:space-between; gap:12px;
+    font:600 12px ui-monospace, Menlo, monospace; margin-top:4px; }
+  #hud .row span.k { color:var(--muted); font-weight:400; }
+  #legend { position:absolute; right:12px; top:12px; z-index:15;
+    pointer-events:none; background:rgba(14,16,20,0.72);
+    border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+  #legend .li { display:flex; align-items:center; gap:7px; margin:3px 0;
+    font:500 11px Inter,sans-serif; white-space:nowrap; }
+  #legend .sw { width:22px; height:4px; border-radius:2px; flex:0 0 auto; }
+  #legend .dot { width:10px; height:10px; border-radius:50%; flex:0 0 auto;
+    border:1.5px solid #000; }
+  #bar { position:absolute; left:0; right:0; bottom:0; height:46px; z-index:20;
+    display:flex; align-items:center; gap:10px; padding:0 12px; overflow-x:auto;
+    background:var(--surface); border-top:1px solid var(--line); }
+  #bar button { background:#20242E; color:var(--text); border:1px solid var(--line);
+    border-radius:4px; padding:7px 12px; cursor:pointer; font:600 12px Inter,sans-serif;
+    white-space:nowrap; }
+  #bar button.on { background:var(--primary, #3B82F6); border-color:transparent;
+    color:#fff; }
+  #bar input[type=range] { flex:1 1 180px; min-width:120px; accent-color:var(--warn); }
+  #bar label { display:flex; align-items:center; gap:6px; white-space:nowrap;
+    font:600 12px Inter,sans-serif; cursor:pointer; color:var(--text); }
+  #bar input[type=checkbox] { width:15px; height:15px; margin:0; cursor:pointer;
+    accent-color:var(--warn); }
+  #bar .meta { color:var(--muted); font:500 12px ui-monospace, Menlo, monospace;
+    white-space:nowrap; }
+  #bar select { background:#20242E; color:var(--text); border:1px solid var(--line);
+    border-radius:4px; padding:6px 8px; font:600 12px Inter,sans-serif; }
+  #bar a { color:var(--muted); text-decoration:none; white-space:nowrap;
+    border:1px solid var(--line); border-radius:4px; padding:7px 10px;
+    font:600 12px Inter,sans-serif; }
+  #bar a:hover { color:var(--text); }
+  .maplibregl-ctrl-bottom-left { bottom:52px; }
+</style></head><body>
+<div id="map"></div>
+<div id="notice">loading session\u2026</div>
+<div id="hud" style="display:none">
+  <div><span class="big" id="h-mph">0</span><span class="unit">mph</span></div>
+  <div class="row"><span class="k">rpm</span><span id="h-rpm">\u2014</span></div>
+  <div class="row"><span class="k">lap</span><span id="h-lap">\u2014</span></div>
+  <div class="row"><span class="k">lap time</span><span id="h-lapt">\u2014</span></div>
+  <div class="row"><span class="k">altitude</span><span id="h-alt">\u2014</span></div>
+</div>
+<div id="legend">
+  <div class="li"><span class="sw" style="background:#FFB020"></span>lap you are driving</div>
+  <div class="li"><span class="sw" style="background:#6B7280"></span>rest of the session</div>
+  <div class="li" id="lg-ideal" style="display:none"><span class="sw" style="background:#6CD07A"></span>ideal line (fastest real lap)</div>
+  <div class="li" id="lg-you" style="display:none"><span class="sw" style="background:#4EA1FF"></span>your best line through it</div>
+  <div class="li"><span class="dot" style="background:#FF4D4D"></span>brake</div>
+  <div class="li"><span class="dot" style="background:#FFB020"></span>apex</div>
+  <div class="li"><span class="dot" style="background:#6CD07A"></span>back to throttle</div>
+</div>
+<div id="bar">
+  <button id="b-play">\u25b6 drive</button>
+  <input id="b-scrub" type="range" min="0" max="1000" value="0" step="1">
+  <span class="meta" id="b-clock">0:00 / 0:00</span>
+  <select id="b-rate" title="playback speed">
+    <option value="1">1\u00d7</option><option value="2">2\u00d7</option>
+    <option value="4">4\u00d7</option><option value="8">8\u00d7</option>
+    <option value="0.25">\u00bc\u00d7</option><option value="0.5">\u00bd\u00d7</option>
+  </select>
+  <label title="keep the camera behind the car"><input type="checkbox" id="b-follow" checked>follow</label>
+  <label title="satellite imagery on or off (black ground)"><input type="checkbox" id="b-sat">satellite</label>
+  <label title="real elevation from the DEM"><input type="checkbox" id="b-ter">terrain</label>
+  <label title="camera height">zoom <input id="b-zoom" type="range" min="13" max="19.5" step="0.1" value="17.4" style="width:110px;flex:0 0 110px"></label>
+  <a href="/review/__USER__/__FILE__">\u2190 pit wall</a>
+</div>
+<script>
+(function () {
+  "use strict";
+  var USER = "__USER__", FILE = "__FILE__";
+  var SAT = __MAP_TILES__, ATTRIB = __MAP_ATTRIB__, MAXZOOM = __MAP_MAXZOOM__;
+  var DEM = __MAP_DEM__, DEMZ = __MAP_DEM_MAXZOOM__;
+  var q = new URLSearchParams(location.search);
+  var pts = (q.get("pts") || "").split("|").map(function (s) {
+    return s.split(",").map(Number);
+  }).filter(function (a) { return a.length === 2 && isFinite(a[0]) && isFinite(a[1]); });
+  function el(id) { return document.getElementById(id); }
+  function notice(msg, err) {
+    var n = el("notice");
+    n.style.display = "block";
+    n.textContent = msg;
+    n.className = err ? "err" : "";
+  }
+  function hideNotice() { el("notice").style.display = "none"; }
+  if (!window.maplibregl) {
+    notice("3D engine failed to load (unpkg.com blocked?)", true);
+    return;
+  }
+  function pref(k, d) {
+    try { var v = localStorage.getItem(k); return v === null ? d : v === "1"; }
+    catch (e) { return d; }
+  }
+  function setPref(k, v) { try { localStorage.setItem(k, v ? "1" : "0"); } catch (e) {} }
+
+  // ---- geometry helpers ---------------------------------------------------
+  function hav(a, b) {
+    var R = 6371008.8, p = Math.PI / 180;
+    var dlat = (b[0] - a[0]) * p, dlon = (b[1] - a[1]) * p;
+    var la1 = a[0] * p, la2 = b[0] * p;
+    var h = Math.sin(dlat / 2) * Math.sin(dlat / 2) +
+            Math.cos(la1) * Math.cos(la2) * Math.sin(dlon / 2) * Math.sin(dlon / 2);
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+  function bearing(a, b) {
+    var p = Math.PI / 180;
+    var y = Math.sin((b[1] - a[1]) * p) * Math.cos(b[0] * p);
+    var x = Math.cos(a[0] * p) * Math.sin(b[0] * p) -
+            Math.sin(a[0] * p) * Math.cos(b[0] * p) * Math.cos((b[1] - a[1]) * p);
+    return (Math.atan2(y, x) / p + 360) % 360;
+  }
+  function fmtClock(s) {
+    s = Math.max(0, Math.round(s));
+    var m = Math.floor(s / 60);
+    return m + ":" + ("0" + (s % 60)).slice(-2);
+  }
+  function fmtLap(s) {
+    if (!isFinite(s) || s <= 0) return "\\u2014";
+    var m = Math.floor(s / 60), r = s - m * 60;
+    return (m ? m + ":" + (r < 10 ? "0" : "") : "") + r.toFixed(2);
+  }
+  function num(v, d) { return (typeof v === "number" && isFinite(v)) ? v.toFixed(d) : null; }
+
+  var satOn = pref("rc3.sat", true) && !!SAT;
+  var terOn = pref("rc3.ter", true) && !!DEM;
+  var follow = true, playing = false, rate = 1;
+  var zoom = 17.4, PITCH = 74, LOOKAHEAD_M = 22;
+
+  // ---- style: one background + optional imagery + optional terrain --------
+  var sources = {}, layers = [{
+    id: "bg", type: "background", paint: { "background-color": "#000000" }
+  }];
+  if (SAT) {
+    sources.sat = { type: "raster", tiles: [SAT], tileSize: 256,
+                    maxzoom: MAXZOOM, attribution: ATTRIB };
+    layers.push({ id: "sat", type: "raster", source: "sat",
+                  layout: { visibility: satOn ? "visible" : "none" } });
+  }
+  if (DEM) {
+    sources.dem = { type: "raster-dem", tiles: [DEM], tileSize: 256,
+                    encoding: "terrarium", maxzoom: DEMZ };
+  }
+  if (!SAT) { el("b-sat").disabled = true; el("b-sat").parentNode.style.opacity = 0.4; }
+  if (!DEM) { el("b-ter").disabled = true; el("b-ter").parentNode.style.opacity = 0.4; }
+  el("b-sat").checked = satOn;
+  el("b-ter").checked = terOn;
+
+  var map = new maplibregl.Map({
+    container: "map", style: { version: 8, sources: sources, layers: layers },
+    center: [-77.0, 39.0], zoom: zoom, pitch: PITCH, bearing: 0, maxPitch: 85,
+    attributionControl: { compact: true }
+  });
+  map.on("error", function (e) {
+    // Tile/CDN errors are common (offline, blocked host). Keep them in the
+    // console instead of throwing overlays over the view.
+    if (e && e.error) console.warn("[track3d]", e.error.message || e.error);
+  });
+
+  // Car marker: a canvas-drawn arrow (no glyph server needed). Wrapped so a
+  // missing 2d context degrades to "no car icon" instead of killing the view.
+  (function () {
+    var c = document.createElement("canvas");
+    c.width = c.height = 64;
+    var g = null;
+    try { g = c.getContext("2d"); } catch (e) { g = null; }
+    if (!g) return;
+    g.fillStyle = "#FFB020"; g.strokeStyle = "#1A1300"; g.lineWidth = 4;
+    g.beginPath(); g.moveTo(32, 5); g.lineTo(57, 57); g.lineTo(32, 45);
+    g.lineTo(7, 57); g.closePath(); g.fill(); g.stroke();
+    map.on("load", function () {
+      try { map.addImage("car-arrow", c, { pixelRatio: 2 }); } catch (e) {}
+    });
+  })();
+
+  // ---- session data -------------------------------------------------------
+  var S = [], T = [], BEAR = [], LAPS = [], lapOf = [], tEnd = 0;
+  var idx = 0, curTime = 0;
+
+  function buildTimeline() {
+    var first = null, i;
+    for (i = 0; i < S.length; i++) {
+      var s = S[i], v = null;
+      if (typeof s.t === "number" && isFinite(s.t)) v = s.t;
+      else if (typeof s.t_ms === "number" && isFinite(s.t_ms)) v = s.t_ms / 1000;
+      if (v !== null && first === null) first = v;
+      T.push(v);
+    }
+    if (first === null) {
+      for (i = 0; i < S.length; i++) T[i] = i / 25;
+    } else {
+      var last = first;
+      for (i = 0; i < T.length; i++) {
+        if (T[i] === null) T[i] = last; else last = T[i];
+        T[i] = T[i] - first;
+      }
+    }
+    tEnd = T.length ? T[T.length - 1] : 0;
+  }
+
+  function buildBearings() {
+    for (var i = 0; i < S.length; i++) {
+      var hdg = S[i].heading_deg;
+      // GPS heading is meaningless at rest, so derive the direction the car is
+      // actually travelling from the trace; fall back to the reported heading.
+      var a = null, b = null;
+      for (var k = i - 1; k >= Math.max(0, i - 60); k--) {
+        if (hav([S[i].lat, S[i].lon], [S[k].lat, S[k].lon]) > 3) { a = [S[k].lat, S[k].lon]; break; }
+      }
+      for (var j = i + 1; j <= Math.min(S.length - 1, i + 60); j++) {
+        if (hav([S[i].lat, S[i].lon], [S[j].lat, S[j].lon]) > 3) { b = [S[j].lat, S[j].lon]; break; }
+      }
+      if (a && b) BEAR[i] = bearing(a, b);
+      else if (i > 0) BEAR[i] = BEAR[i - 1];
+      else if (typeof hdg === "number" && isFinite(hdg)) BEAR[i] = hdg;
+      else BEAR[i] = 0;
+    }
+  }
+
+  function buildLaps() {
+    var i, L;
+    for (i = 0; i < S.length; i++) lapOf[i] = 0;   // 0 = out-lap / before S/F
+    for (var k = 0; k < LAPS.length; k++) {
+      L = LAPS[k];
+      for (i = 0; i < S.length; i++) {
+        if (T[i] >= L.t_start && T[i] <= L.t_end) lapOf[i] = L.lap;
+      }
+    }
+  }
+
+  function idxAt(t) {
+    var lo = 0, hi = T.length - 1;
+    while (lo < hi) {
+      var mid = (lo + hi + 1) >> 1;
+      if (T[mid] <= t) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+  }
+
+  // A point LOOKAHEAD_M metres down the trace from index i (the camera centres
+  // there so the car sits low in the frame, the road ahead filling the view).
+  function lookAhead(i, m) {
+    var d = 0;
+    for (var j = i + 1; j < S.length && j < i + 120; j++) {
+      d += hav([S[j - 1].lat, S[j - 1].lon], [S[j].lat, S[j].lon]);
+      if (d >= m) return [S[j].lat, S[j].lon];
+    }
+    return [S[i].lat, S[i].lon];
+  }
+
+  // Simple per-lap corner markers: apex = slowest point, brake = where the
+  // sustained deceleration into that apex began, throttle = where speed starts
+  // climbing again. Cheap, no server round-trip, and honest about what it is.
+  function lapMarkers() {
+    var out = [], cur = [], curLap = null, i;
+    for (i = 0; i <= S.length; i++) {
+      var lp = (i === S.length) ? null : lapOf[i];
+      if (cur.length && (lp === null || lp !== curLap)) {
+        if (cur.length > 20 && (curLap !== 0 || !LAPS.length)) {
+          var f = markersFor(cur);
+          if (f) out = out.concat(f);
+        }
+        cur = []; curLap = null;
+      }
+      if (lp === null) break;
+      if (curLap === null) curLap = lp;
+      cur.push(i);
+    }
+    return { type: "FeatureCollection", features: out };
+  }
+  function markersFor(idxs) {
+    var best = -1, bestMph = Infinity, i;
+    for (i = 0; i < idxs.length; i++) {
+      var mph = S[idxs[i]].speed_mph;
+      if (typeof mph !== "number" || !isFinite(mph)) continue;
+      if (mph < bestMph) { bestMph = mph; best = i; }
+    }
+    if (best < 0) return null;
+    var out = [], apex = idxs[best];
+    out.push(pt(apex, "apex"));
+    // walk back until the car was clearly faster and accelerating into here
+    var brake = -1;
+    for (i = best; i > 0; i--) {
+      var a = S[idxs[i]].speed_mph, b = S[idxs[i - 1]].speed_mph;
+      if (typeof a !== "number" || typeof b !== "number") break;
+      if (b <= a) { brake = i; break; }
+    }
+    if (brake >= 0 && brake < best) out.push(pt(idxs[brake], "brake"));
+    var thr = -1;
+    for (i = best + 1; i < idxs.length; i++) {
+      var c = S[idxs[i]].speed_mph;
+      if (typeof c !== "number" || !isFinite(c)) continue;
+      if (c > bestMph + 2) { thr = i; break; }
+    }
+    if (thr >= 0) out.push(pt(idxs[thr], "throttle"));
+    return out;
+  }
+  function pt(i, kind) {
+    return { type: "Feature", properties: { kind: kind },
+             geometry: { type: "Point", coordinates: [S[i].lon, S[i].lat] } };
+  }
+
+  function trackFeatures() {
+    var feats = [], cur = [], curLap = null, i;
+    for (i = 0; i < S.length; i++) {
+      var p = [S[i].lon, S[i].lat];
+      if (typeof S[i].lat !== "number" || (S[i].lat === 0 && S[i].lon === 0)) continue;
+      if (curLap === null) curLap = lapOf[i];
+      if (lapOf[i] !== curLap) {
+        if (cur.length > 1) feats.push(line(cur, curLap));
+        cur = []; curLap = lapOf[i];
+      }
+      cur.push(p);
+    }
+    if (cur.length > 1) feats.push(line(cur, curLap === null ? 0 : curLap));
+    return { type: "FeatureCollection", features: feats };
+  }
+  function line(coords, lap) {
+    return { type: "Feature", properties: { lap: lap },
+             geometry: { type: "LineString", coordinates: coords } };
+  }
+
+  function addLineLayers() {
+    map.addSource("traces", { type: "geojson", data: trackFeatures() });
+    map.addLayer({
+      id: "trace-all", type: "line", source: "traces",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": "#6B7280", "line-width": 2, "line-opacity": 0.55 }
+    });
+    map.addLayer({
+      id: "trace-lap", type: "line", source: "traces",
+      filter: ["==", ["get", "lap"], 0],
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: { "line-color": "#FFB020", "line-width": 4 }
+    });
+    var sf = LAPS.sf;
+    if (sf && typeof sf.lat1 === "number" && typeof sf.lat2 === "number" &&
+        (sf.lat1 || sf.lon1) && (sf.lat2 || sf.lon2)) {
+      map.addSource("sf", { type: "geojson", data: {
+        type: "Feature", geometry: { type: "LineString",
+          coordinates: [[sf.lon1, sf.lat1], [sf.lon2, sf.lat2]] } } });
+      map.addLayer({ id: "sf", type: "line", source: "sf",
+        paint: { "line-color": "#E6E8EE", "line-width": 3, "line-opacity": 0.9 } });
+    }
+    map.addSource("mk", { type: "geojson", data: lapMarkers() });
+    var mk = [["brake", "#FF4D4D"], ["apex", "#FFB020"], ["throttle", "#6CD07A"]];
+    for (var i = 0; i < mk.length; i++) {
+      map.addLayer({
+        id: "mk-" + mk[i][0], type: "circle", source: "mk",
+        filter: ["==", ["get", "kind"], mk[i][0]],
+        paint: { "circle-radius": 7, "circle-color": mk[i][1],
+                 "circle-stroke-color": "#000000", "circle-stroke-width": 2 }
+      });
+    }
+    map.addSource("car", { type: "geojson", data: {
+      type: "Feature", properties: { hdg: 0 },
+      geometry: { type: "Point", coordinates: [S[0].lon, S[0].lat] } } });
+    map.addLayer({
+      id: "car", type: "symbol", source: "car",
+      layout: { "icon-image": "car-arrow", "icon-size": 0.55,
+                "icon-rotate": ["get", "hdg"], "icon-rotation-alignment": "map",
+                "icon-allow-overlap": true, "icon-ignore-placement": true }
+    });
+  }
+
+  function setLapHighlight(lap) {
+    if (map.getLayer("trace-lap")) {
+      map.setFilter("trace-lap", ["==", ["get", "lap"], lap || 0]);
+    }
+  }
+
+  // ---- optional ideal / best lines from the lasso polygon -----------------
+  function addIdealLines() {
+    if (pts.length < 3) return;
+    fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) + "/lines", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ region: { points: pts } })
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (!j || !j.ok) return;
+      var add = function (id, color, width, tr) {
+        if (!tr || !tr.trace || tr.trace.length < 2) return;
+        map.addSource(id, { type: "geojson", data: {
+          type: "Feature", geometry: { type: "LineString",
+            coordinates: tr.trace.map(function (p) { return [p[1], p[0]]; }) } } });
+        map.addLayer({ id: id, type: "line", source: id,
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": color, "line-width": width, "line-opacity": 0.95 } });
+        var b = tr.brake;
+        if (b) map.addSource(id + "-b", { type: "geojson", data: {
+          type: "Feature", geometry: { type: "Point", coordinates: [b.lon, b.lat] } } });
+        if (b) map.addLayer({ id: id + "-b", type: "circle", source: id + "-b",
+          paint: { "circle-radius": 8, "circle-color": color,
+                   "circle-stroke-color": "#000000", "circle-stroke-width": 2 } });
+      };
+      var sameLap = j.ideal && j.your_best &&
+        (j.ideal.session === j.your_best.session) && (j.ideal.lap === j.your_best.lap);
+      add("ideal", "#6CD07A", 5, j.ideal);
+      if (!sameLap) add("you", "#4EA1FF", 4, j.your_best);
+      var any = map.getLayer("ideal");
+      if (any) el("lg-ideal").style.display = "flex";
+      if (map.getLayer("you")) el("lg-you").style.display = "flex";
+      notice("ideal line: lap " + (j.ideal ? j.ideal.lap : "?") +
+             (sameLap ? " (same as your best)" : " vs your best"));
+      setTimeout(hideNotice, 4000);
+    }).catch(function () {});
+  }
+
+  // ---- render loop --------------------------------------------------------
+  // The body is wrapped so a bad sample (or a missing layer during a style
+  // toggle) can never kill the animation loop: playback is what the driver is
+  // watching, and a frame that cannot draw must not stop the next one.
+  var renderErrLogged = false;
+  function render() {
+    try { renderBody(); }
+    catch (e) {
+      if (!renderErrLogged) {
+        renderErrLogged = true;
+        console.warn("[track3d] render:", e && e.message ? e.message : e);
+      }
+    }
+  }
+  function renderBody() {
+    var i = idx, s = S[i];
+    if (!s) return;
+    var hdg = BEAR[i];
+    if (map.getSource("car")) {
+      map.getSource("car").setData({
+        type: "Feature", properties: { hdg: hdg },
+        geometry: { type: "Point", coordinates: [s.lon, s.lat] }
+      });
+    }
+    el("h-mph").textContent = (typeof s.speed_mph === "number") ? Math.round(s.speed_mph) : "0";
+    el("h-rpm").textContent = (typeof s.rpm === "number") ? s.rpm : "\\u2014";
+    var lap = LAPS.filter(function (L) { return L.lap === lapOf[i]; })[0];
+    el("h-lap").textContent = lapOf[i] ? lapOf[i] : "out";
+    el("h-lapt").textContent = lap ? fmtLap(T[i] - lap.t_start) : "\\u2014";
+    el("h-alt").textContent = num(s.alt_m, 0) === null ? "\\u2014" : num(s.alt_m, 0) + " m";
+    if (follow) {
+      var la = lookAhead(i, LOOKAHEAD_M);
+      map.jumpTo({ center: [la[1], la[0]], bearing: hdg, pitch: PITCH, zoom: zoom });
+    }
+    setLapHighlight(lapOf[i]);
+    el("b-scrub").value = String(tEnd ? Math.round(1000 * curTime / tEnd) : 0);
+    el("b-clock").textContent = fmtClock(curTime) + " / " + fmtClock(tEnd);
+  }
+
+  var lastTs = 0;
+  function frame(ts) {
+    requestAnimationFrame(frame);   // scheduled FIRST so nothing below can stop it
+    if (!lastTs) lastTs = ts;
+    var dt = Math.min(0.25, (ts - lastTs) / 1000);
+    lastTs = ts;
+    if (playing && S.length) {
+      curTime += dt * rate;
+      if (curTime >= tEnd) { curTime = tEnd; playing = false; syncPlay(); }
+      var ni = idxAt(curTime);
+      if (ni !== idx) { idx = ni; }
+      render();
+    }
+  }
+
+  // ---- controls -----------------------------------------------------------
+  function syncPlay() {
+    el("b-play").textContent = playing ? "\\u23f8 pause" : "\\u25b6 drive";
+    el("b-play").className = playing ? "on" : "";
+  }
+  function seek(t) { curTime = Math.max(0, Math.min(tEnd, t)); idx = idxAt(curTime); render(); }
+
+  el("b-play").addEventListener("click", function () {
+    playing = !playing;
+    if (playing && curTime >= tEnd) curTime = 0;
+    syncPlay();
+  });
+  el("b-scrub").addEventListener("input", function () {
+    playing = false; syncPlay();
+    seek(tEnd * (Number(el("b-scrub").value) / 1000));
+  });
+  el("b-rate").addEventListener("change", function () { rate = Number(el("b-rate").value) || 1; });
+  el("b-follow").addEventListener("change", function () {
+    follow = el("b-follow").checked;
+    el("b-follow").parentNode.classList.toggle("on", follow);
+    if (follow) render();
+  });
+  el("b-sat").addEventListener("change", function () {
+    satOn = el("b-sat").checked; setPref("rc3.sat", satOn);
+    if (map.getLayer("sat")) map.setLayoutProperty("sat", "visibility", satOn ? "visible" : "none");
+  });
+  el("b-ter").addEventListener("change", function () {
+    terOn = el("b-ter").checked; setPref("rc3.ter", terOn);
+    applyTerrain();
+  });
+  el("b-zoom").addEventListener("input", function () {
+    zoom = Number(el("b-zoom").value); if (follow) render();
+  });
+  function applyTerrain() {
+    if (!DEM) return;
+    if (terOn) map.setTerrain({ source: "dem", exaggeration: 1.15 });
+    else map.setTerrain(null);
+  }
+  // Dragging means "I want to look around" — release the chase camera.
+  map.on("dragstart", function () {
+    if (follow) { follow = false; el("b-follow").checked = false; }
+  });
+  map.on("pitchend", function () { PITCH = map.getPitch(); });
+  map.on("zoomend", function () { zoom = map.getZoom(); el("b-zoom").value = String(zoom); });
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === " ") { ev.preventDefault(); el("b-play").click(); }
+    else if (ev.key === "ArrowRight") seek(curTime + 2);
+    else if (ev.key === "ArrowLeft") seek(curTime - 2);
+  });
+
+  // ---- boot ---------------------------------------------------------------
+  map.on("load", function () {
+    applyTerrain();
+    fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) +
+          "/data?target=30000")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        S = (d.samples || []).filter(function (s) {
+          return typeof s.lat === "number" && typeof s.lon === "number" &&
+                 (s.lat || s.lon) && Math.abs(s.lat) <= 90;
+        });
+        if (S.length < 10) { notice("no GPS fixes in this session", true); return; }
+        return fetch("/sessions/" + encodeURIComponent(USER) + "/" +
+                     encodeURIComponent(FILE) + "/laps")
+          .then(function (r) { return r.json(); })
+          .catch(function () { return {}; })
+          .then(function (lj) {
+            LAPS = (lj && lj.laps) || [];
+            buildTimeline();
+            buildBearings();
+            buildLaps();
+            addLineLayers();
+            addIdealLines();
+            hideNotice();
+            el("hud").style.display = "block";
+            curTime = 0; idx = 0;
+            render();
+            requestAnimationFrame(frame);
+          });
+      })
+      .catch(function (e) { notice("could not load session: " + e.message, true); });
+  });
+})();
+</script>
+</body></html>"""
+)
+
 _CAN_REVIEW_HTML = (
     """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>CAN \u00b7 __FILE__</title>
@@ -6268,6 +6969,27 @@ _REVIEW_HTML = (
   .card-body { padding: var(--sp-md); }
   #map { height: 560px; width: 100%; background: var(--bg); }
   .leaflet-container { background: var(--bg); }
+  /* Basemap switch: checkbox strip directly UNDER the map. Off = no tiles at
+     all, just a black surface — what you want when the imagery fights the
+     racing lines. Remembered per browser (localStorage, shared with the
+     lineview popout). */
+  #map.nosat { background: #000; }
+  #map.nosat .leaflet-control-attribution { display: none; }
+  .mapopts { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 8px var(--sp-md); border-top: 1px solid var(--line);
+    background: var(--surface); }
+  .mapchk { display: flex; align-items: center; gap: 8px; cursor: pointer;
+    font: 600 12px var(--ff-ui); color: var(--text); white-space: nowrap;
+    user-select: none; }
+  .mapchk input { width: 16px; height: 16px; margin: 0; cursor: pointer;
+    accent-color: var(--primary); }
+  .mapopts .hint { color: var(--muted); font-weight: 400; font-size: 11px; }
+  .mapopts .sep { width: 1px; height: 20px; background: var(--line); flex: 0 0 auto; }
+  a.mapbtn { display: inline-flex; align-items: center; gap: 6px;
+    background: var(--primary, #3B82F6); color: #fff; text-decoration: none;
+    border-radius: var(--r-md); padding: 7px 12px;
+    font: 600 12px var(--ff-ui); white-space: nowrap; cursor: pointer; }
+  a.mapbtn:hover { filter: brightness(1.08); }
   /* On-map key for the two cars: amber = the lap being viewed, red = the
      comparison lap (its ghost LINE + its dot). Sits inside #map, which Leaflet
      makes position:relative, so it overlays the tiles. */
@@ -6289,6 +7011,20 @@ _REVIEW_HTML = (
     font: 600 11px/1 var(--ff-ui); letter-spacing: 0.08em; text-transform: uppercase; }
   .tile .val.accent { color: var(--primary); }
   .tile .unit { color: var(--muted); font: 500 13px var(--ff-mono); margin-left: 4px; }
+  /* "all channels logged" table (v0.1.171) — every numeric telemetry key the
+     session actually carries, with n/min/avg/max. A missing row means the
+     source was not live, which is itself the diagnostic. */
+  .chtab { width: 100%; border-collapse: collapse; font: 500 12px var(--ff-mono); }
+  .chtab th { text-align: right; color: var(--muted); font: 600 10px var(--ff-ui);
+    letter-spacing: 0.08em; text-transform: uppercase; padding: 4px 6px;
+    border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .chtab th:first-child, .chtab td:first-child { text-align: left; }
+  .chtab td { text-align: right; padding: 3px 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    font-variant-numeric: tabular-nums; }
+  .chtab tr:hover td { background: rgba(255,255,255,0.03); }
+  .chtab td.ch-name { color: var(--text); }
+  .chtab td.ch-unit { color: var(--muted); }
 
   /* ---- scrub bar -------------------------------------------------- */
   .scrub { margin-top: var(--sp-md); padding: var(--sp-md); background: var(--surface);
@@ -6480,6 +7216,16 @@ _REVIEW_HTML = (
             <div class="dl-row dl-note" id="dl-note"></div>
           </div>
         </div>
+        <div id="mapopts" class="mapopts">
+          <label class="mapchk" for="opt-sat">
+            <input type="checkbox" id="opt-sat">
+            <span>Satellite view</span>
+          </label>
+          <span class="sep"></span>
+          <a id="map3d" class="mapbtn" target="_blank" href="/track3d/__USER__/__FILE__"
+             title="first-person 3D drive view — satellite imagery draped over real terrain, your driving line painted on the ground, brake/apex/throttle markers, chase camera">\u25b6 3D drive view</a>
+          <span class="hint">uncheck satellite for a plain black map \u00b7 3D follows the car from the seat</span>
+        </div>
       </div>
       <div class="tiles">
         <div class="tile full">
@@ -6535,6 +7281,13 @@ _REVIEW_HTML = (
                 <div class="v" id="v-gpeak">\u2014</div></div>
             </div>
           </div>
+        </div>
+        <div class="tile full">
+          <div class="label">All channels logged <span class="t-label" id="ch-note"></span></div>
+          <table class="chtab">
+            <thead><tr><th>channel</th><th>unit</th><th>n</th><th>min</th><th>avg</th><th>max</th></tr></thead>
+            <tbody id="chtab"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -6654,14 +7407,104 @@ _REVIEW_HTML = (
       ? (data.count + ' of ' + data.total + ' samples')
       : (data.count + ' samples');
 
+  // ---- every channel the session actually carries ------------------------
+  // The firmware logs all of its live sources (speed, rpm, coolant, oil,
+  // altitude, MAP, IAT, battery, CAN AFR, bench oil, IMU, throttle, timing
+  // advance, AEM AFR/lambda). Rather than one tile per channel this lists
+  // whatever is PRESENT with n/min/avg/max — a row that is missing tells you
+  // that source was not live (or is not wired), which is the useful answer.
+  (function () {
+    const UNITS = { speed_mph: 'mph', rpm: 'rpm', heading_deg: 'deg', alt_m: 'm',
+      coolant_f: 'F', oil_psi: 'psi', oil_can_psi: 'psi', afr: 'AFR', afr_can: 'AFR',
+      lambda: 'lambda', afr_v: 'mV', afr_status: '0-3', iat_f: 'F', map_kpa: 'kPa',
+      tps_pct: '%', spark_deg: 'deg BTDC', batt_v: 'V', ax: 'g', ay: 'g', az: 'g',
+      gx: 'deg/s', gy: 'deg/s', gz: 'deg/s', lap: '#' };
+    const NAMES = { speed_mph: 'speed', rpm: 'rpm', heading_deg: 'heading',
+      alt_m: 'altitude (GPS, MSL)', coolant_f: 'coolant',
+      oil_psi: 'oil pressure (direct ADC)', oil_can_psi: 'oil pressure (CAN)',
+      afr: 'AFR (AEM gauge)', afr_can: 'AFR (MS3 CAN)', lambda: 'lambda (AEM)',
+      afr_v: 'AFR gauge voltage', afr_status: 'AFR status',
+      iat_f: 'intake air temp', map_kpa: 'manifold pressure', tps_pct: 'throttle',
+      spark_deg: 'timing advance', batt_v: 'battery', lap: 'lap counter',
+      ax: 'accel x', ay: 'accel y', az: 'accel z',
+      gx: 'gyro x', gy: 'gyro y', gz: 'gyro z' };
+    // lat/lon/fix/sats have their own tiles; t is the clock.
+    const SKIP = { t: 1, t_ms: 1, lat: 1, lon: 1, fix: 1, sats: 1 };
+    const ORDER = ['speed_mph', 'rpm', 'heading_deg', 'alt_m', 'coolant_f', 'oil_psi',
+      'oil_can_psi', 'afr', 'afr_can', 'lambda', 'afr_v', 'afr_status', 'iat_f',
+      'map_kpa', 'tps_pct', 'spark_deg', 'batt_v', 'lap', 'ax', 'ay', 'az',
+      'gx', 'gy', 'gz'];
+    // lambda carries four decimals — rounding it to 1 makes every row read 1.0
+    const DEC = { lambda: 4, afr: 2, afr_can: 2, afr_v: 0, afr_status: 0, lap: 0,
+      rpm: 0, batt_v: 2, ax: 2, ay: 2, az: 2 };
+    const keys = [], seen = {};
+    for (const s of S) {
+      for (const k in s) {
+        if (SKIP[k] || seen[k]) continue;
+        if (typeof s[k] !== 'number') continue;   // null == sensor absent
+        seen[k] = 1; keys.push(k);
+      }
+    }
+    if (!keys.length) { el('ch-note').textContent = 'none in this session'; return; }
+    keys.sort(function (a, b) {
+      const ia = ORDER.indexOf(a), ib = ORDER.indexOf(b);
+      return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib) || a.localeCompare(b);
+    });
+    const tb = el('chtab');
+    let shown = 0;
+    for (const k of keys) {
+      let n = 0, mn = Infinity, mx = -Infinity, sum = 0;
+      for (const s of S) {
+        const v = s[k];
+        if (typeof v !== 'number' || !isFinite(v)) continue;
+        n++; sum += v; if (v < mn) mn = v; if (v > mx) mx = v;
+      }
+      if (!n) continue;
+      shown++;
+      const dc = DEC[k] == null ? 1 : DEC[k];
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td class="ch-name">' + (NAMES[k] || k) + '</td>' +
+        '<td class="ch-unit">' + (UNITS[k] || '') + '</td>' +
+        '<td>' + n + '</td><td>' + fmt(mn, dc) + '</td><td>' +
+        fmt(sum / n, Math.max(dc, 2)) + '</td><td>' + fmt(mx, dc) + '</td>';
+      tb.appendChild(tr);
+    }
+    el('ch-note').textContent = shown + ' channels \u00b7 n / min / avg / max';
+  })();
+
   // ---- Leaflet map (basemap from the server config; default = keyless Esri
   // imagery. CARTO's dark tiles now need an API key and would render a
   // "API KEY REQUIRED" placeholder here.) ---------------------------------
   const map = L.map('map', { zoomControl: true, attributionControl: true });
-  if (__MAP_TILES__) {
-    L.tileLayer(__MAP_TILES__, {
-      maxZoom: __MAP_MAXZOOM__, attribution: __MAP_ATTRIB__
-    }).addTo(map);
+  // ---- basemap on/off ---------------------------------------------------
+  // Satellite tiles, or nothing but a black surface. The checkbox lives in
+  // the strip directly under the map; the choice is remembered per browser.
+  // Tiles are an additive layer, so toggling never disturbs the trace
+  // polylines / lap markers / lasso polygon drawn on top of them.
+  const sat_chk = el('opt-sat');
+  let sat_layer = null;
+  function applySat(on) {
+    if (on && __MAP_TILES__ && !sat_layer) {
+      sat_layer = L.tileLayer(__MAP_TILES__, {
+        maxZoom: __MAP_MAXZOOM__, attribution: __MAP_ATTRIB__
+      }).addTo(map);
+    } else if (!on && sat_layer) {
+      map.removeLayer(sat_layer);
+      sat_layer = null;
+    }
+    document.getElementById('map').classList.toggle('nosat', !on);
+    if (sat_chk) sat_chk.checked = !!on;
+    try { localStorage.setItem('rc5.sat', on ? '1' : '0'); } catch (e) {}
+  }
+  if (!__MAP_TILES__) {
+    const mo = el('mapopts');
+    if (mo) mo.style.display = 'none';   // server ships no basemap at all
+  } else {
+    let sat_on = true;                   // default: satellite ON
+    try { sat_on = localStorage.getItem('rc5.sat') !== '0'; } catch (e) {}
+    if (sat_chk) sat_chk.addEventListener('change',
+      function () { applySat(sat_chk.checked); });
+    applySat(sat_on);
   }
 
   // Track centerline = all samples that have a valid lat/lon.
@@ -7586,6 +8429,19 @@ _REVIEW_HTML = (
       window.open('/lineview/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+
                   '?pts='+encodeURIComponent(enc), 'lineview',
                   'width=1200,height=850,menubar=no,toolbar=no');
+    });
+    // 3D drive view: the href alone (no polygon) is a whole-session drive.
+    // With a circled section we pass the SAME decimated polygon, so the 3D
+    // window can draw the ideal line / your best line on the ground next to
+    // the line you actually drove — the "us vs the computer" comparison.
+    el('map3d').addEventListener('click', (ev)=>{
+      if (pts.length<3) return;
+      ev.preventDefault();
+      const step = Math.max(1, Math.ceil(pts.length/50));
+      const enc = pts.filter((_,i)=> i%step===0 )
+                     .map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join('|');
+      window.open('/track3d/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+
+                  '?pts='+encodeURIComponent(enc), 'track3d');
     });
     document.querySelectorAll('.ai-preset').forEach(b=>{
       b.addEventListener('click', ()=>{ el('ai-prompt').value=b.dataset.q; ask(); });

@@ -183,6 +183,7 @@ Read at startup, so **`docker compose up -d` is enough — no `--build`**:
 | `RACECAR_MAP_TILES` | Esri `World_Imagery` | Tile URL template; empty = no basemap |
 | `RACECAR_MAP_ATTRIB` | `Imagery © Esri, Maxar, Earthstar Geographics` | Attribution shown in the corner |
 | `RACECAR_MAP_MAXZOOM` | `19` | Leaflet max zoom |
+| `RACECAR_MAP_DEM` | AWS `terrarium` tiles | Elevation for `/track3d`; `none` = flat ground |
 
 Dark map instead of imagery (keeps the old look; Esri's canvas basemaps have
 native data only to z16, so zooming past that upscales):
@@ -194,6 +195,33 @@ RACECAR_MAP_ATTRIB='Tiles (c) Esri'
 
 ⚠️ Esri tile paths are `/{z}/{y}/{x}` (row/col) — **not** `/{z}/{x}/{y}`.
 Swapping those two gives you a map of the wrong place, not an error.
+
+## 3D drive view (`/track3d/<user>/<file>`)
+
+Opened from the review page's **3D drive ↗** button (or copied straight out of
+the URL bar). It is the same session in the driver's seat: satellite imagery
+**draped over real terrain**, the line you drove painted on the ground, brake /
+apex / throttle markers, a HUD (mph, rpm, lap, lap time, altitude) and a chase
+camera that drives the trace on the same playback clock — play/pause,
+¼×–8×, scrub, zoom. Drag the map and the camera releases so you can look
+around; **follow** grabs it back.
+
+Layers are toggles on one map, so nothing is refetched when you flip them:
+**satellite** off = black ground (the lines read like a light table), **terrain**
+off = flat. Both choices are remembered per browser (`localStorage`). The same
+**satellite** checkbox sits under the map on the review page and on the lineview
+popout.
+
+The ground is raster imagery draped on a surface mesh — **not** photogrammetry:
+true 3D buildings/trees would need a keyed source such as Google Photorealistic
+3D Tiles. Elevation comes from `RACECAR_MAP_DEM` (keyless AWS `terrarium`),
+native to ~z15.
+
+Hand a lasso polygon over (`?pts=lat,lon|lat,lon|…`, which the review-page
+button does automatically when a section is circled) and the page also draws the
+**ideal line** (fastest real traverse on record, green) and **your session best
+through it** (blue) over the ground, with that lap's brake point — the
+"what I did vs what the data says is fastest" comparison, in the driver's view.
 
 ## AI corner analysis (review page)
 
