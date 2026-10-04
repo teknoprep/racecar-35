@@ -2593,9 +2593,11 @@ async def caps() -> dict:
     the browser may still be showing a cached page.
     `track3d_v` bumps when the 3D view itself changes materially, so a deploy is
     verifiable: 1 = the satellite/terrain variant, 2 = the DATA-ONLY driving
-    render (no imagery at all) + the map-strip lasso and the AI card cleanup."""
+    render (no imagery at all) + the map-strip lasso and the AI card cleanup,
+    3 = supersampled/anti-aliased render (no log depth buffer), clean kerb quads,
+    rounder markers, auto-recentring free look and the position mini-map."""
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 2}
+            "track3d_v": 3}
 
 
 def _zb_decode(data: bytes) -> bytes:
@@ -6829,6 +6831,10 @@ _TRACK3D_HTML = (
     font:500 11px Inter,sans-serif; white-space:nowrap; }
   #legend .dot { width:10px; height:10px; border-radius:50%; flex:0 0 auto; border:1.5px solid #000; }
   #legend .sw { width:22px; height:4px; border-radius:2px; flex:0 0 auto; }
+  /* plan view: where you are, and what is coming next */
+  #mini { position:absolute; right:14px; bottom:64px; z-index:10; display:none;
+    background:rgba(14,16,20,0.66); border:1px solid var(--line);
+    border-radius:10px; pointer-events:none; }
   #notice { position:absolute; left:50%; top:16px; transform:translateX(-50%); z-index:20;
     background:rgba(14,16,20,0.94); border:1px solid var(--line); border-radius:6px;
     padding:9px 15px; font:600 12px Inter,sans-serif; max-width:78vw; }
@@ -6874,6 +6880,7 @@ _TRACK3D_HTML = (
   <div class="li"><span class="dot" style="background:#FFB020"></span>apex</div>
   <div class="li"><span class="dot" style="background:#6CD07A"></span>throttle</div>
 </div>
+<canvas id="mini" width="200" height="200"></canvas>
 <div id="bar">
   <button id="b-play">▶ drive</button>
   <input id="b-scrub" type="range" min="0" max="1000" value="0" step="1" style="flex:1 1 150px;min-width:100px">
@@ -6895,6 +6902,8 @@ _TRACK3D_HTML = (
     <input id="b-road" type="range" min="6" max="24" step="1" value="12" style="width:74px"></label>
   <span class="sep"></span>
   <label><input type="checkbox" id="b-speedcol" checked>speed colour</label>
+  <label title="render scale: higher supersamples the view, which is what removes jagged/crawling edges. Pick 1x if the GPU struggles"><span class="meta">sharp</span>
+    <select id="b-scale"><option value="1">1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
   <label><input type="checkbox" id="b-markers" checked>markers</label>
   <label><input type="checkbox" id="b-ghost">other laps</label>
   <label><input type="checkbox" id="b-loop" checked>loop</label>
@@ -7234,30 +7243,81 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   };
 
   // Kerb blocks on both edges where the path curves, alternating red/white —
-  // this is what makes a data-only track read as a track.
+  // this is what makes a data-only track read as a track. One clean QUAD per
+  // block (aligned to the arc-length grid, one per edge), not per-centimetre
+  // triangles: chunky overlapping geometry was visibly ragged along the edges.
   RC3D.kerbs = function (path, width, blockM) {
-    var d = path.dense, n = d.x.length, i, side, e;
-    var pos = [], col = [], red = [0.85, 0.22, 0.22], white = [0.88, 0.90, 0.93];
-    var hw = width / 2, kw = 0.55, block = blockM || 3, half = 1.4;
+    var d = path.dense, n = d.x.length, i, side, base;
+    var pos = [], col = [], red = [0.82, 0.24, 0.24], white = [0.90, 0.91, 0.94];
+    var hw = width / 2, kw = 0.45, block = blockM || 2;
+    if (n < 4) return { position: new Float32Array(0), colour: new Float32Array(0), count: 0 };
+    var quad = function (x, z, nx, nz, tx, tz, half, c, y) {
+      var ox = nx * hw, oz = nz * hw;
+      var ix = nx * (hw + kw), iz = nz * (hw + kw);
+      var p = [
+        [x + ox - tx * half, z + oz - tz * half],
+        [x + ox + tx * half, z + oz + tz * half],
+        [x + ix + tx * half, z + iz + tz * half],
+        [x + ix - tx * half, z + iz - tz * half]
+      ];
+      // two triangles, consistent winding (double-sided material anyway)
+      [0, 1, 2, 0, 2, 3].forEach(function (k) {
+        pos.push(p[k][0], y, p[k][1]);
+        col.push(c[0], c[1], c[2]);
+      });
+    };
+    var blockNo = 0, lastBlock = -1;
     for (i = 1; i < n - 1; i++) {
+      base = Math.floor(d.s[i] / block);
+      if (base === lastBlock) continue;
+      lastBlock = base;
       var t0 = d.tan[i - 1], t1 = d.tan[i + 1];
-      if (Math.abs(t0[0] * t1[1] - t0[1] * t1[0]) < 0.0015) continue;   // straights clean
+      // curvature over the block: skip the straights entirely
+      if (Math.abs(t0[0] * t1[1] - t0[1] * t1[0]) < 0.0016) { blockNo++; continue; }
+      var c = (blockNo % 2) ? red : white;
+      blockNo++;
       var tx = d.tan[i][0], tz = d.tan[i][1], nx = -tz, nz = tx;
-      var x = d.x[i], y = d.y[i] + 0.05, z = d.z[i];
-      var c = (Math.floor(d.s[i] / block) % 2) ? red : white;
       for (side = -1; side <= 1; side += 2) {
-        var bx = x + nx * side * hw, bz = z + nz * side * hw;              // inner edge
-        var ix = x + nx * side * (hw + kw), iz = z + nz * side * (hw + kw); // outer edge
-        for (e = -1; e <= 1; e += 2) {
-          var ax = (e < 0 ? bx : ix), az = (e < 0 ? bz : iz);
-          pos.push(ax, y, az,
-                   bx + tx * half * e, y, bz + tz * half * e,
-                   ix + tx * half * e, y, iz + tz * half * e);
-          col.push(c[0], c[1], c[2], c[0], c[1], c[2], c[0], c[1], c[2]);
-        }
+        quad(d.x[i], d.z[i], nx * side, nz * side, tx, tz, block / 2,
+             c, d.y[i] + 0.045);
       }
     }
     return { position: new Float32Array(pos), colour: new Float32Array(col), count: pos.length / 3 };
+  };
+
+  // One consistent answer to "where am I right now": the camera pose, the
+  // surface point, the speed and the lap progress, all from the same instant.
+  // The renderer, the HUD and the mini-map all read THIS, so they cannot
+  // disagree about the car's position.
+  RC3D.frameState = function (path, tNow, lap, opt) {
+    opt = opt || {};
+    var tEnd = path.t.length ? path.t[path.t.length - 1] : 0;
+    var tA = lap ? lap.t_start : 0;
+    var tB = lap ? lap.t_end : tEnd;
+    if (!(tB > tA)) tB = tA + 1;
+    var t = Math.max(tA, Math.min(tB, tNow));
+    var s = RC3D.sAtTime(path, t);
+    var pos = RC3D.pointAtS(path, s);
+    var mph = RC3D.mphAtS(path, s);
+    var latG = opt.bank === false ? 0 : RC3D.latAccel(path, s, mph);
+    var pose = RC3D.cameraPose(path, s, mph, { eye: opt.eye, latG: latG,
+                                               bank: opt.bank !== false });
+    return { t: t, s: s, mph: mph, pos: pos, eye: pose.eye, target: pose.target,
+             roll: pose.roll, lead: pose.lead, latG: latG,
+             progress: Math.max(0, Math.min(1, (t - tA) / (tB - tA))) };
+  };
+
+  // Free-look decay: the mouse gives a temporary look-around, and it eases back
+  // to straight-ahead so the view can never be silently left pointing somewhere
+  // other than where the car is going (the "it doesn't follow me" trap).
+  RC3D.recentreLook = function (look, dt, on) {
+    if (!on) return look;
+    var k = Math.max(0, 1 - dt * 3.5);
+    look.yaw *= k;
+    look.pitch *= k;
+    if (Math.abs(look.yaw) < 1e-4) look.yaw = 0;
+    if (Math.abs(look.pitch) < 1e-4) look.pitch = 0;
+    return look;
   };
 
   RC3D.indexOfTime = function (t, target) {
@@ -7335,9 +7395,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   /* =======================================================================
      2. RENDER LAYER (three.js)
      ======================================================================= */
-  var renderer, scene, camera, canvas, ground;
-  var playing = false, rate = 1, loopLap = true, bank = true;
-  var S = [], PATH = null, LAPS = [], LAPNO = 0;
+  var renderer, scene, camera, canvas, ground, mini, miniCtx;
+  var playing = false, rate = 1, loopLap = true, bank = true, freeLook = false;
+  var scale = 1.5;                       // supersample factor (set on boot)
+  var S = [], PATH = null, BASE = null, LAPS = [], LAPNO = 0;
   var TA = 0, TB = 0, NOW = 0, SMIN = 0, SMAX = 0, cur = null;
   var meshes = { road: null, kerbs: null, markers: null, ghost: null, ideal: null, gantry: null };
   var look = { yaw: 0, pitch: 0 };
@@ -7346,8 +7407,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   function tryRenderer() {
     try {
       canvas = el("view");
+      // antialias:true is MSAA. NOTE: a logarithmic depth buffer (which this
+      // scene does not need — everything sits within ~50 m of the camera) makes
+      // several drivers cut MSAA and shimmer badly, so it is deliberately off.
       renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true,
-        logarithmicDepthBuffer: true });
+                                           powerPreference: "high-performance" });
       return true;
     } catch (e) {
       notice("this browser cannot do WebGL — the 3D drive view needs it", true);
@@ -7377,8 +7441,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     scene = new THREE.Scene();
     var sky = skyTexture();
     scene.background = sky || new THREE.Color(0x0A1220);
-    scene.fog = new THREE.Fog(0x1E2C3A, 220, 1400);
-    camera = new THREE.PerspectiveCamera(68, 1, 0.3, 6000);
+    scene.fog = new THREE.Fog(0x1E2C3A, 200, 1200);
+    camera = new THREE.PerspectiveCamera(68, 1, 0.25, 3000);
     scene.add(new THREE.HemisphereLight(0xC3D6E8, 0x191C21, 1.1));
     var sun = new THREE.DirectionalLight(0xFFFFFF, 0.7);
     sun.position.set(-1, 2.4, 0.6);
@@ -7448,11 +7512,14 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var colours = { brake: 0xFF4D4D, apex: 0xFFB020, throttle: 0x6CD07A };
     list.forEach(function (mk) {
       var c = colours[mk.kind] || 0xFFFFFF;
-      var cone = new THREE.Mesh(new THREE.ConeGeometry(0.6, 1.6, 12),
-                                new THREE.MeshLambertMaterial({ color: c }));
+      // 20-sided cones + a touch of emissive: faceted, dark-shaded cones were
+      // reading as aliased blobs at speed.
+      var cone = new THREE.Mesh(new THREE.ConeGeometry(0.6, 1.6, 20),
+                                new THREE.MeshLambertMaterial({ color: c,
+                                  emissive: c, emissiveIntensity: 0.35 }));
       cone.position.set(mk.x, mk.y + 0.8, mk.z);
       grp.add(cone);
-      var pole = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 8, 8),
+      var pole = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 8, 10),
                                 new THREE.MeshBasicMaterial({ color: c }));
       pole.position.set(mk.x, mk.y + 4, mk.z);
       grp.add(pole);
@@ -7528,6 +7595,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       if (!PATH) return;
       var L = lapObj(LAPNO), base = PATH, sub = null;
       if (L) { sub = slicePath(PATH, L.t_start, L.t_end); if (sub) base = sub; }
+      BASE = base;
       meshes.road = makeRoad(base, opts.road, 0.03, opts.speedColour, null, 1);
       scene.add(meshes.road);
       meshes.kerbs = makeKerbs(base, opts.road);
@@ -7558,7 +7626,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   function resize() {
     var w = canvas.clientWidth || window.innerWidth;
     var h = canvas.clientHeight || (window.innerHeight - 52);
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    // Supersampling: this scene is a few thousand triangles, so rendering above
+    // the CSS resolution is cheap and it is what actually removes the crawling
+    // edges (MSAA alone leaves thin, high-contrast ribbon edges sparkling).
+    renderer.setPixelRatio(scale * Math.min(2, window.devicePixelRatio || 1));
     renderer.setSize(w, h, false);
     camera.aspect = w / Math.max(1, h);
     camera.updateProjectionMatrix();
@@ -7566,38 +7637,99 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 
   function render() {
     if (!PATH) return;
-    var s = Math.max(SMIN, Math.min(SMAX, RC3D.sAtTime(PATH, NOW)));
-    var mph = RC3D.mphAtS(PATH, s);
-    var pose = RC3D.cameraPose(PATH, s, mph, {
-      eye: opts.eye, latG: bank ? RC3D.latAccel(PATH, s, mph) : 0, bank: bank
-    });
-    var eye = new THREE.Vector3(pose.eye.x, pose.eye.y, pose.eye.z);
-    var tgt = new THREE.Vector3(pose.target.x, pose.target.y, pose.target.z);
+    var L = lapObj(LAPNO);
+    var st = RC3D.frameState(PATH, NOW, L, { eye: opts.eye, bank: bank });
+    var eye = new THREE.Vector3(st.eye.x, st.eye.y, st.eye.z);
+    var tgt = new THREE.Vector3(st.target.x, st.target.y, st.target.z);
     if (look.yaw || look.pitch) {
+      // temporary look-around: rotate the aim, the eye stays on the car
       var dir = tgt.clone().sub(eye).normalize();
       dir.applyEuler(new THREE.Euler(0, look.yaw, 0));
       dir.y += look.pitch;
-      tgt = eye.clone().add(dir.normalize().multiplyScalar(pose.lead));
+      tgt = eye.clone().add(dir.normalize().multiplyScalar(st.lead));
     }
     camera.position.copy(eye);
     camera.up.set(0, 1, 0);
     camera.lookAt(tgt);
-    if (pose.roll) camera.rotateZ(pose.roll);
-    camera.fov = Math.max(60, Math.min(84, 66 + mph * 0.09));
+    if (st.roll) camera.rotateZ(st.roll);
+    camera.fov = Math.max(60, Math.min(84, 66 + st.mph * 0.09));
     camera.updateProjectionMatrix();
     renderer.render(scene, camera);
 
-    var L = lapObj(LAPNO);
-    el("h-mph").textContent = Math.round(mph);
+    el("h-mph").textContent = Math.round(st.mph);
     el("h-rpm").textContent = (cur && typeof cur.rpm === "number") ? cur.rpm : "—";
     el("h-lap").textContent = LAPNO ? LAPNO : "whole session";
     el("h-lapt").textContent = L ? fmtLap(NOW - L.t_start) : fmtLap(NOW);
     el("h-best").textContent = L && L.seconds ? fmtLap(L.seconds) : "—";
     el("h-alt").textContent = (cur && typeof cur.alt_m === "number")
       ? Math.round(cur.alt_m) + " m" : "—";
-    el("h-bar").style.width = Math.min(100, (mph / 160) * 100) + "%";
+    el("h-bar").style.width = Math.min(100, (st.mph / 160) * 100) + "%";
     el("b-clock").textContent = fmtClock(NOW - TA) + " / " + fmtClock(TB - TA);
     el("b-scrub").value = String(TB > TA ? Math.round(1000 * (NOW - TA) / (TB - TA)) : 0);
+    drawMini(st.s);
+  }
+
+  /* ---- mini-map: an unambiguous "you are HERE" ---------------------------
+     The chase camera already puts you on the line, but a small plan view makes
+     the position, the lap direction and what is coming next obvious — and it
+     proves at a glance that what is being drawn IS the lap you are driving. */
+  var miniFit = null;
+  function miniPrepare() {
+    var base = BASE || PATH;
+    if (!base) return;
+    var d = base.dense, i;
+    var minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (i = 0; i < d.x.length; i++) {
+      if (d.x[i] < minX) minX = d.x[i];
+      if (d.x[i] > maxX) maxX = d.x[i];
+      if (d.z[i] < minZ) minZ = d.z[i];
+      if (d.z[i] > maxZ) maxZ = d.z[i];
+    }
+    if (!isFinite(minX)) return;
+    miniFit = { minX: minX, minZ: minZ, w: Math.max(1, maxX - minX),
+                h: Math.max(1, maxZ - minZ), base: base };
+  }
+  function drawMini(s) {
+    if (!miniCtx || !miniFit || !PATH) return;
+    var W = mini.width, H = mini.height, pad = 8;
+    var k = Math.min((W - pad * 2) / miniFit.w, (H - pad * 2) / miniFit.h);
+    var ox = (W - miniFit.w * k) / 2, oz = (H - miniFit.h * k) / 2;
+    var px = function (x) { return ox + (x - miniFit.minX) * k; };
+    var pz = function (z) { return oz + (z - miniFit.minZ) * k; };
+    var d = miniFit.base.dense, i;
+    miniCtx.clearRect(0, 0, W, H);
+    miniCtx.lineWidth = 3;
+    miniCtx.strokeStyle = "#3A4150";
+    miniCtx.beginPath();
+    for (i = 0; i < d.x.length; i += 3) {
+      if (i === 0) miniCtx.moveTo(px(d.x[i]), pz(d.z[i]));
+      else miniCtx.lineTo(px(d.x[i]), pz(d.z[i]));
+    }
+    miniCtx.stroke();
+    var sf = LAPS.sf;
+    if (sf && typeof sf.lat1 === "number" && typeof sf.lat2 === "number") {
+      var a = RC3D.project(sf.lat1, sf.lon1, PATH.o);
+      var b = RC3D.project(sf.lat2, sf.lon2, PATH.o);
+      miniCtx.strokeStyle = "#E6E8EE";
+      miniCtx.lineWidth = 2;
+      miniCtx.beginPath();
+      miniCtx.moveTo(px(a.x), pz(a.z));
+      miniCtx.lineTo(px(b.x), pz(b.z));
+      miniCtx.stroke();
+    }
+    var p = RC3D.pointAtS(PATH, s);
+    var hdg = p.tan;
+    miniCtx.fillStyle = "#FFB020";
+    miniCtx.beginPath();
+    miniCtx.arc(px(p.x), pz(p.z), 5, 0, Math.PI * 2);
+    miniCtx.fill();
+    // a short heading whisker so the direction of travel is obvious
+    miniCtx.strokeStyle = "#FFB020";
+    miniCtx.lineWidth = 3;
+    miniCtx.beginPath();
+    miniCtx.moveTo(px(p.x), pz(p.z));
+    miniCtx.lineTo(px(p.x + hdg[0] * 14), pz(p.z + hdg[1] * 14));
+    miniCtx.stroke();
   }
 
   function advance(dt) {
@@ -7623,6 +7755,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     lastTs = ts;
     if (!PATH) return;
     if (playing) advance(dt);
+    RC3D.recentreLook(look, dt, !freeLook);
     try { render(); }
     catch (e) {
       if (!frame.warned) { frame.warned = true; console.warn("[track3d] render:", e && e.message ? e.message : e); }
@@ -7636,7 +7769,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     TB = L ? L.t_end : (PATH.t[PATH.t.length - 1] || 0);
     if (!(TB > TA)) TB = TA + 1;
     NOW = TA;
+    look.yaw = 0; look.pitch = 0;      // a lap change always re-centres the view
     rebuild();
+    miniPrepare();
     render();
   }
 
@@ -7701,10 +7836,22 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     });
     el("b-loop").addEventListener("change", function () { loopLap = el("b-loop").checked; });
     el("b-bank").addEventListener("change", function () { bank = el("b-bank").checked; });
+    if (el("b-scale")) {
+      el("b-scale").value = String(scale);
+      el("b-scale").addEventListener("change", function () {
+        scale = Number(el("b-scale").value) || 1;
+        resize();
+      });
+    }
 
     var dragging = false, lx = 0, ly = 0;
-    canvas.addEventListener("mousedown", function (e) { dragging = true; lx = e.clientX; ly = e.clientY; });
-    window.addEventListener("mouseup", function () { dragging = false; });
+    canvas.addEventListener("mousedown", function (e) {
+      dragging = true; freeLook = true; lx = e.clientX; ly = e.clientY;
+    });
+    window.addEventListener("mouseup", function () {
+      // released -> the view eases back to following the car by itself
+      dragging = false; freeLook = false;
+    });
     window.addEventListener("mousemove", function (e) {
       if (!dragging) return;
       look.yaw -= (e.clientX - lx) * 0.004;
@@ -7751,6 +7898,12 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   function start() {
     if (!tryRenderer()) return;
     buildScene();
+    // supersample by default: 1.5x on a standard display, 2x on a hi-dpi one.
+    // The scene is a few thousand triangles, so this is cheap and it is the
+    // difference between "jagged everywhere" and a clean edge.
+    scale = Math.min(2, Math.max(1.5, window.devicePixelRatio || 1));
+    mini = el("mini");
+    if (mini) { try { miniCtx = mini.getContext("2d"); } catch (e) { miniCtx = null; } }
     resize();
     wire();
     fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) +
@@ -7772,6 +7925,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
             fillLapSelect();
             hideNotice();
             el("hud").style.display = "block";
+            if (el("mini")) el("mini").style.display = "block";
             setLap(Number(el("b-lap").value) || 0);
             addIdeal();
             playing = true;

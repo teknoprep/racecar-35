@@ -247,7 +247,48 @@ R.markers = (function () {
            y: mk.map(function (m) { return +m.y.toFixed(4); }).join(",") };
 })();
 
-// 10. altitude is referenced to the session minimum (no floating track)
+// 10a. "where am I" — the single frameState the camera, HUD and mini-map all
+//      read must put the camera ON the car for every instant of the lap, and lap
+//      progress must run 0 -> 1 monotonically. This is exactly what "the view
+//      doesn't follow me" looks like when it breaks.
+R.follow = (function () {
+  var lap = { lap: 1, t_start: 4, t_end: 20, seconds: 16 };
+  var worst = 0, back = 0, prev = -1, prog0 = null, prog1 = null;
+  for (var k = 0; k <= 400; k++) {
+    var t = lap.t_start + (lap.t_end - lap.t_start) * (k / 400);
+    var st = RC3D.frameState(path, t, lap, { eye: 1.15 });
+    // the camera's ground position must be the path at that time
+    var near = 1e9;
+    for (var i = 0; i < path.cum.length; i += 5) {
+      var p = RC3D.pointAtS(path, path.cum[i]);
+      var d = Math.hypot(p.x - st.pos.x, p.z - st.pos.z);
+      if (d < near) near = d;
+    }
+    if (near > worst) worst = near;
+    if (k === 0) prog0 = st.progress;
+    if (k === 400) prog1 = st.progress;
+    if (st.progress < prev - 1e-9) back++;
+    prev = st.progress;
+  }
+  // a time outside the lap clamps INTO the lap rather than leaving the driver
+  var before = RC3D.frameState(path, 0, lap, {});
+  var after = RC3D.frameState(path, 1e6, lap, {});
+  return { worst: worst, back: back, prog0: prog0, prog1: prog1,
+           clampStart: before.t, clampEnd: after.t,
+           eye: RC3D.frameState(path, 10, lap, { eye: 1.15 }).eye.y -
+                RC3D.frameState(path, 10, lap, { eye: 1.15 }).pos.y };
+})();
+
+// 10b. free look eases back on its own, so the view cannot be left pointing
+//      away from the car (the other half of "it doesn't follow me")
+R.recentre = (function () {
+  var lk = { yaw: 0.4, pitch: -0.3 }, i;
+  var held = RC3D.recentreLook({ yaw: 0.4, pitch: -0.3 }, 0.05, false);
+  for (i = 0; i < 120; i++) RC3D.recentreLook(lk, 1 / 60, true);
+  return { heldYaw: held.yaw, yaw: lk.yaw, pitch: lk.pitch };
+})();
+
+// 11. altitude is referenced to the session minimum (no floating track)
 R.alt = (function () {
   var s = circle(400, 100, { alt: true });
   var p = RC3D.buildPath(s, { smooth: 5 });
@@ -279,6 +320,12 @@ class Track3DMathTests(unittest.TestCase):
         self.assertIn("first-person DRIVING view, rendered from DATA ONLY", html)
         for banned in ("World_Imagery", "tileLayer", "maplibre", "raster-dem", "arcgisonline"):
             self.assertNotIn(banned, html, f"/track3d must not pull {banned}")
+        # smoothness: MSAA on, supersampling available, and NO logarithmic depth
+        # buffer (several drivers drop MSAA with one, which shimmers)
+        self.assertIn("antialias: true", html)
+        self.assertNotIn("logarithmicDepthBuffer", html)
+        self.assertIn("setPixelRatio(scale", html)
+        self.assertIn('id="b-scale"', html)
 
         # --- extract the module and drive the real RC3D layer ----------------
         import re
@@ -376,7 +423,24 @@ class Track3DMathTests(unittest.TestCase):
         self.assertIn("apex", res["markers"]["kinds"])
         self.assertGreaterEqual(res["markers"]["n"], 2)
 
-        # 10. altitude referenced to the session minimum so the ribbon sits on
+        # 10a. the camera is ON the car at every instant of the lap, and lap
+        #      progress runs 0 -> 1 monotonically
+        f = res["follow"]
+        self.assertLess(f["worst"], 3.0, "camera is not on the driven line")
+        self.assertEqual(f["back"], 0, "lap progress must not run backwards")
+        self.assertLess(f["prog0"], 0.02)
+        self.assertGreater(f["prog1"], 0.98)
+        self.assertAlmostEqual(f["clampStart"], 4.0, places=3)   # clamped into the lap
+        self.assertAlmostEqual(f["clampEnd"], 20.0, places=3)
+        self.assertAlmostEqual(f["eye"], 1.15, places=3)
+
+        # 10b. look-around eases back so the view can never be left behind
+        rc = res["recentre"]
+        self.assertAlmostEqual(rc["heldYaw"], 0.4, places=6)     # held while dragging
+        self.assertLess(abs(rc["yaw"]), 0.02, "free look did not recentre")
+        self.assertLess(abs(rc["pitch"]), 0.02)
+
+        # 11. altitude referenced to the session minimum so the ribbon sits on
         #     the ground plane instead of floating at MSL
         self.assertAlmostEqual(res["alt"]["min"], 0.0, places=3)
         self.assertGreater(res["alt"]["max"], 5)
