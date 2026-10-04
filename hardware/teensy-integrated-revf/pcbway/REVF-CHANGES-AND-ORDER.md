@@ -6,11 +6,20 @@ settings against the new Gerbers and BOM**, which are in this folder.
 
 ## 1. NEW: the CAN transceiver is ON THE BOARD (`J7` and its module are deleted)
 
-On the bench the external SN65HVD230 plug-in module that was going to be fitted at `J7`
-**received but never drove the bus**: with `TXD` held at 0 V, `CANH-CANL` measured 0 V, so
-the logger never ACKed and the ECU retransmitted one frame forever. **Delete `J7` and do
-not fit any CAN module.** It is replaced by a soldered transceiver whose mode pin is
-hard-wired to normal mode:
+On the bench the external module that was going to be fitted at `J7` **received but never
+drove the bus**: it never ACKed, so the sender retransmitted ~3,800 identical frames/s.
+**The root cause was NOT the transceiver concept — the module was mislabelled.** Sold as an
+"SN65HVD230", it carries a **TJA1051T/3-class** chip (same footprint, different pins): pin 3
+VCC needs **5 V** (the driver locks out below 4.5 V), pin 5 is **VIO** not Vref, pin 8 is
+**S/standby**. Driven the SN65HVD230 way — VCC 3.3 V, pin 5 floating, pin 8 floating — the
+driver was locked out and floating VIO was phantom-fed from TXD (~2.1 V), so RXD collapsed
+whenever TXD went low; every Teensy-side self-test still looked like a working transmitter.
+Rewired VCC 5 V / pin 5 3.3 V / pin 8 GND it ran at exactly 200 frames/s, both ids, 0
+errors. Full analysis: `../../CAN-TRANSCEIVER-FINDINGS-2026-10-04.md`.
+
+**Delete `J7` and do not fit any CAN module.** A plug-in board can carry the wrong chip and
+be wired three ways wrong; the soldered transceiver below has its supplies and mode pin
+hard-wired, so none of that can happen.
 
 | Ref | Function | MPN | Manufacturer |
 |---|---|---|---|
@@ -24,15 +33,24 @@ hard-wired to normal mode:
 | C52 | 4.7 nF 50 V X7R 0805, termination midpoint | `CL21B472KBANNNC` | Samsung |
 
 `U21` pin 8 (`STB`) is tied **directly to GND with no resistor** — `STB` high is standby /
-receive-only, which is exactly the failure being removed. `J14` is **1 CANH / 2 CANL /
+receive-only, never ACKs. `J14` is **1 CANH / 2 CANL /
 3 GND**. The split termination (`R58`+`R59` = 120.8 Ω across the pair, `C52` from the
 midpoint to GND) is enabled by the `JP2` shunt and **must only be fitted when this board
 is an end of the bus**. `TP6`/`TP7` are `CAN_TX`/`CAN_RX` test points, and the former
 CAN-module header `J7` is gone from the Gerbers, CPL and BOM.
 
 Orderable alternates for U21, in order: `TCAN1042VDRQ1`, then NXP `TJA1051T/3/1J` (its
-pin 8 `S` must also go to GND). **Do not substitute an SN65HVD230** (±4/+16 V bus fault)
-or a non-VIO TJA1051T/TJA1050 (5 V RXD would damage the 3.3 V Teensy).
+pin 8 `S` must also go to GND).
+
+⚠️ **No unapproved substitution of U21.** Order `TCAN1042HGVDRQ1` from **authorized
+distribution only** (TI / Mouser / Digi-Key / LCSC-original) and do **not** substitute
+without written approval — no clones, no re-marked parts. The **`V` suffix is mandatory**:
+`TCAN1042DRQ1` / `TCAN1042HDRQ1` / `TCAN1042GDRQ1` have **pin 5 = NC**, which puts 5 V on
+Teensy pin 23 and destroys it. **Never** an SN65HVD23x, a plain `TJA1051T` (no `/3`), a
+`TJA1050`, or any "pin-compatible" equivalent.
+
+This applies because the bench failure was a **mislabelled part** (a TJA1051T/3-class chip
+sold as an SN65HVD230): correct marking is the whole defence here.
 
 All eight new lines are standard **LCSC / TI / onsemi / Phoenix Contact / Samtec / Yageo /
 Murata / Samsung** stock parts — no consignment and no customer-supplied module, exactly

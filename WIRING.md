@@ -237,6 +237,42 @@ the screen's WiFi address/status.
 
 ---
 
+## 7b. CAN transceiver — MS3Pro / bench (Teensy CAN1, pins 22 / 23)
+
+The Teensy's `FlexCAN1` is on **pin 22 (CTX/TX) and pin 23 (CRX/RX)**. Wiring the module
+to those pins is trivial; **powering it correctly is what has bitten us**, so read this
+before wiring any plug-in board.
+
+### The Amazon "SN65HVD230" modules are mislabelled
+
+The "3-Pack SN65HVD230 CAN Transceiver Module" (ASIN B0FDLDXCK9) carries a SOIC-8 that
+behaves as a **TJA1051T/3-class** part. Same footprint as an SN65HVD230, different pin
+meanings. Bench-verified 2026-10-04 — see `hardware/CAN-TRANSCEIVER-FINDINGS-2026-10-04.md`.
+
+| Module pin | If it were an SN65HVD230 | What the fitted chip needs |
+| --- | --- | --- |
+| 3 (VCC) | 3.3 V | **5 V** — below 4.5 V the transmitter is locked out |
+| 5 | Vref — leave floating | **VIO = 3.3 V** — floating it phantom-feeds RXD from TXD (~2.1 V) |
+| 8 | Rs | **S / standby → GND** — high means receive-only, no ACK |
+
+**Correct bench wiring: `VCC = 5 V`, pin 5 = `3.3 V`, pin 8 = `GND`**, plus of course
+`TXD → pin 22`, `RXD → pin 23`, `CANH`/`CANL` to the bus, common ground, 120 Ω at the
+ends. Wrong wiring gives the exact "receives but never ACKs" symptom: ~3,800 identical
+frames/s retransmitted. Correct wiring gives ~200 frames/s at a 100 Hz feed, both IDs,
+0 errors.
+
+⚠️ Never put **3.3 V on VCC**, and never put **5 V on pin 5**.
+
+### On Rev F the transceiver is on the board
+
+Rev F (and later) has a soldered **`U21` = TI `TCAN1042HGV-Q1`** — VCC = `+5V_MAIN`,
+VIO = `+3V3_MCU`, STB tied to GND. There is no module to wire. Because `VIO` is the
+Teensy's own 3.3 V rail, **CAN needs both `J1` (12 V, for the 5 V buck) and the Teensy
+seated**; on Teensy-USB power alone VCC = 0 and CAN re-shows the same "no ACK" symptom.
+That is not a fault. Acceptance tests: `hardware/teensy-integrated-revf/design/BRINGUP.md`.
+
+---
+
 ## 8. SD card
 
 The Teensy 4.1 has a **built-in SDIO socket** on the back of the board.

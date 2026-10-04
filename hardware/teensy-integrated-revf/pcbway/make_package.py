@@ -55,6 +55,12 @@ FIXUPS = {
                          'to the Teensy VBAT/GND pads is hand-made by the customer.', None, None),
     '1729021': ('3-pos 5.08mm Phoenix field terminal - J14 CAN (1 CANH / 2 CANL / 3 GND), J4 OIL, '
                 'J11 THROTTLE, J12 BRAKE (the analog three are 1 +5V / 2 return / 3 signal).', None, None),
+    'TCAN1042HGVDRQ1': ('U21 CAN TRANSCEIVER - TI TCAN1042HGVDRQ1 from AUTHORIZED DISTRIBUTION ONLY '
+                        '(TI / Mouser / Digi-Key / LCSC-original). Do NOT substitute without written '
+                        'approval; no clones, no re-marked parts. The "V" suffix is MANDATORY - it is the '
+                        'VIO pin (pin 5); a non-V TCAN1042 has pin 5 = NC and would put 5V on the 3.3V '
+                        'Teensy. Approved alternates only: TCAN1042VDRQ1, then NXP TJA1051T/3/1J (its '
+                        'pin 8 S must also go to GND).', None, None),
 }
 for r in rows:
     if r['mpn'] in FIXUPS:

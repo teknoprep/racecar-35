@@ -49,23 +49,33 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   NO Pololu module and NO socket)** with explicit P-channel reverse protection (Q3) and the
   on-board **car input-voltage monitor** (180 k/20 k divider on A16/pin 40), plus
   the Pi 5 video UART (J13) and the throttle/brake inputs (J11/J12).
-  **Rev F fixes CAN: the external SN65HVD230 module and its J7 header are DELETED** — on
-  the bench (2026-10-03) that module received but never DROVE the bus (TXD held at 0 V,
-  CANH-CANL stayed 0 V), so the logger never ACKed and the ECU retransmitted one frame
-  forever. It is replaced by a soldered **TI TCAN1042HGV-Q1 (`TCAN1042HGVDRQ1`), U21,
-  SOIC-8, AEC-Q100, +/-70 V bus fault, VIO = +3V3_MCU on pin 5**, with **STB (pin 8)
-  hard-tied to GND** — STB high is standby/receive-only with no ACK, the exact failure
-  being designed out, so there is no resistor/pull-up/jumper on it. **J14 (Phoenix
+  **Rev F fixes CAN: the external CAN module and its J7 header are DELETED.** Root cause
+  (bench, 2026-10-04, `hardware/CAN-TRANSCEIVER-FINDINGS-2026-10-04.md`): the module sold as
+  an "SN65HVD230" actually carried a **TJA1051T/3-class chip** — same footprint, different
+  pins (pin 3 VCC needs **5 V**, pin 5 is **VIO**, pin 8 is **S/standby**). Driven the
+  SN65HVD230 way (VCC 3.3 V, pin 5 floating) the driver was locked out and floating VIO was
+  phantom-fed from TXD (~2.1 V), so RXD collapsed when TXD went low: received fine, never
+  drove a dominant bit, never ACKed, sender storming ~3,800 frames/s. Rewired VCC 5 V /
+  pin 5 3.3 V / pin 8 GND -> exactly 200 frames/s, both ids, 0 errors. It is replaced by a
+  soldered **TI TCAN1042HGV-Q1 (`TCAN1042HGVDRQ1`), U21, SOIC-8, AEC-Q100, +/-70 V bus
+  fault, VIO = +3V3_MCU on pin 5**, with **STB (pin 8) hard-tied to GND** — STB high is
+  standby/receive-only with no ACK, so there is no resistor/pull-up/jumper on it.
+  ⚠️ **U21 must not be substituted**: order from AUTHORIZED DISTRIBUTION ONLY, no
+  substitution without written approval, and the **`V` suffix is mandatory** (it *is* the
+  VIO pin — `TCAN1042DRQ1`/`TCAN1042HDRQ1`/`TCAN1042GDRQ1` have **pin 5 = NC**, putting 5 V
+  on Teensy pin 23). Approved alternates only: `TCAN1042VDRQ1`, then NXP `TJA1051T/3/1J`
+  (pin 8 `S` also to GND). **Never an SN65HVD23x, never a plain TJA1051T (no /3), never a
+  TJA1050 or clone.** Incoming inspection: match U21's top marking to TI's Device Marking
+  for the ordered PN and photograph it into `logs/`. **J14 (Phoenix
   1729021) = 1 CANH / 2 CANL / 3 GND**, placed MID-BOARD where J7 was (the left edge
   cannot take a 9th screw terminal with usable clearances, and U21 then sits within ~20 mm
   of it). Switchable **split 120.8 ohm termination** = 2x 60.4 ohm 1% (R58/R59) + 4.7 nF
   (C52), enabled by the **JP2 shunt ONLY at a bus end**; **NUP2105L** bus TVS (D25);
-  **TP6/TP7** CAN_TX/CAN_RX probes. Accepted U21 alternates, in order: `TCAN1042VDRQ1`,
-  then NXP `TJA1051T/3/1J` (pin 8 `S` also to GND). **Never an SN65HVD230, never a
-  non-VIO TJA1051T/TJA1050** (5 V RXD). **No firmware change** — 500 kbit/s, normal
+  **TP6/TP7** CAN_TX/CAN_RX probes. **No firmware change** — 500 kbit/s, normal
   ACKing mode; the TCAN1042's TXD dominant time-out will cut the `CANHOLD` diagnostic
-  short, which is expected. CAN needs the 5 V rail, so it is dead on Teensy-USB-only
-  power. Rev F **also restores the board's silkscreen**: Rev C-E's generator moved EVERY
+  short, which is expected, and it makes `CANHOLDON` + a multimeter an INVALID test on this
+  board. **CAN needs BOTH the 5 V rail (J1) AND the Teensy seated** (VIO is the Teensy's
+  3.3 V), so it is dead on Teensy-USB-only power — not a fault. Rev F **also restores the board's silkscreen**: Rev C-E's generator moved EVERY
   footprint's silk to `F.Fab`, so no part carried a pin-1 dot, diode cathode band,
   electrolytic polarity mark or outline (0 of 193 footprints had any `F.SilkS`); Rev F
   keeps library footprint silk (only the ESP32 module outline over the antenna notch stays
@@ -888,7 +898,7 @@ lockstep** — keep all four (+ the legacy alias) equal.
   - **Serial2** (RX 7, TX 8): u-blox GNSS UART
   - **Serial3** (TX 14, RX 15): bidirectional dash link to CrowPanel UART0
   - **Pin 9**: tach input via opto (`FreqMeasureMulti` FlexPWM2_2_B input capture). Used only when `sensor_type == 0` (Direct); MS3Pro CAN supplies RPM when `== 1`. **⚠️ Do NOT use the plain `FreqMeasure` lib here** — on T4.x (`__IMXRT1062__`) it is hard-wired to **pin 22** (FlexPWM4 CH0-A, = our CAN1 TX) and silently ignores pin 9, so it reads 0 forever. `FreqMeasureMulti.begin(9)` is the only thing that actually captures on pin 9. (This bit us hard: looked like a wiring problem for ages.)
-  - **CAN1** (TX 22, RX 23): **MS3Pro MegaSquirt CAN bus** via SN65HVD230 transceiver. See "MS3Pro CAN" section.
+  - **CAN1** (TX 22, RX 23): **MS3Pro MegaSquirt CAN bus**. Rev F has a soldered `U21` (TI `TCAN1042HGV-Q1`); the bench uses a `TJA1051T/3`-class breakout wired VCC 5 V / pin 5 3.3 V / pin 8 GND (mislabelled as SN65HVD230 — see "MS3Pro CAN" and `hardware/CAN-TRANSCEIVER-FINDINGS-2026-10-04.md`).
   - **Wire / I²C** (SDA 18, SCL 19): MPU-6050 IMU (AD0→GND ⇒ addr 0x68)
   - **A2** (pin 16): oil-pressure transducer (0.5–4.5 V via 10k/20k divider). **A3** (pin 17): coolant NTC thermistor (150 Ω pull-up). Used in Direct sensor mode.
   - **Pins 0 / 1**: Serial1 to the Pi 5 video box (RX1 / TX1, 115200, 3.3 V). v0.1.150.
@@ -1842,19 +1852,22 @@ conductors to the MS3Pro CAN-H / CAN-L / signal ground. **No firmware change —
 normal ACKing mode.** The TCAN1042's TXD dominant time-out (~1 ms) cuts the firmware's
 `CANHOLD` diagnostic short; that is expected.
 
-The paragraphs below describe the OLD bench arrangement (an external SN65HVD230 on a
-breakout, plugged into `J7` on Rev E and earlier). Its bit-rate and byte-offset contract is
-unchanged, but **Rev F deletes that module and header** — that module class received but
-never drove the bus, which is the failure Rev F designs out. Keep the description for bench
-testing with a bare transceiver:
+The paragraphs below describe the OLD bench arrangement (an external module on a breakout,
+plugged into `J7` on Rev E and earlier). Its bit-rate and byte-offset contract is unchanged,
+but **Rev F deletes that module and header**. ⚠️ **The bench module is `TJA1051T/3`-class,
+not an SN65HVD230**, despite the label — root cause documented 2026-10-04 in
+`hardware/CAN-TRANSCEIVER-FINDINGS-2026-10-04.md`. Bench-wire it
+**VCC = 5 V, pin 5 (VIO) = 3.3 V, pin 8 (S) = GND**; the SN65HVD230 wiring below (3.3 V VCC)
+reproduces the exact "receives but never ACKs, ~3,800 frames/s storm" failure:
 
-The Teensy reads the MS3Pro ECU over **CAN1 (TX 22, RX 23)** via an **SN65HVD230 ("VP230")**
-3.3 V transceiver — **NOT** an MCP2551 (that's 5 V and would damage the Teensy). The blue
+The Teensy reads the MS3Pro ECU over **CAN1 (TX 22, RX 23)** via a **`TJA1051T/3`-class**
+3.3 V-logic transceiver (the Amazon breakout labelled "SN65HVD230" is this chip) — **NOT**
+an MCP2551 (that's 5 V and would damage the Teensy). The blue
 breakout has an **onboard 120 Ω terminator** (silkscreen `R2 = 121`), so no external resistor
 is needed; it must sit at the **end** of the bus (Teensy ↔ MS3Pro = correct).
 
-Wiring: `3V3→3.3V, GND→GND, CTX(TXD)→pin 22, CRX(RXD)→pin 23, CANH→MS3Pro CAN-H,
-CANL→MS3Pro CAN-L`.
+Wiring: `5V→VCC, 3V3→pin 5 (VIO), GND→GND and pin 8 (S), CTX(TXD)→pin 22, CRX(RXD)→pin 23,
+CANH→MS3Pro CAN-H, CANL→MS3Pro CAN-L`.
 
 Software (`src/main.cpp`): `FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;` at
 `CAN_BAUD = 500000`, `CAN_BASE_ID = 0x5E8` (1512, MS3 "Simplified Dash" base). `pumpCAN()` parses frames and `CAN_STALE_MS = 2000`

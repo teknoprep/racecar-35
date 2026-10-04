@@ -84,15 +84,25 @@ shunts, the CR2032 cell, the J9 RTC lead (housing + contacts + wire), M3 standof
 
 ## Step 3 — CAN (new in Rev F)
 
-The external SN65HVD230 module and its `J7` header are **gone** — don't expect them in the
+The external CAN module and its `J7` header are **gone** — don't expect them in the
 Gerbers or BOM. In their place the board is built with a soldered **`TCAN1042HGV-Q1`**
 (`U21`) whose `STB` pin is tied to GND, a **`NUP2105L`** bus TVS, a third Phoenix
 **`1729021`** field terminal (`J14` = **1 CANH / 2 CANL / 3 GND**) and a switchable
 **split 120.8 Ω** termination behind the **`JP2`** shunt.
 
-Orderable alternates for `U21`, in order: `TCAN1042VDRQ1`, then NXP `TJA1051T/3/1J` (its
-pin 8 `S` must also go to GND). **Never** an SN65HVD230 (±4/+16 V bus fault) and **never** a
-non-VIO TJA1051T/TJA1050 (5 V RXD would damage the 3.3 V Teensy).
+⚠️ **`U21` must not be substituted.** Order `TCAN1042HGVDRQ1` from **authorized
+distribution only**, and do not swap it without written approval — no clones, no re-marked
+parts. The reason is a bench-proven one: the module this replaces was **mislabelled** (a
+TJA1051T/3-class chip sold as an SN65HVD230), and the pinout difference caused the failure.
+Approved alternates, in order: `TCAN1042VDRQ1`, then NXP `TJA1051T/3/1J` (its pin 8 `S` must
+also go to GND). The **`V` suffix is mandatory** — `TCAN1042DRQ1` / `TCAN1042HDRQ1` /
+`TCAN1042GDRQ1` have **pin 5 = NC**, which would put 5 V on Teensy pin 23 and destroy it.
+**Never** an SN65HVD23x, a plain `TJA1051T` (no `/3`), a `TJA1050`, or a "pin-compatible"
+clone.
+
+**When the boards arrive, check `U21`'s top marking against TI's *Device Marking* for
+`TCAN1042HGVDRQ1` before power-up and reject on mismatch** (procedure in
+`../design/BRINGUP.md`).
 
 CAN is **not built or measured**. Bring-up acceptance (U21 VCC/VIO/STB voltages, ~60 Ω at
 J14 with the jumper, a CANable `CANTX,10` test) is in `../design/BRINGUP.md`.

@@ -37,21 +37,31 @@ and `J14` presents `CANH` / `CANL` / `GND` with switchable split termination. Se
 
 ## Onboard CAN (Rev F) — no plug-in module
 
-**Problem (measured on the bench, 2026-10-03).** The external SN65HVD230 module on `J7`
-received frames but **never drove the bus**: with `TXD` held at 0 V, `CANH-CANL` measured
-0 V. Two different Teensys, two modules of that product and a bare 30-line FlexCAN_T4
-sketch all behaved identically. With no ACK from the logger the ECU retransmitted one frame
-forever — telemetry updated 1.8 times a second instead of ~100, and the second frame id
-never arrived. A receive-only node is worse than no node, so the module and its header are
-gone.
+**Problem (root-caused on the bench, 2026-10-04).** The external CAN module on `J7` received
+frames but **never drove the bus**, so it never ACKed and the sender retransmitted ~3,800
+identical frames/s. The module — sold as an "SN65HVD230" — actually carries a
+**TJA1051T/3-class chip**, and the two share a footprint but not a pinout: pin 3 (VCC) needs
+**5 V** (the driver locks out below 4.5 V), pin 5 is **VIO** not Vref, and pin 8 is **S /
+standby**. Driven the SN65HVD230 way (VCC = 3.3 V, pin 5 floating, pin 8 floating) the driver
+was locked out, and a floating VIO was phantom-fed from TXD (~2.1 V), so RXD collapsed
+whenever TXD went low — an internal echo that made every Teensy-side self-test *look* like a
+working transmitter. Rewired as VCC 5 V / pin 5 3.3 V / pin 8 GND it ran at exactly 200
+frames/s, both ids, 0 errors. Full analysis:
+`../../CAN-TRANSCEIVER-FINDINGS-2026-10-04.md`.
 
-**Fix: a soldered transceiver whose mode pin cannot be left in standby.**
+A plug-in module therefore has three failure modes the carrier cannot control: the wrong chip
+on the board, the wrong wiring to it, and no 5 V rail on a USB-only bench. Rev F removes all
+three by **soldering down a known part with the rails and mode pin hard-wired**.
+
+**Fix: a soldered transceiver whose supply and mode pin cannot be wrong.**
 
 * `U21` = **TI TCAN1042HGVDRQ1** (`TCAN1042HGV-Q1`), SOIC-8, AEC-Q100, ±70 V bus fault
-  protection, **`VIO` on pin 5** for 3.3 V logic. Order of preference for alternates:
-  `TCAN1042VDRQ1`, then NXP `TJA1051T/3/1J` (its pin 8 `S` must also go to GND).
-  **Never** an SN65HVD230 (±4/+16 V bus fault — the failure being removed) and **never** a
-  non-VIO TJA1051T/TJA1050 (5 V RXD would damage the Teensy).
+  protection, **`VIO` on pin 5** for 3.3 V logic. **Authorized distribution only; no
+  substitution without written approval.** Approved alternates, in order: `TCAN1042VDRQ1`,
+  then NXP `TJA1051T/3/1J` (its pin 8 `S` must also go to GND).
+  ⚠️ **The `V` suffix is mandatory** — it *is* the VIO pin. `TCAN1042DRQ1` / `TCAN1042HDRQ1`
+  / `TCAN1042GDRQ1` have **pin 5 = NC**, so RXD would swing to 5 V and destroy Teensy pin 23.
+  **Never** an SN65HVD23x, a plain `TJA1051T` (no `/3`), a `TJA1050`, or any clone.
 * Pins: 1 `TXD`→`CAN_TX` (Teensy pin 22 = U1 pad 29), 2 `GND`, 3 `VCC`→`+5V_MAIN`,
   4 `RXD`→`CAN_RX` (Teensy pin 23 = U1 pad 28), 5 `VIO`→`+3V3_MCU`, 6 `CANL`, 7 `CANH`,
   **8 `STB` hard-tied to GND**. `STB` high is standby = receive-only with no ACK — exactly

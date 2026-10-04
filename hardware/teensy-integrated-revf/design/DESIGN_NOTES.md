@@ -37,8 +37,13 @@ design example (SLVSBN0C 8.2) with the input narrowed to the car's real 10–20 
 - **CAN (Rev F):** `U21` = **TI TCAN1042HGV-Q1** soldered down (SOIC-8, AEC-Q100, ±70 V
   bus fault, `VIO` on pin 5). `TXD`/`RXD` go to Teensy pins 22/23 (U1 pads 29/28),
   `VCC` = `+5V_MAIN`, `VIO` = `+3V3_MCU`, and **`STB` (pin 8) is hard-tied to GND** —
-  standby is receive-only with no ACK, the failure that removed the external SN65HVD230
-  module (with `TXD` held low it received but never drove `CANH-CANL` off 0 V). `J14`
+  standby is receive-only with no ACK. ⚠️ The bench root cause (2026-10-04) was that the
+  "SN65HVD230" plug-in module actually carried a **TJA1051T/3-class** chip (5 V VCC, pin 5 =
+  VIO, pin 8 = S) driven the SN65HVD230 way — 3.3 V VCC locked the driver out and floating
+  VIO phantom-fed RXD from TXD (~2.1 V), so it received but never drove the bus. Soldering a
+  defined part with `VCC` = 5 V, `VIO` = 3.3 V and `STB` = GND removes that whole class of
+  failure. **Authorized distribution only, no substitution without written approval** — a
+  non-`V` TCAN1042 has pin 5 = NC and would put 5 V on Teensy pin 23. `J14`
   (Phoenix 1729021) carries **1 CANH / 2 CANL / 3 GND**; `R58`+`R59` are a switchable
   **split 120.8 Ω** termination (2 × 60.4 Ω 1 %) with `C52` 4.7 nF to GND, enabled by the
   `JP2` shunt **only at a bus end**; `D25` (`NUP2105L`) is the bus TVS; `TP6`/`TP7` are

@@ -107,7 +107,24 @@ TX/RX are **crossed** on both cables.
 | --- | --- | --- |
 | u-blox NEO-M9N | pin 7 RX ← GPS TX, pin 8 TX → GPS RX | 3.3 V / GND |
 | GY-521 MPU-6050 | pin 18 SDA, pin 19 SCL | **3.3 V** (not 5 V), AD0 to GND |
-| SN65HVD230 CAN | pin 22 TX, pin 23 RX | 3.3 V — only if MegaSquirt |
+| CAN transceiver module | pin 22 TX, pin 23 RX | **5 V VCC + 3.3 V VIO — NOT 3.3 V on VCC. See the warning below.** |
+
+⚠️ **The Amazon "3-Pack SN65HVD230 CAN Transceiver Module" (ASIN B0FDLDXCK9) is
+MISLABELLED — the SOIC-8 on it behaves as a TJA1051T/3-class chip, not an SN65HVD230.**
+The two parts share the footprint but not the pin meanings, so wire it as a TJA1051T/3:
+
+| Module pin | SN65HVD230 would be | What the fitted chip actually needs |
+| --- | --- | --- |
+| 3 (VCC) | 3.3 V | **5 V** (needs 4.5–5.5 V; the driver is locked out below that) |
+| 5 | Vref — leave floating | **VIO = 3.3 V** — floating it lets TXD phantom-feed RXD (measures ~2.1 V) |
+| 8 | Rs | **S / standby → GND** (high = receive-only, never ACKs) |
+
+Wired the SN65HVD230 way (VCC = 3.3 V, pin 5 floating, pin 8 floating) the logger
+**receives but never transmits a dominant bit**, so it never ACKs; the sender then
+retransmits ~3,800 identical frames/s and values update only a few times a second.
+With VCC 5 V / pin 5 3.3 V / pin 8 GND it runs at exactly 200 frames/s, both IDs, 0
+errors. Full analysis and the un-foolable acceptance tests:
+`../CAN-TRANSCEIVER-FINDINGS-2026-10-04.md`.
 
 ## Parts to buy for this board
 

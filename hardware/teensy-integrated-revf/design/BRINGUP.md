@@ -69,27 +69,66 @@ thermometer.** Do not connect a Li-ion car battery directly to an untested assem
 
 ## CAN bring-up (Rev F) — must PASS before any car bus connection
 
-DC levels, **with J1 powered** (CAN is dead on Teensy-USB power alone):
+> **Root cause this checklist exists to catch** (bench, 2026-10-04): the Amazon "SN65HVD230"
+> modules are mislabelled TJA1051T/3-class chips. Wired the SN65HVD230 way (VCC = 3.3 V,
+> pin 5 floating) the logger *receives* but never drives a dominant bit, never ACKs, and the
+> sender storms ~3,800 frames/s. Full analysis:
+> `../../../CAN-TRANSCEIVER-FINDINGS-2026-10-04.md`.
 
-| Point | Expected |
-|---|---|
-| U21 pin 3 (VCC) | **5.0 V** |
-| U21 pin 5 (VIO) | **3.3 V** |
-| U21 pin 8 (STB) | **0 V** (hard-tied to GND; anything else means standby/receive-only) |
+### 0. Prerequisites — get these right or the test lies
 
-Termination, **everything unpowered**: measure `CANH-CANL` at `J14`. Expect about **60 Ω**
-with the ECU connected and the `JP2` shunt fitted at the bus end (120.8 Ω on this board in
-parallel with the ECU's 120 Ω); a lone fitted shunt reads about **120 Ω**.
+* **Power: `J1` at 12 V must be connected AND the Teensy must be seated.** `U21` VCC is
+  `+5V_MAIN` (from the buck) and VIO is `+3V3_MCU` (**the Teensy's own 3.3 V rail**). On
+  Teensy-USB power alone VCC = 0 and the board shows the *identical* "no ACK" symptom.
+  That is not a fault — do not "fix" it.
+* **Incoming inspection of `U21` BEFORE power-up.** Read the top marking and compare it
+  with TI's *Device Marking* column in the Package Option Addendum for
+  `TCAN1042HGVDRQ1`; photograph it into `logs/`. **Mismatch = reject the part.**
+  The part is substituted at your peril: the **`V` suffix is mandatory** (it *is* the VIO
+  pin). `TCAN1042DRQ1` / `TCAN1042HDRQ1` / `TCAN1042GDRQ1` have **pin 5 = NC**, so RXD
+  would swing to 5 V and **destroy Teensy pin 23**. Never accept an SN65HVD23x, a plain
+  `TJA1051T` (no `/3`), a `TJA1050`, or any "pin-compatible" clone for U21.
+  Approved alternates, only: `TCAN1042VDRQ1`, then NXP `TJA1051T/3/1J` (its pin 8 `S`
+  likewise goes to GND).
 
-Functional test with a **CANable 2.5** running slcan (Elmue-style firmware) and **error
-reports enabled** (`MFE`, `S6`, `O`) on the same bus as the logger:
+### 1. DC levels (with J1 powered and the Teensy seated)
 
-1. The adapter must report **no ACK errors**. An `E2x…` / protocol-3 report means nothing
-   is ACKing — the exact receive-only failure that removed the SN65HVD230 module.
-2. The Teensy USB command **`CANTX,10`** must deliver **10 frames that the CANable receives
-   exactly once each** (no duplicates, no missing).
-3. On a bench feed the logger's `CANDIAG` line must show about **200 frames/s**, listing
-   **both `0x700` and `0x701`**, with roughly **0 % duplicates**.
+| Point | Expected | Fail signature |
+|---|---|---|
+| U21 pin 3 (VCC) | **5.0 V** | 3.3 V / 0 V = wrong supply (the original bench bug) |
+| U21 pin 5 (VIO) | **3.3 V** | **~2 V = VIO floating / phantom-fed by TXD** — reject |
+| U21 pin 8 (STB) | **0 V** | non-zero = standby, receive-only, never ACKs |
+
+### 2. Termination (everything unpowered)
+
+Measure `CANH-CANL` at `J14`: about **60 Ω** with the ECU connected and the `JP2` shunt
+fitted at the bus end (120.8 Ω here in parallel with the ECU's 120 Ω); a lone fitted shunt
+reads about **120 Ω**.
+
+### 3. Functional tests that cannot be fooled
+
+With a **CANable 2.5** running slcan (Elmue firmware), **error reports on** (`ME`), on the
+same bus:
+
+1. **Single-frame ACK test (decisive).** Have the CANable send **one** frame. The logger's
+   `CANDIAG total` must rise by **exactly 1**, and the CANable must report **no** `E?3……`
+   (protocol error 3 = No ACK). Thousands = no ACK = **FAIL**. (On the old module the chip
+   had no dominant time-out; on Rev F the TCAN1042 does — see §4.)
+2. **Feed test.** A 100 Hz bench feed must read **≈200 frames/s** on `CANDIAG`, listing
+   **both `0x700` and `0x701`**, with `oil`/`afr`/`batt` ≠ `-1` and roughly **0 %
+   duplicates**. **~3,800 frames/s is a retransmit storm and is a FAIL**, even though it
+   superficially looks like "receiving fine".
+3. **Transmit test.** Teensy USB `CANTX,10` must deliver 10 frames the CANable receives
+   **exactly once each**, with the Teensy transmit-error counter (`TXerr`) staying **0**.
+
+### 4. Diagnostics that are NOT valid pass criteria on Rev F
+
+* Firmware `CANDRIVE` / `CANPROBE` "TX PATH OK" — an internal TXD→RXD echo passes it
+  (that echo is *why* the old module fooled every self-test).
+* The bench console's "fps ≥ 50 → ACKING" verdict — a 3,800/s storm passes it.
+* `CANHOLDON` + a multimeter on `CANH-CANL`: the Rev F **TCAN1042 TXD dominant time-out
+  (~1 ms) releases the bus**, so a perfectly healthy board reads ≈0 V. It was only ever a
+  valid test on the old module because that chip had no time-out.
 
 Only then connect a real vehicle bus. These are bench acceptance criteria, not automotive
 transient qualification.
