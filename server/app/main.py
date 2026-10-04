@@ -2590,8 +2590,12 @@ async def caps() -> dict:
     'track3d' is a WEB-side marker, not a dash one: it tells you at a glance
     whether the running image is new enough to serve the 3D drive view
     (`curl <host>/caps`). Handy because the host watcher rebuilds in place and
-    the browser may still be showing a cached page."""
-    return {"ok": True, "zblocks": True, "coach": True, "track3d": True}
+    the browser may still be showing a cached page.
+    `track3d_v` bumps when the 3D view itself changes materially, so a deploy is
+    verifiable: 1 = the satellite/terrain variant, 2 = the DATA-ONLY driving
+    render (no imagery at all) + the map-strip lasso and the AI card cleanup."""
+    return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
+            "track3d_v": 2}
 
 
 def _zb_decode(data: bytes) -> bytes:
