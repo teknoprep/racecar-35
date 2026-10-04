@@ -1,0 +1,228 @@
+(footprint "SMDIP-4_W9.53mm"
+	(version 20241229)
+	(generator "pcbnew")
+	(generator_version "9.0")
+	(layer "F.Cu")
+	(descr "4-lead surface-mounted (SMD) DIP package, row spacing 9.53mm (375 mils)")
+	(tags "SMD DIP DIL PDIP SMDIP 2.54mm 9.53mm 375mil")
+	(property "Reference" "REF**"
+		(at 0 -3.6 0)
+		(layer "F.SilkS")
+		(uuid "78527ecb-2e2d-4139-a75b-890d327fbd95")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "SMDIP-4_W9.53mm"
+		(at 0 3.6 0)
+		(layer "F.Fab")
+		(uuid "9f5ad7ae-2a38-407e-b1be-172531b3165f")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "0f44906b-3f37-4ccb-aab6-b123f8c6ffeb")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "d7eae6cc-7593-4314-b708-a1fc814de71c")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd)
+	(fp_line
+		(start -3.235 -2.6)
+		(end -3.235 2.6)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "bf8de677-3473-47d0-b42f-12ef80b372a5")
+	)
+	(fp_line
+		(start -3.235 2.6)
+		(end 3.235 2.6)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "62c94a72-6105-4478-881c-ef3ed6172f50")
+	)
+	(fp_line
+		(start -1 -2.6)
+		(end -3.235 -2.6)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "ee73fc6a-9c72-4880-977a-25082d38b14b")
+	)
+	(fp_line
+		(start 3.235 -2.6)
+		(end 1 -2.6)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "bfa29748-0330-4c3b-a744-3192fb366b18")
+	)
+	(fp_line
+		(start 3.235 2.6)
+		(end 3.235 -2.6)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "b5849f29-33fd-4d24-9dc3-a00270c1909f")
+	)
+	(fp_arc
+		(start 1 -2.6)
+		(mid 0 -1.6)
+		(end -1 -2.6)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "0d2006c4-3fcc-4b6b-912d-066042f656eb")
+	)
+	(fp_rect
+		(start -6.02 -2.79)
+		(end 6.02 2.79)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.CrtYd")
+		(uuid "54653f8c-b45d-4021-9208-d6dea222719e")
+	)
+	(fp_line
+		(start -3.175 -1.54)
+		(end -2.175 -2.54)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "184ef724-f8e5-46fa-a405-2347d4f3a97d")
+	)
+	(fp_line
+		(start -3.175 2.54)
+		(end -3.175 -1.54)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "0450ff50-8be1-49c1-8e2d-f065b7f71585")
+	)
+	(fp_line
+		(start -2.175 -2.54)
+		(end 3.175 -2.54)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "aa5ada8b-0649-40a7-b3f0-5a781e5a9c57")
+	)
+	(fp_line
+		(start 3.175 -2.54)
+		(end 3.175 2.54)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "72ac923c-1cb5-4935-8839-5d06afa41587")
+	)
+	(fp_line
+		(start 3.175 2.54)
+		(end -3.175 2.54)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "8611321c-46b4-4ec8-a465-421001648834")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "eb58f291-dd41-45b2-90e9-66791014b89d")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" smd roundrect
+		(at -4.765 -1.27)
+		(size 2 1.78)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.140449)
+		(uuid "a40a6473-52ee-439a-bdd8-a68fd6605f21")
+	)
+	(pad "2" smd roundrect
+		(at -4.765 1.27)
+		(size 2 1.78)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.140449)
+		(uuid "52802844-8b17-4e0a-ac13-149ad12aebef")
+	)
+	(pad "3" smd roundrect
+		(at 4.765 1.27)
+		(size 2 1.78)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.140449)
+		(uuid "a85aec1f-47b3-46b0-a3c1-817092c90671")
+	)
+	(pad "4" smd roundrect
+		(at 4.765 -1.27)
+		(size 2 1.78)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.140449)
+		(uuid "0a3ef0fa-72b0-4372-89a8-92052b4d031f")
+	)
+	(embedded_fonts no)
+	(model "${KICAD9_3DMODEL_DIR}/Package_DIP.3dshapes/SMDIP-4_W9.53mm.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

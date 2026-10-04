@@ -1,0 +1,194 @@
+(footprint "Fuse_Littelfuse-NANO2-451_453"
+	(version 20241229)
+	(generator "pcbnew")
+	(generator_version "9.0")
+	(layer "F.Cu")
+	(descr "Littelfuse NANO2 https://www.littelfuse.com/~/media/electronics/datasheets/fuses/littelfuse_fuse_451_453_datasheet.pdf.pdf")
+	(tags "Fuse Nano2")
+	(property "Reference" "REF**"
+		(at 0 -2.5 0)
+		(unlocked yes)
+		(layer "F.SilkS")
+		(uuid "cdebeb96-2c13-4488-98df-08d9d7ea1693")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "Fuse_Littelfuse-NANO2-451_453"
+		(at 0 2.7 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "d60e5cf0-1a0f-4fd5-9570-d85f1be3e9f4")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "e9775981-f279-42b7-82e0-62e91b8423be")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "5def9673-6bfb-453d-bd90-fc4c5d42faba")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd)
+	(fp_line
+		(start -1.215 -1.455)
+		(end 1.215 -1.455)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "66033d4a-62a9-47f7-b422-31e9e6dacc28")
+	)
+	(fp_line
+		(start -1.215 1.455)
+		(end 1.215 1.455)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "7fdf5706-bfde-447a-bea1-7de16db7b588")
+	)
+	(fp_line
+		(start -3.69 -1.83)
+		(end 3.69 -1.83)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "ba75ae18-057c-46e2-a5e4-0bc201533033")
+	)
+	(fp_line
+		(start -3.69 1.83)
+		(end -3.69 -1.83)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "9412fb60-b8d3-42c6-94d9-00ffd5332caf")
+	)
+	(fp_line
+		(start 3.69 -1.83)
+		(end 3.69 1.83)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "41f3afdc-4c38-4cb5-90e0-0a024d3f2436")
+	)
+	(fp_line
+		(start 3.69 1.83)
+		(end -3.69 1.83)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "d7998586-02ab-45e6-85ec-7bcee676eee5")
+	)
+	(fp_line
+		(start -3.05 -1.345)
+		(end -3.05 1.345)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "78009587-d8d1-4f2a-addd-2bf4edad89a9")
+	)
+	(fp_line
+		(start -3.05 -1.345)
+		(end 3.05 -1.345)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "dfd71b32-789c-4967-9d94-a0b02c905d26")
+	)
+	(fp_line
+		(start -3.05 1.345)
+		(end 3.05 1.345)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "f4dd7596-4d2e-4e95-bb83-37d0b22ef9ee")
+	)
+	(fp_line
+		(start 3.05 1.345)
+		(end 3.05 -1.345)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "bedc55d0-a8b0-4ba7-b18f-637d23c7c7cd")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "1a48c9a1-b7b5-49bc-961b-7be320c5dc74")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" smd rect
+		(at -2.455 0)
+		(size 1.96 3.15)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "d541f5b3-1757-4ff5-ac9e-c0c6f8ce4608")
+	)
+	(pad "2" smd rect
+		(at 2.455 0)
+		(size 1.96 3.15)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(uuid "30a676d5-50cc-4947-aa46-124e22b7876c")
+	)
+	(embedded_fonts no)
+	(model "${KICAD9_3DMODEL_DIR}/Fuse.3dshapes/Fuse_Littelfuse-NANO2-451_453.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

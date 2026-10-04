@@ -38,8 +38,8 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
 - **New network-module firmware/transport/ownership and service/update support are
   NOT implemented.** Do not add an OTA artifact or claim fast uploads from a render.
   Current v0.1.149 code still uses screen WiFi; its existing OTA path stays intact.
-- **Active revision for new builds is Rev F** (`hardware/teensy-integrated-revf/`, forked
-  from the unbuilt Rev E at `hardware/teensy-integrated-reve/`): **4 copper layers**
+- **Active revision for new builds is Rev F** (`hardware/teensy-integrated-revf/`,
+  superseding the unbuilt Rev E, which is deleted): **4 copper layers**
   (F.Cu signals, **In1.Cu continuous GND plane with no routing**, In2.Cu signals, B.Cu
   signals), **1 oz outer copper**, **150 x 155 mm**, **193 footprints, 104 nets, 538
   connected pads, 131 vias, 749 pin/geometry/calculation assertions; ERC/DRC/unconnected
@@ -65,12 +65,18 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   non-VIO TJA1051T/TJA1050** (5 V RXD). **No firmware change** — 500 kbit/s, normal
   ACKing mode; the TCAN1042's TXD dominant time-out will cut the `CANHOLD` diagnostic
   short, which is expected. CAN needs the 5 V rail, so it is dead on Teensy-USB-only
-  power. Order day: `pcbway/Racecar-RevF-PCBWAY-GERBERS.zip` +
+  power. Rev F **also restores the board's silkscreen**: Rev C-E's generator moved EVERY
+  footprint's silk to `F.Fab`, so no part carried a pin-1 dot, diode cathode band,
+  electrolytic polarity mark or outline (0 of 193 footprints had any `F.SilkS`); Rev F
+  keeps library footprint silk (only the ESP32 module outline over the antenna notch stays
+  on `F.Fab`), so `U21` has a printed pin-1 dot and polarity is visible on the board.
+  Order day: `pcbway/Racecar-RevF-PCBWAY-GERBERS.zip` +
   `Racecar-RevF-BOM-pcbway-assembly.csv` + `Racecar-RevF-CPL.csv` (regenerate all three
   with `pcbway/make_package.py`); order settings in `pcbway/REVF-CHANGES-AND-ORDER.md`.
   Re-export with `fabrication/export.py --engineering-prototype`. **No automotive
   transient qualification, and no built, measured or independently reviewed board.**
-- Revision **E** (superseded by Rev F, retained at `hardware/teensy-integrated-reve/`):
+- Revision **E** (DELETED — superseded by Rev F; its only content not carried into Rev F
+  was the external CAN-module header `J7`, which Rev F removes):
   first revision with the 5 V rail as our own **TPS54560BDDAR** buck and the car
   input-voltage monitor; it still carried the external CAN-module header that Rev F deletes.
 - Revision **D** (superseded, retained at `hardware/teensy-integrated-revd/`):

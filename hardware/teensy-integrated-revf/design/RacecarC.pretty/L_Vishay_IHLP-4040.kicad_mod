@@ -1,0 +1,283 @@
+(footprint "L_Vishay_IHLP-4040"
+	(version 20241229)
+	(generator "pcbnew")
+	(generator_version "9.0")
+	(layer "F.Cu")
+	(descr "Inductor, Vishay, IHLP-4040, 10.3x10.3x5.4mm, (https://www.vishay.com/docs/34499/ihlp4040ed5a.pdf), generated with kicad-footprint-generator gen_inductor.py")
+	(tags "shielded SMT")
+	(property "Reference" "REF**"
+		(at 0 -6.1 0)
+		(layer "F.SilkS")
+		(uuid "f5afdd4b-83ef-4786-a29b-847df91c39b7")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "L_Vishay_IHLP-4040"
+		(at 0 6.1 0)
+		(layer "F.Fab")
+		(uuid "90cb87f7-f8e3-455d-84a8-c760b7bef9f8")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "2f56752e-dfcd-4ded-8a43-16e5a7f02a5d")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "c6ac7953-7501-4be2-82cd-f096431e7550")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd)
+	(fp_line
+		(start -5.26 -5.26)
+		(end 5.26 -5.26)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "9b25c144-8ea2-47c0-a6ce-04a9204eefc0")
+	)
+	(fp_line
+		(start -5.26 -2.736)
+		(end -5.26 -5.26)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "b1fae23f-4632-4de0-847a-6e2a86105e22")
+	)
+	(fp_line
+		(start -5.26 5.26)
+		(end -5.26 2.736)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "327742a4-80be-4497-9532-7b5211a3995a")
+	)
+	(fp_line
+		(start 5.26 -5.26)
+		(end 5.26 -2.736)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "78866dce-b8e9-48c7-ad1b-784f951f1f13")
+	)
+	(fp_line
+		(start 5.26 2.736)
+		(end 5.26 5.26)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "0d590d68-c75c-4c4b-8254-51fa0397db1d")
+	)
+	(fp_line
+		(start 5.26 5.26)
+		(end -5.26 5.26)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "9c6ced67-3ed2-4dfb-94df-e80ffd16c5fc")
+	)
+	(fp_line
+		(start -6.35 -2.73)
+		(end -5.4 -2.73)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "bcc7a38b-1cdf-4723-9a8f-82dd39188c9a")
+	)
+	(fp_line
+		(start -6.35 2.73)
+		(end -6.35 -2.73)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "7b3cfd4c-2b59-4a4a-9cf5-21351990f63d")
+	)
+	(fp_line
+		(start -5.4 -5.4)
+		(end 5.4 -5.4)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "c0a1db2f-d42c-48dc-9d3b-e245f23db767")
+	)
+	(fp_line
+		(start -5.4 -2.73)
+		(end -5.4 -5.4)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "26a9938b-9315-4553-93dd-2463b5b76fa1")
+	)
+	(fp_line
+		(start -5.4 2.73)
+		(end -6.35 2.73)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "922cdf77-cffb-4d12-9ad6-a37155cd182d")
+	)
+	(fp_line
+		(start -5.4 5.4)
+		(end -5.4 2.73)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "d0beac5a-d7b8-407a-9c6f-fc6fead649dc")
+	)
+	(fp_line
+		(start 5.4 -5.4)
+		(end 5.4 -2.73)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "a1631a0d-3de1-4ae5-bea0-6b03231f7d6e")
+	)
+	(fp_line
+		(start 5.4 -2.73)
+		(end 6.35 -2.73)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "2b44fdfa-4dc2-4aba-a51a-cc742896ab51")
+	)
+	(fp_line
+		(start 5.4 2.73)
+		(end 5.4 5.4)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "107e835e-9997-4c23-b45d-5cd7f2d8b435")
+	)
+	(fp_line
+		(start 5.4 5.4)
+		(end -5.4 5.4)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "c42e1c19-6f34-4d1d-9323-f7a97c9a9de1")
+	)
+	(fp_line
+		(start 6.35 -2.73)
+		(end 6.35 2.73)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "7cda5dc4-bdd8-4c3b-8732-cafcbcf3f180")
+	)
+	(fp_line
+		(start 6.35 2.73)
+		(end 5.4 2.73)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "a2271b2e-c200-458d-a8f7-ce6eecebbbfc")
+	)
+	(fp_rect
+		(start -5.15 -5.15)
+		(end 5.15 5.15)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.Fab")
+		(uuid "b1cb4644-8daf-49d0-9244-3d183c71b328")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "acfc76ca-95ed-4754-96f0-7126e5baf31e")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" smd roundrect
+		(at -4.5085 0)
+		(size 3.175 4.953)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.07874)
+		(uuid "14813a38-6595-41a9-b0e5-5a18db02fac7")
+	)
+	(pad "2" smd roundrect
+		(at 4.5085 0)
+		(size 3.175 4.953)
+		(layers "F.Cu" "F.Mask" "F.Paste")
+		(roundrect_rratio 0.07874)
+		(uuid "956757bb-6460-4e89-a14a-406acee18ccd")
+	)
+	(embedded_fonts no)
+	(model "${KICAD9_3DMODEL_DIR}/Inductor_SMD.3dshapes/L_Vishay_IHLP-4040.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

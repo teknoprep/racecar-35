@@ -1,0 +1,5511 @@
+[
+  {
+    "ref": "Q3",
+    "value": "AO4485 P-FET 40V",
+    "footprint": "RacecarC:SOIC-8_3.9x4.9mm_P1.27mm",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "VIN_PROTECTED",
+      "3": "VIN_PROTECTED",
+      "4": "Q_REV_GATE",
+      "5": "VIN_FUSED",
+      "6": "VIN_FUSED",
+      "7": "VIN_FUSED",
+      "8": "VIN_FUSED"
+    },
+    "names": {
+      "1": "S",
+      "2": "S",
+      "3": "S",
+      "4": "G",
+      "5": "D",
+      "6": "D",
+      "7": "D",
+      "8": "D"
+    },
+    "types": {
+      "1": "power_out",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive",
+      "5": "power_in",
+      "6": "passive",
+      "7": "passive",
+      "8": "passive"
+    },
+    "mpn": "AO4485",
+    "maker": "Alpha & Omega Semiconductor",
+    "group": "power",
+    "x": 62,
+    "y": 94,
+    "angle": 180,
+    "notes": "Reverse-polarity protection: DRAIN=raw input, SOURCE=protected load so the body diode blocks a reversed supply. P-Channel, 40V, 15mOhm at Vgs=-10V. Vds 40V vs the 32V TVS clamp.",
+    "alias": "Q_REV"
+  },
+  {
+    "ref": "R51",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "Q_REV_GATE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "power",
+    "x": 69,
+    "y": 91.5,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_REVG"
+  },
+  {
+    "ref": "D24",
+    "value": "BZX84C15",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "Q_REV_GATE",
+      "2": null,
+      "3": "VIN_PROTECTED"
+    },
+    "names": {
+      "1": "A",
+      "2": "NC",
+      "3": "K"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "BZX84C15",
+    "maker": "Nexperia",
+    "group": "power",
+    "x": 68,
+    "y": 94.5,
+    "angle": 0,
+    "notes": "15V gate-source clamp for Q_REV: Vgs rating is +/-20V, the input can reach 32V.",
+    "alias": "D_REVZ"
+  },
+  {
+    "ref": "C43",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "BOOT_MAIN",
+      "2": "SW_MAIN"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 72.5,
+    "y": 93,
+    "angle": 0,
+    "notes": "Bootstrap capacitor BOOT-SW, 50V rated for a 20V rail.",
+    "alias": "C_BOOT"
+  },
+  {
+    "ref": "U2",
+    "value": "TPS54560B 5V 5A BUCK",
+    "footprint": "RacecarC:SOIC-8-1EP_3.9x4.9mm_P1.27mm_EP2.41x3.3mm",
+    "pins": {
+      "": null,
+      "1": "BOOT_MAIN",
+      "2": "VIN_PROTECTED",
+      "3": "EN_MON",
+      "4": "RT_MON",
+      "5": "FB_MAIN",
+      "6": "COMP_MAIN",
+      "7": "GND",
+      "8": "SW_MAIN",
+      "9": "GND"
+    },
+    "names": {
+      "": "",
+      "1": "BOOT",
+      "2": "VIN",
+      "3": "EN",
+      "4": "RT/CLK",
+      "5": "FB",
+      "6": "COMP",
+      "7": "GND",
+      "8": "SW",
+      "9": "PowerPAD"
+    },
+    "types": {
+      "": "passive",
+      "1": "passive",
+      "2": "power_in",
+      "3": "passive",
+      "4": "passive",
+      "5": "passive",
+      "6": "passive",
+      "7": "passive",
+      "8": "power_out",
+      "9": "power_in"
+    },
+    "mpn": "TPS54560BDDAR",
+    "maker": "Texas Instruments",
+    "group": "power",
+    "x": 72.5,
+    "y": 101,
+    "angle": 0,
+    "notes": "60V 5A asynchronous buck at 400kHz, TI 5V/5A design example. PowerPAD (pad 9) is GND and carries the heat: thermal vias north and south of the pad, NOT inside it, so no via-in-pad resin fill is needed.",
+    "alias": "U2"
+  },
+  {
+    "ref": "C41",
+    "value": "10uF 50V X7R 1210",
+    "footprint": "RacecarC:C_1210_3225Metric",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM32ER71H106KA12L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 68.5,
+    "y": 105.8,
+    "angle": 0,
+    "notes": "50V rating on a 10-20V rail; a 5A buck input needs ceramic close to the VIN pin, not only C1 bulk.",
+    "alias": "C_IN1"
+  },
+  {
+    "ref": "C42",
+    "value": "10uF 50V X7R 1210",
+    "footprint": "RacecarC:C_1210_3225Metric",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM32ER71H106KA12L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 73.5,
+    "y": 105.8,
+    "angle": 0,
+    "notes": "50V rating on a 10-20V rail; a 5A buck input needs ceramic close to the VIN pin, not only C1 bulk.",
+    "alias": "C_IN2"
+  },
+  {
+    "ref": "D23",
+    "value": "SS56 catch diode",
+    "footprint": "RacecarC:D_SMB",
+    "pins": {
+      "1": "SW_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "SS56",
+    "maker": "MDD",
+    "group": "power",
+    "x": 79,
+    "y": 99,
+    "angle": 270,
+    "notes": "Asynchronous buck catch diode: 5A, 60V vs the 32V clamp. Carries the full inductor current during off-time.",
+    "alias": "D_MAIN"
+  },
+  {
+    "ref": "L2",
+    "value": "6.8uH 8A RMS SHIELDED",
+    "footprint": "RacecarC:L_Vishay_IHLP-4040",
+    "pins": {
+      "1": "SW_MAIN",
+      "2": "+5V_MAIN"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "power_out"
+    },
+    "mpn": "IHLP4040DZER6R8M01",
+    "maker": "Vishay",
+    "group": "power",
+    "x": 88,
+    "y": 94.5,
+    "angle": 0,
+    "notes": "6.8uH, 23.3mOhm, 13.5A saturation / 8A RMS vs 5A DC and 5.7A peak. Lmin for 20V in / 400kHz / 5A is 6.25uH.",
+    "alias": "L_MAIN"
+  },
+  {
+    "ref": "C44",
+    "value": "47uF 16V X5R 1210",
+    "footprint": "RacecarC:C_1210_3225Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM32ER61C476KE15L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 80,
+    "y": 113.5,
+    "angle": 270,
+    "notes": "TI design example output capacitance (3x47uF); the compensation below assumes it.",
+    "alias": "C_OUT1"
+  },
+  {
+    "ref": "C45",
+    "value": "47uF 16V X5R 1210",
+    "footprint": "RacecarC:C_1210_3225Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM32ER61C476KE15L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 85,
+    "y": 113.5,
+    "angle": 270,
+    "notes": "TI design example output capacitance (3x47uF); the compensation below assumes it.",
+    "alias": "C_OUT2"
+  },
+  {
+    "ref": "C46",
+    "value": "47uF 16V X5R 1210",
+    "footprint": "RacecarC:C_1210_3225Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM32ER61C476KE15L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 90,
+    "y": 113.5,
+    "angle": 270,
+    "notes": "TI design example output capacitance (3x47uF); the compensation below assumes it.",
+    "alias": "C_OUT3"
+  },
+  {
+    "ref": "R53",
+    "value": "52.3k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "FB_MAIN"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0752K3L",
+    "maker": "Yageo",
+    "group": "power",
+    "x": 87,
+    "y": 105,
+    "angle": 270,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_FBH"
+  },
+  {
+    "ref": "R54",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "FB_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "power",
+    "x": 83,
+    "y": 105,
+    "angle": 270,
+    "notes": "0805; >=0.125W",
+    "alias": "R_FBL"
+  },
+  {
+    "ref": "R55",
+    "value": "16.9k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "COMP_MAIN",
+      "2": "COMP_RC"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0716K9L",
+    "maker": "Yageo",
+    "group": "power",
+    "x": 78.5,
+    "y": 105.8,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_COMP"
+  },
+  {
+    "ref": "C47",
+    "value": "4.7n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "COMP_RC",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "CL21B472KBANNNC",
+    "maker": "Samsung",
+    "group": "power",
+    "x": 82,
+    "y": 109.5,
+    "angle": 0,
+    "notes": "Compensation zero at the modulator pole (TI 8.2.2.11).",
+    "alias": "C_COMP"
+  },
+  {
+    "ref": "C48",
+    "value": "47p",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "COMP_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "CL21C470JBANNNC",
+    "maker": "Samsung",
+    "group": "power",
+    "x": 86.5,
+    "y": 109.5,
+    "angle": 0,
+    "notes": "High-frequency compensation pole.",
+    "alias": "C_CPOLE"
+  },
+  {
+    "ref": "R52",
+    "value": "240k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "RT_MON",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07240KL",
+    "maker": "Yageo",
+    "group": "power",
+    "x": 68.5,
+    "y": 109.5,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_RT"
+  },
+  {
+    "ref": "R56",
+    "value": "680k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "EN_MON"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07680KL",
+    "maker": "Yageo",
+    "group": "power",
+    "x": 73,
+    "y": 109.5,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_UV1"
+  },
+  {
+    "ref": "R57",
+    "value": "100k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "EN_MON",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07100KL",
+    "maker": "Yageo",
+    "group": "power",
+    "x": 77.5,
+    "y": 109.5,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_UV2"
+  },
+  {
+    "ref": "U3",
+    "value": "TSR 1-2433",
+    "footprint": "RacecarC:Converter_DCDC_TRACO_TSR-1_THT",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND",
+      "3": "+3V3_AUX"
+    },
+    "names": {
+      "1": "VIN",
+      "2": "GND",
+      "3": "VOUT"
+    },
+    "types": {
+      "1": "power_in",
+      "2": "passive",
+      "3": "power_out"
+    },
+    "mpn": "TSR 1-2433",
+    "maker": "TRACO Power",
+    "group": "power",
+    "x": 106,
+    "y": 74,
+    "angle": 0,
+    "notes": "Separate 1A module fed by the protected rail (10-20V), NOT the marginal 5V input.",
+    "alias": "U3"
+  },
+  {
+    "ref": "C3",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 102,
+    "y": 67,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U3I"
+  },
+  {
+    "ref": "C4",
+    "value": "10u",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR61E106KA73L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 115,
+    "y": 79,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U3O"
+  },
+  {
+    "ref": "U6",
+    "value": "TSR 1-2433",
+    "footprint": "RacecarC:Converter_DCDC_TRACO_TSR-1_THT",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND",
+      "3": "+3V3_NET"
+    },
+    "names": {
+      "1": "VIN",
+      "2": "GND",
+      "3": "VOUT"
+    },
+    "types": {
+      "1": "power_in",
+      "2": "passive",
+      "3": "power_out"
+    },
+    "mpn": "TSR 1-2433",
+    "maker": "TRACO Power",
+    "group": "power",
+    "x": 120,
+    "y": 111,
+    "angle": 0,
+    "notes": "Separate 1A module fed by the protected rail (10-20V), NOT the marginal 5V input.",
+    "alias": "U_NET_PWR"
+  },
+  {
+    "ref": "C5",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 116,
+    "y": 104,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U_NET_PWRI"
+  },
+  {
+    "ref": "C6",
+    "value": "10u",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_NET",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR61E106KA73L",
+    "maker": "Murata",
+    "group": "power",
+    "x": 129,
+    "y": 116,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U_NET_PWRO"
+  },
+  {
+    "ref": "J1",
+    "value": "POWER IN",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",
+    "pins": {
+      "1": "VIN_RAW",
+      "2": "GND"
+    },
+    "names": {
+      "1": "10-20V IN",
+      "2": "GND"
+    },
+    "types": {
+      "1": "power_out",
+      "2": "power_out"
+    },
+    "mpn": "1729018",
+    "maker": "Phoenix Contact",
+    "group": "power",
+    "x": 30,
+    "y": 131,
+    "angle": 270,
+    "notes": "",
+    "alias": "J1"
+  },
+  {
+    "ref": "F1",
+    "value": "5A fuse",
+    "footprint": "RacecarC:Fuse_Littelfuse-NANO2-451_453",
+    "pins": {
+      "1": "VIN_RAW",
+      "2": "VIN_FUSED"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "0451005.MRL",
+    "maker": "Littelfuse",
+    "group": "power",
+    "x": 40.5,
+    "y": 116,
+    "angle": 0,
+    "notes": "",
+    "alias": "F1"
+  },
+  {
+    "ref": "F2",
+    "value": "3A fuse",
+    "footprint": "RacecarC:Fuse_Littelfuse-NANO2-451_453",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "+5V_SCREEN"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "0451003.MRL",
+    "maker": "Littelfuse",
+    "group": "power",
+    "x": 46,
+    "y": 132,
+    "angle": 180,
+    "notes": "",
+    "alias": "F2"
+  },
+  {
+    "ref": "D1",
+    "value": "SMBJ20CA",
+    "footprint": "RacecarC:D_SMB",
+    "pins": {
+      "1": "VIN_FUSED",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "SMBJ20CA",
+    "maker": "Littelfuse",
+    "group": "power",
+    "x": 48,
+    "y": 108,
+    "angle": 0,
+    "notes": "Bidirectional TVS; NOT automotive load-dump qualification",
+    "alias": "D1"
+  },
+  {
+    "ref": "C1",
+    "value": "100uF 50V",
+    "footprint": "RacecarC:CP_Radial_D8.0mm_P3.50mm",
+    "pins": {
+      "1": "VIN_PROTECTED",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "EEU-FR1H101",
+    "maker": "Panasonic",
+    "group": "power",
+    "x": 55,
+    "y": 116,
+    "angle": 180,
+    "notes": "",
+    "alias": "C1"
+  },
+  {
+    "ref": "C2",
+    "value": "470uF 10V",
+    "footprint": "RacecarC:CP_Radial_D8.0mm_P3.50mm",
+    "pins": {
+      "1": "+5V_SCREEN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "EEU-FR1A471B",
+    "maker": "Panasonic",
+    "group": "power",
+    "x": 103,
+    "y": 119,
+    "angle": 0,
+    "notes": "",
+    "alias": "C2"
+  },
+  {
+    "ref": "D2",
+    "value": "SS14",
+    "footprint": "RacecarC:D_SMA",
+    "pins": {
+      "1": "VIN_DIODE",
+      "2": "+5V_MAIN"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "SS14",
+    "maker": "onsemi",
+    "group": "power",
+    "x": 92,
+    "y": 29,
+    "angle": 0,
+    "notes": "BOM-REV1: onsemi is the orderable MPN (bare SS14 from Diodes Inc is not).",
+    "alias": "D2"
+  },
+  {
+    "ref": "JP1",
+    "value": "MCU POWER",
+    "footprint": "RacecarC:PinHeader_1x02_P2.54mm_Vertical",
+    "pins": {
+      "1": "VIN_DIODE",
+      "2": "TEENSY_VIN"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "TSW-102-07-G-S",
+    "maker": "Samtec",
+    "group": "power",
+    "x": 84,
+    "y": 29,
+    "angle": 0,
+    "notes": "Fit shunt after unloaded rail tests; cut Teensy VUSB-VIN before dual-power use",
+    "alias": "JP1"
+  },
+  {
+    "ref": "U1",
+    "value": "Teensy 4.1 SOCKETED",
+    "footprint": "RacecarC:Teensy41_Socket",
+    "pins": {
+      "1": "GND",
+      "2": "VID_RX_MCU",
+      "3": "VID_TX_MCU",
+      "4": null,
+      "5": null,
+      "6": null,
+      "7": "NET_IRQ_MCU",
+      "8": "NET_RESET_ASSERT",
+      "9": "GPS_RX_MCU",
+      "10": "GPS_TX_MCU",
+      "11": "TACH_MCU",
+      "12": "NET_CS_MCU",
+      "13": "NET_MOSI_MCU",
+      "14": "NET_MISO_MCU",
+      "15": "+3V3_MCU",
+      "16": "BRK_ADC",
+      "17": null,
+      "18": null,
+      "19": null,
+      "20": null,
+      "21": null,
+      "22": null,
+      "23": null,
+      "24": null,
+      "25": "TEENSY_VIN",
+      "26": "GND",
+      "27": "+3V3_MCU",
+      "28": "CAN_RX",
+      "29": "CAN_TX",
+      "30": "TPS_ADC",
+      "31": "AFR_ADC",
+      "32": "IMU_SCL",
+      "33": "IMU_SDA",
+      "34": "NTC_ADC",
+      "35": "OIL_ADC",
+      "36": "DASH_RX_MCU",
+      "37": "DASH_TX_MCU",
+      "38": "NET_SCK_MCU",
+      "39": "GND",
+      "40": null,
+      "41": "VINMON_ADC",
+      "42": null,
+      "43": null,
+      "44": null,
+      "45": null,
+      "46": null,
+      "47": null,
+      "48": null
+    },
+    "names": {
+      "1": "GND",
+      "2": "P0",
+      "3": "P1",
+      "4": "P2",
+      "5": "P3",
+      "6": "P4",
+      "7": "P5",
+      "8": "P6",
+      "9": "P7",
+      "10": "P8",
+      "11": "P9",
+      "12": "P10",
+      "13": "P11",
+      "14": "P12",
+      "15": "+3V3_MCU",
+      "16": "P24",
+      "17": "P25",
+      "18": "P26",
+      "19": "P27",
+      "20": "P28",
+      "21": "P29",
+      "22": "P30",
+      "23": "P31",
+      "24": "P32",
+      "25": "TEENSY_VIN",
+      "26": "GND",
+      "27": "+3V3_MCU",
+      "28": "P23",
+      "29": "P22",
+      "30": "P21",
+      "31": "P20",
+      "32": "P19",
+      "33": "P18",
+      "34": "P17",
+      "35": "P16",
+      "36": "P15",
+      "37": "P14",
+      "38": "P13",
+      "39": "GND",
+      "40": "P41",
+      "41": "P40",
+      "42": "P39",
+      "43": "P38",
+      "44": "P37",
+      "45": "P36",
+      "46": "P35",
+      "47": "P34",
+      "48": "P33"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive",
+      "5": "passive",
+      "6": "passive",
+      "7": "passive",
+      "8": "passive",
+      "9": "passive",
+      "10": "passive",
+      "11": "passive",
+      "12": "passive",
+      "13": "passive",
+      "14": "passive",
+      "15": "power_out",
+      "16": "passive",
+      "17": "passive",
+      "18": "passive",
+      "19": "passive",
+      "20": "passive",
+      "21": "passive",
+      "22": "passive",
+      "23": "passive",
+      "24": "passive",
+      "25": "power_in",
+      "26": "passive",
+      "27": "passive",
+      "28": "passive",
+      "29": "passive",
+      "30": "passive",
+      "31": "passive",
+      "32": "passive",
+      "33": "passive",
+      "34": "passive",
+      "35": "passive",
+      "36": "passive",
+      "37": "passive",
+      "38": "passive",
+      "39": "passive",
+      "40": "passive",
+      "41": "passive",
+      "42": "passive",
+      "43": "passive",
+      "44": "passive",
+      "45": "passive",
+      "46": "passive",
+      "47": "passive",
+      "48": "passive"
+    },
+    "mpn": "TEENSY41",
+    "maker": "PJRC",
+    "group": "mcu",
+    "x": 60,
+    "y": 28,
+    "angle": 0,
+    "notes": "CUT VUSB-VIN. Two 24-pin sockets. VBAT via separate removable 2-wire service lead to labelled Teensy VBAT/GND pads.",
+    "alias": "U1"
+  },
+  {
+    "ref": "C7",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "mcu",
+    "x": 82,
+    "y": 42,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_MCU"
+  },
+  {
+    "ref": "BT1",
+    "value": "CR2032 HOLDER",
+    "footprint": "RacecarC:BatteryHolder_Keystone_1058_1x2032",
+    "pins": {
+      "1": "VBAT_CELL",
+      "2": "GND"
+    },
+    "names": {
+      "1": "CELL+",
+      "2": "CELL-"
+    },
+    "types": {
+      "1": "power_out",
+      "2": "passive"
+    },
+    "mpn": "1058",
+    "maker": "Keystone",
+    "group": "mcu",
+    "x": 117,
+    "y": 144,
+    "angle": 0,
+    "notes": "Fit Panasonic CR2032 AFTER reflow/cleaning. Primary cell: NO charging.",
+    "alias": "BT1"
+  },
+  {
+    "ref": "J9",
+    "value": "TO TEENSY VBAT/GND",
+    "footprint": "RacecarC:JST_XH_B2B-XH-A_1x02_P2.50mm_Vertical",
+    "pins": {
+      "1": "VBAT_CELL",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "B2B-XH-A(LF)(SN)",
+    "maker": "JST",
+    "group": "mcu",
+    "x": 92,
+    "y": 137,
+    "angle": 0,
+    "notes": "Short removable lead: 1 to Teensy VBAT auxiliary pad, 2 GND. NEVER 3V3/ONOFF. Required assembly operation.",
+    "alias": "J_BAT"
+  },
+  {
+    "ref": "U21",
+    "value": "TCAN1042HGV-Q1",
+    "footprint": "RacecarC:SOIC-8_3.9x4.9mm_P1.27mm",
+    "pins": {
+      "1": "CAN_TX",
+      "2": "GND",
+      "3": "+5V_MAIN",
+      "4": "CAN_RX",
+      "5": "+3V3_MCU",
+      "6": "CANL",
+      "7": "CANH",
+      "8": "GND"
+    },
+    "names": {
+      "1": "TXD",
+      "2": "GND",
+      "3": "VCC",
+      "4": "RXD",
+      "5": "VIO",
+      "6": "CANL",
+      "7": "CANH",
+      "8": "STB"
+    },
+    "types": {
+      "1": "input",
+      "2": "power_in",
+      "3": "power_in",
+      "4": "output",
+      "5": "power_in",
+      "6": "bidirectional",
+      "7": "bidirectional",
+      "8": "input"
+    },
+    "mpn": "TCAN1042HGVDRQ1",
+    "maker": "Texas Instruments",
+    "group": "can",
+    "x": 131,
+    "y": 61,
+    "angle": 0,
+    "notes": "AEC-Q100 CAN transceiver, +/-70V bus fault protection, VIO=3.3V so RXD is 3.3V logic. STB (pin 8) is tied DIRECTLY to GND with no resistor: standby is receive-only (no ACK), the exact failure mode of the removed SN65HVD230 module. Acceptable alternates: TCAN1042VDRQ1, then NXP TJA1051T/3/1J (its pin 8 = S must also go to GND). Do NOT fit an SN65HVD230 (only -4/+16V bus fault) or any non-VIO TJA1051T/TJA1050 (5V RXD would damage the Teensy).",
+    "alias": "U21"
+  },
+  {
+    "ref": "C49",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "can",
+    "x": 127,
+    "y": 55.5,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U21V"
+  },
+  {
+    "ref": "C50",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "can",
+    "x": 131,
+    "y": 55.5,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U21IO"
+  },
+  {
+    "ref": "C51",
+    "value": "1u",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H105KA12L",
+    "maker": "Murata",
+    "group": "can",
+    "x": 135,
+    "y": 55.5,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U21B"
+  },
+  {
+    "ref": "J14",
+    "value": "CAN",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal",
+    "pins": {
+      "1": "CANH",
+      "2": "CANL",
+      "3": "GND"
+    },
+    "names": {
+      "1": "CANH",
+      "2": "CANL",
+      "3": "GND"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "1729021",
+    "maker": "Phoenix Contact",
+    "group": "can",
+    "x": 110,
+    "y": 61,
+    "angle": 0,
+    "notes": "1 CANH, 2 CANL, 3 GND (signal-ground reference to the ECU). Fit the split-termination jumper JP2 ONLY when this board is an end of the CAN bus.",
+    "alias": "J14"
+  },
+  {
+    "ref": "D25",
+    "value": "NUP2105L",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "CANH",
+      "2": "CANL",
+      "3": "GND"
+    },
+    "names": {
+      "1": "LINE1",
+      "2": "LINE2",
+      "3": "GND"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "NUP2105LT1G",
+    "maker": "onsemi",
+    "group": "can",
+    "x": 140,
+    "y": 62.5,
+    "angle": 0,
+    "notes": "Dual bidirectional CAN bus protector at J14 (SOT-23). Alternates: Nexperia PESD2CAN,215 or TI ESD2CAN24DBZRQ1.",
+    "alias": "D_U21TVS"
+  },
+  {
+    "ref": "JP2",
+    "value": "CAN TERM",
+    "footprint": "RacecarC:PinHeader_1x02_P2.54mm_Vertical",
+    "pins": {
+      "1": "CANH",
+      "2": "CAN_TERM"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "TSW-102-07-G-S",
+    "maker": "Samtec",
+    "group": "can",
+    "x": 140.5,
+    "y": 55.5,
+    "angle": 0,
+    "notes": "CAN TERM jumper (Samtec TSW-102 + shunt, as JP1). FIT ONLY IF THIS BOARD IS A BUS END; remove the shunt on a mid-bus tap. Do not fit while the ECU end is already terminated at 120R.",
+    "alias": "JP2"
+  },
+  {
+    "ref": "R58",
+    "value": "60.4R 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "CAN_TERM",
+      "2": "CAN_TERM_MID"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0760R4L",
+    "maker": "Yageo",
+    "group": "can",
+    "x": 132,
+    "y": 67,
+    "angle": 0,
+    "notes": "Split-termination upper leg. Two 60.4R in series = 120.8R across CANH/CANL.",
+    "alias": "R_T1"
+  },
+  {
+    "ref": "R59",
+    "value": "60.4R 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "CAN_TERM_MID",
+      "2": "CANL"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0760R4L",
+    "maker": "Yageo",
+    "group": "can",
+    "x": 137,
+    "y": 67,
+    "angle": 0,
+    "notes": "Split-termination lower leg.",
+    "alias": "R_T2"
+  },
+  {
+    "ref": "C52",
+    "value": "4.7n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "CAN_TERM_MID",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "CL21B472KBANNNC",
+    "maker": "Samsung",
+    "group": "can",
+    "x": 142,
+    "y": 67,
+    "angle": 0,
+    "notes": "Split-termination midpoint bypass to GND (50V X7R).",
+    "alias": "C_T"
+  },
+  {
+    "ref": "TP6",
+    "value": "CAN_TX",
+    "footprint": "RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "CAN_TX"
+    },
+    "names": {
+      "1": "1"
+    },
+    "types": {
+      "1": "passive"
+    },
+    "mpn": "PCB test pad",
+    "maker": "PCB",
+    "group": "mechanical",
+    "x": 118,
+    "y": 70,
+    "angle": 0,
+    "notes": "",
+    "alias": "TP6"
+  },
+  {
+    "ref": "TP7",
+    "value": "CAN_RX",
+    "footprint": "RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "CAN_RX"
+    },
+    "names": {
+      "1": "1"
+    },
+    "types": {
+      "1": "passive"
+    },
+    "mpn": "PCB test pad",
+    "maker": "PCB",
+    "group": "mechanical",
+    "x": 122,
+    "y": 70,
+    "angle": 0,
+    "notes": "",
+    "alias": "TP7"
+  },
+  {
+    "ref": "J13",
+    "value": "PI 5 VIDEO 3V3 UART",
+    "footprint": "RacecarC:JST_XH_B4B-XH-A_1x04_P2.50mm_Vertical",
+    "pins": {
+      "1": "GND",
+      "2": "VID_TX_CABLE",
+      "3": "VID_RX_CABLE",
+      "4": "GND"
+    },
+    "names": {
+      "1": "GND",
+      "2": "TX to Pi",
+      "3": "RX from Pi",
+      "4": "GND"
+    },
+    "types": {
+      "1": "passive",
+      "2": "output",
+      "3": "input",
+      "4": "passive"
+    },
+    "mpn": "B4B-XH-A(LF)(SN)",
+    "maker": "JST",
+    "group": "video",
+    "x": 158,
+    "y": 128,
+    "angle": 0,
+    "notes": "Pi 5 UART 115200 8N1, 3.3V only. NO 5V/12V here. Cameras and USB storage stay on the Pi and are NOT powered by this board.",
+    "alias": "J_VID"
+  },
+  {
+    "ref": "R1",
+    "value": "1k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "VID_TX_MCU",
+      "2": "VID_TX_CABLE"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "group": "video",
+    "x": 158,
+    "y": 108,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_VIDTX"
+  },
+  {
+    "ref": "R2",
+    "value": "1k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "VID_RX_CABLE",
+      "2": "VID_RX_MCU"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "group": "video",
+    "x": 158,
+    "y": 118,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_VIDRX"
+  },
+  {
+    "ref": "D3",
+    "value": "UART ESD",
+    "footprint": "RacecarC:D_SOD-323",
+    "pins": {
+      "1": "VID_TX_CABLE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PESD5V0S1BA,115",
+    "maker": "Nexperia",
+    "group": "video",
+    "x": 152,
+    "y": 108,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_VIDTX"
+  },
+  {
+    "ref": "D4",
+    "value": "UART ESD",
+    "footprint": "RacecarC:D_SOD-323",
+    "pins": {
+      "1": "VID_RX_CABLE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PESD5V0S1BA,115",
+    "maker": "Nexperia",
+    "group": "video",
+    "x": 152,
+    "y": 118,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_VIDRX"
+  },
+  {
+    "ref": "U7",
+    "value": "ICM-42670-P",
+    "footprint": "RacecarC:InvenSense_LGA-14_2.5x3.0mm_P0.50mm",
+    "pins": {
+      "1": "GND",
+      "2": "GND",
+      "3": "GND",
+      "4": null,
+      "5": "+3V3_MCU",
+      "6": "GND",
+      "7": "GND",
+      "8": "+3V3_MCU",
+      "9": null,
+      "10": "GND",
+      "11": "GND",
+      "12": "+3V3_MCU",
+      "13": "IMU_SCL",
+      "14": "IMU_SDA"
+    },
+    "names": {
+      "1": "AP_SDO/AP_AD0",
+      "2": "RESV",
+      "3": "RESV",
+      "4": "INT1",
+      "5": "VDDIO",
+      "6": "GND",
+      "7": "FSYNC",
+      "8": "VDD",
+      "9": "INT2",
+      "10": "RESV",
+      "11": "RESV",
+      "12": "AP_CS",
+      "13": "AP_SCL",
+      "14": "AP_SDA"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive",
+      "5": "power_in",
+      "6": "passive",
+      "7": "passive",
+      "8": "power_in",
+      "9": "passive",
+      "10": "passive",
+      "11": "passive",
+      "12": "passive",
+      "13": "input",
+      "14": "bidirectional"
+    },
+    "mpn": "ICM-42670-P",
+    "maker": "TDK InvenSense",
+    "group": "imu",
+    "x": 96,
+    "y": 45,
+    "angle": 0,
+    "notes": "Address 0x68 (AP_AD0=GND); AP_CS=VDDIO selects I2C. Polling only; INT1/INT2 unconnected. RESV pads grounded per DS-000451.",
+    "alias": "U_IMU"
+  },
+  {
+    "ref": "C9",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "imu",
+    "x": 94,
+    "y": 40,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_IMUV"
+  },
+  {
+    "ref": "C10",
+    "value": "10n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "CL21B103KBANNNC",
+    "maker": "Samsung",
+    "group": "imu",
+    "x": 91,
+    "y": 45,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_IMUL"
+  },
+  {
+    "ref": "C11",
+    "value": "2.2u",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "CC0805KKX7R9BB225",
+    "maker": "Yageo",
+    "group": "imu",
+    "x": 96,
+    "y": 50,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_IMUR"
+  },
+  {
+    "ref": "R3",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "IMU_SDA"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "imu",
+    "x": 101,
+    "y": 39,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_SDA"
+  },
+  {
+    "ref": "R4",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "IMU_SCL"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "imu",
+    "x": 107,
+    "y": 43,
+    "angle": 90,
+    "notes": "0805; >=0.125W",
+    "alias": "R_SCL"
+  },
+  {
+    "ref": "U8",
+    "value": "NEO-M9N-00B",
+    "footprint": "RacecarC:ublox_NEO",
+    "pins": {
+      "1": null,
+      "2": "+3V3_AUX",
+      "3": null,
+      "4": "GND",
+      "5": null,
+      "6": null,
+      "7": "GND",
+      "8": null,
+      "9": null,
+      "10": "GND",
+      "11": "RF_GNSS",
+      "12": "GND",
+      "13": "GND",
+      "14": null,
+      "15": null,
+      "16": null,
+      "17": null,
+      "18": null,
+      "19": null,
+      "20": "GPS_TX_AUX",
+      "21": "GPS_RX_AUX",
+      "22": "+3V3_AUX",
+      "23": "+3V3_AUX",
+      "24": "GND"
+    },
+    "names": {
+      "1": "SAFEBOOT_N",
+      "2": "D_SEL",
+      "3": "TIMEPULSE",
+      "4": "EXTINT",
+      "5": "USB_DM",
+      "6": "USB_DP",
+      "7": "V_USB",
+      "8": "RESET_N",
+      "9": "VCC_RF",
+      "10": "GND",
+      "11": "RF_IN",
+      "12": "GND",
+      "13": "GND",
+      "14": "LNA_EN",
+      "15": "RESERVED",
+      "16": "RESERVED",
+      "17": "RESERVED",
+      "18": "SDA",
+      "19": "SCL",
+      "20": "TXD",
+      "21": "RXD",
+      "22": "V_BCKP",
+      "23": "VCC",
+      "24": "GND"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive",
+      "5": "passive",
+      "6": "passive",
+      "7": "passive",
+      "8": "passive",
+      "9": "passive",
+      "10": "passive",
+      "11": "passive",
+      "12": "passive",
+      "13": "passive",
+      "14": "passive",
+      "15": "passive",
+      "16": "passive",
+      "17": "passive",
+      "18": "passive",
+      "19": "passive",
+      "20": "output",
+      "21": "input",
+      "22": "power_in",
+      "23": "power_in",
+      "24": "passive"
+    },
+    "mpn": "NEO-M9N-00B",
+    "maker": "u-blox",
+    "group": "gps",
+    "x": 125,
+    "y": 45,
+    "angle": 0,
+    "notes": "USB disabled: V_USB GND, D+/- open. No GPS coin-cell load: V_BCKP=VCC. VCC_RF unused; antenna bias from protected AUX rail.",
+    "alias": "U_GPS"
+  },
+  {
+    "ref": "C12",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "gps",
+    "x": 115,
+    "y": 51,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_GPS1"
+  },
+  {
+    "ref": "C13",
+    "value": "10u",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR61E106KA73L",
+    "maker": "Murata",
+    "group": "gps",
+    "x": 105,
+    "y": 56,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_GPS2"
+  },
+  {
+    "ref": "J8",
+    "value": "GPS SMA FEMALE",
+    "footprint": "RacecarC:SMA_Amphenol_901-143_Horizontal",
+    "pins": {
+      "1": "RF_ANT",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "901-143",
+    "maker": "Amphenol RF",
+    "group": "gps",
+    "x": 125,
+    "y": 24.5,
+    "angle": 0,
+    "notes": "Active GPS antenna 3.3V bias, never WiFi. Supplier drawing/board-edge fit must be inspected.",
+    "alias": "J_ANT"
+  },
+  {
+    "ref": "C14",
+    "value": "100pF C0G",
+    "footprint": "RacecarC:C_0402_1005Metric",
+    "pins": {
+      "1": "RF_ANT",
+      "2": "RF_GNSS"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM1555C1H101JA01D",
+    "maker": "Murata",
+    "group": "gps",
+    "x": 125,
+    "y": 33,
+    "angle": 270,
+    "notes": "",
+    "alias": "C_RF"
+  },
+  {
+    "ref": "L1",
+    "value": "27nH RF choke",
+    "footprint": "RacecarC:L_0402_1005Metric",
+    "pins": {
+      "1": "RF_ANT",
+      "2": "ANT_BIAS"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "LQG15HS27NJ02D",
+    "maker": "Murata",
+    "group": "gps",
+    "x": 128,
+    "y": 30,
+    "angle": 0,
+    "notes": "",
+    "alias": "L_RF"
+  },
+  {
+    "ref": "D5",
+    "value": "RF ESD",
+    "footprint": "RacecarC:D_SOD-882",
+    "pins": {
+      "": null,
+      "1": "RF_ANT",
+      "2": "GND"
+    },
+    "names": {
+      "": "",
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "": "passive",
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PESD5V0F1BL,315",
+    "maker": "Nexperia",
+    "group": "gps",
+    "x": 125,
+    "y": 29.8,
+    "angle": 0,
+    "notes": "BOM-REV1: 5.5V standoff / 0.4pF bidirectional (PESD3V3U1UL was 3.3V/2.6pF and is out of stock). Same SOD-882/DFN1006-2 footprint; antenna bias is 3.3V so the higher standoff is also correct. Verify capacitance/S-parameter budget at GNSS bands.",
+    "alias": "D_RF"
+  },
+  {
+    "ref": "U9",
+    "value": "TPS2553",
+    "footprint": "RacecarC:SOT-23-6",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND",
+      "3": "+3V3_AUX",
+      "4": null,
+      "5": "+3V3_AUX",
+      "6": "ANT_SWITCH"
+    },
+    "names": {
+      "1": "IN",
+      "2": "GND",
+      "3": "EN",
+      "4": "FAULT_N",
+      "5": "ILIM",
+      "6": "OUT"
+    },
+    "types": {
+      "1": "power_in",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive",
+      "5": "passive",
+      "6": "power_out"
+    },
+    "mpn": "TPS2553DBVR",
+    "maker": "Texas Instruments",
+    "group": "gps",
+    "x": 140,
+    "y": 34,
+    "angle": 0,
+    "notes": "ILIM tied to IN: 50/75/100mA min/typ/max limit per datasheet. Antenna fed from AUX, not GPS VCC_RF.",
+    "alias": "U_ANT"
+  },
+  {
+    "ref": "R5",
+    "value": "10R 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "ANT_SWITCH",
+      "2": "ANT_BIAS"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710RL",
+    "maker": "Yageo",
+    "group": "gps",
+    "x": 137,
+    "y": 28,
+    "angle": 0,
+    "notes": "",
+    "alias": "R_ANT_FILTER"
+  },
+  {
+    "ref": "C15",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "gps",
+    "x": 140,
+    "y": 40,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_ANT_IN"
+  },
+  {
+    "ref": "C16",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "ANT_BIAS",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "gps",
+    "x": 143,
+    "y": 30,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_ANT_OUT"
+  },
+  {
+    "ref": "U10",
+    "value": "SN74LVC1G125",
+    "footprint": "RacecarC:SOT-23-5",
+    "pins": {
+      "1": "GND",
+      "2": "GPS_TX_MCU",
+      "3": "GND",
+      "4": "GPS_RX_AUX",
+      "5": "+3V3_AUX"
+    },
+    "names": {
+      "1": "OE_N",
+      "2": "A",
+      "3": "GND",
+      "4": "Y",
+      "5": "VCC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "input",
+      "3": "passive",
+      "4": "tri_state",
+      "5": "power_in"
+    },
+    "mpn": "SN74LVC1G125DBVR",
+    "maker": "Texas Instruments",
+    "group": "gps",
+    "x": 111,
+    "y": 34,
+    "angle": 0,
+    "notes": "",
+    "alias": "U_GTX"
+  },
+  {
+    "ref": "C17",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_AUX",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "gps",
+    "x": 107,
+    "y": 32,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_GTX"
+  },
+  {
+    "ref": "J3",
+    "value": "TACH INPUT",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",
+    "pins": {
+      "1": "TACH_IN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "SIGNAL",
+      "2": "RETURN"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "1729018",
+    "maker": "Phoenix Contact",
+    "group": "tach",
+    "x": 30,
+    "y": 32,
+    "angle": 270,
+    "notes": "ECU/cluster conditioned 3.3/5/battery-level waveform ONLY. NEVER coil or injector.",
+    "alias": "J_TACH"
+  },
+  {
+    "ref": "R6",
+    "value": "180k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TACH_IN",
+      "2": "TACH_SENSE"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07180KL",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 39,
+    "y": 28,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TTOP"
+  },
+  {
+    "ref": "R7",
+    "value": "22k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TACH_SENSE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0722KL",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 43,
+    "y": 28,
+    "angle": 90,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TBOT"
+  },
+  {
+    "ref": "C18",
+    "value": "1n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "TACH_SENSE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "CC0805KRX7R9BB102",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 47,
+    "y": 28,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_TFILTER"
+  },
+  {
+    "ref": "D6",
+    "value": "LM4040 2.5",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "TACH_SENSE",
+      "2": "GND",
+      "3": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A",
+      "3": "A/NC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "LM4040AIM3-2.5/NOPB",
+    "maker": "Texas Instruments",
+    "group": "tach",
+    "x": 41,
+    "y": 34,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_TPOS"
+  },
+  {
+    "ref": "D7",
+    "value": "PMEG2010ER",
+    "footprint": "RacecarC:Nexperia_CFP3_SOD-123W",
+    "pins": {
+      "1": "TACH_SENSE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PMEG2010ER,115",
+    "maker": "Nexperia",
+    "group": "tach",
+    "x": 40.5,
+    "y": 39,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_TNEG"
+  },
+  {
+    "ref": "U11",
+    "value": "LM2903B",
+    "footprint": "RacecarC:SOIC-8_3.9x4.9mm_P1.27mm",
+    "pins": {
+      "1": "TACH_CMP",
+      "2": "TACH_REF",
+      "3": "TACH_SENSE",
+      "4": "GND",
+      "5": "GND",
+      "6": "TACH_REF",
+      "7": null,
+      "8": "+5V_MAIN"
+    },
+    "names": {
+      "1": "OUT1",
+      "2": "IN1-",
+      "3": "IN1+",
+      "4": "GND",
+      "5": "IN2+",
+      "6": "IN2-",
+      "7": "OUT2",
+      "8": "VCC"
+    },
+    "types": {
+      "1": "open_collector",
+      "2": "input",
+      "3": "input",
+      "4": "passive",
+      "5": "input",
+      "6": "input",
+      "7": "open_collector",
+      "8": "power_in"
+    },
+    "mpn": "LM2903BIDR",
+    "maker": "Texas Instruments",
+    "group": "tach",
+    "x": 51,
+    "y": 42,
+    "angle": 0,
+    "notes": "",
+    "alias": "U_CMP"
+  },
+  {
+    "ref": "R8",
+    "value": "240k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "TACH_REF"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07240KL",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 54,
+    "y": 34,
+    "angle": 90,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TREFH"
+  },
+  {
+    "ref": "R9",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TACH_REF",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 55,
+    "y": 38,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TREFL"
+  },
+  {
+    "ref": "C19",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "TACH_REF",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "tach",
+    "x": 55,
+    "y": 47,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_TREF"
+  },
+  {
+    "ref": "C20",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "tach",
+    "x": 48,
+    "y": 47,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_CMP"
+  },
+  {
+    "ref": "R10",
+    "value": "2.2M 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TACH_CMP",
+      "2": "TACH_SENSE"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-072M2L",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 45,
+    "y": 42,
+    "angle": 90,
+    "notes": "0805; >=0.125W",
+    "alias": "R_THYST"
+  },
+  {
+    "ref": "R11",
+    "value": "4.7k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "TACH_CMP"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-074K7L",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 41,
+    "y": 46,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TPULL"
+  },
+  {
+    "ref": "R12",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TACH_CMP",
+      "2": "TACH_BASE"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 39,
+    "y": 50,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TBASE"
+  },
+  {
+    "ref": "R13",
+    "value": "100k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TACH_BASE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07100KL",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 45,
+    "y": 51,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TBE"
+  },
+  {
+    "ref": "Q1",
+    "value": "MMBT3904",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "TACH_BASE",
+      "2": "GND",
+      "3": "TACH_LED_K"
+    },
+    "names": {
+      "1": "B",
+      "2": "E",
+      "3": "C"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "MMBT3904,215",
+    "maker": "Nexperia",
+    "group": "tach",
+    "x": 50,
+    "y": 53,
+    "angle": 0,
+    "notes": "",
+    "alias": "Q_TLED"
+  },
+  {
+    "ref": "R14",
+    "value": "680 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "TACH_LED_A"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07680RL",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 55,
+    "y": 52,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TLED"
+  },
+  {
+    "ref": "U12",
+    "value": "VO617A-3",
+    "footprint": "RacecarC:SMDIP-4_W9.53mm",
+    "pins": {
+      "1": "TACH_LED_A",
+      "2": "TACH_LED_K",
+      "3": "GND",
+      "4": "TACH_OPTO"
+    },
+    "names": {
+      "1": "LED A",
+      "2": "LED K",
+      "3": "E",
+      "4": "C"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive",
+      "4": "open_collector"
+    },
+    "mpn": "VO617A-3X017T",
+    "maker": "Vishay",
+    "group": "tach",
+    "x": 96,
+    "y": 59,
+    "angle": 0,
+    "notes": "100-200% CTR grade; ground shared, not whole-system galvanic isolation.",
+    "alias": "U_OPTO"
+  },
+  {
+    "ref": "R15",
+    "value": "4.7k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "TACH_OPTO"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-074K7L",
+    "maker": "Yageo",
+    "group": "tach",
+    "x": 99,
+    "y": 65,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TOPULL"
+  },
+  {
+    "ref": "U13",
+    "value": "SN74LVC2G17",
+    "footprint": "RacecarC:SOT-23-6",
+    "pins": {
+      "1": "TACH_OPTO",
+      "2": "GND",
+      "3": "GPS_TX_AUX",
+      "4": "GPS_RX_MCU",
+      "5": "+3V3_MCU",
+      "6": "TACH_MCU"
+    },
+    "names": {
+      "1": "1A",
+      "2": "GND",
+      "3": "2A",
+      "4": "2Y",
+      "5": "VCC",
+      "6": "1Y"
+    },
+    "types": {
+      "1": "input",
+      "2": "passive",
+      "3": "input",
+      "4": "output",
+      "5": "power_in",
+      "6": "output"
+    },
+    "mpn": "SN74LVC2G17DBVR",
+    "maker": "Texas Instruments",
+    "group": "tach",
+    "x": 85,
+    "y": 57,
+    "angle": 0,
+    "notes": "Inputs tolerate 5.5V, Ioff isolation; GPS AUX cannot back-power MCU through this buffer.",
+    "alias": "U_INPUT"
+  },
+  {
+    "ref": "C21",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "tach",
+    "x": 88,
+    "y": 52,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_INPUT"
+  },
+  {
+    "ref": "J4",
+    "value": "OIL 0.5-4.5V",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal",
+    "pins": {
+      "1": "+5V_SENSOR",
+      "2": "GND",
+      "3": "OIL_SIGNAL"
+    },
+    "names": {
+      "1": "5V OUT",
+      "2": "RETURN",
+      "3": "SIGNAL"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "1729021",
+    "maker": "Phoenix Contact",
+    "group": "analog",
+    "x": 30,
+    "y": 46,
+    "angle": 270,
+    "notes": "",
+    "alias": "J_OIL"
+  },
+  {
+    "ref": "F3",
+    "value": "100mA PTC",
+    "footprint": "RacecarC:Fuse_1206_3216Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "+5V_SENSOR"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "1206L010/60WR",
+    "maker": "Littelfuse",
+    "group": "analog",
+    "x": 40,
+    "y": 60,
+    "angle": 0,
+    "notes": "BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.",
+    "alias": "F_SENSOR"
+  },
+  {
+    "ref": "J11",
+    "value": "THROTTLE 0.5-4.5V",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal",
+    "pins": {
+      "1": "+5V_TPS",
+      "2": "GND",
+      "3": "TPS_SIGNAL"
+    },
+    "names": {
+      "1": "5V OUT",
+      "2": "RETURN",
+      "3": "SIGNAL"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "1729021",
+    "maker": "Phoenix Contact",
+    "group": "analog",
+    "x": 30,
+    "y": 93,
+    "angle": 270,
+    "notes": "",
+    "alias": "J_TPS"
+  },
+  {
+    "ref": "F4",
+    "value": "100mA PTC",
+    "footprint": "RacecarC:Fuse_1206_3216Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "+5V_TPS"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "1206L010/60WR",
+    "maker": "Littelfuse",
+    "group": "analog",
+    "x": 146,
+    "y": 34,
+    "angle": 0,
+    "notes": "BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.",
+    "alias": "F_TPS"
+  },
+  {
+    "ref": "J12",
+    "value": "BRAKE 0.5-4.5V",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-3-5.08_1x03_P5.08mm_Horizontal",
+    "pins": {
+      "1": "+5V_BRK",
+      "2": "GND",
+      "3": "BRK_SIGNAL"
+    },
+    "names": {
+      "1": "5V OUT",
+      "2": "RETURN",
+      "3": "SIGNAL"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "1729021",
+    "maker": "Phoenix Contact",
+    "group": "analog",
+    "x": 30,
+    "y": 112,
+    "angle": 270,
+    "notes": "",
+    "alias": "J_BRAKE"
+  },
+  {
+    "ref": "F5",
+    "value": "100mA PTC",
+    "footprint": "RacecarC:Fuse_1206_3216Metric",
+    "pins": {
+      "1": "+5V_MAIN",
+      "2": "+5V_BRK"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "1206L010/60WR",
+    "maker": "Littelfuse",
+    "group": "analog",
+    "x": 146,
+    "y": 56,
+    "angle": 0,
+    "notes": "BOM-REV1: 1206L010/30YR does not exist in the 1206L series; the 0.10A part is 1206L010/60WR (60V) in the same 1206 package.",
+    "alias": "F_BRK"
+  },
+  {
+    "ref": "J5",
+    "value": "COOLANT NTC",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",
+    "pins": {
+      "1": "NTC_SIGNAL",
+      "2": "GND"
+    },
+    "names": {
+      "1": "NTC",
+      "2": "RETURN"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "1729018",
+    "maker": "Phoenix Contact",
+    "group": "analog",
+    "x": 30,
+    "y": 65,
+    "angle": 270,
+    "notes": "",
+    "alias": "J_COOL"
+  },
+  {
+    "ref": "J6",
+    "value": "AEM 30-0300 ONLY",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",
+    "pins": {
+      "1": "AFR_SIGNAL",
+      "2": "GND"
+    },
+    "names": {
+      "1": "WHITE SIG+",
+      "2": "BROWN RETURN"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "1729018",
+    "maker": "Phoenix Contact",
+    "group": "analog",
+    "x": 30,
+    "y": 79,
+    "angle": 270,
+    "notes": "External AEM gauge only. Gauge supply/heater NOT powered here.",
+    "alias": "J_AFR"
+  },
+  {
+    "ref": "R16",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "OIL_SIGNAL",
+      "2": "OIL_CLAMP"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 41,
+    "y": 66,
+    "angle": 0,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_OILH"
+  },
+  {
+    "ref": "R17",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "OIL_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 47,
+    "y": 66,
+    "angle": 90,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_OILL"
+  },
+  {
+    "ref": "D8",
+    "value": "LM4040 3.0",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "OIL_CLAMP",
+      "2": "GND",
+      "3": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A",
+      "3": "A/NC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "LM4040AIM3-3.0/NOPB",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 51,
+    "y": 70,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_OILP"
+  },
+  {
+    "ref": "D9",
+    "value": "PMEG2010ER",
+    "footprint": "RacecarC:Nexperia_CFP3_SOD-123W",
+    "pins": {
+      "1": "OIL_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PMEG2010ER,115",
+    "maker": "Nexperia",
+    "group": "analog",
+    "x": 43,
+    "y": 71,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_OILN"
+  },
+  {
+    "ref": "R18",
+    "value": "1k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "OIL_CLAMP",
+      "2": "OIL_FILTER"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 49,
+    "y": 75,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_OILF"
+  },
+  {
+    "ref": "C22",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "OIL_FILTER",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 54,
+    "y": 75,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_OILF"
+  },
+  {
+    "ref": "R19",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "AFR_SIGNAL",
+      "2": "AFR_CLAMP"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 41,
+    "y": 90,
+    "angle": 0,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_AFRH"
+  },
+  {
+    "ref": "R20",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "AFR_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 47,
+    "y": 90,
+    "angle": 90,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_AFRL"
+  },
+  {
+    "ref": "D10",
+    "value": "LM4040 3.0",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "AFR_CLAMP",
+      "2": "GND",
+      "3": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A",
+      "3": "A/NC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "LM4040AIM3-3.0/NOPB",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 53,
+    "y": 97,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_AFRP"
+  },
+  {
+    "ref": "D11",
+    "value": "PMEG2010ER",
+    "footprint": "RacecarC:Nexperia_CFP3_SOD-123W",
+    "pins": {
+      "1": "AFR_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PMEG2010ER,115",
+    "maker": "Nexperia",
+    "group": "analog",
+    "x": 47,
+    "y": 103,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_AFRN"
+  },
+  {
+    "ref": "R21",
+    "value": "1k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "AFR_CLAMP",
+      "2": "AFR_FILTER"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 54,
+    "y": 104,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_AFRF"
+  },
+  {
+    "ref": "C23",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "AFR_FILTER",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 56,
+    "y": 99,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_AFRF"
+  },
+  {
+    "ref": "R22",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NTC_SIGNAL",
+      "2": "NTC_CLAMP"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 43,
+    "y": 78,
+    "angle": 0,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_NTCH"
+  },
+  {
+    "ref": "R23",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NTC_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 49,
+    "y": 78,
+    "angle": 90,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_NTCL"
+  },
+  {
+    "ref": "D12",
+    "value": "LM4040 3.0",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "NTC_CLAMP",
+      "2": "GND",
+      "3": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A",
+      "3": "A/NC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "LM4040AIM3-3.0/NOPB",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 53,
+    "y": 82,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_NTCP"
+  },
+  {
+    "ref": "D13",
+    "value": "PMEG2010ER",
+    "footprint": "RacecarC:Nexperia_CFP3_SOD-123W",
+    "pins": {
+      "1": "NTC_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PMEG2010ER,115",
+    "maker": "Nexperia",
+    "group": "analog",
+    "x": 45,
+    "y": 83,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_NTCN"
+  },
+  {
+    "ref": "R24",
+    "value": "1k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NTC_CLAMP",
+      "2": "NTC_FILTER"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 51,
+    "y": 87,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NTCF"
+  },
+  {
+    "ref": "C24",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "NTC_FILTER",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 56,
+    "y": 87,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_NTCF"
+  },
+  {
+    "ref": "R25",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TPS_SIGNAL",
+      "2": "TPS_CLAMP"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 152,
+    "y": 40,
+    "angle": 0,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_TPSH"
+  },
+  {
+    "ref": "R26",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TPS_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 158,
+    "y": 40,
+    "angle": 90,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_TPSL"
+  },
+  {
+    "ref": "D14",
+    "value": "LM4040 3.0",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "TPS_CLAMP",
+      "2": "GND",
+      "3": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A",
+      "3": "A/NC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "LM4040AIM3-3.0/NOPB",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 162,
+    "y": 44,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_TPSP"
+  },
+  {
+    "ref": "D15",
+    "value": "PMEG2010ER",
+    "footprint": "RacecarC:Nexperia_CFP3_SOD-123W",
+    "pins": {
+      "1": "TPS_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PMEG2010ER,115",
+    "maker": "Nexperia",
+    "group": "analog",
+    "x": 154,
+    "y": 45,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_TPSN"
+  },
+  {
+    "ref": "R27",
+    "value": "1k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "TPS_CLAMP",
+      "2": "TPS_FILTER"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 160,
+    "y": 49,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_TPSF"
+  },
+  {
+    "ref": "C25",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "TPS_FILTER",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 165,
+    "y": 49,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_TPSF"
+  },
+  {
+    "ref": "R28",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "BRK_SIGNAL",
+      "2": "BRK_CLAMP"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 152,
+    "y": 62,
+    "angle": 0,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_BRKH"
+  },
+  {
+    "ref": "R29",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "BRK_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 158,
+    "y": 62,
+    "angle": 90,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_BRKL"
+  },
+  {
+    "ref": "D16",
+    "value": "LM4040 3.0",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "BRK_CLAMP",
+      "2": "GND",
+      "3": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A",
+      "3": "A/NC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "LM4040AIM3-3.0/NOPB",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 162,
+    "y": 66,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_BRKP"
+  },
+  {
+    "ref": "D17",
+    "value": "PMEG2010ER",
+    "footprint": "RacecarC:Nexperia_CFP3_SOD-123W",
+    "pins": {
+      "1": "BRK_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PMEG2010ER,115",
+    "maker": "Nexperia",
+    "group": "analog",
+    "x": 154,
+    "y": 67,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_BRKN"
+  },
+  {
+    "ref": "R30",
+    "value": "1k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "BRK_CLAMP",
+      "2": "BRK_FILTER"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 160,
+    "y": 71,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_BRKF"
+  },
+  {
+    "ref": "C26",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "BRK_FILTER",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 165,
+    "y": 71,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_BRKF"
+  },
+  {
+    "ref": "R48",
+    "value": "180k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "VIN_FUSED",
+      "2": "VINMON_CLAMP"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD07180KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 131,
+    "y": 72,
+    "angle": 0,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_VINMONH"
+  },
+  {
+    "ref": "R49",
+    "value": "20k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "VINMON_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD0720KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 137,
+    "y": 72,
+    "angle": 90,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_VINMONL"
+  },
+  {
+    "ref": "D21",
+    "value": "LM4040 3.0",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "VINMON_CLAMP",
+      "2": "GND",
+      "3": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A",
+      "3": "A/NC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "LM4040AIM3-3.0/NOPB",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 141,
+    "y": 76,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_VINMONP"
+  },
+  {
+    "ref": "D22",
+    "value": "PMEG2010ER",
+    "footprint": "RacecarC:Nexperia_CFP3_SOD-123W",
+    "pins": {
+      "1": "VINMON_CLAMP",
+      "2": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PMEG2010ER,115",
+    "maker": "Nexperia",
+    "group": "analog",
+    "x": 133,
+    "y": 77,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_VINMONN"
+  },
+  {
+    "ref": "R50",
+    "value": "1k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "VINMON_CLAMP",
+      "2": "VINMON_FILTER"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-071KL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 139,
+    "y": 81,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_VINMONF"
+  },
+  {
+    "ref": "C40",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "VINMON_FILTER",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 144,
+    "y": 81,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_VINMONF"
+  },
+  {
+    "ref": "D18",
+    "value": "PMEG2010ER",
+    "footprint": "RacecarC:Nexperia_CFP3_SOD-123W",
+    "pins": {
+      "1": "NTC_FEED",
+      "2": "+5V_MAIN"
+    },
+    "names": {
+      "1": "K",
+      "2": "A"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PMEG2010ER,115",
+    "maker": "Nexperia",
+    "group": "analog",
+    "x": 89,
+    "y": 69,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_NTC_SUP"
+  },
+  {
+    "ref": "R31",
+    "value": "150 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NTC_FEED",
+      "2": "NTC_EXC"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07150RL",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 89,
+    "y": 74,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NTC_BIAS"
+  },
+  {
+    "ref": "U14",
+    "value": "LM4040 4.1",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "NTC_EXC",
+      "2": "GND",
+      "3": "GND"
+    },
+    "names": {
+      "1": "K",
+      "2": "A",
+      "3": "A/NC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "LM4040AIM3-4.1/NOPB",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 94,
+    "y": 79,
+    "angle": 0,
+    "notes": "",
+    "alias": "U_NTC_REF"
+  },
+  {
+    "ref": "C27",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "NTC_EXC",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 89,
+    "y": 81,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_NTC_EXC"
+  },
+  {
+    "ref": "R32",
+    "value": "2.49k 0.1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NTC_EXC",
+      "2": "NTC_SIGNAL"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RT0805BRD072K49L",
+    "maker": "Yageo",
+    "group": "analog",
+    "x": 97,
+    "y": 86,
+    "angle": 0,
+    "notes": "Thin-film 0.1%",
+    "alias": "R_NTC_PU"
+  },
+  {
+    "ref": "U15",
+    "value": "TMUX1511",
+    "footprint": "RacecarC:TSSOP-14_4.4x5mm_P0.65mm",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "OIL_FILTER",
+      "3": "OIL_ADC",
+      "4": "+3V3_MCU",
+      "5": "AFR_FILTER",
+      "6": "AFR_ADC",
+      "7": "GND",
+      "8": "NTC_ADC",
+      "9": "NTC_FILTER",
+      "10": "+3V3_MCU",
+      "11": "VINMON_ADC",
+      "12": "VINMON_FILTER",
+      "13": "+3V3_MCU",
+      "14": "+3V3_MCU"
+    },
+    "names": {
+      "1": "SEL1",
+      "2": "S1",
+      "3": "D1",
+      "4": "SEL2",
+      "5": "S2",
+      "6": "D2",
+      "7": "GND",
+      "8": "D3",
+      "9": "S3",
+      "10": "SEL3",
+      "11": "D4",
+      "12": "S4",
+      "13": "SEL4",
+      "14": "VDD"
+    },
+    "types": {
+      "1": "input",
+      "2": "passive",
+      "3": "passive",
+      "4": "input",
+      "5": "passive",
+      "6": "passive",
+      "7": "passive",
+      "8": "passive",
+      "9": "passive",
+      "10": "input",
+      "11": "passive",
+      "12": "passive",
+      "13": "input",
+      "14": "power_in"
+    },
+    "mpn": "TMUX1511PWR",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 129,
+    "y": 87,
+    "angle": 0,
+    "notes": "Power-off protection ONLY to 3.6V: independent shunts limit S1-S4 below 3.6V. Channel 4 = car input voltage monitor (VINMON), routed to Teensy A16/pin 40.",
+    "alias": "U_ADC"
+  },
+  {
+    "ref": "C28",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 136,
+    "y": 86,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_ADC"
+  },
+  {
+    "ref": "U16",
+    "value": "TMUX1511",
+    "footprint": "RacecarC:TSSOP-14_4.4x5mm_P0.65mm",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "TPS_FILTER",
+      "3": "TPS_ADC",
+      "4": "+3V3_MCU",
+      "5": "BRK_FILTER",
+      "6": "BRK_ADC",
+      "7": "GND",
+      "8": null,
+      "9": null,
+      "10": null,
+      "11": null,
+      "12": "GND",
+      "13": "GND",
+      "14": "+3V3_MCU"
+    },
+    "names": {
+      "1": "SEL1",
+      "2": "S1",
+      "3": "D1",
+      "4": "SEL2",
+      "5": "S2",
+      "6": "D2",
+      "7": "GND",
+      "8": "D3",
+      "9": "S3",
+      "10": "SEL3",
+      "11": "D4",
+      "12": "S4",
+      "13": "SEL4",
+      "14": "VDD"
+    },
+    "types": {
+      "1": "input",
+      "2": "passive",
+      "3": "passive",
+      "4": "input",
+      "5": "passive",
+      "6": "passive",
+      "7": "passive",
+      "8": "passive",
+      "9": "passive",
+      "10": "input",
+      "11": "passive",
+      "12": "passive",
+      "13": "input",
+      "14": "power_in"
+    },
+    "mpn": "TMUX1511PWR",
+    "maker": "Texas Instruments",
+    "group": "analog",
+    "x": 156,
+    "y": 90,
+    "angle": 0,
+    "notes": "Channels 1-2 = throttle/brake. Channels 3-4 unused. Powered-off isolation only to 3.6V; shunts are the protection.",
+    "alias": "U_ADC2"
+  },
+  {
+    "ref": "C29",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "analog",
+    "x": 163,
+    "y": 90,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_ADC2"
+  },
+  {
+    "ref": "J2",
+    "value": "SCREEN J10 ONLY",
+    "footprint": "RacecarC:TerminalBlock_Phoenix_MKDS-1,5-4-5.08_1x04_P5.08mm_Horizontal",
+    "pins": {
+      "1": "GND",
+      "2": "+5V_SCREEN",
+      "3": "DASH_RX_CABLE",
+      "4": "DASH_TX_CABLE"
+    },
+    "names": {
+      "1": "GND",
+      "2": "5V OUT",
+      "3": "RX FROM",
+      "4": "TX TO"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive"
+    },
+    "mpn": "1729034",
+    "maker": "Phoenix Contact",
+    "group": "screen",
+    "x": 30,
+    "y": 145,
+    "angle": 270,
+    "notes": "",
+    "alias": "J2"
+  },
+  {
+    "ref": "U4",
+    "value": "SN74LVC1T45",
+    "footprint": "RacecarC:SOT-23-6",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND",
+      "3": "DASH_TX_MCU",
+      "4": "DASH_TX_5V",
+      "5": "+3V3_MCU",
+      "6": "+5V_SCREEN"
+    },
+    "names": {
+      "1": "VCCA",
+      "2": "GND",
+      "3": "A",
+      "4": "B",
+      "5": "DIR",
+      "6": "VCCB"
+    },
+    "types": {
+      "1": "power_in",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive",
+      "5": "input",
+      "6": "power_in"
+    },
+    "mpn": "SN74LVC1T45DBVR",
+    "maker": "Texas Instruments",
+    "group": "screen",
+    "x": 46,
+    "y": 120,
+    "angle": 0,
+    "notes": "",
+    "alias": "U4"
+  },
+  {
+    "ref": "C30",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "screen",
+    "x": 42,
+    "y": 121,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U4A"
+  },
+  {
+    "ref": "C31",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+5V_SCREEN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "screen",
+    "x": 50,
+    "y": 122,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U4B"
+  },
+  {
+    "ref": "U5",
+    "value": "SN74LVC1T45",
+    "footprint": "RacecarC:SOT-23-6",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND",
+      "3": "DASH_RX_MCU",
+      "4": "DASH_RX_5V",
+      "5": "GND",
+      "6": "+5V_SCREEN"
+    },
+    "names": {
+      "1": "VCCA",
+      "2": "GND",
+      "3": "A",
+      "4": "B",
+      "5": "DIR",
+      "6": "VCCB"
+    },
+    "types": {
+      "1": "power_in",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive",
+      "5": "input",
+      "6": "power_in"
+    },
+    "mpn": "SN74LVC1T45DBVR",
+    "maker": "Texas Instruments",
+    "group": "screen",
+    "x": 54,
+    "y": 125,
+    "angle": 0,
+    "notes": "",
+    "alias": "U5"
+  },
+  {
+    "ref": "C32",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "screen",
+    "x": 50,
+    "y": 126,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U5A"
+  },
+  {
+    "ref": "C33",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+5V_SCREEN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "screen",
+    "x": 59,
+    "y": 123,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_U5B"
+  },
+  {
+    "ref": "R33",
+    "value": "100 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "DASH_TX_5V",
+      "2": "DASH_TX_CABLE"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07100RL",
+    "maker": "Yageo",
+    "group": "screen",
+    "x": 42,
+    "y": 146,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_DTX"
+  },
+  {
+    "ref": "R34",
+    "value": "100 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "DASH_RX_CABLE",
+      "2": "DASH_RX_5V"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07100RL",
+    "maker": "Yageo",
+    "group": "screen",
+    "x": 44,
+    "y": 140,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_DRX"
+  },
+  {
+    "ref": "R35",
+    "value": "47k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "DASH_TX_MCU"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0747KL",
+    "maker": "Yageo",
+    "group": "screen",
+    "x": 52,
+    "y": 137,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_DTIDLE"
+  },
+  {
+    "ref": "R36",
+    "value": "47k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+5V_SCREEN",
+      "2": "DASH_RX_CABLE"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0747KL",
+    "maker": "Yageo",
+    "group": "screen",
+    "x": 50,
+    "y": 141,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_DRIDLE"
+  },
+  {
+    "ref": "D19",
+    "value": "UART ESD",
+    "footprint": "RacecarC:D_SOD-323",
+    "pins": {
+      "1": "DASH_TX_CABLE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PESD5V0S1BA,115",
+    "maker": "Nexperia",
+    "group": "screen",
+    "x": 40,
+    "y": 150,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_DTX"
+  },
+  {
+    "ref": "D20",
+    "value": "UART ESD",
+    "footprint": "RacecarC:D_SOD-323",
+    "pins": {
+      "1": "DASH_RX_CABLE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "PESD5V0S1BA,115",
+    "maker": "Nexperia",
+    "group": "screen",
+    "x": 40,
+    "y": 143,
+    "angle": 0,
+    "notes": "",
+    "alias": "D_DRX"
+  },
+  {
+    "ref": "U17",
+    "value": "ESP32-S3-WROOM-1-N8R2",
+    "footprint": "RacecarC:ESP32-S3-WROOM-1",
+    "pins": {
+      "": null,
+      "1": "GND",
+      "2": "+3V3_NET",
+      "3": "NET_EN",
+      "4": null,
+      "5": null,
+      "6": null,
+      "7": null,
+      "8": null,
+      "9": null,
+      "10": null,
+      "11": null,
+      "12": null,
+      "13": null,
+      "14": null,
+      "15": null,
+      "16": null,
+      "17": null,
+      "18": "NET_CS",
+      "19": "NET_MOSI",
+      "20": "NET_SCK",
+      "21": "NET_MISO",
+      "22": "NET_IRQ",
+      "23": null,
+      "24": null,
+      "25": null,
+      "26": null,
+      "27": "NET_BOOT",
+      "28": null,
+      "29": null,
+      "30": null,
+      "31": null,
+      "32": null,
+      "33": null,
+      "34": null,
+      "35": null,
+      "36": "NET_UART_RX",
+      "37": "NET_UART_TX",
+      "38": null,
+      "39": null,
+      "40": "GND",
+      "41": "GND"
+    },
+    "names": {
+      "": "",
+      "1": "GND",
+      "2": "3V3",
+      "3": "EN",
+      "4": "4",
+      "5": "5",
+      "6": "6",
+      "7": "7",
+      "8": "8",
+      "9": "9",
+      "10": "10",
+      "11": "11",
+      "12": "12",
+      "13": "13",
+      "14": "14",
+      "15": "15",
+      "16": "16",
+      "17": "17",
+      "18": "GPIO10 CS",
+      "19": "GPIO11 MOSI",
+      "20": "GPIO12 SCK",
+      "21": "GPIO13 MISO",
+      "22": "GPIO14 IRQ",
+      "23": "23",
+      "24": "24",
+      "25": "25",
+      "26": "26",
+      "27": "GPIO0 BOOT",
+      "28": "28",
+      "29": "29",
+      "30": "30",
+      "31": "31",
+      "32": "32",
+      "33": "33",
+      "34": "34",
+      "35": "35",
+      "36": "GPIO44 RXD0",
+      "37": "GPIO43 TXD0",
+      "38": "38",
+      "39": "39",
+      "40": "GND",
+      "41": "EP GND"
+    },
+    "types": {
+      "": "passive",
+      "1": "passive",
+      "2": "power_in",
+      "3": "input",
+      "4": "passive",
+      "5": "passive",
+      "6": "passive",
+      "7": "passive",
+      "8": "passive",
+      "9": "passive",
+      "10": "passive",
+      "11": "passive",
+      "12": "passive",
+      "13": "passive",
+      "14": "passive",
+      "15": "passive",
+      "16": "passive",
+      "17": "passive",
+      "18": "passive",
+      "19": "passive",
+      "20": "passive",
+      "21": "passive",
+      "22": "passive",
+      "23": "passive",
+      "24": "passive",
+      "25": "passive",
+      "26": "passive",
+      "27": "passive",
+      "28": "passive",
+      "29": "passive",
+      "30": "passive",
+      "31": "passive",
+      "32": "passive",
+      "33": "passive",
+      "34": "passive",
+      "35": "passive",
+      "36": "input",
+      "37": "output",
+      "38": "passive",
+      "39": "passive",
+      "40": "passive",
+      "41": "passive"
+    },
+    "mpn": "ESP32-S3-WROOM-1-N8R2",
+    "maker": "Espressif",
+    "group": "wifi",
+    "x": 68,
+    "y": 162.25,
+    "angle": 180,
+    "notes": "PCB antenna over carrier notch; ALL-LAYER keepout. New coprocessor firmware required. No WiFi external antenna.",
+    "alias": "U_NET"
+  },
+  {
+    "ref": "C34",
+    "value": "10u",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_NET",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR61E106KA73L",
+    "maker": "Murata",
+    "group": "wifi",
+    "x": 81,
+    "y": 139,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_NETB"
+  },
+  {
+    "ref": "C35",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_NET",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "wifi",
+    "x": 81,
+    "y": 147,
+    "angle": 90,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_NETD"
+  },
+  {
+    "ref": "R37",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_NET",
+      "2": "NET_EN"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 89,
+    "y": 132,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NETEN"
+  },
+  {
+    "ref": "C36",
+    "value": "1u",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "NET_EN",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H105KA12L",
+    "maker": "Murata",
+    "group": "wifi",
+    "x": 94,
+    "y": 132,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_NETEN"
+  },
+  {
+    "ref": "R38",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_NET",
+      "2": "NET_BOOT"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 99,
+    "y": 131,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NETBOOT"
+  },
+  {
+    "ref": "Q2",
+    "value": "MMBT3904",
+    "footprint": "RacecarC:SOT-23",
+    "pins": {
+      "1": "NET_RESET_BASE",
+      "2": "GND",
+      "3": "NET_EN"
+    },
+    "names": {
+      "1": "B",
+      "2": "E",
+      "3": "C"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive"
+    },
+    "mpn": "MMBT3904,215",
+    "maker": "Nexperia",
+    "group": "wifi",
+    "x": 101,
+    "y": 127,
+    "angle": 0,
+    "notes": "",
+    "alias": "Q_NETRESET"
+  },
+  {
+    "ref": "R39",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NET_RESET_ASSERT",
+      "2": "NET_RESET_BASE"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 107,
+    "y": 129,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NETRB"
+  },
+  {
+    "ref": "R40",
+    "value": "100k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NET_RESET_BASE",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-07100KL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 107,
+    "y": 134,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NETRPD"
+  },
+  {
+    "ref": "U18",
+    "value": "SN74LVC125A",
+    "footprint": "RacecarC:TSSOP-14_4.4x5mm_P0.65mm",
+    "pins": {
+      "1": "GND",
+      "2": "NET_CS_MCU",
+      "3": "NET_CS_PRE",
+      "4": "GND",
+      "5": "NET_MOSI_MCU",
+      "6": "NET_MOSI_PRE",
+      "7": "GND",
+      "8": "NET_SCK_PRE",
+      "9": "NET_SCK_MCU",
+      "10": "GND",
+      "11": null,
+      "12": "GND",
+      "13": "+3V3_NET",
+      "14": "+3V3_NET"
+    },
+    "names": {
+      "1": "1OE_N",
+      "2": "1A",
+      "3": "1Y",
+      "4": "2OE_N",
+      "5": "2A",
+      "6": "2Y",
+      "7": "GND",
+      "8": "3Y",
+      "9": "3A",
+      "10": "3OE_N",
+      "11": "4Y",
+      "12": "4A",
+      "13": "4OE_N",
+      "14": "VCC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "tri_state",
+      "4": "passive",
+      "5": "passive",
+      "6": "tri_state",
+      "7": "passive",
+      "8": "tri_state",
+      "9": "passive",
+      "10": "passive",
+      "11": "tri_state",
+      "12": "passive",
+      "13": "passive",
+      "14": "power_in"
+    },
+    "mpn": "SN74LVC125APWR",
+    "maker": "Texas Instruments",
+    "group": "wifi",
+    "x": 134,
+    "y": 102,
+    "angle": 0,
+    "notes": "",
+    "alias": "U_SPI_TX"
+  },
+  {
+    "ref": "C37",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_NET",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "wifi",
+    "x": 141,
+    "y": 100,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_SPITX"
+  },
+  {
+    "ref": "R41",
+    "value": "33 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NET_CS_PRE",
+      "2": "NET_CS"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0733RL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 132,
+    "y": 112,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NETCS"
+  },
+  {
+    "ref": "R42",
+    "value": "33 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NET_MOSI_PRE",
+      "2": "NET_MOSI"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0733RL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 135,
+    "y": 109,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NETMOSI"
+  },
+  {
+    "ref": "R43",
+    "value": "33 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NET_SCK_PRE",
+      "2": "NET_SCK"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0733RL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 140,
+    "y": 107,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_NETSCK"
+  },
+  {
+    "ref": "R44",
+    "value": "10k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "NET_CS_MCU"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0710KL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 100,
+    "y": 91,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_CS_IDLE"
+  },
+  {
+    "ref": "R45",
+    "value": "47k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NET_SCK_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0747KL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 100,
+    "y": 100,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_SCK_IDLE"
+  },
+  {
+    "ref": "U19",
+    "value": "SN74LVC2G125",
+    "footprint": "RacecarC:VSSOP-8_2.3x2mm_P0.5mm",
+    "pins": {
+      "1": "GND",
+      "2": "NET_MISO",
+      "3": "NET_MISO_MCU",
+      "4": "GND",
+      "5": "NET_IRQ_MCU",
+      "6": "NET_IRQ",
+      "7": "GND",
+      "8": "+3V3_MCU"
+    },
+    "names": {
+      "1": "1OE_N",
+      "2": "1A",
+      "3": "1Y",
+      "4": "GND",
+      "5": "2Y",
+      "6": "2A",
+      "7": "2OE_N",
+      "8": "VCC"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "tri_state",
+      "4": "passive",
+      "5": "tri_state",
+      "6": "passive",
+      "7": "passive",
+      "8": "power_in"
+    },
+    "mpn": "SN74LVC2G125DCUR",
+    "maker": "Texas Instruments",
+    "group": "wifi",
+    "x": 106,
+    "y": 99,
+    "angle": 0,
+    "notes": "",
+    "alias": "U_SPI_RX"
+  },
+  {
+    "ref": "C38",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_MCU",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "wifi",
+    "x": 111,
+    "y": 95,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_SPIRX"
+  },
+  {
+    "ref": "R46",
+    "value": "47k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NET_IRQ",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0747KL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 112,
+    "y": 102,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_IRQ_IDLE"
+  },
+  {
+    "ref": "R47",
+    "value": "47k 1%",
+    "footprint": "RacecarC:R_0805_2012Metric",
+    "pins": {
+      "1": "NET_MISO",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "RC0805FR-0747KL",
+    "maker": "Yageo",
+    "group": "wifi",
+    "x": 117,
+    "y": 99,
+    "angle": 0,
+    "notes": "0805; >=0.125W",
+    "alias": "R_MISO_IDLE"
+  },
+  {
+    "ref": "J10",
+    "value": "NET 3V3 UART SERVICE",
+    "footprint": "RacecarC:PinHeader_2x03_P2.54mm_Vertical",
+    "pins": {
+      "1": "GND",
+      "2": "+3V3_NET",
+      "3": "NET_UART_TX",
+      "4": "NET_UART_EXT_RX",
+      "5": "NET_BOOT",
+      "6": "NET_EN"
+    },
+    "names": {
+      "1": "1",
+      "2": "2",
+      "3": "3",
+      "4": "4",
+      "5": "5",
+      "6": "6"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive",
+      "4": "passive",
+      "5": "passive",
+      "6": "passive"
+    },
+    "mpn": "TSW-103-07-G-D",
+    "maker": "Samtec",
+    "group": "wifi",
+    "x": 135,
+    "y": 122,
+    "angle": 0,
+    "notes": "1GND 2 3V3 REFERENCE OUT 3TX fromNET 4RX toNET 5BOOT0 6EN. 5/6 open-drain or ground ONLY. Do NOT power via pin2.",
+    "alias": "J_NET_SERVICE"
+  },
+  {
+    "ref": "U20",
+    "value": "SN74LVC1G125",
+    "footprint": "RacecarC:SOT-23-5",
+    "pins": {
+      "1": "GND",
+      "2": "NET_UART_EXT_RX",
+      "3": "GND",
+      "4": "NET_UART_RX",
+      "5": "+3V3_NET"
+    },
+    "names": {
+      "1": "1",
+      "2": "2",
+      "3": "3",
+      "4": "4",
+      "5": "5"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive",
+      "3": "passive",
+      "4": "tri_state",
+      "5": "power_in"
+    },
+    "mpn": "SN74LVC1G125DBVR",
+    "maker": "Texas Instruments",
+    "group": "wifi",
+    "x": 135,
+    "y": 134,
+    "angle": 0,
+    "notes": "Prevents powered USB-UART TX backfeeding an unpowered NET rail",
+    "alias": "U_NETUART"
+  },
+  {
+    "ref": "C39",
+    "value": "100n",
+    "footprint": "RacecarC:C_0805_2012Metric",
+    "pins": {
+      "1": "+3V3_NET",
+      "2": "GND"
+    },
+    "names": {
+      "1": "1",
+      "2": "2"
+    },
+    "types": {
+      "1": "passive",
+      "2": "passive"
+    },
+    "mpn": "GRM21BR71H104KA01L",
+    "maker": "Murata",
+    "group": "wifi",
+    "x": 143,
+    "y": 134,
+    "angle": 0,
+    "notes": "X7R 50V; 10uF is X5R 25V",
+    "alias": "C_NETUART"
+  },
+  {
+    "ref": "H1",
+    "value": "M3 MOUNT",
+    "footprint": "RacecarC:MountingHole_3.2mm_M3",
+    "pins": {
+      "": null
+    },
+    "names": {
+      "": ""
+    },
+    "types": {
+      "": "passive"
+    },
+    "mpn": "M3 insulated hardware",
+    "maker": "Assembly",
+    "group": "mechanical",
+    "x": 24,
+    "y": 24,
+    "angle": 0,
+    "notes": "",
+    "alias": "H1"
+  },
+  {
+    "ref": "H2",
+    "value": "M3 MOUNT",
+    "footprint": "RacecarC:MountingHole_3.2mm_M3",
+    "pins": {
+      "": null
+    },
+    "names": {
+      "": ""
+    },
+    "types": {
+      "": "passive"
+    },
+    "mpn": "M3 insulated hardware",
+    "maker": "Assembly",
+    "group": "mechanical",
+    "x": 166,
+    "y": 24,
+    "angle": 0,
+    "notes": "",
+    "alias": "H2"
+  },
+  {
+    "ref": "H3",
+    "value": "M3 MOUNT",
+    "footprint": "RacecarC:MountingHole_3.2mm_M3",
+    "pins": {
+      "": null
+    },
+    "names": {
+      "": ""
+    },
+    "types": {
+      "": "passive"
+    },
+    "mpn": "M3 insulated hardware",
+    "maker": "Assembly",
+    "group": "mechanical",
+    "x": 24,
+    "y": 171,
+    "angle": 0,
+    "notes": "",
+    "alias": "H3"
+  },
+  {
+    "ref": "H4",
+    "value": "M3 MOUNT",
+    "footprint": "RacecarC:MountingHole_3.2mm_M3",
+    "pins": {
+      "": null
+    },
+    "names": {
+      "": ""
+    },
+    "types": {
+      "": "passive"
+    },
+    "mpn": "M3 insulated hardware",
+    "maker": "Assembly",
+    "group": "mechanical",
+    "x": 166,
+    "y": 171,
+    "angle": 0,
+    "notes": "",
+    "alias": "H4"
+  },
+  {
+    "ref": "TP1",
+    "value": "GND",
+    "footprint": "RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "GND"
+    },
+    "names": {
+      "1": "1"
+    },
+    "types": {
+      "1": "passive"
+    },
+    "mpn": "PCB test pad",
+    "maker": "PCB",
+    "group": "mechanical",
+    "x": 55,
+    "y": 151,
+    "angle": 0,
+    "notes": "",
+    "alias": "TP1"
+  },
+  {
+    "ref": "TP2",
+    "value": "+5V_MAIN",
+    "footprint": "RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "+5V_MAIN"
+    },
+    "names": {
+      "1": "1"
+    },
+    "types": {
+      "1": "passive"
+    },
+    "mpn": "PCB test pad",
+    "maker": "PCB",
+    "group": "mechanical",
+    "x": 97,
+    "y": 106,
+    "angle": 0,
+    "notes": "",
+    "alias": "TP2"
+  },
+  {
+    "ref": "TP3",
+    "value": "+3V3_AUX",
+    "footprint": "RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "+3V3_AUX"
+    },
+    "names": {
+      "1": "1"
+    },
+    "types": {
+      "1": "passive"
+    },
+    "mpn": "PCB test pad",
+    "maker": "PCB",
+    "group": "mechanical",
+    "x": 112,
+    "y": 83,
+    "angle": 0,
+    "notes": "",
+    "alias": "TP3"
+  },
+  {
+    "ref": "TP4",
+    "value": "+3V3_NET",
+    "footprint": "RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "+3V3_NET"
+    },
+    "names": {
+      "1": "1"
+    },
+    "types": {
+      "1": "passive"
+    },
+    "mpn": "PCB test pad",
+    "maker": "PCB",
+    "group": "mechanical",
+    "x": 143,
+    "y": 116,
+    "angle": 0,
+    "notes": "",
+    "alias": "TP4"
+  },
+  {
+    "ref": "TP5",
+    "value": "+3V3_MCU",
+    "footprint": "RacecarC:TestPoint_THTPad_D2.0mm_Drill1.0mm",
+    "pins": {
+      "1": "+3V3_MCU"
+    },
+    "names": {
+      "1": "1"
+    },
+    "types": {
+      "1": "passive"
+    },
+    "mpn": "PCB test pad",
+    "maker": "PCB",
+    "group": "mechanical",
+    "x": 82,
+    "y": 47,
+    "angle": 0,
+    "notes": "",
+    "alias": "TP5"
+  }
+]

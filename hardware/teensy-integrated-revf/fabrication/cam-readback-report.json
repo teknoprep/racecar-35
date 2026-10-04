@@ -1,0 +1,24 @@
+{
+  "gerbers_parsed": 9,
+  "drills_matched_to_cad": {
+    "PTH": 217,
+    "NPTH": 4
+  },
+  "bounds_mm": [
+    [
+      19.975,
+      -160.025
+    ],
+    [
+      150.025,
+      -19.975
+    ]
+  ],
+  "package_sha256": "fa6ce18554cf6427070f349b53c90867bb5ac45b638da6ebbfd4a3251f18cb88",
+  "parser_notices": [
+    "12 \"G90\": G90 header statement found after end of header",
+    "26 \"G90\": G90 header statement found after end of header"
+  ],
+  "independent_electrical_review": false,
+  "physical_validation": false
+}
