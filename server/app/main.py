@@ -10917,8 +10917,27 @@ _REVIEW_HTML = (
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>""" + _BASE_CSS + """
-  .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: var(--sp-md); }
-  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  /* Three columns on a wide screen: the map, the live tiles + G-meter, and the
+     "all channels" table on the RIGHT. The map card stretches to the row's
+     height and the map itself grows to fill it, so there is never an empty
+     box under the 3D-drive / circle buttons whichever column is tallest.
+     Narrower: the table drops under the tiles; narrower still: one column. */
+  main { max-width: 2200px; }
+  .grid { display: grid; gap: var(--sp-md); align-items: stretch;
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.85fr) minmax(0, 0.9fr);
+    grid-template-areas: "map tiles chan"; }
+  .grid > .mapcard { grid-area: map; display: flex; flex-direction: column; }
+  .grid > .tiles { grid-area: tiles; align-content: start; }
+  .grid > .chancol { grid-area: chan; display: flex; flex-direction: column;
+    gap: var(--sp-md); min-width: 0; }
+  @media (max-width: 1500px) {
+    main { max-width: 1400px; }
+    .grid { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+      grid-template-areas: "map tiles" "map chan"; }
+  }
+  @media (max-width: 980px) {
+    .grid { grid-template-columns: 1fr; grid-template-areas: "map" "tiles" "chan"; }
+  }
   .card { background: var(--surface); border: 1px solid var(--line);
     border-radius: var(--r-md); overflow: hidden; }
   .card-head { display:flex; justify-content:space-between; align-items:center;
@@ -10926,6 +10945,7 @@ _REVIEW_HTML = (
     background: var(--surface); }
   .card-body { padding: var(--sp-md); }
   #map { height: 560px; width: 100%; background: var(--bg); }
+  .mapcard #map { height: auto; min-height: 560px; flex: 1 1 auto; }
   .leaflet-container { background: var(--bg); }
   /* Basemap switch: checkbox strip directly UNDER the map. Off = no tiles at
      all, just a black surface — what you want when the imagery fights the
@@ -11202,7 +11222,7 @@ _REVIEW_HTML = (
   <div id="loading" class="loading">loading session\u2026</div>
   <div id="app" style="display:none">
     <div class="grid">
-      <div class="card">
+      <div class="card mapcard">
         <div class="card-head"><span class="t-label">Track Map</span>
           <span class="t-label" id="gps-status">\u2014</span></div>
         <div id="map">
@@ -11282,6 +11302,8 @@ _REVIEW_HTML = (
             </div>
           </div>
         </div>
+      </div>
+      <div class="chancol">
         <div class="tile full">
           <div class="label">All channels logged <span class="t-label" id="ch-note"></span></div>
           <table class="chtab">
@@ -11481,6 +11503,15 @@ _REVIEW_HTML = (
   // imagery. CARTO's dark tiles now need an API key and would render a
   // "API KEY REQUIRED" placeholder here.) ---------------------------------
   const map = L.map('map', { zoomControl: true, attributionControl: true });
+  // The map's height follows its card (which follows the tallest column), so
+  // Leaflet must be told whenever that changes, or it leaves grey bands.
+  if (window.ResizeObserver) {
+    let rz = 0;
+    new ResizeObserver(function () {
+      cancelAnimationFrame(rz);
+      rz = requestAnimationFrame(function () { map.invalidateSize({ pan: false }); });
+    }).observe(el('map'));
+  }
   // ---- basemap on/off ---------------------------------------------------
   // Satellite tiles, or nothing but a black surface. The checkbox lives in
   // the strip directly under the map; the choice is remembered per browser.
