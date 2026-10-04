@@ -682,6 +682,397 @@ R.world = (function () {
            unrle: RC3D.unrle("3p2w1g") };
 })();
 
+// ---- driver input from REAL logger behaviour ------------------------------
+// deterministic noise
+function rng(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function gauss(r) { var u = Math.max(1e-12, r()), v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+var MPH_PER_G_S = 9.80665 / 0.44704;          // mph gained per second at 1 g
+
+// A trace the way the logger writes it: each fix at its 40 ms slot, then a
+// REPEAT of it 40 ms later, then the next fix 1 ms after that. Speed is
+// quantised to 0.1 mph. segs = [[g, secs], ...]; returns rows + truth.
+function loggerTrace(v0, segs, opts) {
+  opts = opts || {};
+  var rows = [], truth = [], v = v0, dist = 0, tt = 0, lat0 = 39.0, lon0 = -77.0, k = 0;
+  segs.forEach(function (sg) {
+    var n = Math.round(sg[1] * 25);
+    for (var j = 0; j < n; j++) {
+      var tFix = k * 0.041;                   // repeat at +0.040, next fix at +0.041
+      var dt = k ? 0.041 : 0;
+      v = Math.max(0, v + sg[0] * MPH_PER_G_S * dt);
+      dist += v * 0.44704 * dt;
+      var row = { t: 1700000000 + tFix, lat: lat0 + dist / 111320, lon: lon0,
+                  speed_mph: Math.round(v * 10) / 10, rpm: 5000 };
+      if (opts.imu) { var im = opts.imu(sg[0], k); row.ax = im[0]; row.ay = im[1]; row.az = im[2]; }
+      rows.push(row);
+      truth.push({ t: tFix, g: sg[0], mph: v });
+      if (opts.repeats !== false) {
+        var rep = {}; for (var key in row) rep[key] = row[key];
+        rep.t = row.t + 0.040;
+        rows.push(rep);
+      }
+      k++;
+    }
+  });
+  return { rows: rows, truth: truth };
+}
+
+R.clean = (function () {
+  var tr = loggerTrace(40, [[0.2, 4]]);
+  var rows = tr.rows.slice();
+  rows.splice(10, 0, { t: rows[9].t + 0.0005, rpm: 4000 });   // no fix: kept untouched
+  var c = RC3D.cleanFixes(rows);
+  var gaps = [], noFix = 0;
+  for (var i = 0; i < c.length; i++) {
+    if (typeof c[i].lat !== "number") { noFix++; continue; }
+    if (i && typeof c[i - 1].lat === "number") gaps.push(c[i].t - c[i - 1].t);
+  }
+  gaps.sort(function (a, b) { return a - b; });
+  var p = RC3D.buildPath(rows, { smooth: 3 });
+  var pk = RC3D.buildPath(rows, { smooth: 3, keepRepeats: true });
+  // laps are given as times: the cleaned path keeps the same time base
+  var lap = { lap: 1, t_start: 1.0, t_end: 3.0 };
+  var fs = RC3D.frameState(p, 2.0, lap, {});
+  return { rows: rows.length, kept: c.length, fixes: tr.truth.length, noFix: noFix,
+           gapMin: gaps[0], gapMax: gaps[gaps.length - 1], same: c[0] === rows[0],
+           pathN: p.n, pathKeep: pk.n, samplesN: p.samples.length,
+           srcLast: p.srcIndex[p.srcIndex.length - 1], t0: p.t[0],
+           tMatch: Math.abs(p.t[5] - (c[5].t - c[0].t)),
+           lapProgress: fs.progress, lapT: fs.t };
+})();
+
+R.longG = (function () {
+  // 0.5 g constant from 20 mph, logger repeats + 0.1 mph quantisation, 25 Hz
+  var tr = loggerTrace(20, [[0, 2], [0.5, 6], [0, 2]]);
+  var p = RC3D.buildPath(tr.rows, { smooth: 5 });
+  var errs = [];
+  for (var i = 0; i < p.n; i++) {
+    if (p.t[i] > 2.6 && p.t[i] < 7.6) errs.push(Math.abs(p.accel[i] - 0.5));
+  }
+  errs.sort(function (a, b) { return a - b; });
+  var steady = [];
+  for (i = 0; i < p.n; i++) if (p.t[i] > 8.8 && p.t[i] < 9.6) steady.push(Math.abs(p.accel[i]));
+  // the old neighbour-difference on the RAW rows is what made garbage of it
+  var raw = RC3D.buildPath(tr.rows, { smooth: 5, keepRepeats: true }), rawWorst = 0;
+  for (i = 0; i < raw.n; i++) if (raw.t[i] > 2.6 && raw.t[i] < 7.6) rawWorst = Math.max(rawWorst, Math.abs(raw.accel[i] - 0.5));
+  return { n: errs.length, median: errs[errs.length >> 1], worst: errs[errs.length - 1],
+           steadyWorst: Math.max.apply(null, steady), source: p.accelSource };
+})();
+
+R.fusion = (function () {
+  // a long varying-g drive: brake/throttle/coast waves, always above 30 mph
+  var segs = [];
+  for (var q = 0; q < 40; q++) segs.push([0.3, 3], [0, 1], [-0.8, 1.2], [-0.1, 1]);
+  var r = rng(7), th = 0.6;
+  var good = loggerTrace(60, segs, { repeats: false, imu: function (g) {
+    // unknown mounting: rotated + scaled + offset copy of the true g, plus noise
+    return [0.9 * g * Math.cos(th) + 0.05 + 0.03 * gauss(r),
+            0.9 * g * Math.sin(th) - 0.03 + 0.03 * gauss(r),
+            1.0 + 0.1 * g + 0.03 * gauss(r)];
+  } });
+  var r2 = rng(11);
+  var junk = loggerTrace(60, segs, { repeats: false, imu: function () {
+    return [0.3 * gauss(r2), 0.3 * gauss(r2), 1 + 0.3 * gauss(r2)];
+  } });
+  var pg = RC3D.buildPath(good.rows, { smooth: 3 });
+  var pj = RC3D.buildPath(junk.rows, { smooth: 3 });
+  function err(p, tr) {
+    var e = [];
+    for (var i = 0; i < p.n; i++) {
+      // skip the edges of each step: truth is a square wave, both estimates smear it
+      var tt = p.t[i], near = false;
+      for (var k = Math.max(0, i - 8); k <= Math.min(p.n - 1, i + 8); k++) if (tr.truth[k].g !== tr.truth[i].g) near = true;
+      if (!near) e.push(Math.abs(p.accel[i] - tr.truth[i].g));
+    }
+    e.sort(function (a, b) { return a - b; });
+    return e[e.length >> 1];
+  }
+  var gpsOnly = RC3D.longG(pg.t, good.rows.map(function (s) { return s.speed_mph; }), null);
+  return { goodSource: pg.accelSource, goodR: pg.imuR, junkSource: pj.accelSource, junkR: pj.imuR,
+           goodErr: err(pg, good), junkErr: err(pj, junk), gpsOnlySource: gpsOnly.source };
+})();
+
+R.input = (function () {
+  // classifier on a designed g/speed trace (25 Hz)
+  var t = [], sp = [], ac = [];
+  function seg(secs, mph, g) {
+    for (var k = 0; k < Math.round(secs * 25); k++) {
+      t.push(t.length / 25); sp.push(typeof mph === "function" ? mph(k) : mph);
+      ac.push(typeof g === "function" ? g(k / 25) : g);
+    }
+  }
+  seg(5, 110, 0.0);                       // top speed, full throttle, g ~ 0
+  seg(3, 90, -0.12);                      // coasting at 90: drag alone
+  seg(2, 70, -0.8);                       // braking
+  seg(4, 50, function (x) { return (x >= 1 && x < 1.25) ? -0.10 : 0.3; });  // shift dip
+  seg(3, 50, function (x) { return (x >= 1 && x < 1.12) ? -0.5 : -0.069; });  // brake blip in a coast
+  seg(2, 8, 0.2);                         // crawling: never throttle
+  seg(2, 8, -0.6);                        // ... but braking still counts
+  var path = { t: t, speed: sp, accel: ac };
+  var r = RC3D.inputStates(path);
+  function at(sec) { return r.state[Math.round(sec * 25)]; }
+  function lv(sec) { return r.level[Math.round(sec * 25)]; }
+  return { top: at(2.5), coast90: at(6.5), brake: at(9), shiftDip: at(11.1),
+           afterShift: at(12.5), blip: at(15.05), coast50: at(16), crawl: at(18), crawlBrake: at(20.5),
+           lvTop: lv(2.5), lvBrake: lv(9), lvCoast: lv(6.5),
+           coastG100: RC3D.coastG(100), coastG0: RC3D.coastG(0),
+           colThr: RC3D.inputColour(1, 1), colThrLo: RC3D.inputColour(1, 0.15),
+           colBrk: RC3D.inputColour(-1, 1), colBrkLo: RC3D.inputColour(-1, 0.15),
+           colCoast: RC3D.inputColour(0, 0) };
+})();
+
+R.events = (function () {
+  // a lap: three braking zones (to 45, 60, 35 mph) and one LIFT (85 -> ~77)
+  var v = 60, segs = [];
+  function to(target, g) { var s = (target - v) / (g * MPH_PER_G_S); v = target; segs.push([g, s]); }
+  function hold(g, secs) { v += g * MPH_PER_G_S * secs; segs.push([g, secs]); }
+  var expect = [];                        // the slowest point of each event
+  to(100, 0.3); hold(0, 3);
+  to(45, -0.8); hold(RC3D.coastG(45), 1.5); expect.push(v);   // rolls on a little
+  to(85, 0.3); hold(-0.15, 2.4); expect.push(v);
+  to(95, 0.3); to(60, -0.8); hold(RC3D.coastG(60), 1.0); expect.push(v);
+  to(90, 0.3); to(35, -0.8); expect.push(v); to(60, 0.3);
+  var tr = loggerTrace(60, segs);
+  var p = RC3D.buildPath(tr.rows, { smooth: 5 });
+  var ev = RC3D.cornerEvents(p, {});
+  var half = RC3D.cornerEvents(p, { i0: 0, i1: Math.floor(p.n / 2) });
+  return { kinds: ev.map(function (e) { return e.kind; }).join(","),
+           mins: ev.map(function (e) { return +e.min_mph.toFixed(1); }), expect: expect,
+           entry: ev.map(function (e) { return +e.entry_mph.toFixed(1); }),
+           peak: ev.map(function (e) { return +e.peak_g.toFixed(2); }),
+           ordered: ev.every(function (e) {
+             return e.brake_i <= e.release_i && e.brake_i <= e.min_i && e.min_i <= e.throttle_i &&
+                    e.brake_s <= e.min_s && e.min_s <= e.throttle_s &&
+                    p.input.state[e.throttle_i] === 1;
+           }),
+           sorted: ev.every(function (e, i) { return !i || ev[i - 1].brake_i <= e.brake_i; }),
+           halfN: half.length };
+})();
+
+// a closed circuit with varying curvature (metres, local frame)
+function loopPt(th) { return [400 * Math.cos(th) + 80 * Math.cos(3 * th), 250 * Math.sin(th) + 40 * Math.sin(2 * th)]; }
+function loopNormal(th) {
+  var e = 1e-4, a = loopPt(th - e), b = loopPt(th + e), tx = b[0] - a[0], tz = b[1] - a[1], L = Math.hypot(tx, tz);
+  return [-tz / L, tx / L];
+}
+R.register = (function () {
+  var lx = [], lz = [], fx = [], fz = [], r = rng(3), N = 3000, lap, k;
+  for (k = 0; k <= N; k++) { var q = loopPt(2 * Math.PI * k / N); lx.push(q[0] - 3); lz.push(q[1] + 2); }
+  for (lap = 0; lap < 5; lap++) {
+    // racing line: +/-4 m off centre at CORNER scale (~150-250 m wavelength).
+    // A wander at the scale of the whole lap (1-5 cycles) is genuinely
+    // indistinguishable from a shift of the line, so that is not what is tested.
+    var ph = r() * 6.28, ph2 = r() * 6.28, fr = 9 + lap;
+    for (k = 0; k < 2400; k++) {
+      var th = 2 * Math.PI * k / 2400, p0 = loopPt(th), nn = loopNormal(th);
+      var w = 3 * Math.sin(fr * th + ph) + Math.sin(2.3 * fr * th + ph2);
+      fx.push(p0[0] + nn[0] * w + gauss(r)); fz.push(p0[1] + nn[1] * w + gauss(r));
+    }
+  }
+  var reg = RC3D.registerLine(lx, lz, fx, fz, {});
+  var big = [], bz = [];
+  for (k = 0; k < lx.length; k++) { big.push(lx[k] - 12); bz.push(lz[k] + 9); }
+  var reg2 = RC3D.registerLine(big, bz, fx, fz, {});
+  return { dx: reg.dx, dz: reg.dz, med: reg.medDist, inFrac: reg.inFrac, used: reg.used,
+           dx2: reg2.dx, dz2: reg2.dz };
+})();
+
+R.consensus = (function () {
+  var r = rng(21), lat0 = 39.0, lon0 = -77.0, cosl = Math.cos(lat0 * Math.PI / 180);
+  var rows = [], laps = [], tt = 0, lapN, k;
+  function toLL(x, z) { return [lat0 - z / 111320, lon0 + x / (111320 * cosl)]; }
+  // loop length ~2.2 km; each lap at its own speed, its own smooth wander
+  for (lapN = 0; lapN < 6; lapN++) {
+    var v = 30 + (lapN === 2 ? 1.0 : 0.15 * lapN), ph = r() * 6.28, fr = 3 + (lapN % 4);
+    var amp = 2.5, n = Math.round(2230 / v * 25), t0 = tt;
+    for (k = 0; k < n; k++) {
+      var th = 2 * Math.PI * k / n, p0 = loopPt(th), nn = loopNormal(th);
+      var w = amp * Math.sin(fr * th + ph);
+      var ll = toLL(p0[0] + nn[0] * w + gauss(r), p0[1] + nn[1] * w + gauss(r));
+      rows.push({ t: 1700000000 + tt, lat: ll[0], lon: ll[1], speed_mph: v / 0.44704 });
+      tt += 0.04;
+    }
+    laps.push({ lap: lapN + 1, t_start: t0, t_end: tt, seconds: tt - t0 });
+  }
+  var p = RC3D.buildPath(rows, { smooth: 5, denseStep: 1 });
+  // the truth in the path's own frame
+  var tx = [], tz = [];
+  for (k = 0; k <= 4000; k++) {
+    var q = loopPt(2 * Math.PI * k / 4000), lq = toLL(q[0], q[1]), pr = RC3D.project(lq[0], lq[1], p.o);
+    tx.push(pr.x); tz.push(pr.z);
+  }
+  var truth = RC3D.lineIndex(tx, tz, 20);
+  function meanErr(x, z) {
+    var s = 0, c = 0;
+    for (var i = 0; i < x.length; i += 3) { var h = truth.nearest(x[i], z[i], 40); if (h) { s += h.d; c++; } }
+    return c ? s / c : 1e9;
+  }
+  var kd = p.dense.total / p.total, single = [];
+  laps.forEach(function (L) {
+    var a = RC3D.sAtTime(p, L.t_start) * kd, b = RC3D.sAtTime(p, L.t_end) * kd, x = [], z = [];
+    for (var i = 0; i < p.dense.s.length; i++) if (p.dense.s[i] >= a && p.dense.s[i] <= b) { x.push(p.dense.x[i]); z.push(p.dense.z[i]); }
+    single.push(meanErr(x, z));
+  });
+  var cons = RC3D.consensusLine(p, laps);
+  var one = RC3D.consensusLine(p, laps.slice(0, 1));
+  return { cons: meanErr(cons.x, cons.z), bestSingle: Math.min.apply(null, single),
+           single: single, pts: cons.x.length, onePts: one.x.length };
+})();
+
+R.snap = (function () {
+  var o = { lat: 39.0, lon: -77.0 }, lx = [], lz = [], k;
+  for (k = -500; k <= 500; k += 2) { lx.push(k); lz.push(0); }
+  var offs = [3, 4.8, -6, 8.9, 12, -4.5, -9.5], samples = [];
+  offs.forEach(function (d, i) {
+    var ll = RC3D.localToLatLon(-200 + i * 50, d, o);
+    samples.push({ t: i, lat: ll[0], lon: ll[1], speed_mph: 50, rpm: 4000 + i });
+  });
+  samples.push({ t: 99, rpm: 1 });                      // no fix: passed through
+  var before = JSON.stringify(samples);
+  var res = RC3D.snapSamples(samples, o, lx, lz, function () { return 5; });
+  var after = res.samples.map(function (s) {
+    if (typeof s.lat !== "number") return null;
+    var p = RC3D.project(s.lat, s.lon, o);
+    return [+p.x.toFixed(3), +p.z.toFixed(3)];
+  });
+  return { moved: res.moved, after: after, untouched: JSON.stringify(samples) === before,
+           kept: res.samples[1].rpm, len: res.samples.length,
+           same: res.samples[0] === samples[0] };
+})();
+
+// ---- sample arc length <-> spline arc length over a LONG session ---------
+// 12 laps of jittery 25 Hz fixes: the spline is built on decimated control
+// points, so its length and the summed fix-to-fix chords drift apart. One
+// global ratio put the car 180 m from where it really was by lap 8 at Summit
+// Point; the knot map must keep it on the fix it is showing.
+R.knots = (function () {
+  var r = rng(5), lat0 = 39.0, lon0 = -77.0, cosl = Math.cos(lat0 * Math.PI / 180);
+  var rows = [], tt = 0, lap, k;
+  for (lap = 0; lap < 12; lap++) {
+    var v = 30 + 2 * Math.sin(lap), n = Math.round(2230 / v * 25);
+    for (k = 0; k < n; k++) {
+      var th = 2 * Math.PI * k / n, p0 = loopPt(th);
+      // some laps wide, some tight: the chord/spline ratio varies lap to lap
+      var nn = loopNormal(th), w = (lap % 3) * 2.5;
+      var x = p0[0] + nn[0] * w + 0.8 * gauss(r), z = p0[1] + nn[1] * w + 0.8 * gauss(r);
+      rows.push({ t: 1700000000 + tt, lat: lat0 - z / 111320, lon: lon0 + x / (111320 * cosl),
+                  speed_mph: v / 0.44704 });
+      tt += 0.04;
+    }
+  }
+  var p = RC3D.buildPath(rows, { smooth: 3, denseStep: 1 });
+  var worst = 0, worstRatio = 0;
+  for (k = 0; k < p.n; k += 97) {
+    var q = RC3D.pointAtS(p, RC3D.sAtTime(p, p.t[k]));
+    worst = Math.max(worst, Math.hypot(q.x - p.x[k], q.z - p.z[k]));
+    // what the old single ratio would have drawn
+    var sd = RC3D.sAtTime(p, p.t[k]) * p.dense.total / p.total, d = p.dense, j = 0;
+    while (j < d.s.length - 1 && d.s[j] < sd) j++;
+    worstRatio = Math.max(worstRatio, Math.hypot(d.x[j] - p.x[k], d.z[j] - p.z[k]));
+  }
+  // and the inverse is the inverse
+  var rt = 0;
+  for (k = 0; k < 50; k++) {
+    var s0 = p.total * k / 50;
+    rt = Math.max(rt, Math.abs(RC3D.denseToCum(p, RC3D.cumToDense(p, s0)) - s0));
+  }
+  return { knots: p.dense.knC ? p.dense.knC.length : 0, worst: worst, worstRatio: worstRatio,
+           roundTrip: rt, n: p.n };
+})();
+
+// ---- a closed lap that runs past its own start must not fold back ----------
+R.trimLoop = (function () {
+  var x = [], z = [], k, N = 2000, over = 25;       // 25 m past the start
+  var circ = 2 * Math.PI * 300;
+  for (k = 0; k <= N + Math.round(over / circ * N); k++) {
+    var a = 2 * Math.PI * k / N; x.push(300 * Math.sin(a)); z.push(-300 * Math.cos(a));
+  }
+  var t = RC3D.trimLoop(x, z);
+  var n = t.x.length, len = 0;
+  for (k = 1; k < n; k++) len += Math.hypot(t.x[k] - t.x[k - 1], t.z[k] - t.z[k - 1]);
+  // closed through linePath: no heading reversal anywhere
+  var lp = RC3D.linePath(t.x, t.z, t.x.map(function () { return 0; }), { closed: true, step: 1 });
+  var cs = RC3D.corners(lp, {}), maxTurn = 0, d = lp.dense;
+  for (k = 2; k < d.x.length; k++) {
+    var h1 = Math.atan2(d.z[k - 1] - d.z[k - 2], d.x[k - 1] - d.x[k - 2]);
+    var h2 = Math.atan2(d.z[k] - d.z[k - 1], d.x[k] - d.x[k - 1]);
+    var dh = Math.abs(((h2 - h1 + 3 * Math.PI) % (2 * Math.PI)) - Math.PI);
+    maxTurn = Math.max(maxTurn, dh * 180 / Math.PI);
+  }
+  // a line that stops SHORT of its start is left alone
+  var gx = x.slice(0, N - 20), gz = z.slice(0, N - 20), g = RC3D.trimLoop(gx, gz);
+  return { len: len, circ: circ, gap: Math.hypot(t.x[n - 1] - t.x[0], t.z[n - 1] - t.z[0]),
+           maxTurnDeg: maxTurn, cutTail: t.cutTail, shortKept: g.x.length === gx.length };
+})();
+
+// ---- driven layout != prepared layout: pull on where they agree only ------
+R.blend = (function () {
+  // prepared: a 1 km x 400 m rounded rectangle. Driven: the same, but a
+  // short-course link cuts straight across the middle of the bottom half.
+  var lx = [], lz = [], cx = [], cz = [], k;
+  function rect(t) {                         // t in [0,1): a stadium, 300 m radius ends
+    var L = 1000, Rr = 200, per = 2 * L + 2 * Math.PI * Rr, d = t * per;
+    if (d < L) return [d - L / 2, -Rr];
+    d -= L; if (d < Math.PI * Rr) { var a = d / Rr; return [L / 2 + Rr * Math.sin(a), -Rr * Math.cos(a)]; }
+    d -= Math.PI * Rr; if (d < L) return [L / 2 - d, Rr];
+    d -= L; var b = d / Rr; return [-L / 2 - Rr * Math.sin(b), Rr * Math.cos(b)];
+  }
+  for (k = 0; k < 3256; k++) { var q = rect(k / 3256); lx.push(q[0]); lz.push(q[1]); }
+  // driven: 2 m off the prepared line (GPS / racing line) everywhere, plus a
+  // 40 m smooth bulge INTO the infield on the bottom straight - a bypass road
+  // the prepared layout does not have
+  var bump = function (x) { return Math.abs(x) < 160 ? 0.5 * (1 + Math.cos(Math.PI * x / 160)) : 0; };
+  for (k = 0; k < 3256; k++) {
+    var q2 = rect(k / 3256), inside = q2[1] < -150 ? 40 * bump(q2[0]) : 0;
+    cx.push(q2[0]); cz.push(q2[1] + 2 + inside);
+  }
+  var b = RC3D.blendOnto(cx, cz, lx, lz, { near: 8, blend: 40 });
+  var idx = RC3D.lineIndex(lx, lz, 20), onPrep = 0, onPrepN = 0, link = 0, linkN = 0, jump = 0;
+  for (k = 0; k < b.x.length; k++) {
+    var h = idx.nearest(b.x[k], b.z[k], 100), qq = rect(k / 3256);
+    var inLink = qq[1] < -150 && qq[0] > -60 && qq[0] < 60;
+    var farFromLink = !(qq[1] < -150 && qq[0] > -200 && qq[0] < 200);
+    if (farFromLink) { onPrep = Math.max(onPrep, h ? h.d : 99); onPrepN++; }
+    if (inLink) { link = Math.max(link, Math.hypot(b.x[k] - cx[k], b.z[k] - cz[k])); linkN++; }
+    if (k) jump = Math.max(jump, Math.hypot(b.x[k] - b.x[k - 1], b.z[k] - b.z[k - 1]));
+  }
+  return { onPrep: onPrep, onPrepN: onPrepN, link: link, linkN: linkN, jump: jump, matched: b.matched };
+})();
+
+// ---- terrain grids decode only at exactly the promised size ----------------
+R.decode = (function () {
+  var meta = { cols: 3, rows: 2, bounds: [0, 0, 1, 1], base: 100, scale: 0.5 };
+  var ok = new ArrayBuffer(12), dv = new DataView(ok);
+  for (var k = 0; k < 6; k++) dv.setUint16(k * 2, k * 10, true);
+  var g = RC3D.decodeDem(meta, ok);
+  return { ok: g ? Array.prototype.slice.call(g.values) : null,
+           longer: RC3D.decodeDem(meta, new ArrayBuffer(14)) === null,
+           shorter: RC3D.decodeDem(meta, new ArrayBuffer(10)) === null };
+})();
+
+// ---- an S-bend is two corners, not one that cancels out --------------------
+R.sbend = (function () {
+  var pts = [], lat0 = 39.0, lon0 = -77.0, heading = 0, step = 2.0;
+  function push(dist, turnPerM) {
+    var n = Math.max(1, Math.round(dist / step));
+    for (var k = 0; k < n; k++) {
+      heading += turnPerM * step * 180 / Math.PI;
+      var rr = heading * Math.PI / 180;
+      lat0 += Math.cos(rr) * step / 111320;
+      lon0 += Math.sin(rr) * step / (111320 * Math.cos(lat0 * Math.PI / 180));
+      pts.push({ lat: lat0, lon: lon0, speed_mph: 60, alt_m: 0 });
+    }
+  }
+  push(600, 0);
+  push(70 * Math.PI / 180 * 60, 1 / 60);       // 70 deg right, 60 m radius
+  push(70 * Math.PI / 180 * 60, -1 / 60);      // straight into 70 deg left
+  push(600, 0);
+  var p = RC3D.buildPath(pts, { smooth: 3, denseStep: 2 });
+  var cs = RC3D.corners(p, {});
+  return { n: cs.length, degs: cs.map(function (c) { return Math.round(c.deg); }),
+           dirs: cs.map(function (c) { return c.dir; }) };
+})();
+
 console.log(JSON.stringify(R));
 """
 
@@ -959,6 +1350,158 @@ class Track3DMathTests(unittest.TestCase):
         #     the ground plane instead of floating at MSL
         self.assertAlmostEqual(res["alt"]["min"], 0.0, places=3)
         self.assertGreater(res["alt"]["max"], 5)
+
+        # 13. driver input from REAL logger behaviour. The logger writes each
+        #     fix twice (repeat 40 ms later, next fix 1 ms after that): repeats
+        #     go, first appearances stay ~41 ms apart, rows without a fix stay.
+        c = res["clean"]
+        self.assertEqual(c["kept"], c["fixes"] + 1, c)
+        self.assertEqual(c["noFix"], 1)
+        self.assertTrue(c["same"], "cleanFixes must not copy rows")
+        self.assertAlmostEqual(c["gapMin"], 0.041, delta=0.002)
+        self.assertAlmostEqual(c["gapMax"], 0.041, delta=0.002)
+        self.assertEqual(c["pathN"], c["kept"], "buildPath must drop repeats")
+        self.assertEqual(c["pathKeep"], c["rows"], "keepRepeats opts out")
+        self.assertEqual(c["samplesN"], c["pathN"])
+        self.assertEqual(c["srcLast"], c["rows"] - 2, "srcIndex maps back to the input")
+        # the time base is unchanged, so laps (given as times) still line up
+        self.assertEqual(c["t0"], 0)
+        self.assertLess(c["tMatch"], 1e-9)
+        self.assertAlmostEqual(c["lapProgress"], 0.5, places=6)
+        self.assertAlmostEqual(c["lapT"], 2.0, places=6)
+
+        # longitudinal g by time regression: 0.5 g with repeats + 0.1 mph steps
+        lg = res["longG"]
+        self.assertGreater(lg["n"], 100)
+        self.assertLess(lg["worst"], 0.05, lg)
+        self.assertLess(lg["steadyWorst"], 0.05, lg)
+        self.assertEqual(lg["source"], "gps", "no IMU -> gps only")
+
+        # IMU fusion only when the IMU actually fits the GPS g
+        fu = res["fusion"]
+        self.assertEqual(fu["goodSource"], "gps+imu", fu)
+        self.assertGreater(fu["goodR"], 0.85)
+        self.assertLess(fu["goodErr"], 0.05, fu)
+        self.assertEqual(fu["junkSource"], "gps", fu)
+        self.assertLess(fu["junkR"], 0.5)
+        self.assertLess(fu["junkErr"], 0.05, fu)
+        self.assertEqual(fu["gpsOnlySource"], "gps")
+
+        # throttle / coast / brake relative to the speed-dependent coast curve
+        ip = res["input"]
+        self.assertEqual(ip["top"], 1, "full throttle at top speed (g ~ 0) is throttle")
+        self.assertEqual(ip["coast90"], 0, "-0.12 g at 90 mph is just drag: coast")
+        self.assertEqual(ip["brake"], -1)
+        self.assertEqual(ip["shiftDip"], 1, "a 0.25 s shift dip stays throttle")
+        self.assertEqual(ip["afterShift"], 1)
+        self.assertEqual(ip["blip"], 0, "a brake blip under 0.25 s is coast")
+        self.assertEqual(ip["coast50"], 0)
+        self.assertEqual(ip["crawl"], 0, "below 12 mph is never throttle")
+        self.assertEqual(ip["crawlBrake"], -1, "... but braking still counts")
+        self.assertGreater(ip["lvTop"], 0.15)
+        self.assertGreater(ip["lvBrake"], 0.6)
+        self.assertEqual(ip["lvCoast"], 0)
+        self.assertAlmostEqual(ip["coastG100"], -0.14, places=6)
+        self.assertAlmostEqual(ip["coastG0"], -0.045, places=6)
+        thr, thrLo = ip["colThr"], ip["colThrLo"]
+        brk, brkLo = ip["colBrk"], ip["colBrkLo"]
+        self.assertGreater(thr[1], max(thr[0], thr[2]) + 0.5, "throttle is green")
+        self.assertGreater(thr[1], thrLo[1], "harder throttle is brighter")
+        self.assertGreaterEqual(thrLo[1], 0.45 * 0.99, "throttle green is floored")
+        self.assertGreater(brk[0], max(brk[1], brk[2]) + 0.5, "brake is red")
+        self.assertGreater(brk[0], brkLo[0], "harder braking is brighter")
+        co = ip["colCoast"]
+        self.assertGreater(co[0], 0.8)
+        self.assertGreater(co[1], 0.6)
+        self.assertLess(co[2], 0.35, "coast is amber")
+
+        # braking zones + lifts: the right count, the right slowest points
+        ev = res["events"]
+        self.assertEqual(ev["kinds"], "brake,lift,brake,brake", ev)
+        for got, want in zip(ev["mins"], ev["expect"]):
+            self.assertAlmostEqual(got, want, delta=1.0, msg=ev)
+        self.assertAlmostEqual(ev["peak"][0], 0.8, delta=0.08)
+        self.assertAlmostEqual(ev["peak"][1], 0.15, delta=0.05)
+        self.assertGreater(ev["entry"][0], 95)
+        self.assertTrue(ev["ordered"], ev)
+        self.assertTrue(ev["sorted"])
+        self.assertEqual(ev["halfN"], 1, "the i0/i1 window must be honoured")
+
+        # registration: a (3, -2) m misplaced line comes back, despite a racing
+        # line +/-4 m off centre and 1 m GPS noise; a bigger shift converges too
+        rg = res["register"]
+        self.assertLess(abs(rg["dx"] - 3), 0.3, rg)
+        self.assertLess(abs(rg["dz"] + 2), 0.3, rg)
+        self.assertLess(abs(rg["dx2"] - 15), 0.5, rg)
+        self.assertLess(abs(rg["dz2"] + 11), 0.5, rg)
+        self.assertLess(rg["med"], 3.5)
+        self.assertGreater(rg["inFrac"], 0.95)
+        self.assertGreater(rg["used"], 1000)
+
+        # consensus of all laps beats every single lap
+        cs = res["consensus"]
+        self.assertLess(cs["cons"], cs["bestSingle"] * 0.85, cs)
+        self.assertGreater(cs["pts"], 1000)
+        self.assertGreater(cs["onePts"], 1000, "one lap -> the reference itself")
+
+        # snapping: only the band just past the edge is pulled in
+        sn = res["snap"]
+        self.assertEqual(sn["moved"], 3, sn)
+        want = [[-200, 3], [-150, 4.6], [-100, -4.6], [-50, 4.6], [0, 12], [50, -4.5], [100, -9.5], None]
+        for got, w in zip(sn["after"], want):
+            if w is None:
+                self.assertIsNone(got)
+                continue
+            self.assertAlmostEqual(got[0], w[0], delta=0.01)
+            self.assertAlmostEqual(got[1], w[1], delta=0.01)
+        self.assertTrue(sn["untouched"], "snapSamples must not mutate its input")
+        self.assertTrue(sn["same"], "unmoved rows are passed through")
+        self.assertEqual(sn["kept"], 4001)
+        self.assertEqual(sn["len"], 8)
+
+        # time -> place over a 12-lap session: the knot map keeps the car on the
+        # fix it is showing; one global ratio drifted tens of metres
+        kn = res["knots"]
+        if three is not None:
+            self.assertGreater(kn["knots"], 1000, kn)
+            self.assertLess(kn["worst"], 4.0, kn)
+            self.assertGreater(kn["worstRatio"], 4 * kn["worst"],
+                               "the test must actually exercise the drift")
+        self.assertLess(kn["roundTrip"], 1e-6)
+
+        # a closed lap that overruns its start is cut, so the loop never
+        # folds back into a fake hairpin at the seam
+        tl = res["trimLoop"]
+        self.assertLess(abs(tl["len"] - tl["circ"]), 3.0, tl)
+        self.assertLess(tl["gap"], 2.0, tl)
+        self.assertLess(tl["maxTurnDeg"], 3.0, tl)
+        self.assertGreater(tl["cutTail"], 10)
+        self.assertTrue(tl["shortKept"], "a line short of its start is left alone")
+
+        # driven layout vs prepared layout: on the prepared line where they are
+        # the same road, the driven shape where they are not, no step between
+        bl = res["blend"]
+        self.assertLess(bl["onPrep"], 0.3, bl)
+        self.assertGreater(bl["onPrepN"], 2000)
+        self.assertLess(bl["link"], 0.5, bl)
+        self.assertGreater(bl["linkN"], 50)
+        self.assertLess(bl["jump"], 1.6, bl)
+        self.assertGreater(bl["matched"], 0.85)
+        self.assertLess(bl["matched"], 0.97)
+
+        # terrain grids: exact length only (a cached grid from another bake
+        # would decode as wrong terrain)
+        dc = res["decode"]
+        self.assertEqual(dc["ok"], [100, 105, 110, 115, 120, 125])
+        self.assertTrue(dc["longer"])
+        self.assertTrue(dc["shorter"])
+
+        # an S-bend is two corners of opposite hand (merged, they cancelled)
+        sb = res["sbend"]
+        self.assertEqual(sb["n"], 2, sb)
+        self.assertEqual(sorted(sb["dirs"]), [-1, 1])
+        for d in sb["degs"]:
+            self.assertGreater(abs(d), 55, sb)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ shape, its real width and its real surroundings:
                can drape the REAL asphalt, kerbs, run-off and grass on the
                ground with no tile fetching at view time
 
-Everything is keyless (OSM Overpass, Esri World Imagery, AWS terrain) and cached
+Everything is keyless (OSM Overpass, Esri World Imagery, AWS + USGS terrain) and cached
 under RACECAR_DATA_DIR so a track is prepared once and then just read.
 
 CLI:
@@ -55,7 +55,6 @@ ESRI = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
 TERRARIUM = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 OVERPASS = [
     "https://overpass-api.de/api/interpreter",
-    "https://overpass.osm.ch/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
@@ -209,8 +208,9 @@ def imagery_mosaic(bbox, z: int, cache_dir: pathlib.Path,
 def mosaic_px(bounds: dict, lat: float, lon: float):
     """lat/lon -> (px, py) float pixel in the mosaic (y grows southward)."""
     z = bounds["z"]
-    return (lon_to_x(lon, z) - bounds["x0"] * TILE,
-            lat_to_y(lat, z) - bounds["y0"] * TILE)
+    k = bounds.get("scale", 1.0)        # a downscaled copy of the mosaic (the baked JPEG)
+    return ((lon_to_x(lon, z) - bounds["x0"] * TILE) * k,
+            (lat_to_y(lat, z) - bounds["y0"] * TILE) * bounds.get("scale_y", k))
 
 
 def sample_px(img, x: float, y: float):
@@ -291,6 +291,271 @@ def dem_grid(bbox, cols: int, rows: int, cache_dir: pathlib.Path, z: int = 14,
 
 
 # ---------------------------------------------------------------------------
+# high-resolution elevation: USGS 3DEP (US) -> AWS terrarium (anywhere)
+# ---------------------------------------------------------------------------
+DEM3DEP = ("https://elevation.nationalmap.gov/arcgis/rest/services/"
+           "3DEPElevation/ImageServer/exportImage?")
+DEM_MAX_TILE_PX = 2000
+DEM_BAD_MAX_FRAC = 0.02           # more invalid cells than this = the source failed
+DEM_MIN_OK_M, DEM_MAX_OK_M = -500.0, 9000.0
+
+
+def _grid_dims(bbox, max_cells: int, min_cell_m: float):
+    """(cols, rows, cell_m) for a NODE grid over bbox: sample (r,c) sits at
+    lat = s + (n-s)*r/(rows-1), lon = w + (e-w)*c/(cols-1)."""
+    s, w, n, e = [float(x) for x in bbox]
+    h_m = max(1.0, (n - s) * M_PER_DEG_LAT)
+    w_m = max(1.0, (e - w) * M_PER_DEG_LAT * math.cos(math.radians((s + n) / 2)))
+    cell = max(float(min_cell_m), math.sqrt(h_m * w_m / float(max_cells)))
+    cols = max(2, int(w_m / cell))
+    rows = max(2, int(h_m / cell))
+    return cols, rows, math.sqrt((w_m / (cols - 1)) * (h_m / (rows - 1)))
+
+
+def _clean_dem(v, what: str):
+    """Fill the few invalid cells (NaN, nodata ~ -3.4e38, absurd values) with the
+    median; refuse the whole grid when more than DEM_BAD_MAX_FRAC are bad."""
+    v = np.asarray(v, dtype=np.float32)
+    bad = ~np.isfinite(v) | (v < DEM_MIN_OK_M) | (v > DEM_MAX_OK_M)
+    frac = float(bad.mean()) if v.size else 1.0
+    if frac >= DEM_BAD_MAX_FRAC or bad.all():
+        raise RuntimeError("%s: %.1f%% of the cells are invalid" % (what, 100 * frac))
+    if bad.any():
+        v = v.copy()
+        v[bad] = float(np.median(v[~bad]))
+    return v
+
+
+def _dem3dep(bbox, cols: int, rows: int, cache_dir: pathlib.Path, log=print,
+             timeout: float = 90.0):
+    """(rows, cols) float32, SOUTH row first, node-aligned (see _grid_dims)."""
+    import hashlib
+    s, w, n, e = [float(x) for x in bbox]
+    dx = (e - w) / (cols - 1)
+    dy = (n - s) / (rows - 1)
+    out = np.empty((rows, cols), dtype=np.float32)
+    col_parts = np.array_split(np.arange(cols), max(1, -(-cols // DEM_MAX_TILE_PX)))
+    row_parts = np.array_split(np.arange(rows), max(1, -(-rows // DEM_MAX_TILE_PX)))
+    for rp in row_parts:
+        for cp in col_parts:
+            r0, r1, c0, c1 = int(rp[0]), int(rp[-1]) + 1, int(cp[0]), int(cp[-1]) + 1
+            tw, th = c1 - c0, r1 - r0
+            # a pixel AREA is requested, so pad half a cell to centre pixels on nodes
+            bb = (w + c0 * dx - dx / 2, s + r0 * dy - dy / 2,
+                  w + (c1 - 1) * dx + dx / 2, s + (r1 - 1) * dy + dy / 2)
+            url = DEM3DEP + urllib.parse.urlencode({
+                "bbox": "%.8f,%.8f,%.8f,%.8f" % bb, "bboxSR": 4326, "imageSR": 4326,
+                "size": f"{tw},{th}", "format": "tiff", "pixelType": "F32",
+                "noDataInterpretation": "esriNoDataMatchAny",
+                "interpolation": "RSP_BilinearInterpolation", "f": "image"})
+            cpath = cache_dir / "dem3dep" / (hashlib.sha1(url.encode()).hexdigest() + ".tif")
+            blob = _cache_get(cpath)
+            arr = None
+            fresh = False
+            for attempt in (1, 2, 3):
+                if blob is None:
+                    try:
+                        blob = _get(url, timeout=timeout)
+                        fresh = True
+                    except Exception as ex:
+                        log(f"[dem3dep] request failed ({type(ex).__name__}: {ex})")
+                        blob = None
+                        time.sleep(min(6, 2 * attempt))
+                        continue
+                try:
+                    a = np.array(Image.open(io.BytesIO(blob)), dtype=np.float32)
+                    if a.shape != (th, tw):
+                        raise ValueError("got %s, wanted %s" % (a.shape, (th, tw)))
+                    arr = a
+                    break
+                except Exception as ex:
+                    log(f"[dem3dep] bad answer ({type(ex).__name__}: {ex})")
+                    blob = None
+                    try:                   # a cached bad blob must not be re-read forever
+                        cpath.unlink()
+                    except OSError:
+                        pass
+            if arr is None:
+                raise RuntimeError("3DEP gave no usable tile")
+            if fresh:
+                _cache_put(cpath, blob)
+            out[r0:r1, c0:c1] = arr[::-1]          # TIFF row 0 is NORTH
+    return _clean_dem(out, "3DEP")
+
+
+def _terrarium_tile(z: int, tx: int, ty: int, cache_dir: pathlib.Path, log=print):
+    p = cache_dir / "dem" / str(z) / str(tx) / f"{ty}.png"
+    blob = _cache_get(p)
+    if blob is None:
+        try:
+            blob = _get(TERRARIUM.format(z=z, x=tx, y=ty))
+            _cache_put(p, blob)
+        except Exception as e:
+            log(f"[dem] tile {z}/{tx}/{ty} failed: {e}")
+            return None
+    try:
+        a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGB"), dtype=np.float32)
+        return (a[:, :, 0] * 256.0 + a[:, :, 1] + a[:, :, 2] / 256.0) - 32768.0
+    except Exception:
+        return None
+
+
+def _terrarium_grid(bbox, cols: int, rows: int, z: int, cache_dir: pathlib.Path,
+                    log=print, max_tiles: int = 400):
+    """BILINEAR terrarium samples on the node grid; (rows, cols) float32, south first.
+    (dem_elevations is nearest-pixel, which terraces a 3 m grid.)"""
+    s, w, n, e = [float(x) for x in bbox]
+    lons = np.linspace(w, e, cols)
+    lats = np.linspace(s, n, rows)
+    X = (lons + 180.0) / 360.0 * (TILE << z) - 0.5            # pixel CENTRES at +0.5
+    r = np.radians(np.clip(lats, -85.05112878, 85.05112878))
+    Y = (1.0 - np.arcsinh(np.tan(r)) / math.pi) / 2.0 * (TILE << z) - 0.5
+    tx0, tx1 = int(math.floor(X.min() / TILE)), int(math.floor((X.max() + 1) / TILE))
+    ty0, ty1 = int(math.floor(Y.min() / TILE)), int(math.floor((Y.max() + 1) / TILE))
+    nt = (tx1 - tx0 + 1) * (ty1 - ty0 + 1)
+    if nt > max_tiles:
+        raise RuntimeError(f"{nt} terrarium tiles at z{z} is too many")
+    M = np.full(((ty1 - ty0 + 1) * TILE, (tx1 - tx0 + 1) * TILE), np.nan, dtype=np.float32)
+    jobs = [(tx, ty) for ty in range(ty0, ty1 + 1) for tx in range(tx0, tx1 + 1)]
+
+    def one(j):
+        return j, _terrarium_tile(z, j[0], j[1], cache_dir, log)
+    if len(jobs) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            res = list(ex.map(one, jobs))
+    else:
+        res = [one(j) for j in jobs]
+    for (tx, ty), a in res:
+        if a is not None:
+            M[(ty - ty0) * TILE:(ty - ty0 + 1) * TILE,
+              (tx - tx0) * TILE:(tx - tx0 + 1) * TILE] = a
+    fx, fy = X - tx0 * TILE, Y - ty0 * TILE
+    i0 = np.clip(np.floor(fx).astype(int), 0, M.shape[1] - 2)
+    j0 = np.clip(np.floor(fy).astype(int), 0, M.shape[0] - 2)
+    ax = np.clip(fx - i0, 0.0, 1.0)[None, :]
+    ay = np.clip(fy - j0, 0.0, 1.0)[:, None]
+    top = M[np.ix_(j0, i0)] * (1 - ax) + M[np.ix_(j0, i0 + 1)] * ax
+    bot = M[np.ix_(j0 + 1, i0)] * (1 - ax) + M[np.ix_(j0 + 1, i0 + 1)] * ax
+    return _clean_dem(top * (1 - ay) + bot * ay, f"terrarium z{z}")
+
+
+def _dem_fetch(bbox, cols, rows, cache_dir, terrarium_z: int, log):
+    try:
+        return _dem3dep(bbox, cols, rows, cache_dir, log=log), "USGS 3DEP"
+    except Exception as e:
+        log(f"[dem] 3DEP unavailable ({type(e).__name__}: {e}); using AWS terrarium z{terrarium_z}")
+    return (_terrarium_grid(bbox, cols, rows, terrarium_z, cache_dir, log=log),
+            f"AWS terrarium z{terrarium_z}")
+
+
+def dem_hires(bbox, cache_dir: pathlib.Path, max_cells: int = 250_000,
+              min_cell_m: float = 3.0, log=print) -> dict:
+    """Hi-res elevation grid over bbox = (min_lat, min_lon, max_lat, max_lon).
+
+    {"cols","rows","bounds":[s,w,n,e],"cell_m","source","values": float32 ndarray
+    (rows*cols, row-major, SOUTH row first)}. Sample (r,c) is the NODE at
+    lat = s+(n-s)*r/(rows-1), lon = w+(e-w)*c/(cols-1). USGS 3DEP where it
+    covers (US), else AWS terrarium z15 with bilinear sampling. Raises when
+    neither source gives a usable grid."""
+    _require_deps()
+    cache_dir = pathlib.Path(cache_dir)
+    cols, rows, cell = _grid_dims(bbox, max_cells, min_cell_m)
+    v, src = _dem_fetch(bbox, cols, rows, cache_dir, 15, log)
+    log(f"[dem] hi-res {cols}x{rows} @ {cell:.1f} m from {src}: "
+        f"{float(v.min()):.1f}..{float(v.max()):.1f} m")
+    return {"cols": cols, "rows": rows, "bounds": [float(x) for x in bbox],
+            "cell_m": round(cell, 2), "source": src,
+            "values": v.reshape(-1).astype(np.float32)}
+
+
+def dem_far(centre_lat: float, centre_lon: float, half_m: float = 3500.0,
+            cells: int = 240, cache_dir: Optional[pathlib.Path] = None,
+            log=print) -> dict:
+    """Coarse elevation over a square of +-half_m round the track: the distant
+    hills for the horizon. Same layout as dem_hires (3DEP, else terrarium z12)."""
+    _require_deps()
+    cache_dir = pathlib.Path(cache_dir) if cache_dir else \
+        pathlib.Path(tempfile.gettempdir()) / "trackprep-cache"
+    dlat = half_m / M_PER_DEG_LAT
+    dlon = half_m / (M_PER_DEG_LAT * math.cos(math.radians(centre_lat)))
+    bbox = (centre_lat - dlat, centre_lon - dlon, centre_lat + dlat, centre_lon + dlon)
+    v, src = _dem_fetch(bbox, int(cells), int(cells), cache_dir, 12, log)
+    log(f"[dem] far {cells}x{cells} from {src}: {float(v.min()):.1f}..{float(v.max()):.1f} m")
+    return {"cols": int(cells), "rows": int(cells), "bounds": [float(x) for x in bbox],
+            "cell_m": round(2.0 * half_m / (cells - 1), 2), "source": src,
+            "values": v.reshape(-1).astype(np.float32)}
+
+
+def dem_sample(grid: dict, lats, lons):
+    """Bilinear read of a dem_hires/dem_far grid; NaN outside its bounds."""
+    s, w, n, e = grid["bounds"]
+    cols, rows = int(grid["cols"]), int(grid["rows"])
+    V = np.asarray(grid["values"], dtype=np.float32).reshape(rows, cols)
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    fx = (lons - w) / (e - w) * (cols - 1)
+    fy = (lats - s) / (n - s) * (rows - 1)
+    inside = (fx >= 0) & (fx <= cols - 1) & (fy >= 0) & (fy <= rows - 1)
+    i0 = np.clip(np.floor(fx).astype(int), 0, cols - 2)
+    j0 = np.clip(np.floor(fy).astype(int), 0, rows - 2)
+    ax = np.clip(fx - i0, 0.0, 1.0)
+    ay = np.clip(fy - j0, 0.0, 1.0)
+    top = V[j0, i0] * (1 - ax) + V[j0, i0 + 1] * ax
+    bot = V[j0 + 1, i0] * (1 - ax) + V[j0 + 1, i0 + 1] * ax
+    out = (top * (1 - ay) + bot * ay).astype(float)
+    out[~inside] = np.nan
+    return out
+
+
+def write_dem_bin(grid: dict, path) -> dict:
+    """Quantise a grid to uint16 little-endian: q = round((v - base) / scale),
+    base = min (floored to 1 mm), scale 0.05 m (0.1 / 0.25 if the range needs it).
+    Rows are SOUTH first, row-major. Atomic (unique temp + os.replace)."""
+    _require_deps()
+    path = pathlib.Path(path)
+    v = np.asarray(grid["values"], dtype=np.float64).reshape(-1)
+    if v.size != int(grid["cols"]) * int(grid["rows"]):
+        raise ValueError("values do not match cols*rows")
+    base = math.floor(float(v.min()) * 1000.0) / 1000.0
+    span = float(v.max()) - base
+    scale = 0.05
+    for sc in (0.05, 0.1, 0.25):
+        scale = sc
+        if span / sc <= 65535:
+            break
+    q = np.clip(np.rint((v - base) / scale), 0, 65535).astype("<u2")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(q.tobytes())
+        os.chmod(tmp, 0o644)             # mkstemp makes 0600; the server may run as another user
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return {"file": path.name, "cols": int(grid["cols"]), "rows": int(grid["rows"]),
+            "bounds": [float(x) for x in grid["bounds"]], "base": base, "scale": scale,
+            "cell_m": grid.get("cell_m"), "source": grid.get("source"),
+            "format": "u16le"}
+
+
+def read_dem_bin(meta: dict, path):
+    """Inverse of write_dem_bin -> float32 ndarray (rows*cols, south row first)."""
+    _require_deps()
+    raw = pathlib.Path(path).read_bytes()
+    q = np.frombuffer(raw, dtype="<u2")
+    if q.size != int(meta["cols"]) * int(meta["rows"]):
+        raise ValueError("dem bin is %d samples, meta says %d x %d"
+                         % (q.size, meta["cols"], meta["rows"]))
+    return (float(meta["base"]) + q.astype(np.float64) * float(meta["scale"])).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # OpenStreetMap raceways
 # ---------------------------------------------------------------------------
 OSM_CACHE_DIR = pathlib.Path(os.environ.get("RACECAR_OSM_CACHE")
@@ -305,20 +570,49 @@ def _osm_cache_path(bbox, key_extra: str = "") -> pathlib.Path:
     return OSM_CACHE_DIR / (h + ".json")
 
 
-def osm_raceways(bbox, timeout: float = 90.0, log=print, use_cache: bool = True):
-    """`highway=raceway` ways inside bbox -> [{name, width_m, points[(lat,lon)]}].
+def _overpass_search(q: str, timeout: float, log, build, is_empty):
+    """POST `q` to the Overpass mirrors until one gives a NON-EMPTY answer.
 
-    Cached on disk (45 days) and PREFERRED when the API is unreachable: Overpass
-    is a shared community service that rate-limits, and a stale cache beats
-    failing a track preparation. Also, mirrors are only tried with backoff so a
-    busy day does not turn into a hammering loop.
-    """
-    min_lat, min_lon, max_lat, max_lon = bbox
-    q = (f'[out:json][timeout:{int(timeout)-5}];'
-         f'way["highway"="raceway"]({min_lat},{min_lon},{max_lat},{max_lon});'
-         f'out geom;')
-    cp = _osm_cache_path(bbox, "raceway")
-    fresh = None
+    An empty answer is not proof of anything: a region-limited mirror (the
+    Switzerland-only instance we used to list) returns a perfectly VALID empty
+    document for a US bbox, and a busy main instance can do the same, so one
+    mirror saying "nothing" must not end the search. Errors back off (bounded)
+    and retry the same mirror once, then move on.
+
+    Returns the built result of the first non-empty answer; else the (empty)
+    result of a mirror that DID answer; else None (every mirror failed)."""
+    body = urllib.parse.urlencode({"data": q}).encode()
+    errs = 0
+    empty = None
+    for ep in OVERPASS:
+        for attempt in (1, 2):
+            try:
+                d = json.loads(_get(ep, timeout=timeout, data=body))
+                if not isinstance(d, dict):
+                    raise ValueError("not an object")
+                rem = str(d.get("remark") or "")
+                if "runtime error" in rem.lower():
+                    raise RuntimeError(rem[:80])        # partial answer: do not trust
+            except Exception as e:
+                errs += 1
+                log(f"[osm] {ep}: {type(e).__name__}")
+                time.sleep(min(8, 2 * errs))
+                continue
+            res = build(d.get("elements") or [])
+            if is_empty(res):
+                log(f"[osm] {ep}: empty answer; trying the next mirror")
+                empty = res
+                break
+            return res
+    return empty
+
+
+def _osm_cached(bbox, key: str, q: str, timeout: float, log, use_cache: bool,
+                build, is_empty):
+    """Shared cache / mirror / stale-fallback logic. Returns the result, or
+    None when nothing at all could be obtained (every mirror failed, no cache).
+    Only NON-EMPTY results are ever cached."""
+    cp = _osm_cache_path(bbox, key)
     if use_cache:
         try:
             if cp.is_file():
@@ -326,54 +620,246 @@ def osm_raceways(bbox, timeout: float = 90.0, log=print, use_cache: bool = True)
                 if age_days <= OSM_CACHE_DAYS:
                     fresh = json.loads(cp.read_text("utf-8"))
                     log("[osm] cache hit (%.1f days old)" % age_days)
+                    return fresh
         except Exception:
-            fresh = None
-    if fresh is not None:
-        return fresh
-    body = urllib.parse.urlencode({"data": q}).encode()
-    errs = 0
-    for ep in OVERPASS:
-        for attempt in (1, 2):
+            pass
+    res = _overpass_search(q, timeout, log, build, is_empty)
+    if res is not None and not is_empty(res):
+        if use_cache:
             try:
-                d = json.loads(_get(ep, timeout=timeout, data=body))
-            except Exception as e:
-                errs += 1
-                log(f"[osm] {ep}: {type(e).__name__}")
-                time.sleep(min(8, 2 * errs))
-                continue
-            out = []
-            for e in d.get("elements", []):
-                g = e.get("geometry") or []
-                if len(g) < 2:
-                    continue
-                tags = e.get("tags", {})
-                try:
-                    w = float(tags.get("width", "").replace("m", "").strip())
-                except Exception:
-                    w = None
-                out.append({"id": e.get("id"), "name": tags.get("name"),
-                            "width_m": w, "surface": tags.get("surface"),
-                            "sport": tags.get("sport"),
-                            "points": [(p["lat"], p["lon"]) for p in g]})
-            if out and use_cache:
-                try:
-                    cp.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = cp.with_suffix(".tmp")
-                    tmp.write_text(json.dumps(out), "utf-8")
-                    tmp.replace(cp)
-                except OSError:
-                    pass
-            return out
+                cp.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cp.with_suffix(".tmp")
+                tmp.write_text(json.dumps(res), "utf-8")
+                tmp.replace(cp)
+            except OSError:
+                pass
+        return res
     if use_cache:
         try:                                   # last resort: any stale copy
             if cp.is_file():
                 stale = json.loads(cp.read_text("utf-8"))
-                log("[osm] all mirrors down; using a STALE cache copy")
+                log("[osm] no live data; using a STALE cache copy")
                 return stale
         except Exception:
             pass
-    log("[osm] all mirrors failed (%d attempts)" % errs)
-    return []
+    if res is None:
+        log("[osm] all mirrors failed")
+    return res
+
+
+def osm_raceways(bbox, timeout: float = 90.0, log=print, use_cache: bool = True):
+    """`highway=raceway` ways inside bbox -> [{name, width_m, points[(lat,lon)]}].
+
+    Cached on disk (45 days) and PREFERRED when the API is unreachable: Overpass
+    is a shared community service that rate-limits, and a stale cache beats
+    failing a track preparation. Also, mirrors are only tried with backoff so a
+    busy day does not turn into a hammering loop. An EMPTY answer from one
+    mirror falls through to the next (and is never cached).
+    """
+    min_lat, min_lon, max_lat, max_lon = bbox
+    q = (f'[out:json][timeout:{int(timeout)-5}];'
+         f'way["highway"="raceway"]({min_lat},{min_lon},{max_lat},{max_lon});'
+         f'out geom;')
+
+    def build(elements):
+        out = []
+        for e in elements:
+            g = e.get("geometry") or []
+            if len(g) < 2:
+                continue
+            tags = e.get("tags", {})
+            try:
+                w = float(tags.get("width", "").replace("m", "").strip())
+            except Exception:
+                w = None
+            out.append({"id": e.get("id"), "name": tags.get("name"),
+                        "width_m": w, "surface": tags.get("surface"),
+                        "sport": tags.get("sport"),
+                        "points": [(p["lat"], p["lon"]) for p in g]})
+        return out
+
+    res = _osm_cached(bbox, "raceway", q, timeout, log, use_cache, build,
+                      lambda r: not r)
+    return res or []
+
+
+# ---------------------------------------------------------------------------
+# OpenStreetMap features: buildings, water, woods, roads, barriers, trees ...
+# ---------------------------------------------------------------------------
+OSM_ATTRIB = "\u00a9 OpenStreetMap contributors (ODbL)"
+FEATURE_CAPS = {"buildings": 4000, "roads": 4000, "barriers": 3000, "trees": 6000,
+                "polygons": 3000}
+_AREA_CLASSES = ("water", "woods", "scrub", "grass", "farmland", "parking", "paved")
+_BARRIERS = {"fence", "wall", "guard_rail", "retaining_wall", "jersey_barrier",
+             "city_wall", "hedge", "handrail"}
+_ROAD_SKIP = {"steps", "elevator", "platform"}
+_GRASS_LANDUSE = {"grass", "meadow", "recreation_ground", "village_green"}
+_FARM_LANDUSE = {"farmland", "orchard", "vineyard", "farmyard"}
+_GRASS_LEISURE = {"park", "pitch", "golf_course"}
+
+
+def _empty_features() -> dict:
+    d = {"v": 1, "attrib": OSM_ATTRIB, "buildings": []}
+    for k in _AREA_CLASSES:
+        d[k] = []
+    d.update({"roads": [], "barriers": [], "tree_rows": [], "trees": []})
+    return d
+
+
+def _features_empty(f) -> bool:
+    if not f:
+        return True
+    return not any(f.get(k) for k in
+                   ("buildings", "roads", "barriers", "tree_rows", "trees") + _AREA_CLASSES)
+
+
+_NUM = r"(-?\d+(?:[.,]\d+)?)"
+
+
+def parse_height_m(v) -> Optional[float]:
+    """OSM `height` -> metres. '12', '12 m', '12.5m', "40'", '40 ft', "40'6\\""."""
+    if v is None:
+        return None
+    t = str(v).strip().lower()
+    if not t:
+        return None
+    m = re.match(r"^" + _NUM + r"\s*'\s*(?:" + _NUM + r"\s*\"?)?$", t)
+    if m:
+        val = float(m.group(1).replace(",", ".")) * 0.3048
+        if m.group(2):
+            val += float(m.group(2).replace(",", ".")) * 0.0254
+    else:
+        m = re.match(r"^" + _NUM + r"\s*(m|meters?|metres?|ft|feet|foot)?\.?$", t)
+        if not m:
+            return None
+        val = float(m.group(1).replace(",", "."))
+        if (m.group(2) or "").startswith("f"):
+            val *= 0.3048
+    if not (0.0 < val < 1000.0):
+        return None
+    return round(val, 1)
+
+
+def _parse_levels(v) -> Optional[int]:
+    try:
+        n = int(float(str(v).strip().replace(",", ".")))
+    except Exception:
+        return None
+    return n if 0 < n < 300 else None
+
+
+def _geom_pts(g):
+    return [[round(float(p["lat"]), 6), round(float(p["lon"]), 6)]
+            for p in (g or []) if p and "lat" in p and "lon" in p]
+
+
+def _ring(g):
+    """Closed way geometry -> ring without the repeated closing point (or None)."""
+    pts = _geom_pts(g)
+    if len(pts) < 4 or pts[0] != pts[-1]:
+        return None
+    pts = pts[:-1]
+    return pts if len(pts) >= 3 else None
+
+
+def _area_class(tags: dict) -> Optional[str]:
+    nat, lu, lei = tags.get("natural"), tags.get("landuse"), tags.get("leisure")
+    if nat == "water" or tags.get("waterway") == "riverbank" or lu in ("reservoir", "basin"):
+        return "water"
+    if nat == "wood" or lu == "forest":
+        return "woods"
+    if nat in ("scrub", "heath"):
+        return "scrub"
+    if lu in _GRASS_LANDUSE or nat == "grassland" or lei in _GRASS_LEISURE:
+        return "grass"
+    if lu in _FARM_LANDUSE:
+        return "farmland"
+    if tags.get("amenity") == "parking":
+        return "parking"
+    if tags.get("area:highway"):
+        return "paved"
+    return None
+
+
+def _features_from_elements(elements) -> dict:
+    out = _empty_features()
+    caps = FEATURE_CAPS
+    for e in elements:
+        tags = e.get("tags") or {}
+        et = e.get("type")
+        if et == "node":
+            if tags.get("natural") == "tree" and "lat" in e and "lon" in e \
+                    and len(out["trees"]) < caps["trees"]:
+                out["trees"].append([round(float(e["lat"]), 6), round(float(e["lon"]), 6)])
+            continue
+        if et == "way":
+            g = e.get("geometry") or []
+            b = tags.get("building")
+            if b and b != "no":
+                ring = _ring(g)
+                if ring and len(out["buildings"]) < caps["buildings"]:
+                    out["buildings"].append({
+                        "p": ring, "k": b,
+                        "h": parse_height_m(tags.get("height") or tags.get("building:height")),
+                        "l": _parse_levels(tags.get("building:levels")),
+                        "n": tags.get("name")})
+                continue
+            cls = _area_class(tags)
+            if cls:
+                ring = _ring(g)
+                if ring and len(out[cls]) < caps["polygons"]:
+                    out[cls].append(ring)
+            hw = tags.get("highway")
+            if hw and hw not in _ROAD_SKIP and tags.get("area") != "yes":
+                pts = _geom_pts(g)
+                if len(pts) >= 2 and len(out["roads"]) < caps["roads"]:
+                    try:
+                        w = float(str(tags.get("width", "")).replace("m", "").strip())
+                    except Exception:
+                        w = None
+                    out["roads"].append({"p": pts, "k": hw,
+                                         "w": w if (w and 0 < w < 100) else None,
+                                         "n": tags.get("name")})
+            bar = tags.get("barrier")
+            if bar in _BARRIERS:
+                pts = _geom_pts(g)
+                if len(pts) >= 2 and len(out["barriers"]) < caps["barriers"]:
+                    out["barriers"].append({"p": pts, "k": bar})
+            if tags.get("natural") == "tree_row":
+                pts = _geom_pts(g)
+                if len(pts) >= 2 and len(out["tree_rows"]) < caps["polygons"]:
+                    out["tree_rows"].append(pts)
+        elif et == "relation":
+            cls = _area_class(tags)
+            if not cls:
+                continue
+            for m in e.get("members") or []:
+                if m.get("type") != "way" or m.get("role") != "outer":
+                    continue
+                ring = _ring(m.get("geometry"))
+                if ring and len(out[cls]) < caps["polygons"]:
+                    out[cls].append(ring)
+    return out
+
+
+def osm_features(bbox, timeout: float = 90.0, log=print, use_cache: bool = True) -> dict:
+    """Buildings, water, woods, roads, barriers, trees ... inside bbox as one
+    COMPACT dict (see the module notes / asset schema "features"). bbox =
+    (min_lat, min_lon, max_lat, max_lon). Cached like osm_raceways; an
+    all-mirrors-empty/failed answer returns the empty features dict."""
+    s, w, n, e = bbox
+    bb = f"({s},{w},{n},{e})"
+    parts = ['way["building"]', 'way["natural"]', 'way["landuse"]',
+             'way["amenity"="parking"]', 'way["highway"]', 'way["barrier"]',
+             'way["leisure"]', 'way["area:highway"]', 'way["man_made"]',
+             'way["waterway"="riverbank"]', 'node["natural"="tree"]',
+             'relation["natural"="water"]', 'relation["landuse"]',
+             'relation["natural"="wood"]']
+    q = (f'[out:json][timeout:{max(10, int(timeout) - 5)}];('
+         + "".join(p + bb + ";" for p in parts) + ');out geom;')
+    res = _osm_cached(bbox, "features", q, timeout, log, use_cache,
+                      _features_from_elements, _features_empty)
+    return res if res is not None else _empty_features()
 
 
 def way_length_m(points) -> float:
@@ -689,6 +1175,9 @@ def measure_width(img, bounds, line, opts=None):
     to the fixed rules only when the two clusters are too similar to separate.
 
     Returns left[], right[], width[], ok[], confidence, and the classifier used.
+    With opts["raw"] it also returns left_raw[] / right_raw[]: the UNPROCESSED
+    per-station edges along the line's -normal / +normal (0 where not ok), which
+    refine_centreline uses (the published left/right go through a squeeze).
     """
     _require_deps()
     opts = opts or {}
@@ -761,6 +1250,8 @@ def measure_width(img, bounds, line, opts=None):
         left[i], right[i], ok[i] = lw, rw, True
     conf = float(ok.mean()) if n else 0.0
     used = "learned" if learned is not None else "colour"
+    raw_out = ({"left_raw": left.tolist(), "right_raw": right.tolist()}
+               if opts.get("raw") else {})
     if ok.sum() >= 3 and conf >= float(opts.get("min_confidence") or 0.25):
         det = left[ok] + right[ok]
         med = float(np.median(det))
@@ -788,12 +1279,129 @@ def measure_width(img, bounds, line, opts=None):
                 "median_width_m": round(rep, 2), "mode_width_m": round(rep, 2),
                 "classifier": used,
                 "asphalt_rgb": None if learned is None else [round(float(x), 1) for x in learned[0]],
-                "background_rgb": None if learned is None else [round(float(x), 1) for x in learned[1]]}
+                "background_rgb": None if learned is None else [round(float(x), 1) for x in learned[1]],
+                **raw_out}
     fallback = float(opts.get("width_fallback_m") or 12.0)
     return {"left": [fallback / 2] * n, "right": [fallback / 2] * n,
             "width": [fallback] * n, "ok": ok.tolist(), "confidence": conf,
             "median_width_m": fallback, "mode_width_m": fallback,
-            "classifier": used, "asphalt_rgb": None, "background_rgb": None}
+            "classifier": used, "asphalt_rgb": None, "background_rgb": None,
+            **raw_out}
+
+
+# ---------------------------------------------------------------------------
+# centreline refinement: pull the line onto the middle of the paved corridor
+# ---------------------------------------------------------------------------
+REFINE_MAX_SHIFT_M = 4.0
+REFINE_MIN_OK_FRAC = 0.35
+
+
+def _movavg(a, k: int):
+    a = np.asarray(a, dtype=float)
+    k = max(1, int(k))
+    if k <= 1 or a.size == 0:
+        return a.copy()
+    r = k // 2
+    pad = np.pad(a, (r, k - 1 - r), mode="edge")
+    return np.convolve(pad, np.ones(k) / k, "valid")
+
+
+def _line_frame(lats, lons) -> dict:
+    """lat/lon stations -> the same dict resample() makes (s, tan, normal), but
+    WITHOUT resampling, so an existing asset's stations keep their indices."""
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    lat0, lon0 = float(lats.mean()), float(lons.mean())
+    kx = M_PER_DEG_LAT * math.cos(math.radians(lat0))
+    xs = (lons - lon0) * kx
+    ys = (lats - lat0) * M_PER_DEG_LAT
+    dx, dy = np.gradient(xs), np.gradient(ys)
+    ang = np.arctan2(dx, dy)
+    cum = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(xs), np.diff(ys)))])
+    return {"lat": lats, "lon": lons, "s": cum, "total_m": float(cum[-1]),
+            "tan": ang, "normal": np.stack([np.cos(ang), -np.sin(ang)], axis=1)}
+
+
+def _centre_offsets(ok, left_raw, right_raw, max_shift: float = REFINE_MAX_SHIFT_M):
+    """Smoothed lateral offset (m, along +normal) of the paved corridor's middle.
+
+    The profile's NEGATIVE offsets are `left`, so the corridor spans
+    [-left, +right] along the normal and its middle is (right - left) / 2.
+    Robust: a 21-station rolling median of the ok stations, then a 15-station
+    moving average; where fewer than 40 % of a 41-station neighbourhood are ok
+    the imagery has not seen the road there and the offset fades to 0 (smoothly)."""
+    ok = np.asarray(ok, dtype=bool)
+    n = len(ok)
+    if n == 0:
+        return np.zeros(0)
+    raw = (np.asarray(right_raw, dtype=float) - np.asarray(left_raw, dtype=float)) / 2.0
+    med = np.full(n, np.nan)
+    for i in range(n):
+        lo, hi = max(0, i - 10), min(n, i + 11)
+        sel = ok[lo:hi]
+        if sel.any():
+            med[i] = float(np.median(raw[lo:hi][sel]))
+    valid = ~np.isnan(med)
+    if not valid.any():
+        return np.zeros(n)
+    idx = np.arange(n)
+    med = np.interp(idx, idx[valid], med[valid])
+    sm = _movavg(med, 15)
+    cs = np.concatenate([[0], np.cumsum(ok.astype(int))])
+    lo = np.maximum(0, idx - 20)
+    hi = np.minimum(n, idx + 21)
+    frac = (cs[hi] - cs[lo]) / np.maximum(1, hi - lo)
+    gate = _movavg((frac >= 0.4).astype(float), 21)
+    return np.clip(sm * gate, -max_shift, max_shift)
+
+
+def _refine_stations(line: dict, img, bounds: dict, opts=None):
+    """-> (offsets_m per station, report). Does not move anything."""
+    opts = dict(opts or {})
+    opts["raw"] = True
+    n = len(line["lat"])
+    m = measure_width(img, bounds, line, opts) or {}
+    ok, lr, rr = m.get("ok"), m.get("left_raw"), m.get("right_raw")
+    if ok is None or lr is None or rr is None or len(ok) != n:
+        return np.zeros(n), {"mean_abs_shift_m": 0.0, "max_abs_shift_m": 0.0,
+                             "ok_frac": 0.0, "applied": False}
+    ok_arr = np.asarray(ok, dtype=bool)
+    ok_frac = float(ok_arr.mean()) if n else 0.0
+    off = _centre_offsets(ok_arr, lr, rr, float(opts.get("max_shift_m") or REFINE_MAX_SHIFT_M))
+    applied = ok_frac >= float(opts.get("min_ok_frac") or REFINE_MIN_OK_FRAC)
+    if not applied:
+        off = np.zeros(n)
+    return off, {"mean_abs_shift_m": round(float(np.abs(off).mean()), 2) if n else 0.0,
+                 "max_abs_shift_m": round(float(np.abs(off).max()), 2) if n else 0.0,
+                 "ok_frac": round(ok_frac, 3), "applied": bool(applied)}
+
+
+def _shift_along_normal(lats, lons, normal, off):
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    coslat = math.cos(math.radians(float(lats.mean())))
+    nrm = np.asarray(normal, dtype=float)
+    return (lats + off * nrm[:, 1] / M_PER_DEG_LAT,
+            lons + off * nrm[:, 0] / (M_PER_DEG_LAT * coslat))
+
+
+def refine_centreline(line_points, img, bounds, opts=None):
+    """Centre a (lat,lon) line on the paved corridor the imagery shows.
+
+    OSM ways and driven lines routinely sit 1-4 m off the middle of the tarmac.
+    Returns (points[(lat,lon)...], report) with report = {mean_abs_shift_m,
+    max_abs_shift_m, ok_frac, applied}. Applied only when the imagery found the
+    corridor on >= 35 % of the stations; otherwise the (resampled) input is
+    returned unmoved. Shifts are clamped to +-4 m. bounds as measure_width's."""
+    _require_deps()
+    opts = dict(opts or {})
+    line = resample(line_points, float(opts.get("step_m") or 2.0))
+    off, rep = _refine_stations(line, img, bounds, opts)
+    if rep["applied"]:
+        la, lo = _shift_along_normal(line["lat"], line["lon"], line["normal"], off)
+    else:
+        la, lo = line["lat"], line["lon"]
+    return [(float(a), float(b)) for a, b in zip(la, lo)], rep
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1615,274 @@ def add_landcover(asset: dict, img, bounds: dict, log=print) -> dict:
     return asset
 
 
+# ---------------------------------------------------------------------------
+# enrichment: real-world features, hi-res terrain, a centred line
+# ---------------------------------------------------------------------------
+ENRICH_VERSION = 1
+ENRICH_RETRY_S = 6 * 3600           # a failed network step is not retried sooner
+_ENRICH_ACTIVE = set()
+_ENRICH_ACTIVE_LOCK = threading.Lock()
+# One writer per asset: a bake and a background enrichment both write
+# <slug>.json AND <slug>.dem.bin / .demfar.bin, so they must not interleave
+# (metadata from one, grid from the other, decodes as garbage terrain).
+# Lock order: slug lock, then _LANDCOVER_LOCK.
+_SLUG_LOCKS: dict = {}
+_SLUG_LOCKS_GUARD = threading.Lock()
+
+
+def _slug_lock(asset_path) -> "threading.Lock":
+    key = str(pathlib.Path(asset_path).resolve())
+    with _SLUG_LOCKS_GUARD:
+        lk = _SLUG_LOCKS.get(key)
+        if lk is None:
+            lk = _SLUG_LOCKS[key] = threading.Lock()
+        return lk
+
+
+def _write_json_atomic(path: pathlib.Path, obj: dict) -> None:
+    path = pathlib.Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=path.stem + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _expand_bbox(bbox, margin_m: float):
+    s, w, n, e = [float(x) for x in bbox]
+    dlat = margin_m / M_PER_DEG_LAT
+    dlon = margin_m / (M_PER_DEG_LAT * math.cos(math.radians((s + n) / 2)))
+    return (s - dlat, w - dlon, n + dlat, e + dlon)
+
+
+def _asset_bbox(asset: dict, prefer_dem: bool):
+    d = asset.get("dem") or {}
+    if prefer_dem and d.get("bounds") and len(d["bounds"]) == 4:
+        return tuple(float(x) for x in d["bounds"])
+    if asset.get("bbox") and len(asset["bbox"]) == 4:
+        return tuple(float(x) for x in asset["bbox"])
+    la = [p[0] for p in asset["line"]]
+    lo = [p[1] for p in asset["line"]]
+    return (min(la), min(lo), max(la), max(lo))
+
+
+def _texture_bounds(tex: dict, size) -> dict:
+    """The baked JPEG is the (possibly downscaled) Mercator mosaic: rebuild the
+    {"z","x0","y0","scale"} frame mosaic_px() needs from its lat/lon bounds."""
+    z = 18
+    b = tex["bounds"]
+    x0, x1 = lon_to_x(b["west"], z), lon_to_x(b["east"], z)
+    y0, y1 = lat_to_y(b["north"], z), lat_to_y(b["south"], z)
+    return {"z": z, "x0": x0 / TILE, "y0": y0 / TILE,
+            "scale": size[0] / (x1 - x0), "scale_y": size[1] / (y1 - y0),
+            "lat0": b["north"], "lat1": b["south"], "lon0": b["west"], "lon1": b["east"]}
+
+
+def _enrich_missing(asset: dict, adir: pathlib.Path) -> bool:
+    if not asset.get("features"):
+        return True
+    for k in ("dem_hr", "dem_far"):
+        m = asset.get(k)
+        if not m or not (adir / str(m.get("file") or "?")).is_file():
+            return True
+    return False
+
+
+def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
+                  network: bool = True, refine: bool = True) -> bool:
+    """Mutates `asset` (and writes <slug>.dem.bin / <slug>.demfar.bin into adir).
+    Every step is independent: one failing never stops the others. Returns True
+    when a .bin file was (re)written."""
+    wrote = False
+    slug = asset.get("slug") or "track"
+    now = time.time()
+    line = asset.get("line") or []
+    lats = np.array([p[0] for p in line], dtype=float)
+    lons = np.array([p[1] for p in line], dtype=float)
+    refined_now = False
+
+    # a. centreline refinement, offline, from the asset's own texture ----------
+    tex = asset.get("texture")
+    if refine and "centreline_refine" not in asset and tex and tex.get("file") \
+            and len(line) >= 20 and (adir / tex["file"]).is_file():
+        try:
+            with Image.open(adir / tex["file"]) as im:
+                img = im.convert("RGB")
+            frame = _line_frame(lats, lons)
+            off, rep = _refine_stations(frame, img, _texture_bounds(tex, img.size))
+            asset["centreline_refine"] = rep
+            if rep["applied"]:
+                la, lo = _shift_along_normal(lats, lons, frame["normal"], off)
+                asset["line"] = [[float(a), float(b), p[2] if len(p) > 2 else None]
+                                 for a, b, p in zip(la, lo, line)]
+                lats, lons = la, lo
+                refined_now = True
+            log(f"[{slug}] centreline refine: {rep}")
+        except Exception as e:
+            log(f"[{slug}] centreline refine failed: {type(e).__name__}: {e}")
+
+    # b. OSM features ----------------------------------------------------------
+    if network and not asset.get("features") and len(line) >= 2 \
+            and now - float(asset.get("features_tried") or 0) >= ENRICH_RETRY_S:
+        try:
+            bb = _expand_bbox(_asset_bbox(asset, True), 250.0)
+            f = osm_features(bb, log=log)
+            if _features_empty(f):
+                raise RuntimeError("Overpass returned no features")
+            asset["features"] = f
+            asset.pop("features_error", None)
+            asset.pop("features_tried", None)
+            log(f"[{slug}] features: " + ", ".join(
+                f"{k}={len(v)}" for k, v in f.items() if isinstance(v, list)))
+        except Exception as e:
+            asset["features_error"] = f"{type(e).__name__}: {e}"[:200]
+            asset["features_tried"] = int(now)
+            log(f"[{slug}] features failed: {asset['features_error']}")
+
+    # c. hi-res + far elevation ------------------------------------------------
+    hr_grid = None
+    hr_new = False
+    dem_ok_to_try = now - float(asset.get("dem_tried") or 0) >= ENRICH_RETRY_S
+    dem_failed = False
+
+    def need(key):
+        m = asset.get(key)
+        return not m or not (adir / str(m.get("file") or "?")).is_file()
+
+    if network and dem_ok_to_try and len(line) >= 2:
+        if need("dem_hr"):
+            try:
+                bb = _expand_bbox(_asset_bbox(asset, False), 180.0)
+                hr_grid = dem_hires(bb, cache_dir, log=log)
+                asset["dem_hr"] = write_dem_bin(hr_grid, adir / f"{slug}.dem.bin")
+                hr_new = wrote = True
+            except Exception as e:
+                dem_failed = True
+                hr_grid = None
+                log(f"[{slug}] hi-res dem failed: {type(e).__name__}: {e}")
+        if need("dem_far"):
+            try:
+                c = asset.get("centre") or [float(lats.mean()), float(lons.mean())]
+                far = dem_far(float(c[0]), float(c[1]), cache_dir=cache_dir, log=log)
+                asset["dem_far"] = write_dem_bin(far, adir / f"{slug}.demfar.bin")
+                wrote = True
+            except Exception as e:
+                dem_failed = True
+                log(f"[{slug}] far dem failed: {type(e).__name__}: {e}")
+        if dem_failed:
+            asset["dem_tried"] = int(now)
+        else:
+            asset.pop("dem_tried", None)
+
+    # d. station elevations from the hi-res grid --------------------------------
+    hr = asset.get("dem_hr")
+    if hr and len(line) >= 2 and (hr_new or refined_now
+                                  or asset.get("line_elev_source") != hr.get("source")):
+        try:
+            grid = hr_grid
+            if grid is None:
+                grid = dict(hr)
+                grid["values"] = read_dem_bin(hr, adir / hr["file"])
+            z = dem_sample(grid, lats, lons)
+            old = np.array([np.nan if p[2] is None else p[2] for p in asset["line"]],
+                           dtype=float)
+            z = np.where(np.isfinite(z), z, old)
+            good = np.isfinite(z)
+            if good.sum() >= 2:
+                idx = np.arange(len(z))
+                z = np.interp(idx, idx[good], z[good])
+                z = _movavg(z, 5)
+                asset["line"] = [[p[0], p[1], round(float(v), 1)]
+                                 for p, v in zip(asset["line"], z)]
+                asset["line_elev_source"] = hr.get("source")
+        except Exception as e:
+            log(f"[{slug}] station elevations failed: {type(e).__name__}: {e}")
+
+    # e. record ------------------------------------------------------------------
+    complete = bool(asset.get("features")) and not _enrich_missing(asset, adir)
+    old = asset.get("enrich") or {}
+    rec = {"v": ENRICH_VERSION if complete else int(old.get("v") or 0),
+           "features": bool(asset.get("features")),
+           "dem_hr": (asset.get("dem_hr") or {}).get("source"),
+           "dem_far": (asset.get("dem_far") or {}).get("source"),
+           "refined": bool((asset.get("centreline_refine") or {}).get("applied"))}
+    if {k: v for k, v in old.items() if k != "at"} != rec:
+        rec["at"] = int(now)
+        asset["enrich"] = rec
+    if hr:
+        src = dict(asset.get("source") or {})
+        src["dem"] = "%s %s m (hi-res)" % (hr.get("source"), hr.get("cell_m"))
+        if asset.get("dem_far"):
+            src["dem_far"] = asset["dem_far"].get("source")
+        if asset.get("features"):
+            src["features"] = "OpenStreetMap (Overpass)"
+        asset["source"] = src
+    return wrote
+
+
+def enrich_asset(asset_path: pathlib.Path, cache_dir: pathlib.Path, log=print,
+                 network: bool = True) -> Optional[dict]:
+    """Idempotently upgrade an EXISTING asset in place (see _enrich_steps).
+
+    Adds `features`, `dem_hr` / `dem_far` (+ their .bin files next to the JSON),
+    a refined `line`, hi-res station elevations and the `enrich` record. Returns
+    the updated asset, or None when there was nothing to do (already enriched,
+    nothing new possible, another thread is already on it). network=False runs
+    only the offline steps. The slow work happens WITHOUT the asset lock; only
+    the final read-merge-write is under it, so serving never waits on Overpass."""
+    import copy
+    asset_path = pathlib.Path(asset_path)
+    key = str(asset_path.resolve())
+    with _ENRICH_ACTIVE_LOCK:
+        if key in _ENRICH_ACTIVE:
+            return None
+        _ENRICH_ACTIVE.add(key)
+    try:
+        _require_deps()
+        # the slug lock spans read -> steps -> merge: a bake of the same track
+        # waits for it (and vice versa), so grids and metadata always match
+        with _slug_lock(asset_path):
+            try:
+                asset = json.loads(asset_path.read_text("utf-8"))
+            except Exception:
+                return None
+            adir = asset_path.parent
+            if int((asset.get("enrich") or {}).get("v") or 0) >= ENRICH_VERSION \
+                    and not _enrich_missing(asset, adir):
+                return None
+            orig = copy.deepcopy(asset)
+            wrote = _enrich_steps(asset, adir, pathlib.Path(cache_dir), log, network=network)
+            changed = {k: asset[k] for k in asset if asset[k] != orig.get(k)}
+            removed = [k for k in orig if k not in asset]
+            if not changed and not removed:
+                return asset if wrote else None      # only a missing .bin was rewritten
+            with _LANDCOVER_LOCK:
+                try:
+                    fresh = json.loads(asset_path.read_text("utf-8"))
+                except Exception:
+                    # deleted under us (a forced re-prepare): never resurrect it
+                    log(f"[enrich] {asset_path.name} vanished mid-run; not written")
+                    return None
+                if fresh.get("generated") != orig.get("generated"):
+                    log(f"[enrich] {asset_path.name} was re-baked mid-run; not merged")
+                    return None
+                fresh.update(changed)
+                for k in removed:
+                    fresh.pop(k, None)
+                _write_json_atomic(asset_path, fresh)
+            return fresh
+    finally:
+        with _ENRICH_ACTIVE_LOCK:
+            _ENRICH_ACTIVE.discard(key)
+
+
 def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
                 log=print, cache_dir: Optional[pathlib.Path] = None) -> dict:
     """Bake one track: centreline + measured width + elevation + ground texture."""
@@ -1030,6 +1906,22 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
 
     log(f"[{slug}] centreline {len(lats)} stations, {line['total_m']:.0f} m")
     img, bounds = imagery_mosaic(bbox, z, cache_dir, log=log)
+    # Centre the line on the paved corridor the imagery shows (OSM ways and
+    # driven lines sit 1-4 m off the middle of the tarmac).
+    refine_report = None
+    if opts.get("refine", True):
+        try:
+            pts, refine_report = refine_centreline(
+                line_points, img, bounds, {"step_m": step})
+            log(f"[{slug}] centreline refine: {refine_report}")
+            if refine_report["applied"]:
+                line = resample(pts, step)
+                lats, lons = line["lat"], line["lon"]
+                min_lat, max_lat = float(lats.min()), float(lats.max())
+                min_lon, max_lon = float(lons.min()), float(lons.max())
+        except Exception as e:
+            log(f"[{slug}] centreline refine failed: {type(e).__name__}: {e}")
+            refine_report = None
     w = measure_width(img, bounds, line, opts)
     osm_w = opts.get("osm_width_m")
     imagery_w = float(w["median_width_m"])
@@ -1121,14 +2013,26 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
             "attrib": "Imagery \u00a9 Esri, Maxar, Earthstar Geographics",
         },
     }
+    if refine_report is not None:
+        asset["centreline_refine"] = refine_report
     if tex_name:
         add_landcover(asset, img, bounds, log=log)
     problems = validate_asset(asset, line)
     if problems:
         raise RuntimeError("refusing to publish a broken track asset: " +
                            "; ".join(problems))
-    (out_dir / f"{slug}.json").write_text(json.dumps(asset), "utf-8")
-    log(f"[{slug}] asset written ({out_dir / (slug + '.json')})")
+    asset_path = out_dir / f"{slug}.json"
+    with _slug_lock(asset_path):
+        if opts.get("enrich", True):
+            # features + hi-res/far terrain, so a fresh bake is complete (every
+            # step is independent and failure is recorded, never fatal)
+            try:
+                _enrich_steps(asset, out_dir, cache_dir, log, network=True, refine=False)
+            except Exception as e:
+                log(f"[{slug}] enrichment failed: {type(e).__name__}: {e}")
+        with _LANDCOVER_LOCK:
+            _write_json_atomic(asset_path, asset)
+    log(f"[{slug}] asset written ({asset_path})")
     return asset
 
 
@@ -1234,8 +2138,44 @@ def main(argv=None) -> int:
     ap.add_argument("--zoom", type=int, default=18)
     ap.add_argument("--list-tracks", action="store_true")
     ap.add_argument("--list-osm", action="store_true")
+    ap.add_argument("--enrich", metavar="SLUG|all",
+                    help="add OSM features, hi-res terrain and a centred line to "
+                         "existing prepared track(s) in place")
+    ap.add_argument("--tracks-dir", help="where the <slug>.json assets live "
+                    "(default DATA_DIR/tracks; e.g. server/app/seed-tracks)")
+    ap.add_argument("--cache-dir", help="tile/DEM cache (default DATA_DIR/tilecache)")
+    ap.add_argument("--no-network", action="store_true",
+                    help="with --enrich: only the offline steps")
     a = ap.parse_args(argv)
     data_dir = pathlib.Path(a.data_dir)
+
+    if a.enrich:
+        tdir = pathlib.Path(a.tracks_dir) if a.tracks_dir else data_dir / "tracks"
+        cdir = pathlib.Path(a.cache_dir) if a.cache_dir else data_dir / "tilecache"
+        slugs = ([f.stem for f in sorted(tdir.glob("*.json"))] if a.enrich == "all"
+                 else [a.enrich])
+        rc = 0
+        for slug in slugs:
+            path = tdir / f"{slug}.json"
+            if not path.is_file():
+                print(f"{slug}: no such asset in {tdir}")
+                rc = 1
+                continue
+            res = enrich_asset(path, cdir, network=not a.no_network)
+            if res is None:
+                print(f"{slug}: nothing to do")
+                continue
+            f = res.get("features") or {}
+            print(f"{slug}: enrich={res.get('enrich')} refine={res.get('centreline_refine')}")
+            print("    features: " + (", ".join(f"{k}={len(v)}" for k, v in f.items()
+                                              if isinstance(v, list)) or "none"),
+                  res.get("features_error") or "")
+            for k in ("dem_hr", "dem_far"):
+                m = res.get(k)
+                if m:
+                    print(f"    {k}: {m['cols']}x{m['rows']} {m['cell_m']} m {m['source']} "
+                          f"-> {m['file']}")
+        return rc
 
     if a.list_tracks:
         for slug, asset in load_assets(data_dir).items():

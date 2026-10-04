@@ -533,6 +533,61 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
+### 3D view v11 — the real place, the layout you drove, what your feet did (`track3d_v` 11)
+Follow-up to v10 ("much better… really close"): more real data, better brake markers, clear brake/throttle/
+coast, and a track shape from GPS + imagery + map together.
+- **More sources, baked into the asset by `trackprep.enrich_asset()`** (`ENRICH_VERSION` 1, `asset.enrich`):
+  OpenStreetMap features (`asset.features`: buildings incl. grandstands, water, woods/grass/parking areas,
+  service roads, fences/walls/guard rails, tree rows/nodes) and **hi-res terrain** — USGS 3DEP lidar
+  (`exportImage`, keyless, float32) where it exists, AWS terrarium z15 otherwise — as raw uint16 side files
+  `<slug>.dem.bin` (~3 m over the circuit) + `<slug>.demfar.bin` (±3.5 km horizon), schema in `asset.dem_hr` /
+  `asset.dem_far` (`u16le`, SOUTH row first, node-registered, `v = base + q*scale`), served at
+  `/trackassets/<slug>/dem/hr|far`. `refine_centreline()` re-centres the OSM line on the imagery's paved
+  corridor. The server enriches any asset older than `ENRICH_VERSION` in the background (`_kick_enrich`, once
+  per slug per process); seeds ship enriched with their `.bin` files (`.gitignore` has an exception).
+  **Overpass mirror landmine:** `overpass.osm.ch` is SWISS-ONLY and silently answers empty for US tracks.
+- **Track shape** (`setupTrack()`): the asset line is rigidly registered onto the GPS fixes
+  (`RC3D.registerLine`; accepted at inFrac >= 0.6, median <= 6 m, shift <= 30 m). If the laps leave that line
+  anywhere (coverage < 97 % — Watkins Glen sessions are the SHORT course on a Grand Prix asset), the track is
+  `RC3D.blendOnto()`: the laps' `consensusLine` pulled onto the prepared line wherever they are the same road
+  (<= 8 m, same direction), faded over ~40 m, so a link the asset lacks keeps the driven shape. No asset →
+  consensus of all laps. A closed loop goes through `RC3D.trimLoop()` first — a lap's line overruns its own
+  start, and closed as-is it folded back into a fake 180-degree "corner" at the seam. Every fix is then
+  snapped into the road band (`snapSamples`; pit lane left alone) and the world (edges, kerbs, run-off,
+  trees, boards, gantry) is built from the TRACK, not the lap slice. The legend states which source won.
+- **Time → place uses spline KNOTS** (`dense.knC/knS`, `RC3D.cumToDense/denseToCum`): sample arc length and
+  spline arc length drift apart over a session (the spline is built on decimated fixes), and the old single
+  ratio put the car **180 m** from its real position by lap 8 at Summit Point — braking showed on the
+  straight and markers sat in the wrong corner. `slicePath` re-bases the knots for a lap.
+- **Driver input** (`RC3D.longG/coastG/inputStates`): repeated GPS rows are dropped first (~57 % of logged
+  rows repeat the previous fix; `/data?fixes=1` dedupes server-side), longitudinal g is a time regression on
+  speed, fused 50/50 with a least-squares-mounted IMU only when it fits (r >= 0.85). Throttle / brake / coast
+  are judged against a speed-dependent COAST curve (`-(0.045 + 0.095 (mph/100)^2)` g) with hysteresis and
+  gear-change cleanup — **green throttle, red brake, amber coast**; HUD shows THROTTLE/BRAKE/COAST.
+  `tps_pct` is NOT used (sparse, laggy BLE data).
+- **Markers** (`RC3D.cornerEvents` per lap): a red BRAKE bar across the road with the entry speed, a MIN
+  label at the slowest point, a green GAS bar where the throttle came back, and a dashed white bar at your
+  best lap's brake point. **Brake boards** (`RC3D.boardsFromData`) go where your laps actually brake (>= 40 %
+  of laps) at 100 m steps before the corner (3, or 5 on a >= 520 m straight at >= 100 mph), on the outside,
+  2.4 m boards. Corners split at a change of hand — an S-bend merged into one "corner" cancelled to ~0°.
+- **Lap detection fix (server-wide):** the Teensy stamps `lap 0` from REC to the first S/F crossing; that
+  segment was reported as lap 1 and, starting mid-track, was usually the session's "best" (Watkins 1:39 out-lap
+  over 1:44 laps). `_detect_laps` now flags it `out_lap` (and a segment ending at a combined file's counter
+  reset `partial`); numbering is unchanged so stored exclusions still match; `_apply_lap_meta` auto-excludes
+  both (reason "out lap"/"partial", re-includable); the lap-summary cache is versioned (`_LAP_RULES_V`).
+  Tests: `tests/test_laps.py`.
+- Debug: `window.__rc3dInfo` (track source, corners, boards, events with track positions) and
+  `window.__rc3dWhere()` (car's track position) — read-only, nothing hangs on them.
+- Review fixes that are easy to regress: out-lap/partial flags ONLY when the Teensy's lap field produced the
+  boundaries (`from_field`) — a stream stamped `lap 0` throughout (S/F never crossed) falls back to line
+  crossing and those laps are REAL; one per-slug lock (`trackprep._slug_lock`) spans a bake's and an
+  enrichment's grid+JSON writes, and an enrichment never writes back an asset that was deleted or re-baked
+  under it (`generated` changed); DEM URLs are versioned (`?v=cols-rows-base-scale-enrich.at`) and decode
+  only at the exact byte length; `/data?fixes=1` is two-pass (byte offsets, then parses only the strided
+  rows); `setupTrack()` falls back to the plain driven line if the full build throws, and every optional
+  builder in `rebuild()` is isolated so the car, ideal line and legend always draw; the viewer shifts the
+  server's lap times by (first fix − first row) because its clock starts at the first FIX.
+
 ### Simulated track dressing (v-server, `track3d_v` 10) — the look of the 3D view
 A satellite drape is 1 m per pixel at best and reads as mush at driving height, so the 3D view draws its OWN
 world, procedurally (canvas noise, deterministic, tileable), placed from what we KNOW about the circuit.
@@ -569,8 +624,8 @@ track the road floated metres above the ground. Now:
   pixels within ±3 cells (~12 m) — wallpaper/wrong-place scores ~0; misregistration is tolerated (Summit
   Point Jefferson's line is ~15 m off the Esri mosaic: 24 % at ±1 cell, 52 % at ±3).
 - **Units**: `RC3D.corners`/`brakeMarkers`/ribbons speak DENSE (spline) arc length, `pointAtS`/`accelAtS`
-  take SAMPLE arc length — they differ by a fraction of a percent (tens of metres over a session). Convert
-  with `denseToCum()`; `slicePath()` converts its window instead of comparing across them.
+  take SAMPLE arc length — they drift apart along a session (180 m by lap 8 at Summit). Convert ONLY with
+  `RC3D.cumToDense`/`RC3D.denseToCum` (piecewise through the spline knots, v11) — never one global ratio.
 - The world is built ONCE at startup, after the asset fetch resolves (it used to build procedurally, then
   again with the asset, so every tree jumped); the console logs `world built in N ms` (~100-350 ms).
 - Host tests (`tests/test_track3d.py` §12) pin: road field = brute force, no tree within 14 m of ANY section
@@ -638,7 +693,8 @@ SERVER baked, and the pipeline published it silently. Now:
   pit buildings, Esses, Boot, paddock) alongside the Summit Point family.
 
 ### 3D road colour = the driver's INPUT, not the speed (v-server)
-The ribbon is coloured by what the driver is doing, computed per station from the **speed trace** (gear
+(Superseded in v11 by throttle / brake / coast classification against a coast curve — see "3D view v11"
+above; `driveColour(g)` is kept in RC3D but nothing draws with it now.) The ribbon is coloured by what the driver is doing, computed per station from the **speed trace** (gear
 independent — an rpm rate cannot compare 1st with 4th, and gear is not logged): `path.accel[i]` = dv/dt in g,
 smoothed twice.
 - **accelerating → green**, floored at 0.40 brightness so ANY real rise reads green (we claim "accelerating"

@@ -10,10 +10,14 @@ The real end-to-end path (OSM raceway + Esri tiles + AWS DEM) is exercised by
 `tests/test_track3d.py` through the baked fixture, and by running
 `python3 -m app.trackprep` by hand (see the module docstring).
 """
+import io
 import json
 import math
+import os
 import pathlib
+import time
 import unittest
+import urllib.parse
 from unittest import mock
 
 try:
@@ -24,6 +28,7 @@ except Exception:                       # pragma: no cover
     HAVE_DEPS = False
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+M = 111320.0
 
 
 def _tp():
@@ -191,7 +196,8 @@ class AssetTests(unittest.TestCase):
             import tempfile
             with tempfile.TemporaryDirectory() as td:
                 asset = tp.build_asset("Test Track", line_pts, pathlib.Path(td),
-                                       {"osm_width_m": 10.0, "line_source": "osm:1"})
+                                       {"osm_width_m": 10.0, "line_source": "osm:1",
+                                        "enrich": False})      # no network in tests
                 self.assertEqual(asset["width_source"], "osm-tag")
                 self.assertEqual(set(asset["width_m"]), {10.0})
                 self.assertEqual(asset["width_imagery_m"], 12.5)
@@ -210,7 +216,7 @@ class AssetTests(unittest.TestCase):
 
                 # without a tag the imagery estimate IS the width
                 asset2 = tp.build_asset("Test Track", line_pts, pathlib.Path(td),
-                                        {"line_source": "session"})
+                                        {"line_source": "session", "enrich": False})
                 self.assertEqual(asset2["width_source"], "imagery")
                 self.assertAlmostEqual(asset2["width_m"][0], 12.5, delta=0.01)
 
@@ -545,6 +551,624 @@ class FixtureSchemaTests(unittest.TestCase):
         self.assertEqual(set(t["bounds"]), {"south", "west", "north", "east"})
         self.assertIn("Esri", t["attrib"])
         self.assertTrue(t["px"][0] >= 512)
+
+
+# ---------------------------------------------------------------------------
+# more data sources: OSM features, hi-res DEM, centreline refinement, enrich
+# ---------------------------------------------------------------------------
+def _overpass_doc():
+    def g(*pts):
+        return [{"lat": a, "lon": b} for a, b in pts]
+    sq = [(39.0, -77.0), (39.0, -76.999), (39.001, -76.999), (39.001, -77.0), (39.0, -77.0)]
+    return {"elements": [
+        {"type": "way", "id": 1, "tags": {"building": "yes", "height": "40'", "name": "Pit"},
+         "geometry": g(*sq)},
+        {"type": "way", "id": 2, "tags": {"building": "house", "height": "12.5m",
+                                          "building:levels": "3"}, "geometry": g(*sq)},
+        {"type": "way", "id": 3, "tags": {"building": "no"}, "geometry": g(*sq)},
+        {"type": "way", "id": 4, "tags": {"building": "yes"},          # not closed
+         "geometry": g(*sq[:4])},
+        {"type": "way", "id": 5, "tags": {"man_made": "tower"}, "geometry": g(*sq)},
+        {"type": "way", "id": 6, "tags": {"highway": "service", "name": "Paddock Rd",
+                                          "width": "6 m"},
+         "geometry": g((39.0, -77.0), (39.0005, -77.0))},
+        {"type": "way", "id": 7, "tags": {"highway": "steps"},
+         "geometry": g((39.0, -77.0), (39.0005, -77.0))},
+        {"type": "way", "id": 8, "tags": {"highway": "service", "area": "yes"},
+         "geometry": g(*sq)},
+        {"type": "way", "id": 9, "tags": {"barrier": "guard_rail"},
+         "geometry": g((39.0, -77.0), (39.0, -76.999))},
+        {"type": "way", "id": 10, "tags": {"barrier": "gate"},
+         "geometry": g((39.0, -77.0), (39.0, -76.999))},
+        {"type": "way", "id": 11, "tags": {"natural": "tree_row"},
+         "geometry": g((39.0, -77.0), (39.0, -76.999))},
+        {"type": "way", "id": 12, "tags": {"leisure": "pitch"}, "geometry": g(*sq)},
+        {"type": "way", "id": 13, "tags": {"amenity": "parking"}, "geometry": g(*sq)},
+        {"type": "node", "id": 14, "lat": 39.0004, "lon": -77.0004,
+         "tags": {"natural": "tree"}},
+        {"type": "node", "id": 15, "lat": 39.0004, "lon": -77.0004, "tags": {"barrier": "bollard"}},
+        {"type": "relation", "id": 16, "tags": {"natural": "water", "type": "multipolygon"},
+         "members": [{"type": "way", "role": "outer", "geometry": g(*sq)},
+                     {"type": "way", "role": "inner", "geometry": g(*sq)},
+                     {"type": "way", "role": "outer", "geometry": g(*sq[:3])}]},
+        {"type": "relation", "id": 17, "tags": {"landuse": "forest"},
+         "members": [{"type": "way", "role": "outer", "geometry": g(*sq)}]},
+    ]}
+
+
+class OsmFeatureTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tp = _tp()
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        p1 = mock.patch.object(self.tp, "OSM_CACHE_DIR", pathlib.Path(self.td.name))
+        p2 = mock.patch.object(self.tp.time, "sleep", lambda *_: None)
+        p1.start(); p2.start()
+        self.addCleanup(p1.stop); self.addCleanup(p2.stop)
+
+    def test_overpass_json_becomes_compact_features(self):
+        tp = self.tp
+        calls = []
+
+        def fake_get(url, timeout=45.0, data=None):
+            calls.append(url)
+            return json.dumps(_overpass_doc()).encode()
+        with mock.patch.object(tp, "_get", fake_get):
+            f = tp.osm_features((38.99, -77.01, 39.01, -76.99), log=lambda *_: None)
+        self.assertNotIn("overpass.osm.ch", " ".join(tp.OVERPASS))
+        self.assertEqual(f["v"], 1)
+        self.assertIn("OpenStreetMap", f["attrib"])
+        b = f["buildings"]
+        self.assertEqual(len(b), 2)                       # no / open / man_made dropped
+        self.assertEqual(b[0]["k"], "yes")
+        self.assertAlmostEqual(b[0]["h"], 12.2, delta=0.06)   # 40 ft
+        self.assertEqual(b[0]["n"], "Pit")
+        self.assertIsNone(b[0]["l"])
+        self.assertEqual(b[1]["h"], 12.5)
+        self.assertEqual(b[1]["l"], 3)
+        self.assertEqual(len(b[0]["p"]), 4)               # closing point dropped
+        self.assertEqual(b[0]["p"][0], [39.0, -77.0])
+        self.assertEqual([r["k"] for r in f["roads"]], ["service"])   # steps, area=yes out
+        self.assertEqual(f["roads"][0]["w"], 6.0)
+        self.assertEqual(f["roads"][0]["n"], "Paddock Rd")
+        self.assertEqual([x["k"] for x in f["barriers"]], ["guard_rail"])  # gate/bollard out
+        self.assertEqual(len(f["tree_rows"]), 1)
+        self.assertEqual(f["trees"], [[39.0004, -77.0004]])
+        self.assertEqual(len(f["water"]), 1)              # outer+closed only
+        self.assertEqual(len(f["woods"]), 1)
+        self.assertEqual(len(f["grass"]), 1)              # leisure=pitch
+        self.assertEqual(len(f["parking"]), 1)
+        for k in ("scrub", "farmland", "paved"):
+            self.assertEqual(f[k], [])
+        # the query asked for what the spec lists
+        self.assertTrue(calls)
+
+    def test_height_parsing(self):
+        tp = self.tp
+        for raw, want in (("12", 12.0), ("12 m", 12.0), ("12.5m", 12.5),
+                          ("40'", 12.2), ("40 ft", 12.2), ("12,5", 12.5)):
+            self.assertAlmostEqual(tp.parse_height_m(raw), want, delta=0.06, msg=raw)
+        for raw in ("", "tall", None, "0", "-3", "5000"):
+            self.assertIsNone(tp.parse_height_m(raw), raw)
+
+    def test_caps_and_degenerate_geometry(self):
+        tp = self.tp
+        els = [{"type": "node", "lat": 1.0, "lon": float(i) / 1e5, "tags": {"natural": "tree"}}
+               for i in range(7000)]
+        els.append({"type": "way", "tags": {"highway": "path"},
+                    "geometry": [{"lat": 1.0, "lon": 1.0}]})        # 1 point: dropped
+        f = tp._features_from_elements(els)
+        self.assertEqual(len(f["trees"]), 6000)
+        self.assertEqual(f["roads"], [])
+
+    def test_empty_mirror_falls_through_and_only_data_is_cached(self):
+        tp = self.tp
+        seen = []
+
+        def fake_get(url, timeout=45.0, data=None):
+            seen.append(url)
+            if url == tp.OVERPASS[0]:
+                return b'{"elements": []}'                          # valid but EMPTY
+            return json.dumps(_overpass_doc()).encode()
+        bbox = (38.99, -77.01, 39.01, -76.99)
+        with mock.patch.object(tp, "_get", fake_get):
+            f = tp.osm_features(bbox, log=lambda *_: None)
+        self.assertEqual(seen, tp.OVERPASS[:2])
+        self.assertEqual(len(f["buildings"]), 2)
+        cp = tp._osm_cache_path(bbox, "features")
+        self.assertTrue(cp.is_file())
+        # a second call is a cache hit: no network at all
+        with mock.patch.object(tp, "_get", side_effect=AssertionError("network")):
+            self.assertEqual(tp.osm_features(bbox, log=lambda *_: None), f)
+
+        # raceways take the same path
+        rw = {"elements": [{"type": "way", "id": 5, "tags": {"highway": "raceway", "width": "10 m"},
+                            "geometry": [{"lat": 1, "lon": 2}, {"lat": 1.1, "lon": 2}]}]}
+        seen.clear()
+
+        def fake_rw(url, timeout=45.0, data=None):
+            seen.append(url)
+            return b'{"elements": []}' if url == tp.OVERPASS[0] else json.dumps(rw).encode()
+        with mock.patch.object(tp, "_get", fake_rw):
+            ways = tp.osm_raceways((0.9, 1.9, 1.2, 2.1), log=lambda *_: None)
+        self.assertEqual(len(ways), 1)
+        self.assertEqual(ways[0]["width_m"], 10.0)
+        self.assertEqual(len(seen), 2)
+
+    def test_every_mirror_empty_returns_empty_and_caches_nothing(self):
+        tp = self.tp
+        seen = []
+
+        def fake_get(url, timeout=45.0, data=None):
+            seen.append(url)
+            return b'{"elements": []}'
+        bbox = (10.0, 10.0, 10.1, 10.1)
+        with mock.patch.object(tp, "_get", fake_get):
+            f = tp.osm_features(bbox, log=lambda *_: None)
+            r = tp.osm_raceways(bbox, log=lambda *_: None)
+        self.assertEqual(seen.count(tp.OVERPASS[-1]), 2)    # every mirror was asked
+        self.assertTrue(tp._features_empty(f))
+        self.assertEqual(r, [])
+        self.assertFalse(tp._osm_cache_path(bbox, "features").exists())
+        self.assertFalse(tp._osm_cache_path(bbox, "raceway").exists())
+
+    def test_errors_back_off_then_use_a_stale_cache(self):
+        tp = self.tp
+        bbox = (20.0, 20.0, 20.1, 20.1)
+        cp = tp._osm_cache_path(bbox, "features")
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        stale = tp._features_from_elements(_overpass_doc()["elements"])
+        cp.write_text(json.dumps(stale))
+        old = time.time() - 90 * 86400
+        os.utime(cp, (old, old))
+        with mock.patch.object(tp, "_get", side_effect=OSError("504")):
+            f = tp.osm_features(bbox, log=lambda *_: None)
+        self.assertEqual(f, stale)
+
+
+@unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
+class DemTests(unittest.TestCase):
+    BBOX = (39.2000, -77.9800, 39.2018, -77.9774)          # ~200 x 220 m
+
+    def setUp(self):
+        import tempfile
+        self.tp = _tp()
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.cache = pathlib.Path(self.td.name) / "cache"
+        p = mock.patch.object(self.tp.time, "sleep", lambda *_: None)
+        p.start(); self.addCleanup(p.stop)
+
+    def _tiff(self, arr):
+        buf = io.BytesIO()
+        Image.fromarray(np.asarray(arr, dtype=np.float32), mode="F").save(buf, "TIFF")
+        return buf.getvalue()
+
+    def test_bin_round_trip_and_south_first(self):
+        tp = self.tp
+        cols, rows = 7, 5
+        r, c = np.mgrid[0:rows, 0:cols]
+        vals = (120.0 + r * 3.7 + c * 0.113).astype(np.float32).reshape(-1)  # grows NORTH
+        grid = {"cols": cols, "rows": rows, "bounds": [1.0, 2.0, 1.1, 2.1],
+                "cell_m": 3.0, "source": "unit", "values": vals}
+        p = pathlib.Path(self.td.name) / "x.dem.bin"
+        meta = tp.write_dem_bin(grid, p)
+        self.assertEqual(meta["format"], "u16le")
+        self.assertEqual(meta["file"], "x.dem.bin")
+        self.assertEqual(meta["scale"], 0.05)
+        self.assertEqual(p.stat().st_size, cols * rows * 2)
+        self.assertEqual(list(pathlib.Path(self.td.name).glob("*.tmp")), [])
+        back = tp.read_dem_bin(meta, p)
+        self.assertLessEqual(float(np.abs(back - vals).max()), meta["scale"] / 2 + 1e-3)
+        # row-major, SOUTH row first: the first row is the lowest here
+        self.assertLess(back[0], back[-1])
+        self.assertAlmostEqual(float(back[0]), 120.0, delta=0.03)
+        raw = np.frombuffer(p.read_bytes(), dtype="<u2")
+        self.assertEqual(int(raw[0]), 0)                       # base = min
+        # a big range switches to a coarser scale instead of clipping
+        grid2 = dict(grid, values=np.linspace(0, 4000, cols * rows).astype(np.float32))
+        m2 = tp.write_dem_bin(grid2, p)
+        self.assertIn(m2["scale"], (0.1, 0.25))
+        b2 = tp.read_dem_bin(m2, p)
+        self.assertLessEqual(float(np.abs(b2 - grid2["values"]).max()), m2["scale"] / 2 + 1e-3)
+
+    def test_3dep_is_used_flipped_and_node_aligned(self):
+        tp = self.tp
+        reqs = []
+        W0 = self.BBOX[1]
+
+        def fake_get(url, timeout=45.0, data=None):
+            self.assertIn("3DEPElevation", url)
+            reqs.append(url)
+            q = urllib.parse.parse_qs(url.split("?", 1)[1])
+            w, s, e, n = [float(x) for x in q["bbox"][0].split(",")]
+            tw, th = [int(x) for x in q["size"][0].split(",")]
+            self.assertEqual(q["pixelType"], ["F32"])
+            lon_c = w + (np.arange(tw) + 0.5) * (e - w) / tw
+            lat_c = n - (np.arange(th) + 0.5) * (n - s) / th      # row 0 = NORTH
+            a = ((lon_c[None, :] - W0) * 1e5 + (lat_c[:, None] - 39.2) * 1e5).astype(np.float32)
+            return self._tiff(a)
+        with mock.patch.object(tp, "_get", fake_get):
+            g = tp.dem_hires(self.BBOX, self.cache, log=lambda *_: None)
+        self.assertEqual(g["source"], "USGS 3DEP")
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(g["values"].dtype, np.float32)
+        self.assertEqual(g["values"].size, g["cols"] * g["rows"])
+        self.assertGreaterEqual(g["cell_m"], 3.0)
+        self.assertLessEqual(g["cols"] * g["rows"], 250_000)
+        V = g["values"].reshape(g["rows"], g["cols"])
+        s, w, n, e = g["bounds"]
+        # node (r, c) is at lat s + (n-s)r/(rows-1): value must match that position
+        for r, c in ((0, 0), (0, g["cols"] - 1), (g["rows"] - 1, 0), (g["rows"] // 2, g["cols"] // 3)):
+            lat = s + (n - s) * r / (g["rows"] - 1)
+            lon = w + (e - w) * c / (g["cols"] - 1)
+            self.assertAlmostEqual(float(V[r, c]), (lon - W0) * 1e5 + (lat - 39.2) * 1e5, delta=0.2)
+        self.assertLess(V[0, 0], V[-1, 0])                     # south row first
+        # cached: the blob is re-used without the network
+        self.assertTrue(list((self.cache / "dem3dep").glob("*.tif")))
+        with mock.patch.object(tp, "_get", side_effect=AssertionError("network")):
+            g2 = tp.dem_hires(self.BBOX, self.cache, log=lambda *_: None)
+        self.assertTrue(np.array_equal(g2["values"], g["values"]))
+
+    def test_large_grids_are_tiled_at_2000_px(self):
+        tp = self.tp
+        reqs = []
+        W0 = self.BBOX[1]
+
+        def fake_get(url, timeout=45.0, data=None):
+            reqs.append(url)
+            q = urllib.parse.parse_qs(url.split("?", 1)[1])
+            w, s, e, n = [float(x) for x in q["bbox"][0].split(",")]
+            tw, th = [int(x) for x in q["size"][0].split(",")]
+            self.assertLessEqual(max(tw, th), 2000)
+            lon_c = w + (np.arange(tw) + 0.5) * (e - w) / tw
+            return self._tiff(np.tile(((lon_c - W0) * 1e5)[None, :], (th, 1)))
+        bbox = (39.2, W0, 39.2004, W0 + 0.05)                  # ~4.3 km x 44 m
+        with mock.patch.object(tp, "_get", fake_get):
+            g = tp.dem_hires(bbox, self.cache, max_cells=10_000_000, min_cell_m=1.0,
+                             log=lambda *_: None)
+        self.assertGreater(g["cols"], 2000)
+        self.assertEqual(len(reqs), -(-g["cols"] // 2000))
+        V = g["values"].reshape(g["rows"], g["cols"])
+        want = (np.linspace(W0, W0 + 0.05, g["cols"]) - W0) * 1e5
+        self.assertLess(float(np.abs(V[0] - want).max()), 0.5)  # seamless across the tiles
+
+    def test_3dep_failure_falls_back_to_bilinear_terrarium(self):
+        tp = self.tp
+        seen = []
+        z15 = {}
+
+        def fake_get(url, timeout=45.0, data=None):
+            seen.append(url)
+            if "nationalmap.gov" in url:
+                raise OSError("boom")
+            self.assertIn("/terrarium/15/", url)
+            # elevation 100 + 0.01 * pixel-column inside the tile (a ramp)
+            col = np.arange(256, dtype=np.float64)
+            v = np.tile(((100.0 + 0.5 * col) + 32768.0)[None, :], (256, 1))
+            rgb = np.stack([np.floor(v / 256), np.floor(v) % 256,
+                            np.floor((v - np.floor(v)) * 256)], axis=2).astype(np.uint8)
+            buf = io.BytesIO()
+            Image.fromarray(rgb, "RGB").save(buf, "PNG")
+            return buf.getvalue()
+        with mock.patch.object(tp, "_get", fake_get):
+            g = tp.dem_hires(self.BBOX, self.cache, log=lambda *_: None)
+        self.assertEqual(g["source"], "AWS terrarium z15")
+        self.assertTrue(any("nationalmap" in u for u in seen))
+        V = g["values"]
+        self.assertTrue(np.isfinite(V).all())
+        self.assertGreaterEqual(float(V.min()), 99.9)
+        self.assertLessEqual(float(V.max()), 100.0 + 0.5 * 255 + 0.1)
+        # bilinear: a 0.5 m/px ramp sampled at ~3 m cells is NOT stair-stepped
+        row = g["values"].reshape(g["rows"], g["cols"])[0]
+        self.assertGreater(len(np.unique(np.round(row, 3))), 20)
+
+        # dem_far uses the same machinery (z12 on the fallback)
+        seen.clear()
+
+        def fake_get12(url, timeout=45.0, data=None):
+            if "nationalmap.gov" in url:
+                raise OSError("boom")
+            self.assertIn("/terrarium/12/", url)
+            return fake_get(url.replace("/12/", "/15/"))
+        with mock.patch.object(tp, "_get", fake_get12):
+            far = tp.dem_far(39.2, -77.97, half_m=3500.0, cells=64, cache_dir=self.cache,
+                             log=lambda *_: None)
+        self.assertEqual(far["source"], "AWS terrarium z12")
+        self.assertEqual((far["cols"], far["rows"]), (64, 64))
+        self.assertAlmostEqual(far["cell_m"], 7000.0 / 63, delta=0.05)
+
+    def test_nodata_is_filled_when_rare_and_refused_when_common(self):
+        tp = self.tp
+        a = np.full((50, 50), 200.0, dtype=np.float32)
+        a[3, 4] = -3.4e38
+        out = tp._clean_dem(a, "t")
+        self.assertEqual(float(out[3, 4]), 200.0)
+        a[:10, :] = -3.4e38
+        with self.assertRaises(RuntimeError):
+            tp._clean_dem(a, "t")
+
+
+@unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
+class RefineTests(unittest.TestCase):
+    LAT0, LON0, Z = 39.0, -77.0, 18
+
+    def _scene(self, road_offset_m, width_m=10.0, scale=1.0):
+        """A straight north-going line 500 m long and a grey road whose middle is
+        `road_offset_m` EAST of it, on grass. Returns (line_points, img, bounds)."""
+        tp = _tp()
+        cols, rows = 8, 6
+        x0 = int(tp.lon_to_x(self.LON0, self.Z) // 256) - cols // 2
+        y0 = int(tp.lat_to_y(self.LAT0, self.Z) // 256) - rows // 2
+        bounds = {"z": self.Z, "x0": x0, "y0": y0,
+                  "lon0": tp.x_to_lon(x0 * 256, self.Z), "lat0": tp.y_to_lat(y0 * 256, self.Z),
+                  "lon1": tp.x_to_lon((x0 + cols) * 256, self.Z),
+                  "lat1": tp.y_to_lat((y0 + rows) * 256, self.Z)}
+        img = Image.new("RGB", (cols * 256, rows * 256), (70, 118, 52))
+        mpp = tp.metres_per_px(self.LAT0, self.Z)
+        px = tp.mosaic_px(bounds, self.LAT0, self.LON0)[0]
+        cx = px + road_offset_m / mpp
+        from PIL import ImageDraw
+        ImageDraw.Draw(img).rectangle([cx - width_m / 2 / mpp, 0, cx + width_m / 2 / mpp,
+                                       img.height], fill=(120, 120, 124))
+        d = 250.0 / M
+        pts = [(self.LAT0 - d + i * (2 * d) / 100, self.LON0) for i in range(101)]
+        return pts, img, bounds
+
+    def _east_shift_m(self, pts_in, pts_out):
+        n = len(pts_out)
+        mid = pts_out[n // 4:3 * n // 4]
+        k = M * math.cos(math.radians(self.LAT0))
+        return float(np.median([(p[1] - self.LON0) * k for p in mid]))
+
+    def test_line_is_pulled_onto_an_offset_road(self):
+        tp = _tp()
+        pts, img, bounds = self._scene(3.0)
+        out, rep = tp.refine_centreline(pts, img, bounds)
+        self.assertTrue(rep["applied"], rep)
+        self.assertGreater(rep["ok_frac"], 0.8)
+        self.assertAlmostEqual(self._east_shift_m(pts, out), 3.0, delta=0.7)
+        self.assertAlmostEqual(rep["max_abs_shift_m"], 3.0, delta=0.9)
+        # and the other side, so the sign is not an accident
+        pts, img, bounds = self._scene(-2.5)
+        out, rep = tp.refine_centreline(pts, img, bounds)
+        self.assertAlmostEqual(self._east_shift_m(pts, out), -2.5, delta=0.7)
+
+    def test_a_centred_road_barely_moves_the_line(self):
+        tp = _tp()
+        pts, img, bounds = self._scene(0.0)
+        out, rep = tp.refine_centreline(pts, img, bounds)
+        self.assertTrue(rep["applied"])
+        self.assertLess(abs(self._east_shift_m(pts, out)), 0.7)
+        self.assertLess(rep["mean_abs_shift_m"], 0.7)
+
+    def test_shift_is_clamped_and_blank_imagery_is_not_applied(self):
+        tp = _tp()
+        pts, img, bounds = self._scene(6.0, width_m=14.0)      # road middle 6 m away
+        out, rep = tp.refine_centreline(pts, img, bounds)
+        self.assertLessEqual(rep["max_abs_shift_m"], 4.0 + 1e-6)
+        pts, _, bounds = self._scene(0.0)
+        blank = Image.new("RGB", (2048, 1536), (70, 118, 52))   # no road anywhere
+        out, rep = tp.refine_centreline(pts, blank, bounds)
+        self.assertFalse(rep["applied"])
+        self.assertEqual(rep["max_abs_shift_m"], 0.0)
+
+    def test_measure_width_raw_does_not_change_existing_outputs(self):
+        tp = _tp()
+        pts, img, bounds = self._scene(0.0)
+        line = tp.resample(pts, 2.0)
+        a = tp.measure_width(img, bounds, line)
+        b = tp.measure_width(img, bounds, line, {"raw": True})
+        self.assertNotIn("left_raw", a)
+        self.assertEqual(a["left"], b["left"])
+        self.assertEqual(a["width"], b["width"])
+        self.assertEqual(len(b["left_raw"]), len(line["lat"]))
+
+
+@unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
+class EnrichTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tp = _tp()
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.d = pathlib.Path(self.td.name)
+        self.cache = self.d / "cache"
+        sc = RefineTests()
+        sc.LAT0, sc.LON0, sc.Z = RefineTests.LAT0, RefineTests.LON0, RefineTests.Z
+        pts, img, bounds = sc._scene(3.0)
+        small = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)   # downscaled
+        small.save(self.d / "e.jpg", quality=92)
+        lons = [p[1] for p in pts]
+        self.tex = {"file": "e.jpg", "px": list(small.size),
+                    "bounds": {"south": bounds["lat1"], "north": bounds["lat0"],
+                               "west": bounds["lon0"], "east": bounds["lon1"]}}
+        line = self.tp.resample(pts, 2.0)
+        self.n = len(line["lat"])
+        self.asset = {
+            "track": "E", "slug": "e", "prep_version": 2, "centre": [39.0, -77.0],
+            "source": {"line": "x", "dem": "AWS terrarium z14"},
+            "bbox": [min(p[0] for p in pts), min(lons), max(p[0] for p in pts), max(lons)],
+            "line": [[float(a), float(b), 100.0] for a, b in zip(line["lat"], line["lon"])],
+            "width_m": [10.0] * self.n, "texture": self.tex,
+            "dem": {"cols": 2, "rows": 2, "bounds": [38.99, -77.01, 39.01, -76.99],
+                    "values": [100.0] * 4}}
+        (self.d / "e.json").write_text(json.dumps(self.asset))
+        self.calls = {"feat": 0, "hr": 0, "far": 0}
+        tp = self.tp
+
+        def feat(bbox, **kw):
+            self.calls["feat"] += 1
+            return tp._features_from_elements(_overpass_doc()["elements"])
+
+        def hires(bbox, cache_dir, **kw):
+            self.calls["hr"] += 1
+            cols, rows = 30, 40
+            r, c = np.mgrid[0:rows, 0:cols]
+            return {"cols": cols, "rows": rows, "bounds": list(bbox), "cell_m": 4.0,
+                    "source": "USGS 3DEP",
+                    "values": (200.0 + r * 1.0).astype(np.float32).reshape(-1)}   # +1 m / row north
+
+        def far(lat, lon, **kw):
+            self.calls["far"] += 1
+            return {"cols": 8, "rows": 8, "bounds": [lat - 0.03, lon - 0.04, lat + 0.03, lon + 0.04],
+                    "cell_m": 900.0, "source": "AWS terrarium z12",
+                    "values": np.linspace(100, 300, 64).astype(np.float32)}
+        for name, fn in (("osm_features", feat), ("dem_hires", hires), ("dem_far", far)):
+            p = mock.patch.object(tp, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(tp.time, "sleep", lambda *_: None)
+        p.start(); self.addCleanup(p.stop)
+
+    def _east_shift(self, a):
+        k = M * math.cos(math.radians(39.0))
+        return float(np.median([(p[1] + 77.0) * k for p in a["line"]]))
+
+    def test_enrich_never_resurrects_or_merges_into_a_rebake(self):
+        """A forced re-prepare deletes the asset; a re-bake replaces it. An
+        enrichment that was mid-run must not write the OLD asset back, nor
+        merge its line/terrain into the new one."""
+        tp = self.tp
+        ap = self.d / "e.json"
+        real_steps = tp._enrich_steps
+
+        def rebake_during(asset, adir, cache_dir, log, **kw):
+            out = real_steps(asset, adir, cache_dir, log, **kw)
+            newer = dict(self.asset, generated=self.asset.get("generated", 0) + 100,
+                         track="E re-baked")
+            ap.write_text(json.dumps(newer))
+            return out
+        with mock.patch.object(tp, "_enrich_steps", rebake_during):
+            self.assertIsNone(tp.enrich_asset(ap, self.cache, log=lambda *_: None))
+        got = json.loads(ap.read_text())
+        self.assertEqual(got["track"], "E re-baked")
+        self.assertNotIn("enrich", got, "nothing from the stale run merged in")
+
+        ap.write_text(json.dumps(self.asset))
+
+        def delete_during(asset, adir, cache_dir, log, **kw):
+            out = real_steps(asset, adir, cache_dir, log, **kw)
+            ap.unlink()
+            return out
+        with mock.patch.object(tp, "_enrich_steps", delete_during):
+            self.assertIsNone(tp.enrich_asset(ap, self.cache, log=lambda *_: None))
+        self.assertFalse(ap.exists(), "a deleted asset stays deleted")
+
+    def test_enrich_adds_everything_and_is_idempotent_and_atomic(self):
+        tp = self.tp
+        quiet = lambda *_: None
+        res = tp.enrich_asset(self.d / "e.json", self.cache, log=quiet)
+        self.assertIsNotNone(res)
+        self.assertEqual(len(res["line"]), len(res["width_m"]))
+        self.assertEqual(len(res["line"]), self.n)
+        # features
+        self.assertEqual(len(res["features"]["buildings"]), 2)
+        # refinement from the (downscaled) texture: the road is 3 m east
+        rep = res["centreline_refine"]
+        self.assertTrue(rep["applied"], rep)
+        self.assertAlmostEqual(self._east_shift(res), 3.0, delta=0.8)
+        # bins next to the json
+        self.assertEqual(res["dem_hr"]["file"], "e.dem.bin")
+        self.assertEqual(res["dem_far"]["file"], "e.demfar.bin")
+        self.assertTrue((self.d / "e.dem.bin").is_file())
+        self.assertTrue((self.d / "e.demfar.bin").is_file())
+        self.assertEqual(res["dem_hr"]["format"], "u16le")
+        # station elevations now come from the hi-res grid (200..239 m, rising north)
+        el = [p[2] for p in res["line"]]
+        self.assertTrue(all(150 < e < 260 for e in el), (min(el), max(el)))
+        self.assertGreater(el[-1], el[0])
+        self.assertEqual(res["line_elev_source"], "USGS 3DEP")
+        self.assertIn("USGS 3DEP", res["source"]["dem"])
+        e = res["enrich"]
+        self.assertEqual(e["v"], tp.ENRICH_VERSION)
+        self.assertTrue(e["features"] and e["refined"])
+        self.assertEqual(e["dem_hr"], "USGS 3DEP")
+        # on disk is the same, nothing temporary left behind
+        on_disk = json.loads((self.d / "e.json").read_text())
+        self.assertEqual(on_disk["enrich"]["v"], tp.ENRICH_VERSION)
+        self.assertEqual([p.name for p in self.d.glob("*.tmp")], [])
+        self.assertEqual([p.name for p in self.d.glob("*.tmp*")], [])
+        # idempotent: nothing left to do, nothing fetched
+        before = dict(self.calls)
+        self.assertIsNone(tp.enrich_asset(self.d / "e.json", self.cache, log=quiet))
+        self.assertEqual(self.calls, before)
+
+    def test_a_missing_bin_is_regenerated(self):
+        tp = self.tp
+        quiet = lambda *_: None
+        tp.enrich_asset(self.d / "e.json", self.cache, log=quiet)
+        (self.d / "e.demfar.bin").unlink()
+        res = tp.enrich_asset(self.d / "e.json", self.cache, log=quiet)
+        self.assertIsNotNone(res)
+        self.assertTrue((self.d / "e.demfar.bin").is_file())
+        self.assertEqual(self.calls["feat"], 1)               # features were not refetched
+
+    def test_offline_mode_never_touches_the_network(self):
+        tp = self.tp
+        with mock.patch.object(tp, "_get", side_effect=AssertionError("network")):
+            res = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None,
+                                  network=False)
+        self.assertEqual(self.calls, {"feat": 0, "hr": 0, "far": 0})
+        self.assertIsNotNone(res)                             # the offline refinement ran
+        self.assertTrue(res["centreline_refine"]["applied"])
+        self.assertNotIn("features", res)
+        self.assertEqual(res["enrich"]["v"], 0)               # not finished
+        self.assertEqual(len(res["line"]), len(res["width_m"]))
+        # a later online call finishes the job without refining twice
+        shift = self._east_shift(res)
+        res2 = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+        self.assertEqual(res2["enrich"]["v"], tp.ENRICH_VERSION)
+        self.assertAlmostEqual(self._east_shift(res2), shift, delta=0.05)
+
+    def test_one_failing_step_does_not_stop_the_others_and_retry_is_rate_limited(self):
+        tp = self.tp
+        with mock.patch.object(tp, "osm_features", side_effect=RuntimeError("504")) as m:
+            res = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+            self.assertIn("features_error", res)
+            self.assertNotIn("features", res)
+            self.assertIn("dem_hr", res)                      # DEM + refine still happened
+            self.assertTrue(res["centreline_refine"]["applied"])
+            self.assertEqual(res["enrich"]["v"], 0)
+            self.assertEqual(m.call_count, 1)
+            # within 6 h: not retried
+            self.assertIsNone(tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None))
+            self.assertEqual(m.call_count, 1)
+        # after the back-off it retries and completes
+        a = json.loads((self.d / "e.json").read_text())
+        a["features_tried"] = int(time.time()) - 7 * 3600
+        (self.d / "e.json").write_text(json.dumps(a))
+        res = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+        self.assertEqual(res["enrich"]["v"], tp.ENRICH_VERSION)
+        self.assertNotIn("features_error", res)
+
+    def test_build_asset_enriches_a_fresh_bake(self):
+        tp = self.tp
+        line_pts = [(39.0 + i * 0.00004, -77.0) for i in range(400)]
+        img = Image.new("RGB", (512, 512), (70, 118, 52))
+        from PIL import ImageDraw
+        ImageDraw.Draw(img).rectangle([252, 0, 260, 256], fill=(96, 97, 100))
+        bounds = {"z": 18, "x0": 0, "y0": 0, "lon0": -77.01, "lat0": 39.01,
+                  "lon1": -76.99, "lat1": 38.99}
+        grid = {"cols": 3, "rows": 3, "bounds": [38.99, -77.01, 39.01, -76.99],
+                "values": [180.0] * 9}
+        with mock.patch.object(tp, "imagery_mosaic", return_value=(img, bounds)), \
+             mock.patch.object(tp, "dem_elevations", side_effect=lambda pts, *a, **k:
+                               [181.0] * len(list(pts))), \
+             mock.patch.object(tp, "dem_grid", return_value=grid):
+            out = self.d / "bake"
+            asset = tp.build_asset("Bake", line_pts, out, {"line_source": "x"},
+                                   log=lambda *_: None)
+        self.assertIn("centreline_refine", asset)
+        self.assertEqual(asset["enrich"]["v"], tp.ENRICH_VERSION)
+        self.assertTrue((out / "tracks/bake.dem.bin").is_file())
+        self.assertTrue((out / "tracks/bake.demfar.bin").is_file())
+        self.assertEqual(len(asset["line"]), len(asset["width_m"]))
+        self.assertEqual(json.loads((out / "tracks/bake.json").read_text())["enrich"]["v"], 1)
+        # no features/dem on a re-enrich: complete already
+        self.assertIsNone(tp.enrich_asset(out / "tracks/bake.json", self.cache,
+                                          log=lambda *_: None))
 
 
 if __name__ == "__main__":
