@@ -2406,6 +2406,225 @@ async def known_tracks(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "tracks": _KNOWN_TRACKS})
 
 
+# ---------------------------------------------------------------------------
+# Track geometry pre-render (app/trackprep.py)
+#
+# The 3D drive view can draw a synthetic constant-width ribbon from our own GPS
+# alone. This is the upgrade: for a track we HAVE data for, bake what the world
+# knows about it — the real width (measured from satellite imagery, or the
+# OpenStreetMap width tag when a circuit is surveyed), real terrain (AWS DEM),
+# and the satellite imagery itself as a ground texture — into one cached asset
+# under DATA_DIR/tracks/.
+#
+# Assets are per TRACK (not per session), so preparing is a once-per-track cost
+# and every later session on that track gets the better render for free.
+# ---------------------------------------------------------------------------
+TRACKS_DIR = DATA_DIR / "tracks"
+_PREP: dict = {}                      # slug -> {state, log[], started, ...}
+_PREP_LOCK = threading.Lock()
+_PREP_KEEP = 40                       # log lines kept per run
+
+
+def _trackprep():
+    """Import the pre-render module. It needs Pillow + numpy; callers turn the
+    ImportError into a real message instead of a 500."""
+    import importlib
+    if __package__:
+        return importlib.import_module(".trackprep", __package__)
+    return importlib.import_module("trackprep")
+
+
+def _track_asset_path(slug: str) -> pathlib.Path:
+    return TRACKS_DIR / (safe_name(slug, default="") + ".json")
+
+
+def _track_slug(track: str) -> str:
+    try:
+        return _trackprep().slugify(track)
+    except Exception:
+        return re.sub(r"[^a-z0-9]+", "-", (track or "").lower()).strip("-") or "track"
+
+
+def _track_asset_for(track: str) -> Optional[dict]:
+    """The prepared asset for a track name, if one exists."""
+    slug = _track_slug(track)
+    p = _track_asset_path(slug)
+    if not p.is_file():
+        return None
+    try:
+        asset = json.loads(p.read_text("utf-8"))
+        asset["slug"] = slug
+        return asset
+    except Exception as e:
+        log.warning("track asset %s unreadable: %s", slug, e)
+        return None
+
+
+def _prep_log(slug: str, msg: str) -> None:
+    with _PREP_LOCK:
+        st = _PREP.setdefault(slug, {})
+        lg = st.setdefault("log", [])
+        lg.append(msg)
+        del lg[:-_PREP_KEEP]
+    log.info("[trackprep %s] %s", slug, msg)
+
+
+def _prep_run(slug: str, track: str, params: dict) -> None:
+    """Background worker: build one track asset. Never raises out."""
+    with _PREP_LOCK:
+        _PREP.setdefault(slug, {})["state"] = "running"
+    try:
+        tp = _trackprep()
+    except Exception as e:
+        with _PREP_LOCK:
+            _PREP[slug].update(state="failed", error=f"trackprep unavailable: {e}")
+        return
+    try:
+        points, source, osm_id, osm_w = params["points"], params["source"], \
+            params.get("osm_id"), params.get("osm_width_m")
+        if len(points) < 20:
+            raise ValueError("not enough GPS fixes to trace the track")
+        asset = tp.build_asset(
+            track, points, DATA_DIR,
+            {"zoom": params.get("zoom", 18), "line_source": source,
+             "osm_id": osm_id, "osm_width_m": osm_w},
+            log=lambda m: _prep_log(slug, m),
+        )
+        with _PREP_LOCK:
+            _PREP[slug].update(state="done", finished=int(time.time()),
+                               summary={"track": asset["track"], "stations": len(asset["line"]),
+                                        "width_m": asset.get("width_osm_m") or asset.get("width_imagery_m"),
+                                        "width_source": asset.get("width_source"),
+                                        "has_texture": bool(asset.get("texture"))})
+    except Exception as e:
+        with _PREP_LOCK:
+            _PREP[slug].update(state="failed", error=str(e)[:300],
+                               finished=int(time.time()))
+
+
+@app.get("/trackassets")
+async def trackassets(request: Request) -> JSONResponse:
+    """Tracks that have been pre-rendered, with what was learned about them."""
+    require_web_user(request)
+    out = []
+    if TRACKS_DIR.is_dir():
+        for f in sorted(TRACKS_DIR.glob("*.json")):
+            try:
+                a = json.loads(f.read_text("utf-8"))
+            except Exception:
+                continue
+            out.append({"slug": f.stem, "track": a.get("track"),
+                        "generated": a.get("generated"),
+                        "width_m": a.get("width_osm_m") or a.get("width_imagery_m"),
+                        "width_source": a.get("width_source"),
+                        "stations": len(a.get("line") or []),
+                        "has_texture": bool(a.get("texture")),
+                        "source": (a.get("source") or {}).get("line")})
+    return JSONResponse({"ok": True, "tracks": out})
+
+
+@app.get("/trackassets/{slug}/asset")
+async def trackasset(request: Request, slug: str) -> JSONResponse:
+    require_web_user(request)
+    p = _track_asset_path(slug)
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="no prepared asset for this track")
+    return JSONResponse(json.loads(p.read_text("utf-8")))
+
+
+@app.get("/trackassets/{slug}/texture.jpg")
+async def trackasset_texture(request: Request, slug: str) -> FileResponse:
+    require_web_user(request)
+    p = TRACKS_DIR / (safe_name(slug, default="") + ".jpg")
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="no texture")
+    return FileResponse(p, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/sessions/{user}/{filename}/track-asset")
+async def session_track_asset(request: Request, user: str, filename: str) -> JSONResponse:
+    """The prepared track asset for this session's track, or 404 with the slug it
+    WOULD use (so the viewer can offer to prepare it)."""
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    slug = _track_slug(_track_key(p.name))
+    asset = _track_asset_for(_track_key(p.name))
+    if not asset:
+        raise HTTPException(status_code=404, detail=json.dumps(
+            {"missing": True, "track": _track_key(p.name), "slug": slug}))
+    return JSONResponse(asset)
+
+
+@app.post("/sessions/{user}/{filename}/track-prep")
+async def session_track_prep(request: Request, user: str, filename: str) -> JSONResponse:
+    """Kick off a pre-render for this session's track (owner-or-admin).
+
+    Uses OUR driven line when the session has one (best: it is the line the car
+    actually takes), and falls back to the OpenStreetMap `highway=raceway` way
+    nearest the session's own coordinates when it does not."""
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    track = _track_key(p.name)
+    try:
+        tp = _trackprep()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"trackprep unavailable: {e}")
+    slug = _track_slug(track)
+    with _PREP_LOCK:
+        cur = (_PREP.get(slug) or {}).get("state")
+        if cur == "running":
+            return JSONResponse({"ok": True, "slug": slug, "state": "running",
+                                 "already": True})
+        _PREP[slug] = {"state": "queued", "track": track, "started": int(time.time()),
+                       "log": []}
+    try:
+        points = tp.session_centreline(p)
+        source, osm_id, osm_w = "session", None, None
+    except Exception as e:
+        _prep_log(slug, f"no usable session line ({e}); trying OpenStreetMap")
+        try:
+            samples = _read_ndjson_samples(p)
+            lat = lon = None
+            for s in samples:
+                if isinstance(s.get("lat"), (int, float)) and (s.get("lat") or s.get("lon")):
+                    lat, lon = float(s["lat"]), float(s["lon"])
+                    break
+            if lat is None:
+                raise ValueError("session has no GPS fixes")
+            bbox = (lat - 0.06, lon - 0.08, lat + 0.06, lon + 0.08)
+            way = tp.osm_best(track, bbox)
+            if not way:
+                raise ValueError("no OSM raceway found near this session")
+            points, source, osm_id, osm_w = way["points"], f"osm:{way['id']}", \
+                way["id"], way.get("width_m")
+        except Exception as e2:
+            with _PREP_LOCK:
+                _PREP[slug].update(state="failed", error=str(e2)[:300])
+            raise HTTPException(status_code=422, detail=str(e2))
+    threading.Thread(target=_prep_run, args=(slug, track,
+                                             {"points": points, "source": source,
+                                              "osm_id": osm_id, "osm_width_m": osm_w}),
+                     daemon=True).start()
+    return JSONResponse({"ok": True, "slug": slug, "state": "queued",
+                         "line_source": source})
+
+
+@app.get("/sessions/{user}/{filename}/track-prep/status")
+async def session_track_prep_status(request: Request, user: str, filename: str) -> JSONResponse:
+    require_web_user(request)
+    gate_view_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    slug = _track_slug(_track_key(p.name))
+    with _PREP_LOCK:
+        st = dict(_PREP.get(slug) or {})
+    if not st and _track_asset_for(_track_key(p.name)):
+        st = {"state": "done", "already": True}
+    return JSONResponse({"ok": True, "slug": slug, "prep": st})
+
+
 @app.post("/sessions/{user}/{filename}/rename")
 async def session_rename(request: Request, user: str, filename: str) -> JSONResponse:
     """Change a session's TRACK (renames the file to <sid>_<track>.ndjson and
@@ -2595,9 +2814,13 @@ async def caps() -> dict:
     verifiable: 1 = the satellite/terrain variant, 2 = the DATA-ONLY driving
     render (no imagery at all) + the map-strip lasso and the AI card cleanup,
     3 = supersampled/anti-aliased render (no log depth buffer), clean kerb quads,
-    rounder markers, auto-recentring free look and the position mini-map."""
+    rounder markers, auto-recentring free look and the position mini-map,
+    4 = PREPARED TRACKS: real width measured from satellite imagery (or the OSM
+    width tag), real terrain from the DEM, and the imagery itself draped as the
+    ground — see app/trackprep.py and /trackassets."""
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 3}
+            "track3d_v": 4}
+
 
 
 def _zb_decode(data: bytes) -> bytes:
@@ -6879,6 +7102,7 @@ _TRACK3D_HTML = (
   <div class="li"><span class="dot" style="background:#FF4D4D"></span>brake</div>
   <div class="li"><span class="dot" style="background:#FFB020"></span>apex</div>
   <div class="li"><span class="dot" style="background:#6CD07A"></span>throttle</div>
+  <div class="li" id="lg-track" style="display:none"></div>
 </div>
 <canvas id="mini" width="200" height="200"></canvas>
 <div id="bar">
@@ -6901,6 +7125,8 @@ _TRACK3D_HTML = (
     <span class="meta">road</span>
     <input id="b-road" type="range" min="6" max="24" step="1" value="12" style="width:74px"></label>
   <span class="sep"></span>
+  <label id="b-ground-lab" style="display:none" title="drape the prepared satellite imagery on the ground: real asphalt, kerbs, grass and run-off"><input type="checkbox" id="b-ground" checked>imagery ground</label>
+  <button id="b-prep" style="display:none" type="button" title="pre-render this track from satellite imagery + OpenStreetMap on the server (once per track)">prepare track</button>
   <label><input type="checkbox" id="b-speedcol" checked>speed colour</label>
   <label title="render scale: higher supersamples the view, which is what removes jagged/crawling edges. Pick 1x if the GPU struggles"><span class="meta">sharp</span>
     <select id="b-scale"><option value="1">1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
@@ -7221,17 +7447,33 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 
   // Road ribbon: two vertices per centreline point, ±width/2 along the normal.
   // (nx,nz) = (-tz, tx) is the RIGHT-hand normal for +x east / -z north.
-  RC3D.ribbon = function (path, width, lift) {
+  RC3D.ribbon = function (path, width, lift, opt) {
     var d = path.dense, n = d.x.length, i;
     var pos = new Float32Array(n * 6), sArr = new Float32Array(n * 2);
+    var uv = opt && opt.uv ? new Float32Array(n * 4) : null;
     var hw = width / 2, lf = lift || 0;
+    var half = (opt && opt.half) || null;      // per-station [left,right] metres
     for (i = 0; i < n; i++) {
       var tx = d.tan[i][0], tz = d.tan[i][1];
       var nx = -tz, nz = tx;
       var x = d.x[i], y = d.y[i] + lf, z = d.z[i];
-      pos[i * 6] = x + nx * hw; pos[i * 6 + 1] = y; pos[i * 6 + 2] = z + nz * hw;
-      pos[i * 6 + 3] = x - nx * hw; pos[i * 6 + 4] = y; pos[i * 6 + 5] = z - nz * hw;
+      var hl = half ? half[0][i] : hw, hr = half ? half[1][i] : hw;
+      if (hl == null || !isFinite(hl) || hl < 2) hl = hw;
+      if (hr == null || !isFinite(hr) || hr < 2) hr = hw;
+      // driver's LEFT is (tz,-tx) and the right is (-tz,tx) — the perpendicular,
+      // which is also what the asset's left/right widths are measured along
+      pos[i * 6] = x + tz * hl; pos[i * 6 + 1] = y; pos[i * 6 + 2] = z - tx * hl;
+      pos[i * 6 + 3] = x - tz * hr; pos[i * 6 + 4] = y; pos[i * 6 + 5] = z + tx * hr;
       sArr[i * 2] = d.s[i]; sArr[i * 2 + 1] = d.s[i];
+      if (uv) {
+        // real-imagery UVs: metres -> lat/lon -> the asset texture's bounds
+        var ll = RC3D.localToLatLon(x + tz * hl, z - tx * hl, opt.o);
+        var rr = RC3D.localToLatLon(x - tz * hr, z + tx * hr, opt.o);
+        uv[i * 4] = (ll[1] - opt.uv.west) / (opt.uv.east - opt.uv.west);
+        uv[i * 4 + 1] = (ll[0] - opt.uv.south) / (opt.uv.north - opt.uv.south);
+        uv[i * 4 + 2] = (rr[1] - opt.uv.west) / (opt.uv.east - opt.uv.west);
+        uv[i * 4 + 3] = (rr[0] - opt.uv.south) / (opt.uv.north - opt.uv.south);
+      }
     }
     var idx = new Uint32Array(Math.max(0, (n - 1) * 6));
     for (i = 0; i < n - 1; i++) {
@@ -7239,7 +7481,153 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       idx[i * 6] = a; idx[i * 6 + 1] = b; idx[i * 6 + 2] = c;
       idx[i * 6 + 3] = b; idx[i * 6 + 4] = e; idx[i * 6 + 5] = c;
     }
-    return { position: pos, index: idx, s: sArr, count: n };
+    return { position: pos, index: idx, s: sArr, uv: uv, count: n };
+  };
+
+  RC3D.localToLatLon = function (x, z, o) {
+    return [o.lat - z / M_LAT,
+            o.lon + x / (M_LAT * Math.cos(o.lat * Math.PI / 180))];
+  };
+
+  // The asset's own terrain grid: a DEM mesh for the ground, so the road does
+  // not float over a flat quad on a circuit with real relief.
+  RC3D.demMesh = function (grid, proj_o, ref) {
+    if (!grid || !grid.values || grid.cols < 2 || grid.rows < 2) return null;
+    var b = grid.bounds;                      // [south, west, north, east]
+    var pos = [], uv = [], idx = [];
+    var cols = grid.cols, rows = grid.rows, r, c;
+    var vals = grid.values;
+    var y0 = (ref == null) ? Infinity : ref, y1 = -Infinity;
+    for (var k = 0; k < vals.length; k++) {
+      if (vals[k] < y0) y0 = vals[k];
+      if (vals[k] > y1) y1 = vals[k];
+    }
+    for (r = 0; r < rows; r++) {
+      var lat = b[0] + (b[2] - b[0]) * (r / (rows - 1));
+      for (c = 0; c < cols; c++) {
+        var lon = b[1] + (b[3] - b[1]) * (c / (cols - 1));
+        var p = RC3D.project(lat, lon, proj_o);
+        pos.push(p.x, vals[r * cols + c] - y0, p.z);
+        uv.push(c / (cols - 1), r / (rows - 1));
+      }
+    }
+    for (r = 0; r < rows - 1; r++) {
+      for (c = 0; c < cols - 1; c++) {
+        var a = r * cols + c, b2 = a + 1, cc = a + cols, dd = cc + 1;
+        idx.push(a, cc, b2, b2, cc, dd);
+      }
+    }
+    return { position: new Float32Array(pos), uv: new Float32Array(uv),
+             index: new Uint32Array(idx), yMin: y0, yMax: y1 };
+  };
+
+  // Nearest prepared-asset station for a local (x,z): gives the REAL width and
+  // the DEM elevation at that point. One spatial hash, built once per track.
+  RC3D.assetSampler = function (asset, proj_o) {
+    if (!asset || !asset.line || asset.line.length < 3) return null;
+    var cell = 25, grid = {}, i;
+    var n = asset.line.length;
+    var xs = new Float64Array(n), zs = new Float64Array(n);
+    for (i = 0; i < n; i++) {
+      var p = RC3D.project(asset.line[i][0], asset.line[i][1], proj_o);
+      xs[i] = p.x; zs[i] = p.z;
+      var key = Math.floor(p.x / cell) + ":" + Math.floor(p.z / cell);
+      (grid[key] || (grid[key] = [])).push(i);
+    }
+    var width = asset.width_m || [], elev = [];
+    for (i = 0; i < n; i++) {
+      var z = asset.line[i][2];
+      elev.push(typeof z === "number" && isFinite(z) ? z : null);
+    }
+    return function (x, z2) {
+      var gx = Math.floor(x / cell), gz = Math.floor(z2 / cell);
+      var best = -1, bd = 1e9;
+      for (var a = -1; a <= 1; a++) {
+        for (var b = -1; b <= 1; b++) {
+          var bucket = grid[(gx + a) + ":" + (gz + b)];
+          if (!bucket) continue;
+          for (var k = 0; k < bucket.length; k++) {
+            var j = bucket[k];
+            var dx = xs[j] - x, dz = zs[j] - z2, d = dx * dx + dz * dz;
+            if (d < bd) { bd = d; best = j; }
+          }
+        }
+      }
+      if (best < 0) return null;
+      var w = width[best];
+      return { i: best, dist: Math.sqrt(bd),
+               width_m: (w > 2 && w < 40) ? w : null,
+               elev_m: elev[best] };
+    };
+  };
+
+  // Bilinear read of the asset's terrain grid — the SAME field the ground mesh
+  // is built from, which is what keeps the road welded to the terrain instead
+  // of a few metres off it (per-station DEM samples vs a coarse mesh disagreed
+  // by up to 2.7 m on the Shenandoah fixture, and it would have shown).
+  RC3D.demAt = function (grid, lat, lon) {
+    var b = grid.bounds, cols = grid.cols, rows = grid.rows, v = grid.values;
+    var fr = (lat - b[0]) / (b[2] - b[0]);
+    var fc = (lon - b[1]) / (b[3] - b[1]);
+    fr = Math.max(0, Math.min(1, fr));
+    fc = Math.max(0, Math.min(1, fc));
+    var r0 = Math.floor(fr * (rows - 1)), c0 = Math.floor(fc * (cols - 1));
+    var r1 = Math.min(rows - 1, r0 + 1), c1 = Math.min(cols - 1, c0 + 1);
+    var tr = fr * (rows - 1) - r0, tc = fc * (cols - 1) - c0;
+    var v00 = v[r0 * cols + c0], v01 = v[r0 * cols + c1];
+    var v10 = v[r1 * cols + c0], v11 = v[r1 * cols + c1];
+    return v00 * (1 - tr) * (1 - tc) + v01 * (1 - tr) * tc +
+           v10 * tr * (1 - tc) + v11 * tr * tc;
+  };
+
+  // Re-seat the path on the prepared terrain. Road AND ground mesh then share
+  // one reference, so the road can never float. The HUD still shows the alt_m
+  // the car logged — a different measurement, and it stays honest.
+  RC3D.applyAssetElevation = function (path, grid, proj_o) {
+    var d = path.dense, i, yref = Infinity, ys = new Float64Array(d.x.length);
+    for (i = 0; i < d.x.length; i++) {
+      var ll = RC3D.localToLatLon(d.x[i], d.z[i], proj_o);
+      ys[i] = RC3D.demAt(grid, ll[0], ll[1]);
+      if (ys[i] < yref) yref = ys[i];
+    }
+    if (!isFinite(yref)) return path.yRef;
+    for (i = 0; i < d.x.length; i++) d.y[i] = ys[i] - yref;
+    path.yRef = yref;
+    return yref;
+  };
+
+  // Per-station left/right half-widths (metres) pulled from a prepared track
+  // asset, by nearest asset station in a spatial hash. This is the difference
+  // between a synthetic 12 m ribbon and the track's ACTUAL width.
+  RC3D.widthSampler = function (asset, proj_o, fallback) {
+    if (!asset || !asset.line || asset.line.length < 3) return null;
+    var cell = 25, grid = {}, i;
+    var xs = new Float64Array(asset.line.length), zs = new Float64Array(asset.line.length);
+    for (i = 0; i < asset.line.length; i++) {
+      var p = RC3D.project(asset.line[i][0], asset.line[i][1], proj_o);
+      xs[i] = p.x; zs[i] = p.z;
+      var key = Math.floor(p.x / cell) + ":" + Math.floor(p.z / cell);
+      (grid[key] || (grid[key] = [])).push(i);
+    }
+    var width = asset.width_m || [];
+    return function (x, z) {
+      var gx = Math.floor(x / cell), gz = Math.floor(z / cell), best = -1, bd = 1e9;
+      for (var a = -1; a <= 1; a++) {
+        for (var b = -1; b <= 1; b++) {
+          var bucket = grid[(gx + a) + ":" + (gz + b)];
+          if (!bucket) continue;
+          for (var k = 0; k < bucket.length; k++) {
+            var j = bucket[k];
+            var dx = xs[j] - x, dz = zs[j] - z, d = dx * dx + dz * dz;
+            if (d < bd) { bd = d; best = j; }
+          }
+        }
+      }
+      if (best < 0) return fallback;
+      var w = width[best];
+      if (!(w > 2) || w > 40) return fallback;
+      return w * (asset.width_scale || 1);
+    };
   };
 
   // Kerb blocks on both edges where the path curves, alternating red/white —
@@ -7400,9 +7788,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   var scale = 1.5;                       // supersample factor (set on boot)
   var S = [], PATH = null, BASE = null, LAPS = [], LAPNO = 0;
   var TA = 0, TB = 0, NOW = 0, SMIN = 0, SMAX = 0, cur = null;
-  var meshes = { road: null, kerbs: null, markers: null, ghost: null, ideal: null, gantry: null };
+  var meshes = { road: null, kerbs: null, markers: null, ghost: null, ideal: null,
+                 gantry: null, ground: null };
+  var ASSET = null, TEX = null, assetSample = null;   // prepared-track data
   var look = { yaw: 0, pitch: 0 };
-  var opts = { smooth: 5, eye: 1.15, road: 12, speedColour: true, markers: true, ghost: false };
+  var realWidth = null;                                   // metres, from the asset
+  var opts = { smooth: 5, eye: 1.15, road: 12, speedColour: true, markers: true,
+               ghost: false, ground: true };
 
   function tryRenderer() {
     try {
@@ -7469,8 +7861,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     });
   }
 
-  function makeRoad(path, width, lift, colourBySpeed, solidColour, alpha) {
-    var r = RC3D.ribbon(path, width, lift);
+  function makeRoad(path, width, lift, colourBySpeed, solidColour, alpha, extra) {
+    extra = extra || {};
+    var r = RC3D.ribbon(path, width, lift, {
+      half: extra.half || null,
+      uv: extra.uvBounds || null,
+      o: extra.o || (PATH && PATH.o)
+    });
     var geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(r.position, 3));
     var cols = new Float32Array(r.position.length);
@@ -7487,11 +7884,42 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
     }
     geo.setAttribute("color", new THREE.BufferAttribute(cols, 3));
+    if (r.uv) geo.setAttribute("uv", new THREE.BufferAttribute(r.uv, 2));
     geo.setIndex(new THREE.BufferAttribute(r.index, 1));
     geo.computeVertexNormals();
-    var mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    var mo = { vertexColors: true, side: THREE.DoubleSide };
+    if (extra.tex) {
+      // satellite imagery of the ACTUAL track surface, sampled through the
+      // asset's bounds; vertex colours tint it by speed
+      mo.map = extra.tex;
+    }
+    var mat = new THREE.MeshLambertMaterial(mo);
     if (alpha != null && alpha < 1) { mat.transparent = true; mat.opacity = alpha; }
     return new THREE.Mesh(geo, mat);
+  }
+
+  // The prepared track's own terrain, textured with its imagery. This is the
+  // "how big is the track" view: real asphalt, real kerbs, real grass, real
+  // run-off, from the same imagery the width was measured off.
+  function rebuildGround() {
+    if (meshes.ground) {
+      scene.remove(meshes.ground);
+      meshes.ground.geometry.dispose();
+      meshes.ground.material.dispose();
+      meshes.ground = null;
+    }
+    if (!opts.ground || !ASSET || !ASSET.dem || !TEX) return;
+    var m = RC3D.demMesh(ASSET.dem, PATH.o, PATH.yRef);
+    if (!m) return;
+    var g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(m.position, 3));
+    g.setAttribute("uv", new THREE.BufferAttribute(m.uv, 1));
+    g.setIndex(new THREE.BufferAttribute(m.index, 1));
+    g.computeVertexNormals();
+    meshes.ground = new THREE.Mesh(g, new THREE.MeshLambertMaterial({
+      map: TEX, side: THREE.DoubleSide
+    }));
+    scene.add(meshes.ground);
   }
 
   function makeKerbs(path, width) {
@@ -7596,9 +8024,34 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       var L = lapObj(LAPNO), base = PATH, sub = null;
       if (L) { sub = slicePath(PATH, L.t_start, L.t_end); if (sub) base = sub; }
       BASE = base;
-      meshes.road = makeRoad(base, opts.road, 0.03, opts.speedColour, null, 1);
+      // Prepared track: real per-station widths and the satellite texture
+      // draped through the asset's bounds. Without one, the synthetic ribbon
+      // and the width slider (as before).
+      var extra = null;
+      if (ASSET && assetSample) {
+        var nb = base.dense.x.length, hl = new Float64Array(nb), hr = new Float64Array(nb);
+        var sum = 0, cnt = 0;
+        for (var bi = 0; bi < nb; bi++) {
+          var r2 = assetSample(base.dense.x[bi], base.dense.z[bi]);
+          var w2 = (r2 && r2.width_m) ? r2.width_m : null;
+          hl[bi] = w2 ? w2 / 2 : null;
+          hr[bi] = w2 ? w2 / 2 : null;
+          if (w2) { sum += w2; cnt++; }
+        }
+        realWidth = cnt ? sum / cnt : null;
+        extra = { half: [hl, hr], o: PATH.o,
+                  uvBounds: (ASSET.texture && TEX) ? ASSET.texture.bounds : null,
+                  tex: TEX };
+        if (el("b-road")) {           // the slider no longer decides the width
+          el("b-road").disabled = true;
+          var lab = el("b-road").parentNode;
+          if (lab) lab.title = "width comes from the prepared track (" +
+            (realWidth ? realWidth.toFixed(1) : "?") + " m)";
+        }
+      }
+      meshes.road = makeRoad(base, opts.road, 0.03, opts.speedColour, null, 1, extra);
       scene.add(meshes.road);
-      meshes.kerbs = makeKerbs(base, opts.road);
+      meshes.kerbs = makeKerbs(base, extra && realWidth ? realWidth : opts.road);
       if (meshes.kerbs) scene.add(meshes.kerbs);
       if (opts.markers) {
         meshes.markers = makeMarkers(RC3D.markers(PATH, LAPS, LAPNO));
@@ -7618,6 +8071,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         meshes.gantry = makeGantry(LAPS.sf);
         if (meshes.gantry) scene.add(meshes.gantry);
       }
+      rebuildGround();
     } catch (e) {
       console.warn("[track3d] rebuild:", e && e.message ? e.message : e);
     }
@@ -7836,6 +8290,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     });
     el("b-loop").addEventListener("change", function () { loopLap = el("b-loop").checked; });
     el("b-bank").addEventListener("change", function () { bank = el("b-bank").checked; });
+    if (el("b-ground")) el("b-ground").addEventListener("change", function () {
+      opts.ground = el("b-ground").checked; rebuildGround();
+    });
+    if (el("b-prep")) el("b-prep").addEventListener("click", prepareTrack);
     if (el("b-scale")) {
       el("b-scale").value = String(scale);
       el("b-scale").addEventListener("change", function () {
@@ -7895,6 +8353,105 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     }).catch(function () {});
   }
 
+  // ---- prepared track (real width / real terrain / real imagery) ----------
+  var assetUrl = "/sessions/" + encodeURIComponent(USER) + "/" +
+                 encodeURIComponent(FILE) + "/track-asset";
+  var prepUrl = "/sessions/" + encodeURIComponent(USER) + "/" +
+                encodeURIComponent(FILE) + "/track-prep";
+  var prepPoll = null;
+
+  function applyAsset(asset) {
+    ASSET = asset;
+    if (!asset || !PATH) return;
+    try {
+      assetSample = RC3D.assetSampler(asset, PATH.o);
+      if (asset.dem) RC3D.applyAssetElevation(PATH, asset.dem, PATH.o);
+    } catch (e) {
+      console.warn("[track3d] asset apply:", e && e.message ? e.message : e);
+    }
+    var attr = (asset.texture && asset.texture.attrib) || "";
+    var src = (asset.source && asset.source.line) || "?";
+    el("lg-track").style.display = "flex";
+    el("lg-track").textContent = asset.track + " — " +
+      (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide (" +
+      (asset.width_source || "?") + "), line from " + src;
+    var note = el("notice");
+    if (note && asset.width_agreement === false) {
+      notice("track " + asset.track + ": imagery says " + asset.width_imagery_m +
+             " m but OSM says " + asset.width_osm_m + " m — using the tag");
+      setTimeout(hideNotice, 5000);
+    }
+    if (asset.texture) {
+      el("b-ground-lab").style.display = "flex";
+      var url = "/trackassets/" + encodeURIComponent(asset.slug) + "/texture.jpg";
+      new THREE.TextureLoader().load(url, function (t) {
+        t.colorSpace = THREE.SRGBColorSpace;
+        TEX = t;
+        rebuild();
+      }, undefined, function () {
+        console.warn("[track3d] texture failed to load");
+      });
+      if (attr) {
+        el("lg-track").textContent += " · " + attr;
+      }
+    }
+    rebuild();
+  }
+
+  function loadAsset() {
+    return fetch(assetUrl).then(function (r) {
+      if (r.ok) return r.json().then(applyAsset);
+      if (r.status !== 404) return null;
+      return r.json().then(function (j) {
+        var d = j && j.detail;
+        if (typeof d === "string") { try { d = JSON.parse(d); } catch (e) { d = null; } }
+        if (d && d.missing) {
+          var b = el("b-prep");
+          b.style.display = "inline-block";
+          b.textContent = "prepare track (" + d.track + ")";
+          b.title = "pre-render " + d.track + " from satellite imagery + OSM";
+        }
+      }).catch(function () {});
+    }).catch(function () {});
+  }
+
+  function prepareTrack() {
+    var b = el("b-prep");
+    b.disabled = true;
+    b.textContent = "preparing…";
+    fetch(prepUrl, { method: "POST" }).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok) throw new Error((j && j.detail) || ("HTTP " + r.status));
+        pollPrep();
+      });
+    }).catch(function (e) {
+      b.disabled = false;
+      b.textContent = "prepare track";
+      notice("prepare failed: " + e.message, true);
+    });
+  }
+
+  function pollPrep() {
+    var b = el("b-prep");
+    fetch(prepUrl + "/status").then(function (r) { return r.json(); }).then(function (j) {
+      var st = (j && j.prep) || {};
+      if (st.state === "done") {
+        b.textContent = "prepared ✓";
+        notice("track prepared — reloading the imagery");
+        setTimeout(function () { location.reload(); }, 900);
+        return;
+      }
+      if (st.state === "failed") {
+        b.disabled = false;
+        b.textContent = "retry prepare";
+        notice("prepare failed: " + (st.error || "unknown"), true);
+        return;
+      }
+      b.textContent = "preparing… (" + (st.state || "?") + ")";
+      prepPoll = setTimeout(pollPrep, 3000);
+    }).catch(function () { prepPoll = setTimeout(pollPrep, 5000); });
+  }
+
   function start() {
     if (!tryRenderer()) return;
     buildScene();
@@ -7927,6 +8484,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
             el("hud").style.display = "block";
             if (el("mini")) el("mini").style.display = "block";
             setLap(Number(el("b-lap").value) || 0);
+            loadAsset().then(function () { miniPrepare(); render(); });
             addIdeal();
             playing = true;
             syncPlay();

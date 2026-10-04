@@ -296,6 +296,92 @@ R.alt = (function () {
   return { min: mn, max: mx, yRef: p.yRef };
 })();
 
+// ---- the REAL Shenandoah asset (imagery-measured width + DEM grid) ---------
+var ASSET = JSON.parse(__ASSET_JSON__);
+R.asset = (function () {
+  var o = { lat: ASSET.centre[0], lon: ASSET.centre[1] };
+  var line = ASSET.line.map(function (p) { return { lat: p[0], lon: p[1], alt_m: p[2] }; });
+  var p = RC3D.buildPath(line, { smooth: 5, denseStep: 3 });
+  var sample = RC3D.assetSampler(ASSET, p.o);
+  // 1. width sampled along the driven line is the real width, not the slider
+  var widths = [], missing = 0;
+  for (var i = 0; i < p.dense.x.length; i += 7) {
+    var r = sample(p.dense.x[i], p.dense.z[i]);
+    if (!r || !r.width_m) { missing++; continue; }
+    widths.push(r.width_m);
+  }
+  widths.sort(function (a, b) { return a - b; });
+  // 2. the ribbon built with those widths is the real width, in metres
+  var half = [new Float64Array(p.dense.x.length), new Float64Array(p.dense.x.length)];
+  for (var j = 0; j < p.dense.x.length; j++) {
+    var rr = sample(p.dense.x[j], p.dense.z[j]);
+    var w = (rr && rr.width_m) ? rr.width_m / 2 : null;
+    half[0][j] = w; half[1][j] = w;
+  }
+  var rib = RC3D.ribbon(p, 12, 0, { half: half, o: p.o,
+    uv: ASSET.texture.bounds });
+  var measured = [];
+  for (var k = 0; k < p.dense.x.length; k += 25) {
+    var lx = rib.position[k * 6], lz = rib.position[k * 6 + 2];
+    var rx = rib.position[k * 6 + 3], rz = rib.position[k * 6 + 5];
+    measured.push(Math.hypot(rx - lx, rz - lz));
+  }
+  measured.sort(function (a, b) { return a - b; });
+  // 3. UVs must land inside the texture
+  var uvMin = 9, uvMax = -9, uvBad = 0;
+  for (var u = 0; u < rib.uv.length; u++) {
+    var v = rib.uv[u];
+    if (!(v >= -0.01 && v <= 1.01)) uvBad++;
+    if (v < uvMin) uvMin = v;
+    if (v > uvMax) uvMax = v;
+  }
+  // 4. terrain: the road must sit ON the DEM mesh, sharing the reference
+  var yref = RC3D.applyAssetElevation(p, ASSET.dem, p.o);
+  var mesh = RC3D.demMesh(ASSET.dem, p.o, yref);
+  var mv = mesh.position, roadMax = -1e9, roadMin = 1e9;
+  for (var m = 1; m < p.dense.y.length; m++) {
+    if (p.dense.y[m] > roadMax) roadMax = p.dense.y[m];
+    if (p.dense.y[m] < roadMin) roadMin = p.dense.y[m];
+  }
+  var meshMin = 1e9, meshMax = -1e9;
+  for (var q = 1; q < mv.length; q += 3) {
+    if (mv[q] < meshMin) meshMin = mv[q];
+    if (mv[q] > meshMax) meshMax = mv[q];
+  }
+  // a mesh vertex under the road centreline must be within a couple of metres
+  // the road must sit ON the terrain field the mesh is built from
+  var worstOnField = 0, worstGap = 0;
+  for (var s3 = 0; s3 < p.dense.x.length; s3 += 11) {
+    var ll3 = RC3D.localToLatLon(p.dense.x[s3], p.dense.z[s3], p.o);
+    var field = RC3D.demAt(ASSET.dem, ll3[0], ll3[1]) - yref;
+    worstOnField = Math.max(worstOnField, Math.abs(field - p.dense.y[s3]));
+  }
+  for (var s2 = 0; s2 < p.dense.x.length; s2 += 40) {
+    var best = 1e9, bx = p.dense.x[s2], bz = p.dense.z[s2];
+    for (var t = 0; t < mv.length; t += 3) {
+      var d2 = Math.hypot(mv[t] - bx, mv[t + 2] - bz);
+      if (d2 < best) { best = d2; if (best < 12) { break; } }
+    }
+    if (best < 12) {
+      var gap = Math.abs(mv[t + 1] - p.dense.y[s2]);
+      if (gap > worstGap) worstGap = gap;
+    }
+  }
+  return {
+    stations: ASSET.line.length, missing: missing,
+    widthMedian: widths.length ? widths[Math.floor(widths.length / 2)] : null,
+    widthMin: widths[0], widthMax: widths[widths.length - 1],
+    ribbonMedian: measured[Math.floor(measured.length / 2)],
+    osm: ASSET.width_osm_m, imagery: ASSET.width_imagery_m,
+    uvBad: uvBad, uvMin: uvMin, uvMax: uvMax,
+    roadMin: roadMin, roadMax: roadMax, meshMin: meshMin, meshMax: meshMax,
+    worstGap: worstGap, worstOnField: worstOnField,
+    demRelief: Math.max.apply(null, ASSET.dem.values) -
+                                  Math.min.apply(null, ASSET.dem.values),
+    densify: mesh.position.length / 3
+  };
+})();
+
 console.log(JSON.stringify(R));
 """
 
@@ -337,7 +423,9 @@ class Track3DMathTests(unittest.TestCase):
         three = next((p for p in THREE_CANDIDATES if p.exists()), None)
         header = (("import * as THREE from '%s';\n" % three.as_uri()) if three
                   else "const THREE = {};\n")
-        src = PRELUDE + header + body + "\n" + DRIVER
+        fixture = (ROOT / "tests/fixtures/track-shenandoah.json").read_text()
+        driver = DRIVER.replace("__ASSET_JSON__", json.dumps(fixture))
+        src = PRELUDE + header + body + "\n" + driver
         with tempfile.TemporaryDirectory() as td:
             f = pathlib.Path(td) / "rc3d_test.mjs"
             f.write_text(src)
@@ -433,6 +521,29 @@ class Track3DMathTests(unittest.TestCase):
         self.assertAlmostEqual(f["clampStart"], 4.0, places=3)   # clamped into the lap
         self.assertAlmostEqual(f["clampEnd"], 20.0, places=3)
         self.assertAlmostEqual(f["eye"], 1.15, places=3)
+
+        # 10c. the REAL prepared track (fixture = the asset actually baked from
+        #      Esri imagery + AWS DEM for Summit Point Shenandoah): the viewer
+        #      must pick up its width, drape its texture and sit on its terrain
+        a = res["asset"]
+        self.assertEqual(a["missing"], 0, "asset sampler lost stations")
+        self.assertGreater(a["stations"], 1000)
+        # OSM tags 10 m; imagery measured 12.5 m — the asset uses the tag, and
+        # the ribbon must come out at THAT width, not the 12 m slider default
+        self.assertAlmostEqual(a["ribbonMedian"], a["osm"], delta=0.6)
+        self.assertGreater(a["widthMedian"], 3)
+        self.assertLess(a["widthMedian"], 30)
+        # every ribbon vertex must sample INSIDE the baked texture
+        self.assertEqual(a["uvBad"], 0, "ribbon UVs outside the texture")
+        self.assertGreaterEqual(a["uvMin"], -0.01)
+        self.assertLessEqual(a["uvMax"], 1.01)
+        # terrain: real relief, and the road sits within a couple of metres of
+        # the DEM mesh (they share one reference so it cannot float)
+        self.assertGreater(a["demRelief"], 5, "DEM fixture has no relief")
+        self.assertLess(a["worstOnField"], 1e-6,
+                        "road is not on the terrain field the mesh uses")
+        self.assertLess(a["worstGap"], 4.0, "road floats off the DEM mesh vertices")
+        self.assertGreater(a["densify"], 1000, "DEM mesh is too coarse to be a ground")
 
         # 10b. look-around eases back so the view can never be left behind
         rc = res["recentre"]

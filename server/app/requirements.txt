@@ -1,2 +1,7 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
+# Track pre-render (app/trackprep.py): satellite-imagery mosaic + asphalt-edge
+# detection + DEM decoding. Both ship manylinux wheels, so the image build stays
+# a download rather than a compile.
+Pillow==11.0.0
+numpy==2.1.3

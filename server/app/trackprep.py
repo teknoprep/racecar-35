@@ -1,0 +1,693 @@
+"""Track geometry pre-render — turn "a line we drove" into a real track.
+
+The 3D drive view (/track3d) can only draw what it knows: a constant-width
+ribbon around the driven line. This module bakes, per TRACK (on demand, cached),
+what the world actually knows about that track, so the render can show its real
+shape, its real width and its real surroundings:
+
+  centreline   from OUR sessions (the line the car drove) or from OpenStreetMap
+               (`highway=raceway` ways, which also carry a `width` tag on some
+               circuits) — whichever is available
+  WIDTH        measured from SATELLITE IMAGERY, not guessed: perpendicular
+               brightness/colour profiles along the centreline find the paved
+               corridor (asphalt + painted kerbs) and report the true left/right
+               distance to its edge, station by station
+  elevation    AWS's keyless "terrarium" DEM (and, when the session carries
+               `alt_m`, that wins — it is what the car actually saw)
+  texture      the satellite mosaic itself, baked to one image so the 3D view
+               can drape the REAL asphalt, kerbs, run-off and grass on the
+               ground with no tile fetching at view time
+
+Everything is keyless (OSM Overpass, Esri World Imagery, AWS terrain) and cached
+under RACECAR_DATA_DIR so a track is prepared once and then just read.
+
+CLI:
+    python3 -m app.trackprep --list-tracks
+    python3 -m app.trackprep --osm "Shenandoah Circuit" --track "Summit Point Shenandoah"
+    python3 -m app.trackprep --session /data/sessions/u/1714_Summit.ndjson --track "..."
+    python3 -m app.trackprep --line line.json --track "My Track"     # [[lat,lon],...]
+"""
+from __future__ import annotations
+
+import io
+import json
+import math
+import os
+import pathlib
+import re
+import time
+import urllib.parse
+import urllib.request
+from typing import Iterable, Optional
+
+try:                                  # Pillow/numpy are the only real deps
+    import numpy as np
+    from PIL import Image
+except Exception:                     # pragma: no cover - reported by the caller
+    np = None
+    Image = None
+
+UA = "racecar-35-trackprep/0.2 (+https://racecar.api.blueuc.com)"
+ESRI = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
+        "World_Imagery/MapServer/tile/{z}/{y}/{x}")
+TERRARIUM = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+OVERPASS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+M_PER_DEG_LAT = 111320.0
+TILE = 256
+
+
+def _require_deps() -> None:
+    if np is None or Image is None:
+        raise RuntimeError("trackprep needs Pillow and numpy (see app/requirements.txt)")
+
+
+def slugify(track: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (track or "").lower()).strip("-")
+    return s or "track"
+
+
+# ---------------------------------------------------------------------------
+# web-mercator helpers
+# ---------------------------------------------------------------------------
+def lon_to_x(lon: float, z: int) -> float:
+    return (lon + 180.0) / 360.0 * (TILE << z)
+
+
+def lat_to_y(lat: float, z: int) -> float:
+    r = math.radians(max(-85.05112878, min(85.05112878, lat)))
+    return (1.0 - math.asinh(math.tan(r)) / math.pi) / 2.0 * (TILE << z)
+
+
+def x_to_lon(x: float, z: int) -> float:
+    return x / (TILE << z) * 360.0 - 180.0
+
+
+def y_to_lat(y: float, z: int) -> float:
+    n = math.pi - 2.0 * math.pi * y / (TILE << z)
+    return math.degrees(math.atan(math.sinh(n)))
+
+
+def metres_per_px(lat: float, z: int) -> float:
+    return 156543.03392804097 * math.cos(math.radians(lat)) / (1 << z)
+
+
+def _get(url: str, timeout: float = 45.0, data: Optional[bytes] = None) -> bytes:
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _cache_get(path: pathlib.Path) -> Optional[bytes]:
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return path.read_bytes()
+    except OSError:
+        return None
+    return None
+
+
+def _cache_put(path: pathlib.Path, blob: bytes, min_bytes: int = 64) -> None:
+    if len(blob) < min_bytes:            # placeholder / error tile
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_bytes(blob)
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# imagery
+# ---------------------------------------------------------------------------
+def imagery_mosaic(bbox, z: int, cache_dir: pathlib.Path,
+                   workers: int = 6, max_tiles: int = 400, log=print):
+    """Stitch Esri World Imagery into ONE image covering `bbox`.
+
+    bbox = (min_lat, min_lon, max_lat, max_lon). Returns (PIL.Image, bounds)
+    where bounds = {"z", "x0", "y0", "lat0", "lon0", "step_lat", "step_lon"} —
+    enough to map a lat/lon back to a pixel.
+    """
+    _require_deps()
+    min_lat, min_lon, max_lat, max_lon = bbox
+    x0 = int(math.floor(lon_to_x(min_lon, z) / TILE))
+    x1 = int(math.floor(lon_to_x(max_lon, z) / TILE))
+    y0 = int(math.floor(lat_to_y(max_lat, z) / TILE))
+    y1 = int(math.floor(lat_to_y(min_lat, z) / TILE))
+    nx, ny = x1 - x0 + 1, y1 - y0 + 1
+    if nx * ny > max_tiles:
+        raise RuntimeError(f"{nx*ny} tiles at z{z} is too many (max {max_tiles}); "
+                           f"lower the zoom or shrink the track")
+    log(f"[imagery] z{z} tiles {nx}x{ny} = {nx*ny}")
+    canvas = Image.new("RGB", (nx * TILE, ny * TILE), (0, 0, 0))
+
+    def one(args):
+        i, j = args
+        x, y = x0 + i, y0 + j
+        p = cache_dir / "imagery" / str(z) / str(x) / f"{y}.jpg"
+        blob = _cache_get(p)
+        if blob is None:
+            url = ESRI.format(z=z, y=y, x=x)
+            try:
+                blob = _get(url)
+                _cache_put(p, blob)
+            except Exception as e:
+                log(f"[imagery] tile {z}/{x}/{y} failed: {e}")
+                return None
+        return (i, j, blob)
+
+    jobs = [(i, j) for j in range(ny) for i in range(nx)]
+    done = 0
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        it = ThreadPoolExecutor(max_workers=workers).map(one, jobs)
+    else:
+        it = map(one, jobs)
+    for res in it:
+        done += 1
+        if res is None:
+            continue
+        i, j, blob = res
+        try:
+            t = Image.open(io.BytesIO(blob)).convert("RGB")
+            canvas.paste(t, (i * TILE, j * TILE))
+        except Exception as e:
+            log(f"[imagery] tile decode failed: {e}")
+        if done % 40 == 0:
+            log(f"[imagery] {done}/{len(jobs)}")
+    bounds = {
+        "z": z, "x0": x0, "y0": y0,
+        "lon0": x_to_lon(x0 * TILE, z), "lat0": y_to_lat(y0 * TILE, z),
+        "lon1": x_to_lon((x1 + 1) * TILE, z), "lat1": y_to_lat((y1 + 1) * TILE, z),
+    }
+    return canvas, bounds
+
+
+def mosaic_px(bounds: dict, lat: float, lon: float):
+    """lat/lon -> (px, py) float pixel in the mosaic (y grows southward)."""
+    z = bounds["z"]
+    return (lon_to_x(lon, z) - bounds["x0"] * TILE,
+            lat_to_y(lat, z) - bounds["y0"] * TILE)
+
+
+def sample_px(img, x: float, y: float):
+    """Nearest-pixel read as an (r,g,b) tuple, or None outside the image."""
+    w, h = img.size
+    xi, yi = int(x), int(y)
+    if xi < 0 or yi < 0 or xi >= w or yi >= h:
+        return None
+    return img.getpixel((xi, yi))
+
+
+# ---------------------------------------------------------------------------
+# elevations (keyless AWS "terrarium" DEM)
+# ---------------------------------------------------------------------------
+def dem_elevations(points: Iterable, cache_dir: pathlib.Path, z: int = 14,
+                   log=print):
+    """Elevation (m) per (lat,lon) from terrarium tiles (z14 ~ 9.5 m/px)."""
+    _require_deps()
+    out, tiles = [], {}
+    for lat, lon in points:
+        tx, ty = int(lon_to_x(lon, z) // TILE), int(lat_to_y(lat, z) // TILE)
+        key = (tx, ty)
+        if key not in tiles:
+            p = cache_dir / "dem" / str(z) / str(tx) / f"{ty}.png"
+            blob = _cache_get(p)
+            if blob is None:
+                try:
+                    blob = _get(TERRARIUM.format(z=z, x=tx, y=ty))
+                    _cache_put(p, blob)
+                except Exception as e:
+                    log(f"[dem] tile {z}/{tx}/{ty} failed: {e}")
+                    blob = None
+            if blob is None:
+                tiles[key] = None
+            else:
+                try:
+                    arr = np.asarray(Image.open(io.BytesIO(blob)).convert("RGB"),
+                                     dtype=np.float32)
+                    tiles[key] = (arr[:, :, 0] * 256.0 + arr[:, :, 1] +
+                                  arr[:, :, 2] / 256.0) - 32768.0
+                except Exception:
+                    tiles[key] = None
+        arr = tiles[key]
+        if arr is None:
+            out.append(None)
+            continue
+        px = int(lon_to_x(lon, z) - tx * TILE)
+        py = int(lat_to_y(lat, z) - ty * TILE)
+        px = max(0, min(TILE - 1, px))
+        py = max(0, min(TILE - 1, py))
+        out.append(float(arr[py, px]))
+    return out
+
+
+def dem_grid(bbox, cols: int, rows: int, cache_dir: pathlib.Path, z: int = 14,
+             log=print):
+    """Coarse elevation grid (metres) over bbox, for the 3D ground mesh.
+
+    Returns {"cols", "rows", "bounds": [south, west, north, east], "values":
+    [row-major, south row first]}. Every sample is a bilinear read of the same
+    keyless terrarium tiles the centreline profile uses, so it costs nothing
+    extra once those are cached. A flat quad would be metres out on a circuit
+    with real relief (Shenandoah climbs ~13 m)."""
+    _require_deps()
+    min_lat, min_lon, max_lat, max_lon = bbox
+    pts = []
+    for r in range(rows):
+        lat = min_lat + (max_lat - min_lat) * (r / max(1, rows - 1))
+        for c in range(cols):
+            lon = min_lon + (max_lon - min_lon) * (c / max(1, cols - 1))
+            pts.append((lat, lon))
+    vals = dem_elevations(pts, cache_dir, z=z, log=log)
+    clean = [v for v in vals if v is not None]
+    fill = float(sorted(clean)[len(clean) // 2]) if clean else 0.0
+    return {"cols": cols, "rows": rows,
+            "bounds": [min_lat, min_lon, max_lat, max_lon],
+            "values": [round(float(fill if v is None else v), 2) for v in vals]}
+
+
+# ---------------------------------------------------------------------------
+# OpenStreetMap raceways
+# ---------------------------------------------------------------------------
+def osm_raceways(bbox, timeout: float = 90.0, log=print):
+    """`highway=raceway` ways inside bbox -> [{name, width_m, points[(lat,lon)]}]."""
+    min_lat, min_lon, max_lat, max_lon = bbox
+    q = (f'[out:json][timeout:{int(timeout)-5}];'
+         f'way["highway"="raceway"]({min_lat},{min_lon},{max_lat},{max_lon});'
+         f'out geom;')
+    body = urllib.parse.urlencode({"data": q}).encode()
+    for ep in OVERPASS:
+        for _ in range(2):
+            try:
+                d = json.loads(_get(ep, timeout=timeout, data=body))
+            except Exception as e:
+                log(f"[osm] {ep}: {type(e).__name__}")
+                time.sleep(2)
+                continue
+            out = []
+            for e in d.get("elements", []):
+                g = e.get("geometry") or []
+                if len(g) < 2:
+                    continue
+                tags = e.get("tags", {})
+                try:
+                    w = float(tags.get("width", "").replace("m", "").strip())
+                except Exception:
+                    w = None
+                out.append({"id": e.get("id"), "name": tags.get("name"),
+                            "width_m": w, "surface": tags.get("surface"),
+                            "sport": tags.get("sport"),
+                            "points": [(p["lat"], p["lon"]) for p in g]})
+            return out
+    return []
+
+
+def osm_best(track: str, bbox, log=print):
+    """Pick the raceway way whose name best matches `track` (else the longest)."""
+    ways = osm_raceways(bbox, log=log)
+    if not ways:
+        return None
+    want = set(re.findall(r"[a-z0-9]+", (track or "").lower()))
+    best, score = None, -1.0
+    for w in ways:
+        have = set(re.findall(r"[a-z0-9]+", (w.get("name") or "").lower()))
+        s = len(want & have) / max(1, len(want)) + min(0.4, len(w["points"]) / 500.0)
+        if s > score:
+            best, score = w, s
+    return best
+
+
+# ---------------------------------------------------------------------------
+# geometry
+# ---------------------------------------------------------------------------
+def resample(points, step_m: float = 2.0, smooth_win: int = 5):
+    """Evenly-spaced, smoothed centreline with a tangent per station."""
+    pts = [(float(a), float(b)) for a, b in points]
+    if len(pts) < 3:
+        raise ValueError("need at least 3 centreline points")
+    lat0 = sum(p[0] for p in pts) / len(pts)
+    lon0 = sum(p[1] for p in pts) / len(pts)
+    kx = M_PER_DEG_LAT * math.cos(math.radians(lat0))
+    xy = np.array([[(p[1] - lon0) * kx, (p[0] - lat0) * M_PER_DEG_LAT] for p in pts])
+
+    def smooth(a, r):
+        r = max(0, int(r))
+        if not r:
+            return a
+        k = np.ones(2 * r + 1) / (2 * r + 1)
+        pad = np.pad(a, ((r, r), (0, 0)), mode="edge")
+        return np.stack([np.convolve(pad[:, 0], k, "valid"),
+                         np.convolve(pad[:, 1], k, "valid")], axis=1)
+    xy = smooth(xy, (smooth_win - 1) // 2)
+    seg = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    n = max(3, int(total / step_m) + 1)
+    ss = np.linspace(0.0, total, n)
+    xs = np.interp(ss, cum, xy[:, 0])
+    ys = np.interp(ss, cum, xy[:, 1])
+    out = {
+        "lat": lat0 + ys / M_PER_DEG_LAT,
+        "lon": lon0 + xs / kx,
+        "s": ss,
+        "total_m": total,
+    }
+    dx = np.gradient(xs)
+    dy = np.gradient(ys)
+    ang = np.arctan2(dx, dy)              # 0 = north, +ve = clockwise (east)
+    out["tan"] = ang
+    out["normal"] = np.stack([np.cos(ang), -np.sin(ang)], axis=1)   # (east,north) perp
+    return out
+
+
+# ---------------------------------------------------------------------------
+# width from imagery — the part that makes the track REAL
+# ---------------------------------------------------------------------------
+def _paved(rgb, opts) -> bool:
+    """Asphalt (or paint on it) rather than grass, trees or gravel run-off.
+
+    Calibrated against real Esri imagery over Shenandoah, where the track reads
+    as LIGHT neutral grey (140-190) and the surroundings are darker and greener
+    (30-130, G-R 10-30). So the discriminators are vegetation GREEN-ness and
+    saturation, not brightness — a "not green = asphalt" rule happily swallows a
+    light gravel paddock.
+    """
+    r, g, b = rgb
+    v = max(r, g, b)
+    mn = min(r, g, b)
+    sat = 0.0 if v == 0 else (v - mn) / float(v)
+    if v < float(opts.get("dark_max") or 25):
+        return False                     # deep shade / tree canopy
+    if (g - max(r, b)) > float(opts.get("green_max") or 6):
+        return False                     # vegetation: grass, trees, moss
+    if sat > float(opts.get("sat_max") or 0.30):
+        return False                     # strongly tinted: dry grass / dirt
+    return True                          # neutral, mid/dark or bleached asphalt
+
+
+def measure_width(img, bounds, line, opts=None):
+    """Per-station left/right half-widths (m) of the paved corridor.
+
+    Walks a perpendicular profile at every station, classifies each sample with
+    `_paved`, and takes the contiguous paved run that contains the centreline.
+    Returns dict with left[], right[], width[], ok[] (per station) and a
+    confidence = fraction of stations that produced a usable run.
+    """
+    _require_deps()
+    opts = opts or {}
+    reach = float(opts.get("reach_m") or 26.0)
+    step = float(opts.get("profile_step_m") or 0.5)
+    min_w = float(opts.get("min_width_m") or 4.0)
+    max_w = float(opts.get("max_width_m") or 30.0)
+    n = len(line["lat"])
+    offs = np.arange(-reach, reach + 1e-9, step)
+    left = np.zeros(n)
+    right = np.zeros(n)
+    ok = np.zeros(n, dtype=bool)
+    for i in range(n):
+        la, lo = float(line["lat"][i]), float(line["lon"][i])
+        # unit perpendicular in metres (east, north)
+        nx, ny = float(line["normal"][i][0]), float(line["normal"][i][1])
+        run = []
+        for o in offs:
+            dlat = (o * ny) / M_PER_DEG_LAT
+            dlon = (o * nx) / (M_PER_DEG_LAT * math.cos(math.radians(la)))
+            px, py = mosaic_px(bounds, la + dlat, lo + dlon)
+            rgb = sample_px(img, px, py)
+            run.append(True if rgb is None else _paved(rgb, opts))
+        # contiguous run containing offset 0
+        zero = int(np.argmin(np.abs(offs)))
+        if not run[zero]:
+            continue
+        a = zero
+        while a > 0 and run[a - 1]:
+            a -= 1
+        b = zero
+        while b < len(run) - 1 and run[b + 1]:
+            b += 1
+        if a == 0 or b == len(run) - 1:
+            continue      # run reaches the profile edge: no real edge either side
+        lw = abs(float(offs[a]))
+        rw = abs(float(offs[b]))
+        if lw + rw < min_w or lw + rw > max_w:
+            continue
+        left[i], right[i], ok[i] = lw, rw, True
+    conf = float(ok.mean()) if n else 0.0
+    if ok.sum() >= 3:
+        det = left[ok] + right[ok]
+        med = float(np.median(det))
+        # MODE in 1 m bins: where the paved-width measurements cluster. A few
+        # stations over a gravel paddock cannot drag the answer away from the
+        # actual circuit the way a median can.
+        hist, edges = np.histogram(det, bins=np.arange(2, 34, 1.0))
+        if hist.sum() >= 3:
+            k = int(np.argmax(hist))
+            near = det[(det >= edges[k] - 1.5) & (det <= edges[k + 1] + 1.5)]
+            rep = float(np.median(near)) if len(near) else med
+        else:
+            rep = med
+        total = np.where(ok, left + right, rep)
+        # median-of-9 then a 7-tap mean: a detected edge is a pixel noisy, and a
+        # single misclassified shadow must not become a 10 m wide bulge
+        k = 9
+        pad = np.pad(total, k // 2, mode="edge")
+        total = np.array([np.median(pad[i:i + k]) for i in range(len(total))])
+        total = np.convolve(np.pad(total, 3, mode="edge"), np.ones(7) / 7, "valid")
+        # asymmetry (how far off-centre the driven line sits) is kept, faded
+        # toward 50/50 where detection was weak
+        ratio = np.where(ok, left / np.maximum(1e-6, left + right), 0.5)
+        ratio = np.clip(0.5 + (ratio - 0.5) * 0.7, 0.15, 0.85)
+        return {"left": (total * ratio).tolist(),
+                "right": (total * (1.0 - ratio)).tolist(),
+                "width": total.tolist(), "ok": ok.tolist(), "confidence": conf,
+                "median_width_m": round(rep, 2), "mode_width_m": round(rep, 2)}
+    fallback = float(opts.get("width_fallback_m") or 12.0)
+    return {"left": [fallback / 2] * n, "right": [fallback / 2] * n,
+            "width": [fallback] * n, "ok": ok.tolist(), "confidence": conf,
+            "median_width_m": fallback}
+
+
+# ---------------------------------------------------------------------------
+# the asset
+# ---------------------------------------------------------------------------
+def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
+                log=print, cache_dir: Optional[pathlib.Path] = None) -> dict:
+    """Bake one track: centreline + measured width + elevation + ground texture."""
+    _require_deps()
+    opts = dict(opts or {})
+    z = int(opts.get("zoom") or 18)
+    step = float(opts.get("step_m") or 2.0)
+    margin_m = float(opts.get("margin_m") or 70.0)
+    cache_dir = cache_dir or (pathlib.Path(data_dir) / "tilecache")
+    out_dir = pathlib.Path(data_dir) / "tracks"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = slugify(track)
+
+    line = resample(line_points, step)
+    lats, lons = line["lat"], line["lon"]
+    min_lat, max_lat = float(lats.min()), float(lats.max())
+    min_lon, max_lon = float(lons.min()), float(lons.max())
+    dlat = margin_m / M_PER_DEG_LAT
+    dlon = margin_m / (M_PER_DEG_LAT * math.cos(math.radians((min_lat + max_lat) / 2)))
+    bbox = (min_lat - dlat, min_lon - dlon, max_lat + dlat, max_lon + dlon)
+
+    log(f"[{slug}] centreline {len(lats)} stations, {line['total_m']:.0f} m")
+    img, bounds = imagery_mosaic(bbox, z, cache_dir, log=log)
+    w = measure_width(img, bounds, line, opts)
+    osm_w = opts.get("osm_width_m")
+    imagery_w = float(w["median_width_m"])
+    if osm_w and 3 <= osm_w <= 30:
+        # A surveyed tag beats anything inferred from pixels; the imagery
+        # estimate is kept as a cross-check.
+        width_profile = [float(osm_w)] * len(line["lat"])
+        width_source = "osm-tag"
+        agreement = abs(imagery_w - float(osm_w)) / float(osm_w) <= 0.4
+    else:
+        width_profile = [float(x) for x in w["width"]]
+        width_source = "imagery"
+        agreement = None
+    log(f"[{slug}] width: imagery {imagery_w:.1f} m (conf {w['confidence']*100:.0f}%), "
+        f"osm tag {osm_w}, using {width_source}"
+        + ("" if agreement is None else f", agreement={agreement}"))
+
+    dz = int(opts.get("dem_zoom") or 14)
+    elev = dem_elevations(zip(lats, lons), cache_dir, z=dz, log=log)
+    if all(e is None for e in elev):
+        elev = [0.0] * len(lats)
+    grid = dem_grid(bbox, int(opts.get("dem_cols") or 40), int(opts.get("dem_rows") or 40),
+                    cache_dir, z=dz, log=log)
+    log(f"[{slug}] dem grid {grid['cols']}x{grid['rows']} "
+        f"{min(grid['values']):.1f}-{max(grid['values']):.1f} m")
+
+    # ground texture: the mosaic itself, cropped to the bbox and downscaled
+    tex_w = int(opts.get("texture_px") or 2048)
+    if img.width > tex_w:
+        ratio = tex_w / img.width
+        tex = img.resize((tex_w, max(1, int(img.height * ratio))), Image.LANCZOS)
+    else:
+        tex = img
+    tex_name = f"{slug}.jpg"
+    try:
+        tex.save(out_dir / tex_name, "JPEG", quality=86, optimize=True)
+    except OSError as e:
+        log(f"[{slug}] texture save failed: {e}")
+        tex_name = None
+
+    asset = {
+        "track": track, "slug": slug, "generated": int(time.time()),
+        "source": {"line": opts.get("line_source") or "session",
+                   "imagery": f"Esri World Imagery z{z}",
+                   "dem": "AWS terrarium z14",
+                   "osm_id": opts.get("osm_id")},
+        "centre": [float(np.mean(lats)), float(np.mean(lons))],
+        "bbox": [min_lat, min_lon, max_lat, max_lon],
+        "line": [[float(a), float(b), None if e is None else round(float(e), 1)]
+                 for a, b, e in zip(lats, lons, elev)],
+        "width_m": [round(float(x), 2) for x in width_profile],
+        "width_source": width_source,
+        "width_imagery_m": round(imagery_w, 2),
+        "width_osm_m": osm_w,
+        "width_agreement": agreement,
+        "width_confidence": round(w["confidence"], 3),
+        "lateral_reference": "centreline from the driven line",
+        "dem": grid,
+        "step_m": step,
+        "texture": None if not tex_name else {
+            "file": tex_name,
+            "bounds": {"south": bounds["lat1"], "west": bounds["lon0"],
+                       "north": bounds["lat0"], "east": bounds["lon1"]},
+            "px": [tex.width, tex.height],
+            "attrib": "Imagery \u00a9 Esri, Maxar, Earthstar Geographics",
+        },
+    }
+    (out_dir / f"{slug}.json").write_text(json.dumps(asset), "utf-8")
+    log(f"[{slug}] asset written ({out_dir / (slug + '.json')})")
+    return asset
+
+
+def session_centreline(path: pathlib.Path, target: int = 6000):
+    """Subsample a session's GPS trace into a centreline (lat,lon) list.
+
+    Multi-lap sessions keep every lap; they overlap within centimetres, the
+    smoothing in resample() copes, and extra passes only make the width
+    measurement more robust."""
+    rows = []
+    with open(path, "rb") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            lat, lon = o.get("lat"), o.get("lon")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) \
+                    and (lat or lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+                rows.append((lat, lon))
+    if len(rows) < 10:
+        raise ValueError("session has no usable GPS fixes")
+    step = max(1, len(rows) // target)
+    return rows[::step]
+
+
+def load_assets(data_dir: pathlib.Path) -> dict:
+    """{slug: asset} for everything already prepared."""
+    out = {}
+    d = pathlib.Path(data_dir) / "tracks"
+    if not d.is_dir():
+        return out
+    for f in sorted(d.glob("*.json")):
+        try:
+            out[f.stem] = json.loads(f.read_text())
+        except Exception:
+            continue
+    return out
+
+
+def main(argv=None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="pre-render a track's real geometry")
+    ap.add_argument("--data-dir", default=os.environ.get("RACECAR_DATA_DIR", "/data"))
+    ap.add_argument("--track")
+    ap.add_argument("--session")
+    ap.add_argument("--osm", help="OSM raceway name to trace (needs --near)")
+    ap.add_argument("--near", help="lat,lon hint used to search OSM, e.g. 39.24,-77.96")
+    ap.add_argument("--osm-id", type=int, help="use this exact OSM way id")
+    ap.add_argument("--line", help="json file of [[lat,lon],...]")
+    ap.add_argument("--zoom", type=int, default=18)
+    ap.add_argument("--list-tracks", action="store_true")
+    ap.add_argument("--list-osm", action="store_true")
+    a = ap.parse_args(argv)
+    data_dir = pathlib.Path(a.data_dir)
+
+    if a.list_tracks:
+        for slug, asset in load_assets(data_dir).items():
+            print(f"{slug:34} {asset.get('track'):28} "
+                  f"stations {len(asset.get('line') or []):5} "
+                  f"width {np.median(asset.get('width_m') or [0]):5.1f} m "
+                  f"conf {asset.get('width_confidence')}")
+        return 0
+
+    if not a.track:
+        ap.error("--track is required (unless --list-tracks)")
+
+    if a.list_osm:
+        line = _line_from_any(a)
+        bbox = _bbox_around(line, 120)
+        for w in osm_raceways(bbox):
+            print(f"{w['id']:>12} {str(w['name']):32} {len(w['points']):5} pts "
+                  f"width={w['width_m']} surface={w['surface']}")
+        return 0
+
+    points, source, osm_id, osm_w = _line_from_any(a, want_source=True)
+    asset = build_asset(a.track, points, data_dir,
+                        {"zoom": a.zoom, "line_source": source, "osm_id": osm_id,
+                         "osm_width_m": osm_w})
+    print(json.dumps({k: asset[k] for k in
+                      ("track", "slug", "source", "width_confidence")}, indent=1))
+    return 0
+
+
+def _bbox_around(points, margin_m: float):
+    lats = [p[0] for p in points]
+    lons = [p[1] for p in points]
+    dlat = margin_m / M_PER_DEG_LAT
+    dlon = margin_m / (M_PER_DEG_LAT * math.cos(math.radians(sum(lats) / len(lats))))
+    return (min(lats) - dlat, min(lons) - dlon, max(lats) + dlat, max(lons) + dlon)
+
+
+def _line_from_any(a, want_source: bool = False):
+    if a.session:
+        pts = session_centreline(pathlib.Path(a.session))
+        return (pts, "session", None, None) if want_source else pts
+    if a.line:
+        pts = [(float(x[0]), float(x[1])) for x in json.loads(pathlib.Path(a.line).read_text())]
+        return (pts, "line-file", None, None) if want_source else pts
+    if a.osm or a.osm_id:
+        if not a.near:
+            raise SystemExit("--osm needs --near lat,lon (the track's area)")
+        lat, lon = [float(x) for x in a.near.split(",")]
+        bbox = (lat - 0.06, lon - 0.08, lat + 0.06, lon + 0.08)
+        ways = osm_raceways(bbox)
+        w = None
+        if a.osm_id:
+            w = next((x for x in ways if x["id"] == a.osm_id), None)
+        else:
+            w = osm_best(a.osm, bbox)
+        if not w:
+            raise SystemExit(f"no raceway way matched {a.osm or a.osm_id!r} near {a.near}")
+        return ((w["points"], f"osm:{w['id']}", w["id"], w.get("width_m"))
+                if want_source else w["points"])
+    raise SystemExit("give one of --session / --line / --osm")
+
+
+if __name__ == "__main__":       # pragma: no cover
+    raise SystemExit(main())
