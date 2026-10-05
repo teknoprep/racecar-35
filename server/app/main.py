@@ -78,6 +78,114 @@ SERVICE_NAME = os.environ.get("RACECAR_SERVICE_NAME", "racecar-35 cloud")
 _PROC_START = int(time.time())
 MAX_BODY_BYTES = int(os.environ.get("RACECAR_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
+# ---------------------------------------------------------------------------
+# WHICH BUILD IS RUNNING (the admin page shows this next to its update button)
+# ---------------------------------------------------------------------------
+# The server has no semver of its own: it IS the repo commit it was built from
+# (`git pull && docker compose up -d --build`), so the honest identity is that
+# commit. Two sources, in order of trust:
+#   1. RACECAR_BUILD_* — baked into the image at BUILD time (Dockerfile ARG,
+#      fed by server/host_updater.sh exporting the values just before compose).
+#      TRUTHFUL: it describes THIS image whatever happens to the checkout next.
+#   2. the host checkout mounted read-only at /repo (compose `../:/repo:ro`),
+#      parsed straight out of .git with no git binary. Needed because it also
+#      works on the very FIRST deploy of this feature, when the updater script
+#      running on the host is still the old one and exports nothing. It
+#      describes the CHECKOUT, which can be NEWER than the image (someone
+#      pulled without rebuilding), so `source` says which one won and
+#      `deploy_pending` flags that case.
+# Neither present is not an error — the version simply reads "unknown".
+BUILD_SHA = (os.environ.get("RACECAR_BUILD_SHA") or "").strip()
+BUILD_SUBJECT = (os.environ.get("RACECAR_BUILD_SUBJECT") or "").strip()
+BUILD_TIME = (os.environ.get("RACECAR_BUILD_TIME") or "").strip()
+REPO_MOUNT = pathlib.Path(os.environ.get("RACECAR_REPO_MOUNT", "/repo"))
+
+
+def _repo_dotgit(repo: pathlib.Path) -> pathlib.Path:
+    """The real .git dir for `repo` (honours a `.git` FILE, i.e. a worktree)."""
+    d = repo / ".git"
+    try:
+        if d.is_file():
+            txt = d.read_text("utf-8").strip()
+            if txt.startswith("gitdir:"):
+                p = pathlib.Path(txt.split(":", 1)[1].strip())
+                return p if p.is_absolute() else (repo / p)
+    except Exception:
+        pass
+    return d
+
+
+def _git_head(repo: pathlib.Path) -> str:
+    """HEAD commit sha out of a .git dir — ref file, packed-refs, or detached."""
+    git = _repo_dotgit(repo)
+    try:
+        head = (git / "HEAD").read_text("utf-8").strip()
+    except Exception:
+        return ""
+    if not head.startswith("ref:"):
+        return head if re.fullmatch(r"[0-9a-f]{40}", head) else ""  # detached
+    ref = head.split(":", 1)[1].strip()
+    try:
+        sha = (git / ref).read_text("utf-8").strip()
+        if re.fullmatch(r"[0-9a-f]{40}", sha):
+            return sha
+    except Exception:
+        pass
+    try:                                    # packed refs, after a gc/fetch
+        for line in (git / "packed-refs").read_text("utf-8").splitlines():
+            line = line.strip()
+            if not line or line[0] in "#^":
+                continue
+            sha, _, name = line.partition(" ")
+            if name.strip() == ref and re.fullmatch(r"[0-9a-f]{40}", sha.strip()):
+                return sha.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _git_subject(repo: pathlib.Path, sha: str) -> str:
+    """First line of a commit message, decompressed straight from the object
+    store (the image has no git binary and no network). Empty when the object
+    is packed rather than loose — the sha alone is then still reported."""
+    if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+        return ""
+    try:
+        raw = zlib.decompress(
+            (_repo_dotgit(repo) / "objects" / sha[:2] / sha[2:]).read_bytes())
+    except Exception:
+        return ""
+    try:
+        msg = raw.split(b"\x00", 1)[1].split(b"\n\n", 1)[1]
+        return msg.decode("utf-8", "replace").splitlines()[0].strip()
+    except Exception:
+        return ""
+
+
+def server_version() -> dict:
+    """Identity of the RUNNING server build (see the notes above BUILD_SHA)."""
+    sha, subject, built, source = BUILD_SHA, BUILD_SUBJECT, BUILD_TIME, "image"
+    repo_sha = _git_head(REPO_MOUNT)
+    if not sha:
+        sha, source = repo_sha, "repo"
+        subject = _git_subject(REPO_MOUNT, repo_sha)
+        built = ""
+    pending = bool(source == "image" and repo_sha and repo_sha != sha)
+    short = sha[:7]
+    # The label sits in the admin header, so keep it short; the full subject
+    # stays in `subject` (and the page's tooltip).
+    label = subject if len(subject) <= 48 else subject[:47].rstrip() + "\u2026"
+    display = " \u00b7 ".join(x for x in (short, label) if x) or "unknown"
+    return {
+        "ok": True,
+        "sha": sha, "short": short, "subject": subject, "built": built,
+        "source": source, "display": display,
+        "repo_sha": repo_sha, "repo_short": repo_sha[:7],
+        "deploy_pending": pending,
+        "started": _PROC_START,
+        "uptime_s": max(0, int(time.time()) - _PROC_START),
+    }
+
 # ---- AI corner analysis (Open WebUI @ ai.blueuc.com, OpenAI-compatible) -----
 # The review page can send the telemetry inside a user-drawn track region to an
 # LLM for coaching feedback. We talk to Open WebUI's OpenAI-compatible API
@@ -2379,6 +2487,10 @@ async def admin_update_status(request: Request) -> JSONResponse:
 
     return JSONResponse({
         "ok": True, "status": st, "pending": pending,
+        # The RUNNING build — the admin page shows this next to the button and
+        # re-reads it after the restart, which is how "what version are we on?"
+        # gets answered without a second endpoint or a page reload.
+        "version": server_version(),
         "running_since": _PROC_START, "now": now,
         "status_age_s": _age(UPDATE_STAT),
         "pending_age_s": _age(UPDATE_REQ),
@@ -3073,6 +3185,12 @@ load();
 </script></body></html>"""
 
 
+# Bumps whenever the 3D drive view changes materially (documented at length in
+# the /caps docstring below). Kept as a constant because /caps and /version both
+# report it — two literals would drift.
+TRACK3D_V = 12
+
+
 @app.get("/caps")
 async def caps() -> dict:
     """Server capability probe for the dash (public, static). The dash asks
@@ -3124,8 +3242,16 @@ async def caps() -> dict:
     track) and shaded by land cover; kerbs, white edge lines, gravel traps,
     Armco that never crosses another section; a chevron driving line coloured
     by the driver's input; markers painted on the road, not poles in it."""
+    v = server_version()
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 12}
+            "track3d_v": TRACK3D_V,
+            # Which build is RUNNING (the same identity the admin page shows
+            # next to its update button, and what `curl <host>/version`
+            # reports) — so one probe answers both "is this image new enough?"
+            # and "which commit is it?". Extra keys: an old dash only looks for
+            # its own capability flags here.
+            "server": v["display"], "server_sha": v["short"],
+            "server_source": v["source"], "deploy_pending": v["deploy_pending"]}
 
 
 
@@ -3223,6 +3349,28 @@ async def nettest(
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "service": SERVICE_NAME, "data_dir": str(DATA_DIR)}
+
+
+@app.get("/version")
+async def version_info() -> dict:
+    """PUBLIC: which build is RUNNING.
+
+    The admin page's "update server" button shows exactly this next to itself
+    (it is also carried by GET /admin/update/status, which that button already
+    polls). Public and tiny so a deploy is verifiable with one curl:
+
+        curl -s https://racecar.api.blueuc.com/version
+
+    `sha`/`display` are the commit this IMAGE was built from when the host
+    updater baked it in (`source: "image"`); otherwise they come from the host
+    checkout mounted read-only at /repo (`source: "repo"`). `deploy_pending`
+    is true when the checkout has moved past the image — i.e. someone pulled
+    without rebuilding, so the button still has work to do.
+    """
+    v = server_version()
+    v["track3d_v"] = TRACK3D_V
+    v["service"] = SERVICE_NAME
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -6311,15 +6459,37 @@ _ADMIN_HTML = (
   <a class="btn" href="/coach">checklist</a>
   <a class="btn" href="/tools/sfpicker">S/F picker</a>
   <button class="btn" id="srvupd" title="git pull + docker compose up -d --build (executed by the host watcher)">update server</button>
-  <span class="t-label" id="srvupdmsg" style="margin-right:var(--sp-md)"></span>
+  <span class="t-label" id="srvupdmsg" style="margin-right:var(--sp-md)" title="">&#8230;</span>
   <script>
   (function(){
     var b=document.getElementById('srvupd'), m=document.getElementById('srvupdmsg');
     if(!b) return;
-    var poll=null, t0=0, clickedAt=0, DEADLINE=3600000;
+    var poll=null, t0=0, clickedAt=0, doneSeenAt=0, DEADLINE=3600000;
     var NOW_CMD='__HINT_NOW__', INST_CMD='__HINT_INSTALL__';
     function fmt(s){ return s||''; }
     function age(s){ return (s===null||s===undefined) ? '' : ' (' + s + 's ago)'; }
+    // --- the RUNNING build: the answer to "what version are we on?" -----------
+    // `j.version` comes from the server (see server_version() in main.py): the
+    // commit THIS image was built from, or the host checkout when the image
+    // carries no build stamp. `deploy_pending` = the checkout has moved on
+    // since the image was built (someone pulled without rebuilding).
+    function ver(j){ var v=(j&&j.version)||{}; return v.display||v.short||'unknown'; }
+    function verTip(j){
+      var v=(j&&j.version)||{}, t=[];
+      t.push('running build: '+(v.display||'unknown'));
+      if(v.sha) t.push('commit: '+v.sha);
+      if(v.source) t.push('source: '+(v.source==='image'
+        ? 'baked into this image at build time'
+        : 'host checkout (.git) \u2014 this image has no build stamp'));
+      if(v.subject) t.push('message: '+v.subject);
+      if(v.built) t.push('built: '+v.built);
+      if(v.deploy_pending) t.push('the checkout is on '+(v.repo_short||'?')+' \u2014 press "update server" to deploy it');
+      if(typeof v.uptime_s==='number') t.push('this process has been up '+v.uptime_s+'s');
+      var st=(j&&j.status)||{};
+      if(st.state) t.push('host watcher: '+st.state+(st.detail?(' \u2014 '+st.detail):'')+age(j.status_age_s));
+      else if(j && !j.watcher_ever) t.push('host watcher has never reported \u2014 on the server host run: '+INST_CMD);
+      return t.join('\\n');
+    }
     function stuck(j, elapsed){
       // The watcher has NEVER written a status file -> it is not installed.
       // That is the usual reason the button 'never works'.
@@ -6334,22 +6504,39 @@ _ADMIN_HTML = (
         var r=await fetch('/admin/update/status'); var j=await r.json();
         var st=(j.status&&j.status.state)||'', pend=!!j.pending;
         var elapsed=(Date.now()-clickedAt)/1000;
+        // While OUR update runs, only status the host wrote AFTER the click
+        // counts: until it reports, the file still holds the PREVIOUS run's
+        // result, and a stale 'done'/'failed' there used to end the poll on
+        // the first tick. Both sides are durations on their own clocks, so
+        // there is no clock-skew problem in comparing them.
+        if(poll && !(typeof j.status_age_s==='number' && j.status_age_s<=elapsed)) st='';
         if(j.running_since && t0 && j.running_since>t0){
-          m.style.color='#2e7d32';
-          m.textContent='updated \u2713 server restarted';
+          // The PROCESS changed -> the rebuild landed. Report the version it is
+          // running now, which is exactly what the button exists to answer.
+          m.style.color='#2e7d32'; m.title=verTip(j);
+          m.textContent='v '+ver(j)+' \u2713 updated';
           b.disabled=false; clearInterval(poll); poll=null; return;
         }
-        if(st==='done' && !pend && j.status_age_s!==null && elapsed>j.status_age_s && j.status_age_s<600){
-          m.style.color='#2e7d32';
-          m.textContent='updated \u2713 host reported done';
-          b.disabled=false; clearInterval(poll); poll=null; return;
+        if(poll && st==='done' && !pend){
+          // The host said done, but this is still the OLD process: the new
+          // container is starting. The running_since jump above is the only
+          // proof it landed, so keep polling for it \u2014 for 90 s, after which
+          // the idle branch below reports whatever is running.
+          if(!doneSeenAt) doneSeenAt=Date.now();
+          if(Date.now()-doneSeenAt<90000){
+            m.style.color='#2e7d32'; m.title=verTip(j);
+            m.textContent='updated \u2713 host reported done, restarting\u2026';
+            return;
+          }
         }
-        if(st==='failed'){
-          m.style.color='#c62828';
+        if(poll && st==='failed'){
+          m.style.color='#c62828'; m.title=verTip(j);
           m.textContent='update FAILED: '+fmt(j.status&&j.status.detail);
           b.disabled=false; clearInterval(poll); poll=null; return;
         }
-        if(stuck(j, elapsed)){
+        // Only an update in progress (ours, or a request already pending on
+        // page load) can be 'stuck'; otherwise the label stays the version.
+        if((poll || pend) && stuck(j, elapsed)){
           m.style.color='#c62828';
           m.textContent = 'no host watcher response \u2014 run this ON THE SERVER HOST:  '
             + (j.watcher_ever ? NOW_CMD : INST_CMD);
@@ -6360,10 +6547,23 @@ _ADMIN_HTML = (
           m.textContent='still no response after 60 min \u2014 run: '+NOW_CMD;
           b.disabled=false; clearInterval(poll); poll=null; return;
         }
-        m.style.color='';
-        m.textContent = pend
-          ? ('queued\u2026 waiting for host watcher' + (st?(' (host: '+fmt(st)+')'):''))
-          : (st ? ('host: '+fmt(st)+age(j.status_age_s)) : 'queued\u2026');
+        if(pend || st==='pulling' || st==='building' || (poll && !st)){
+          // In flight: the host's own words, not the version. (poll && !st) =
+          // the request was consumed but the host has not reported yet.
+          m.style.color=''; m.title=verTip(j);
+          m.textContent = pend ? 'queued\u2026 waiting for host watcher'
+                        : st ? ('host: '+fmt(st)+age(j.status_age_s))
+                        : 'host picked it up\u2026';
+          return;
+        }
+        // Idle: the label IS the version. A finished update stops polling here.
+        // An old failure is a red suffix, not a replacement (details on hover).
+        if(poll){ b.disabled=false; clearInterval(poll); poll=null; }
+        var bad = (st==='failed');
+        m.style.color = bad ? '#c62828' : ''; m.title=verTip(j);
+        m.textContent = 'v ' + ver(j)
+          + (j.version && j.version.deploy_pending ? ' \u2014 checkout is newer, press update'
+             : bad ? ' \u2014 last update FAILED (hover for details)' : '');
       }catch(e){}
     }
     b.addEventListener('click', async function(){
@@ -6375,7 +6575,7 @@ _ADMIN_HTML = (
         var r=await fetch('/admin/update',{method:'POST'});
         var j=await r.json();
         if(!r.ok){ m.style.color='#c62828'; m.textContent='error: '+((j&&j.detail)||r.status); b.disabled=false; return; }
-        clickedAt=Date.now();
+        clickedAt=Date.now(); doneSeenAt=0;
         m.textContent='queued\u2026';
         if(!poll) poll=setInterval(tick,3000);
         tick();

@@ -77,14 +77,28 @@ run_update() {
   say pulling ""
   local out
   if ! out=$(git pull 2>&1); then say failed "git pull: $out"; return 1; fi
-  say building "$(printf '%s' "$out" | tail -1)"
+
+  # STAMP THIS COMMIT INTO THE IMAGE. The app cannot see the checkout, and the
+  # admin page shows the RUNNING version next to its update button — so the
+  # build args are how the new container knows what it is. compose substitutes
+  # them from the environment, so they must be EXPORTED. (Bash keeps running the
+  # ALREADY-PARSED copy of this script, so the first update after this change
+  # may not export them: the app then falls back to the .git mount at /repo.)
+  local sha subj
+  sha=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
+  subj=$(git -C "$REPO" log -1 --pretty=%s 2>/dev/null)
+  export RACECAR_BUILD_SHA="$sha"
+  export RACECAR_BUILD_SUBJECT="$subj"
+  export RACECAR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  say building "${sha:-?} $(printf '%s' "$out" | tail -1)"
 
   cd "$SERVER_DIR" || { say failed "server dir missing"; return 1; }
   if ! out=$(compose -f "$COMPOSE_FILE" up -d --build 2>&1); then
     say failed "compose: $(printf '%s' "$out" | tail -3)"
     return 1
   fi
-  say done "$(printf '%s' "$out" | tail -1)"
+  say done "deployed ${sha:-unknown} — $(printf '%s' "$out" | tail -1)"
 
   flock -u 9
   return 0
@@ -96,6 +110,7 @@ case "${1:-}" in
     echo "server dir   : $SERVER_DIR"
     echo "data dir     : $DATA"
     echo "compose file : $COMPOSE_FILE"
+    echo "checkout     : $(git -C "$REPO" log -1 --oneline 2>/dev/null || echo '(not a git checkout)')"
     w=$(systemctl is-active racecar-updater 2>/dev/null || true)
     t=$(systemctl is-active racecar-updater-safety.timer 2>/dev/null || true)
     echo "watcher      : ${w:-not installed}"

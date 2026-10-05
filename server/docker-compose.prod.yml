@@ -15,7 +15,16 @@
 # Tear down:  docker compose -f docker-compose.prod.yml down
 services:
   cloud:
-    build: .
+    build:
+      context: .
+      # Which commit to STAMP INTO THE IMAGE (admin page / GET /version show it).
+      # host_updater.sh exports RACECAR_BUILD_* before `compose up -d --build`;
+      # with a manual build they are empty and the app falls back to parsing the
+      # checkout bind-mounted at /repo below.
+      args:
+        GIT_SHA: "${RACECAR_BUILD_SHA:-}"
+        GIT_SUBJECT: "${RACECAR_BUILD_SUBJECT:-}"
+        BUILD_TIME: "${RACECAR_BUILD_TIME:-}"
     container_name: racecar35-cloud
     restart: unless-stopped
     # Publish a stable HOST port (default 9000, override with RACECAR_HOST_PORT
@@ -49,6 +58,11 @@ services:
       RACECAR_AI_TIMEOUT_SECONDS: "${RACECAR_AI_TIMEOUT_SECONDS:-120}"
     volumes:
       - ./data:/data
+      # The host checkout's .git, read-only: the fallback way the app learns
+      # which commit is RUNNING (it parses .git/HEAD — no git binary needed) when
+      # the image carries no build stamp, e.g. the very first deploy of this
+      # feature. Only .git is exposed, and an absent path is harmless.
+      - ../.git:/repo/.git:ro
     networks:
       # nginx (bluecloud-proxy) reaches this container by name on proxy_default.
       - proxy

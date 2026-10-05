@@ -20,6 +20,18 @@ RUN pip install --no-cache-dir -r /srv/app/requirements.txt
 # Then copy app source.
 COPY app /srv/app
 
+# Which commit this image was built from — reported by GET /version and shown on
+# the admin page next to its "update server" button. server/host_updater.sh
+# exports these before `compose up -d --build`, and the compose files pass them
+# through as build args. Empty is fine: the app then falls back to the host
+# checkout mounted read-only at /repo, and to "unknown" if that is absent too.
+ARG GIT_SHA=""
+ARG GIT_SUBJECT=""
+ARG BUILD_TIME=""
+ENV RACECAR_BUILD_SHA=$GIT_SHA \
+    RACECAR_BUILD_SUBJECT=$GIT_SUBJECT \
+    RACECAR_BUILD_TIME=$BUILD_TIME
+
 # Persistent volume for saved sessions. The compose file mounts ./data here.
 ENV RACECAR_DATA_DIR=/data
 VOLUME ["/data"]
