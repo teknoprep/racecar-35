@@ -527,6 +527,44 @@ class SeedTrackTests(unittest.TestCase):
                              "treats them as stale and re-prepares")
             self.assertTrue((d / a["texture"]["file"]).is_file(), a["texture"]["file"])
             self.assertIn("Esri", a["texture"]["attrib"])
+            # v2 enrichment: the whole facility's track network + a ground image
+            self.assertEqual((a.get("enrich") or {}).get("v"), 2, a["slug"])
+            net = a.get("network") or {}
+            self.assertEqual(net.get("v"), 1)
+            self.assertTrue(net.get("chains"), a["slug"])
+            kinds = {c["kind"] for c in net["chains"]}
+            self.assertIn("circuit", kinds, a["slug"])
+            self.assertIn("pit", kinds, a["slug"])
+            for c in net["chains"]:
+                if c["kind"] != "area":
+                    self.assertEqual(len(c["p"]), len(c["hw"]))
+                    lo_w, hi_w = (3.0, 30.0) if c["ws"] == "osm" else \
+                        self.tp_clamp(c["kind"])
+                    self.assertGreaterEqual(c["w"], lo_w - 0.1, c)
+                    self.assertLessEqual(c["w"], hi_w + 0.1, c)
+            g = a.get("ground") or {}
+            self.assertEqual(g.get("file"), a["slug"] + ".ground.jpg")
+            self.assertTrue((d / g["file"]).is_file(), g["file"])
+            self.assertLessEqual((d / g["file"]).stat().st_size, 1_700_000)
+            self.assertIn("Esri", g["attrib"])
+            self.assertLessEqual(max(g["px"]), 3072)
+            b = g["bounds"]
+            nb = net["bbox"]
+            self.assertTrue(b["south"] <= nb[0] and b["west"] <= nb[1]
+                            and b["north"] >= nb[2] and b["east"] >= nb[3], a["slug"])
+        # the facility layouts are all there (Summit Point: 3 circuits + kart + pits)
+        sp = json.loads((d / "summit-point.json").read_text())
+        names = {n for c in sp["network"]["chains"] for n in c["names"]}
+        for want in ("Summit Point Circuit", "Jefferson Circuit", "Kart Track", "Pit Lane"):
+            self.assertIn(want, names)
+        wg = json.loads((d / "watkins-glen-grand-prix.json").read_text())
+        names = {n for c in wg["network"]["chains"] for n in c["names"]}
+        for want in ("Pit Lane", "The Boot"):
+            self.assertIn(want, names)
+
+    @staticmethod
+    def tp_clamp(kind):
+        return _tp().WIDTH_CLAMP[kind]
 
 
 class FixtureSchemaTests(unittest.TestCase):
@@ -966,6 +1004,296 @@ class RefineTests(unittest.TestCase):
         self.assertEqual(len(b["left_raw"]), len(line["lat"]))
 
 
+def _way(i, nodes, pts, **tags):
+    return dict({"id": i, "name": None, "width_m": None, "nodes": list(nodes),
+                 "points": list(pts)}, **tags)
+
+
+def _P(k):
+    """node k -> a point on a 100 m grid (deterministic coordinates)"""
+    return (39.0 + (k // 10) * 100 / M, -77.0 + (k % 10) * 100 / (M * math.cos(math.radians(39))))
+
+
+class NetworkMergeTests(unittest.TestCase):
+    def setUp(self):
+        self.tp = _tp()
+
+    def W(self, i, nodes, ids=True, **tags):
+        return _way(i, nodes if ids else [], [_P(k) for k in nodes], **tags)
+
+    def test_degree_two_endpoints_merge(self):
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 3]), self.W(2, [5, 4, 3])])
+        self.assertEqual(len(ch), 1)
+        c = ch[0]
+        self.assertEqual(c["ids"], [1, 2])
+        self.assertEqual(c["points"], [_P(k) for k in (1, 2, 3, 4, 5)])
+        self.assertFalse(c["closed"])
+        self.assertEqual(c["kind"], "circuit")
+        # the merge also works backwards from a later way
+        ch = self.tp.merge_chains([self.W(2, [3, 4, 5]), self.W(1, [1, 2, 3])])
+        self.assertEqual(len(ch), 1)
+        self.assertEqual(ch[0]["points"], [_P(k) for k in (1, 2, 3, 4, 5)])
+        self.assertEqual(ch[0]["ids"], [1, 2])
+
+    def test_junction_breaks_chains(self):
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 3]), self.W(2, [3, 4, 5]),
+                                   self.W(3, [3, 6, 7])])
+        self.assertEqual(sorted(c["ids"] for c in ch), [[1], [2], [3]])
+        # a way passing THROUGH an endpoint (interior occurrence) is a junction too
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 3]), self.W(2, [3, 4, 5]),
+                                   self.W(3, [6, 3, 7])])
+        self.assertEqual(sorted(c["ids"] for c in ch), [[1], [2], [3]])
+
+    def test_kind_change_breaks_chains(self):
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 3], name="Main"),
+                                   self.W(2, [3, 4, 5], name="Pit Lane"),
+                                   self.W(3, [5, 6, 7], name="Pit Lane")])
+        by = {tuple(c["ids"]): c for c in ch}
+        self.assertEqual(set(by), {(1,), (2, 3)})
+        self.assertEqual(by[(2, 3)]["kind"], "pit")
+        self.assertEqual(by[(2, 3)]["names"], ["Pit Lane"])
+
+    def test_closed_loop(self):
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 3], name="A"), self.W(2, [3, 13, 11], name="B"),
+                                   self.W(3, [1, 21, 11], name="A")])
+        self.assertEqual(len(ch), 1)
+        c = ch[0]
+        self.assertTrue(c["closed"])
+        self.assertEqual(sorted(c["ids"]), [1, 2, 3])
+        self.assertEqual(c["names"], [n for n in c["names"] if n])
+        self.assertEqual(sorted(c["names"]), ["A", "B"])
+        self.assertEqual(c["points"][0], c["points"][-1])
+        self.assertEqual(len(c["points"]), 7)
+        # a single closed way, and a loop with a branch at its seam (still closed)
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 12, 11, 1])])
+        self.assertTrue(ch[0]["closed"])
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 12, 11, 1]), self.W(2, [1, 31])])
+        self.assertTrue(next(c for c in ch if c["ids"] == [1])["closed"])
+        self.assertFalse(next(c for c in ch if c["ids"] == [2])["closed"])
+
+    def test_coordinate_fallback_without_node_ids(self):
+        tp = self.tp
+        a = self.W(1, [1, 2, 3], ids=False)
+        b = self.W(2, [3, 4, 5], ids=False)
+        # 0.3 m off: still the same node
+        b["points"][0] = (b["points"][0][0] + 0.3 / M, b["points"][0][1])
+        ch = tp.merge_chains([a, b])
+        self.assertEqual(len(ch), 1)
+        self.assertEqual(ch[0]["ids"], [1, 2])
+        # 2 m off: not connected
+        b["points"][0] = (b["points"][0][0] + 2.0 / M, b["points"][0][1])
+        self.assertEqual(len(tp.merge_chains([a, b])), 2)
+        # junction by coordinates
+        ch = tp.merge_chains([self.W(1, [1, 2, 3], ids=False), self.W(2, [3, 4, 5], ids=False),
+                              self.W(3, [6, 3, 7], ids=False)])
+        self.assertEqual(len(ch), 3)
+        # loop by coordinates
+        ch = tp.merge_chains([self.W(1, [1, 2, 12], ids=False), self.W(2, [12, 11, 1], ids=False)])
+        self.assertEqual(len(ch), 1)
+        self.assertTrue(ch[0]["closed"])
+
+    def test_area_ways_are_their_own_polygons(self):
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 12, 11, 1], area="yes", name="Paddock"),
+                                   self.W(2, [1, 21, 22])])
+        by = {tuple(c["ids"]): c for c in ch}
+        self.assertEqual(by[(1,)]["kind"], "area")
+        self.assertTrue(by[(1,)]["closed"])
+        self.assertEqual(by[(2,)]["kind"], "circuit")
+
+    def test_kind_classification(self):
+        k = self.tp.raceway_kind
+        sq = [_P(1), _P(2), _P(12), _P(1)]
+        cases = [({"name": "Pit Lane"}, "pit"), ({"raceway": "pit_lane"}, "pit"),
+                 ({"name": "PITLANE"}, "pit"), ({"name": "Spitfire Straight"}, "circuit"),
+                 ({"name": "Kart Track"}, "kart"), ({"raceway": "karting"}, "kart"),
+                 ({"name": "Little Thompson Speedway"}, "oval"),
+                 ({"name": "Thompson Speedway"}, "oval"), ({"name": "Tri-Oval"}, "oval"),
+                 ({"raceway": "oval"}, "oval"),
+                 ({"name": "Road Course"}, "circuit"), ({"name": "Shennandoah Circuit"}, "circuit"),
+                 ({}, "circuit"), ({"name": "Drifting Course"}, "circuit")]
+        for tags, want in cases:
+            self.assertEqual(k(dict(tags, points=[_P(1), _P(2)])), want, tags)
+        self.assertEqual(k({"area": "yes", "points": sq, "name": "Pit Lane"}), "area")
+        self.assertEqual(k({"area": "yes", "points": sq[:3], "name": "Pit Lane"}), "pit")
+
+    def test_width_tag_rides_along_per_point(self):
+        ch = self.tp.merge_chains([self.W(1, [1, 2, 3], width_m=10.0), self.W(2, [3, 4, 5])])
+        self.assertEqual(ch[0]["wtag"], [10.0, 10.0, 10.0, None, None])
+
+    def test_osm_raceways_keeps_node_ids_and_tags(self):
+        import tempfile
+        tp = self.tp
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(tp, "OSM_CACHE_DIR", pathlib.Path(td)), \
+                mock.patch.object(tp.time, "sleep", lambda *_: None):
+            g = lambda *ks: [{"lat": _P(k)[0], "lon": _P(k)[1]} for k in ks]  # noqa: E731
+            doc = {"elements": [
+                {"type": "way", "id": 7, "nodes": [101, 102, 103], "geometry": g(1, 2, 3),
+                 "tags": {"highway": "raceway", "name": "Main", "width": "12",
+                          "raceway": "track", "oneway": "yes", "sport": "motor"}},
+                {"type": "way", "id": 8, "nodes": [103, 104], "geometry": g(3, 4),
+                 "tags": {"highway": "raceway", "name": "Main"}},
+                {"type": "way", "id": 9, "nodes": [103, 105], "geometry": g(3, 5),
+                 "tags": {"highway": "raceway", "name": "Pit Lane"}}]}
+            with mock.patch.object(tp, "_get", lambda *a, **k: json.dumps(doc).encode()):
+                ways = tp.osm_raceways((38, -78, 40, -76), log=lambda *_: None)
+            self.assertEqual(ways[0]["nodes"], [101, 102, 103])
+            self.assertEqual((ways[0]["raceway"], ways[0]["oneway"], ways[0]["width_m"],
+                              ways[0]["sport"]), ("track", "yes", 12.0, "motor"))
+            self.assertIn("area", ways[0])
+            self.assertTrue(tp._osm_cache_path((38, -78, 40, -76), "raceway2").is_file())
+            self.assertFalse(tp._osm_cache_path((38, -78, 40, -76), "raceway").exists())
+            # from the cache (JSON lists, not tuples) into chains: junction at 103
+            with mock.patch.object(tp, "_get", side_effect=AssertionError("network")):
+                ch = tp.osm_network((38, -78, 40, -76), log=lambda *_: None)
+            self.assertEqual(sorted(c["ids"] for c in ch), [[7], [8], [9]])
+            self.assertEqual({c["kind"] for c in ch}, {"circuit", "pit"})
+
+
+@unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
+class NetworkWidthTests(unittest.TestCase):
+    def setUp(self):
+        self.tp = _tp()
+        self.cache = pathlib.Path("/nonexistent-cache")
+
+    def _scene(self, width_m, offset=0.0):
+        sc = RefineTests()
+        return sc._scene(offset, width_m=width_m)
+
+    def _net(self, chains, img=None, bounds=None, fail=False, **kw):
+        tp = self.tp
+
+        def mosaic(bbox, z, cache_dir, **k):
+            if fail:
+                raise RuntimeError("tiles blocked")
+            return img, dict(bounds)
+        with mock.patch.object(tp, "imagery_mosaic", mosaic):
+            return tp.build_network(chains, self.cache, log=lambda *_: None, **kw)
+
+    @staticmethod
+    def _chain(pts, kind="circuit", tag=None):
+        return {"ids": [1], "names": ["X"], "kind": kind, "closed": False,
+                "points": pts, "wtag": [tag] * len(pts)}
+
+    def test_imagery_width_and_tag_precedence(self):
+        pts, img, bounds = self._scene(10.0)
+        net = self._net([self._chain(pts)], img, bounds)
+        c = net["chains"][0]
+        self.assertEqual(c["ws"], "imagery")
+        self.assertAlmostEqual(c["w"], 10.0, delta=1.2)
+        l, r = np.array(c["hw"]).T
+        self.assertAlmostEqual(float(np.median(l)), float(np.median(r)), delta=1.0)
+        # an OSM width tag wins over the imagery
+        net = self._net([self._chain(pts, tag=12.0)], img, bounds)
+        c = net["chains"][0]
+        self.assertEqual((c["ws"], c["w"]), ("osm", 12.0))
+        self.assertTrue(all(h == [6.0, 6.0] for h in c["hw"]))
+        # a tag on only part of the chain: those stations only
+        tags = [12.0] * 30 + [None] * (len(pts) - 30)
+        ch = dict(self._chain(pts), wtag=tags)
+        c = self._net([ch], img, bounds)["chains"][0]
+        self.assertEqual(c["ws"], "imagery")
+        self.assertEqual(c["hw"][0], [6.0, 6.0])
+        self.assertNotEqual(c["hw"][-1], [6.0, 6.0])
+
+    def test_defaults_when_imagery_fails(self):
+        pts, img, bounds = self._scene(10.0)
+        chains = [self._chain(pts, k) for k in ("circuit", "oval", "pit", "kart")]
+        net = self._net(chains, fail=True, default_circuit_w=11.0)
+        got = {c["kind"]: (c["ws"], c["w"], c["refined"]) for c in net["chains"]}
+        self.assertEqual(got, {"circuit": ("default", 11.0, False), "oval": ("default", 14.0, False),
+                               "pit": ("default", 9.0, False), "kart": ("default", 6.0, False)})
+        # no road in the imagery at all: also the default
+        blank = Image.new("RGB", img.size, (70, 118, 52))
+        c = self._net([self._chain(pts, "pit")], blank, bounds)["chains"][0]
+        self.assertEqual((c["ws"], c["w"], c["refined"]), ("default", 9.0, False))
+        # and a tag still wins over the default
+        c = self._net([self._chain(pts, "pit", tag=7.0)], fail=True)["chains"][0]
+        self.assertEqual((c["ws"], c["w"]), ("osm", 7.0))
+
+    def test_imagery_width_is_clamped_per_kind(self):
+        pts, img, bounds = self._scene(12.0)
+        c = self._net([self._chain(pts, "kart")], img, bounds)["chains"][0]
+        self.assertEqual(c["ws"], "imagery")
+        self.assertAlmostEqual(c["w"], 9.0, delta=0.05)          # kart max 9
+        self.assertTrue(all(l + r <= 9.0 + 0.11 for l, r in c["hw"]))
+        pts, img, bounds = self._scene(5.0)
+        c = self._net([self._chain(pts, "circuit")], img, bounds)["chains"][0]
+        self.assertAlmostEqual(c["w"], 7.0, delta=0.05)          # circuit min 7
+        c = self._net([self._chain(pts, "pit")], img, bounds)["chains"][0]
+        self.assertAlmostEqual(c["w"], 6.0, delta=0.05)          # pit min 6
+
+    def test_refined_centreline_and_short_chains_and_cap(self):
+        pts, img, bounds = self._scene(10.0, offset=3.0)
+        short = self._chain([pts[0], (pts[0][0] + 10 / M, pts[0][1])])
+        net = self._net([self._chain(pts), short], img, bounds)
+        self.assertEqual(len(net["chains"]), 1)                  # < 15 m dropped
+        c = net["chains"][0]
+        self.assertTrue(c["refined"])
+        k = M * math.cos(math.radians(39.0))
+        mid = c["p"][len(c["p"]) // 4: 3 * len(c["p"]) // 4]
+        self.assertAlmostEqual(float(np.median([(p[1] + 77.0) * k for p in mid])), 3.0, delta=0.8)
+        # the open ends stay pinned (they meet other chains at junctions)
+        self.assertLess(abs((c["p"][0][1] + 77.0) * k), 0.5)
+        # the total-length cap keeps the chains nearest the circuit
+        far = [(a + 0.01, b) for a, b in pts]
+        net = self._net([self._chain(far), self._chain(pts)], img, bounds,
+                        centre=[39.0, -77.0], max_total_m=600.0, imagery=False)
+        self.assertEqual(len(net["chains"]), 1)
+        self.assertLess(abs(net["chains"][0]["p"][0][0] - pts[0][0]), 0.001)
+
+
+@unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
+class GroundImageTests(unittest.TestCase):
+    @staticmethod
+    def fake_mosaic(bbox, z, cache_dir, **kw):
+        """What imagery_mosaic returns: whole tiles, exact Mercator bounds, and
+        a noisy picture (so the JPEG has something to compress)."""
+        tp = _tp()
+        s, w, n, e = bbox
+        x0, x1 = int(tp.lon_to_x(w, z) // 256), int(tp.lon_to_x(e, z) // 256)
+        y0, y1 = int(tp.lat_to_y(n, z) // 256), int(tp.lat_to_y(s, z) // 256)
+        nx, ny = x1 - x0 + 1, y1 - y0 + 1
+        rng = np.random.default_rng(1)
+        a = rng.integers(60, 140, size=(ny * 256, nx * 256, 3), dtype=np.uint8)
+        return Image.fromarray(a, "RGB"), {
+            "z": z, "x0": x0, "y0": y0,
+            "lon0": tp.x_to_lon(x0 * 256, z), "lat0": tp.y_to_lat(y0 * 256, z),
+            "lon1": tp.x_to_lon((x1 + 1) * 256, z), "lat1": tp.y_to_lat((y1 + 1) * 256, z)}
+
+    def test_zoom_crop_bounds_and_size_cap(self):
+        import tempfile
+        tp = _tp()
+        bbox = tp._expand_bbox((42.33, -76.93, 42.345, -76.92), 250.0)   # ~2.2 x 1.3 km
+        with mock.patch.object(tp, "imagery_mosaic", self.fake_mosaic):
+            img, b, z = tp.ground_image(bbox, pathlib.Path("/nonexistent"), log=lambda *_: None)
+        self.assertLessEqual(max(img.size), tp.GROUND_MAX_PX)
+        # the highest zoom that fits: one more would not
+        s, w, n, e = bbox
+        self.assertGreater(max(tp.lon_to_x(e, z + 1) - tp.lon_to_x(w, z + 1),
+                               tp.lat_to_y(s, z + 1) - tp.lat_to_y(n, z + 1)), tp.GROUND_MAX_PX)
+        # cropped to (just over) the requested box, not whole tiles
+        self.assertLessEqual(b["south"], s); self.assertLessEqual(b["west"], w)
+        self.assertGreaterEqual(b["north"], n); self.assertGreaterEqual(b["east"], e)
+        px_m = tp.metres_per_px((s + n) / 2, z)
+        self.assertLess((b["east"] - e) * M * math.cos(math.radians(n)), 2 * px_m)
+        self.assertLess((s - b["south"]) * M, 2 * px_m)
+        # mapping is consistent: the box corners land on the crop's corners
+        self.assertAlmostEqual((tp.lon_to_x(b["east"], z) - tp.lon_to_x(b["west"], z)),
+                               img.size[0], delta=0.01)
+        self.assertAlmostEqual((tp.lat_to_y(b["south"], z) - tp.lat_to_y(b["north"], z)),
+                               img.size[1], delta=0.01)
+        # the JPEG writer respects the byte cap (shrinking if it must)
+        with tempfile.TemporaryDirectory() as td:
+            p = pathlib.Path(td) / "g.ground.jpg"
+            size, q, nbytes = tp._save_jpeg_capped(img, p, max_bytes=400_000)
+            self.assertLessEqual(nbytes, 400_000)
+            self.assertEqual(p.stat().st_size, nbytes)
+            with Image.open(p) as im:
+                self.assertEqual(im.size, tuple(size))
+            self.assertEqual([x.name for x in pathlib.Path(td).iterdir()], ["g.ground.jpg"])
+
+
 @unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
 class EnrichTests(unittest.TestCase):
     def setUp(self):
@@ -1015,7 +1343,30 @@ class EnrichTests(unittest.TestCase):
             return {"cols": 8, "rows": 8, "bounds": [lat - 0.03, lon - 0.04, lat + 0.03, lon + 0.04],
                     "cell_m": 900.0, "source": "AWS terrarium z12",
                     "values": np.linspace(100, 300, 64).astype(np.float32)}
-        for name, fn in (("osm_features", feat), ("dem_hires", hires), ("dem_far", far)):
+        self.scene_img, self.scene_bounds, self.scene_pts = img, bounds, pts
+        self.net_calls = {"osm": 0, "img": 0}
+
+        def network(bbox, **kw):
+            self.net_calls["osm"] += 1
+            east = 12.0 / (M * math.cos(math.radians(39.0)))
+            sq = [(39.0005, -76.9995), (39.0005, -76.9993), (39.0007, -76.9993),
+                  (39.0007, -76.9995), (39.0005, -76.9995)]
+            return [
+                {"ids": [1, 2], "names": ["Main"], "kind": "circuit", "closed": False,
+                 "points": list(pts), "wtag": [None] * len(pts)},
+                {"ids": [3], "names": ["Pit Lane"], "kind": "pit", "closed": False,
+                 "points": [(a, b + east) for a, b in pts[20:60]],
+                 "wtag": [8.0] * 40},
+                {"ids": [4], "names": [], "kind": "circuit", "closed": False,   # 4 m: dropped
+                 "points": [(39.0, -77.0), (39.0 + 4 / M, -77.0)], "wtag": [None, None]},
+                {"ids": [5], "names": ["Paddock"], "kind": "area", "closed": True,
+                 "points": sq, "wtag": [None] * 5}]
+
+        def mosaic(bbox, z, cache_dir, **kw):
+            self.net_calls["img"] += 1
+            return self.scene_img, dict(self.scene_bounds)
+        for name, fn in (("osm_features", feat), ("dem_hires", hires), ("dem_far", far),
+                         ("osm_network", network), ("imagery_mosaic", mosaic)):
             p = mock.patch.object(tp, name, fn)
             p.start()
             self.addCleanup(p.stop)
@@ -1083,7 +1434,49 @@ class EnrichTests(unittest.TestCase):
         self.assertIn("USGS 3DEP", res["source"]["dem"])
         e = res["enrich"]
         self.assertEqual(e["v"], tp.ENRICH_VERSION)
+        self.assertEqual(tp.ENRICH_VERSION, 2)
         self.assertTrue(e["features"] and e["refined"])
+        self.assertEqual(e["network"], 3)
+        # the network: schema
+        net = res["network"]
+        self.assertEqual(net["v"], 1)
+        self.assertIn("OpenStreetMap", net["attrib"])
+        self.assertEqual([c["kind"] for c in net["chains"]], ["circuit", "pit", "area"])
+        for c in net["chains"]:
+            self.assertEqual(set(c), {"ids", "names", "kind", "closed", "p", "hw", "w",
+                                      "ws", "refined"})
+            self.assertIn(c["ws"], ("osm", "imagery", "default"))
+            for p in c["p"]:
+                self.assertEqual(len(p), 2)
+                self.assertEqual(p[0], round(p[0], 6))
+            if c["kind"] == "area":
+                self.assertEqual((c["hw"], c["w"], c["closed"]), ([], 0, True))
+                continue
+            self.assertEqual(len(c["p"]), len(c["hw"]))
+            steps = [tp._dist_m(a, b) for a, b in zip(c["p"], c["p"][1:])]
+            self.assertAlmostEqual(float(np.median(steps)), 3.0, delta=0.3)
+            for l, r in c["hw"]:
+                self.assertEqual(l, round(l, 1))
+        main, pit = net["chains"][0], net["chains"][1]
+        self.assertEqual((main["ws"], main["names"], main["ids"]), ("imagery", ["Main"], [1, 2]))
+        self.assertAlmostEqual(main["w"], 10.0, delta=1.5)
+        self.assertTrue(main["refined"])
+        self.assertEqual((pit["ws"], pit["w"]), ("osm", 8.0))
+        self.assertTrue(all(h == [4.0, 4.0] for h in pit["hw"]))
+        # the ground image: schema + the file
+        g = res["ground"]
+        self.assertEqual(g["file"], "e.ground.jpg")
+        self.assertEqual(set(g["bounds"]), {"south", "north", "west", "east"})
+        self.assertIn("Esri", g["attrib"])
+        self.assertEqual(g["attrib"], self.asset["texture"].get("attrib", tp.ESRI_ATTRIB))
+        self.assertEqual(g["cover"], "network")
+        self.assertLessEqual(g["z"], 18)
+        with Image.open(self.d / "e.ground.jpg") as im:
+            self.assertEqual(list(im.size), g["px"])
+            self.assertLessEqual(max(im.size), tp.GROUND_MAX_PX)
+        b = g["bounds"]
+        self.assertLess(b["south"], b["north"])
+        self.assertLess(b["west"], b["east"])   # (containment: GroundImageTests)
         self.assertEqual(e["dem_hr"], "USGS 3DEP")
         # on disk is the same, nothing temporary left behind
         on_disk = json.loads((self.d / "e.json").read_text())
@@ -1091,9 +1484,59 @@ class EnrichTests(unittest.TestCase):
         self.assertEqual([p.name for p in self.d.glob("*.tmp")], [])
         self.assertEqual([p.name for p in self.d.glob("*.tmp*")], [])
         # idempotent: nothing left to do, nothing fetched
-        before = dict(self.calls)
+        before, nbefore = dict(self.calls), dict(self.net_calls)
         self.assertIsNone(tp.enrich_asset(self.d / "e.json", self.cache, log=quiet))
         self.assertEqual(self.calls, before)
+        self.assertEqual(self.net_calls, nbefore)
+        # a deleted ground image is regenerated without refetching the network
+        (self.d / "e.ground.jpg").unlink()
+        res = tp.enrich_asset(self.d / "e.json", self.cache, log=quiet)
+        self.assertTrue((self.d / "e.ground.jpg").is_file())
+        self.assertEqual(self.net_calls["osm"], nbefore["osm"])
+
+    def test_enrich_missing_v2(self):
+        tp = self.tp
+        res = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+        self.assertFalse(tp._enrich_missing(res, self.d))
+        a = dict(res)
+        a.pop("network")
+        self.assertTrue(tp._enrich_missing(a, self.d))
+        a = dict(res, network={"v": 1, "chains": []})
+        self.assertTrue(tp._enrich_missing(a, self.d))
+        a = dict(res)
+        a.pop("ground")
+        self.assertTrue(tp._enrich_missing(a, self.d))
+        (self.d / "e.ground.jpg").unlink()
+        self.assertTrue(tp._enrich_missing(res, self.d))
+        # a v1 asset (complete for v1) is upgraded by enrich_asset: only the new steps run
+        v1 = dict(res, enrich=dict(res["enrich"], v=1))
+        for k in ("network", "ground"):
+            v1.pop(k)
+        (self.d / "e.json").write_text(json.dumps(v1))
+        before = dict(self.calls)
+        up = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+        self.assertEqual(up["enrich"]["v"], 2)
+        self.assertEqual(self.calls, before)
+
+    def test_network_failure_is_recorded_and_rate_limited(self):
+        tp = self.tp
+        with mock.patch.object(tp, "osm_network", return_value=[]) as m:
+            res = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+            self.assertIn("network_error", res)
+            self.assertNotIn("network", res)
+            self.assertEqual(res["enrich"]["v"], 0)
+            # the ground still came from the line's bbox
+            self.assertEqual(res["ground"]["cover"], "line")
+            self.assertIsNone(tp.enrich_asset(self.d / "e.json", self.cache,
+                                              log=lambda *_: None))
+            self.assertEqual(m.call_count, 1)
+        a = json.loads((self.d / "e.json").read_text())
+        a["network_tried"] = int(time.time()) - 7 * 3600
+        (self.d / "e.json").write_text(json.dumps(a))
+        res = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+        self.assertEqual(res["enrich"]["v"], 2)
+        self.assertNotIn("network_error", res)
+        self.assertEqual(res["ground"]["cover"], "network")      # remade for the network
 
     def test_a_missing_bin_is_regenerated(self):
         tp = self.tp
@@ -1165,7 +1608,10 @@ class EnrichTests(unittest.TestCase):
         self.assertTrue((out / "tracks/bake.dem.bin").is_file())
         self.assertTrue((out / "tracks/bake.demfar.bin").is_file())
         self.assertEqual(len(asset["line"]), len(asset["width_m"]))
-        self.assertEqual(json.loads((out / "tracks/bake.json").read_text())["enrich"]["v"], 1)
+        self.assertEqual(json.loads((out / "tracks/bake.json").read_text())["enrich"]["v"],
+                         tp.ENRICH_VERSION)
+        self.assertTrue(asset["network"]["chains"])
+        self.assertTrue((out / "tracks" / asset["ground"]["file"]).is_file())
         # no features/dem on a re-enrich: complete already
         self.assertIsNone(tp.enrich_asset(out / "tracks/bake.json", self.cache,
                                           log=lambda *_: None))

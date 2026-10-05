@@ -128,12 +128,17 @@ def _cache_put(path: pathlib.Path, blob: bytes, min_bytes: int = 64) -> None:
 # imagery
 # ---------------------------------------------------------------------------
 def imagery_mosaic(bbox, z: int, cache_dir: pathlib.Path,
-                   workers: int = 6, max_tiles: int = 400, log=print):
+                   workers: int = 6, max_tiles: int = 400, log=print,
+                   max_missing: Optional[int] = None):
     """Stitch Esri World Imagery into ONE image covering `bbox`.
 
     bbox = (min_lat, min_lon, max_lat, max_lon). Returns (PIL.Image, bounds)
     where bounds = {"z", "x0", "y0", "lat0", "lon0", "step_lat", "step_lon"} —
     enough to map a lat/lon back to a pixel.
+
+    A tile that fails stays BLACK in the mosaic. max_missing=N raises when more
+    than N tiles failed (the facility ground image and the network widths use 0:
+    a black square reads as "not paved" and would be draped over the ground).
     """
     _require_deps()
     min_lat, min_lon, max_lat, max_lon = bbox
@@ -172,9 +177,11 @@ def imagery_mosaic(bbox, z: int, cache_dir: pathlib.Path,
         it = ThreadPoolExecutor(max_workers=workers).map(one, jobs)
     else:
         it = map(one, jobs)
+    missing = 0
     for res in it:
         done += 1
         if res is None:
+            missing += 1
             continue
         i, j, blob = res
         try:
@@ -185,9 +192,12 @@ def imagery_mosaic(bbox, z: int, cache_dir: pathlib.Path,
             t = Image.open(io.BytesIO(blob)).convert("RGB")
             canvas.paste(t, (i * TILE, j * TILE))
         except Exception as e:
+            missing += 1
             log(f"[imagery] tile decode failed: {e}")
         if done % 40 == 0:
             log(f"[imagery] {done}/{len(jobs)}")
+    if max_missing is not None and missing > max_missing:
+        raise RuntimeError("imagery: %d of %d tiles missing" % (missing, len(jobs)))
     # A blocked or proxied tile source answers every URL with the SAME image,
     # which pastes into a repeating pattern that looks like nothing on earth and
     # silently poisons the width measurement. Refuse to bake that.
@@ -648,7 +658,11 @@ def _osm_cached(bbox, key: str, q: str, timeout: float, log, use_cache: bool,
 
 
 def osm_raceways(bbox, timeout: float = 90.0, log=print, use_cache: bool = True):
-    """`highway=raceway` ways inside bbox -> [{name, width_m, points[(lat,lon)]}].
+    """`highway=raceway` ways inside bbox -> [{id, name, width_m, surface, sport,
+    raceway, area, oneway, nodes[ids], points[(lat,lon)]}].
+
+    `nodes` are the OSM node ids (Overpass `out geom` carries them alongside the
+    geometry); osm_network() uses them to find shared endpoints / junctions.
 
     Cached on disk (45 days) and PREFERRED when the API is unreachable: Overpass
     is a shared community service that rate-limits, and a stale cache beats
@@ -672,15 +686,201 @@ def osm_raceways(bbox, timeout: float = 90.0, log=print, use_cache: bool = True)
                 w = float(tags.get("width", "").replace("m", "").strip())
             except Exception:
                 w = None
+            nodes = e.get("nodes") or []
             out.append({"id": e.get("id"), "name": tags.get("name"),
                         "width_m": w, "surface": tags.get("surface"),
                         "sport": tags.get("sport"),
+                        "raceway": tags.get("raceway"), "area": tags.get("area"),
+                        "oneway": tags.get("oneway"),
+                        "nodes": list(nodes) if len(nodes) == len(g) else [],
                         "points": [(p["lat"], p["lon"]) for p in g]})
         return out
 
-    res = _osm_cached(bbox, "raceway", q, timeout, log, use_cache, build,
+    # "raceway2": the cached BUILT output gained node ids + tags; an old
+    # "raceway" entry (no node ids) must not be reused
+    res = _osm_cached(bbox, "raceway2", q, timeout, log, use_cache, build,
                       lambda r: not r)
     return res or []
+
+
+# ---------------------------------------------------------------------------
+# the facility's whole track NETWORK: every layout, pit lane, kart track, oval
+# ---------------------------------------------------------------------------
+CHAIN_KINDS = ("circuit", "oval", "pit", "kart", "area")
+
+
+def _yes(v) -> bool:
+    return str(v or "").strip().lower() in ("yes", "true", "1")
+
+
+def _way_is_closed(way) -> bool:
+    pts = way.get("points") or []
+    if len(pts) < 4:                      # a ring needs 3 distinct points + the closing one
+        return False
+    nodes = way.get("nodes") or []
+    if nodes and len(nodes) == len(pts):
+        return nodes[0] == nodes[-1]
+    return _dist_m(pts[0], pts[-1]) <= 0.5
+
+
+def raceway_kind(way) -> str:
+    """circuit / oval / pit / kart / area for one osm_raceways() way."""
+    name = str(way.get("name") or "").lower()
+    rw = str(way.get("raceway") or "").lower()
+    if _yes(way.get("area")) and _way_is_closed(way):
+        return "area"
+    if rw in ("pit_lane", "pitlane", "pit") or re.search(r"\bpit", name):
+        return "pit"
+    if rw in ("karting", "kart") or "kart" in name:
+        return "kart"
+    if rw == "oval" or re.search(r"speedway|oval", name):
+        return "oval"
+    return "circuit"
+
+
+def _coord_keys(ways, tol_m: float = 0.5):
+    """Per way, a node key per point: points within tol_m share a key (the
+    fallback when ways carry no OSM node ids)."""
+    allp = [p for w in ways for p in w["points"]]
+    lat0 = sum(p[0] for p in allp) / max(1, len(allp))
+    lon0 = sum(p[1] for p in allp) / max(1, len(allp))
+    kx = M_PER_DEG_LAT * math.cos(math.radians(lat0))
+    grid, reps, out = {}, [], []
+    t2 = tol_m * tol_m
+    for w in ways:
+        ks = []
+        for la, lo in w["points"]:
+            x, y = (lo - lon0) * kx, (la - lat0) * M_PER_DEG_LAT
+            gx, gy = int(math.floor(x / tol_m)), int(math.floor(y / tol_m))
+            found = None
+            for a in (-1, 0, 1):
+                for b in (-1, 0, 1):
+                    for k in grid.get((gx + a, gy + b), ()):
+                        if (reps[k][0] - x) ** 2 + (reps[k][1] - y) ** 2 <= t2:
+                            found = k
+                            break
+                    if found is not None:
+                        break
+                if found is not None:
+                    break
+            if found is None:
+                found = len(reps)
+                reps.append((x, y))
+                grid.setdefault((gx, gy), []).append(found)
+            ks.append(found)
+        out.append(ks)
+    return out
+
+
+def merge_chains(ways):
+    """Merge raceway ways end-to-end into CHAINS.
+
+    Two ways continue into one another only through a shared endpoint node of
+    degree exactly 2 (way-ends + way-interior occurrences meeting there) and only
+    when their kinds match; a junction (degree >= 3) or a kind change ends a chain.
+    Node ids are used when every way carries them, else points within 0.5 m are
+    the same node. `area` ways (closed, area=yes) are their own polygon chains.
+
+    -> [{"ids", "names", "kind", "closed", "points": [(lat,lon)...],
+         "wtag": [OSM width tag (m) or None per point]}]"""
+    ws = []
+    for w in ways or []:
+        pts = [(float(p[0]), float(p[1])) for p in (w.get("points") or [])]
+        if len(pts) >= 2:
+            ws.append(dict(w, points=pts))
+    if not ws:
+        return []
+    if all(w.get("nodes") and len(w["nodes"]) == len(w["points"]) for w in ws):
+        keys = [list(w["nodes"]) for w in ws]
+    else:
+        keys = _coord_keys(ws)
+    kinds = [raceway_kind(w) for w in ws]
+    deg, ends = {}, {}
+    for i, ks in enumerate(keys):
+        for k in ks:
+            deg[k] = deg.get(k, 0) + 1
+        ends.setdefault(ks[0], []).append((i, 0))
+        ends.setdefault(ks[-1], []).append((i, 1))
+
+    def partner(i, k):
+        if deg.get(k) != 2 or kinds[i] == "area":
+            return None
+        e = ends.get(k) or []
+        if len(e) != 2 or e[0][0] == e[1][0]:
+            return None
+        j, ej = e[1] if e[0][0] == i else e[0]
+        if kinds[j] != kinds[i]:
+            return None
+        return j, ej
+
+    def wtag(i):
+        v = ws[i].get("width_m")
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if 3.0 <= v <= 30.0 else None
+
+    used = [False] * len(ws)
+    chains = []
+    for i in range(len(ws)):
+        if used[i]:
+            continue
+        used[i] = True
+        seq = [(i, False)]
+        if kinds[i] != "area":
+            cur, k = i, keys[i][-1]
+            while True:                       # forward
+                p = partner(cur, k)
+                if not p or used[p[0]]:
+                    break
+                j, ej = p
+                used[j] = True
+                rev = ej == 1                 # entered at its end: walk it backwards
+                seq.append((j, rev))
+                k = keys[j][0] if rev else keys[j][-1]
+                cur = j
+            cur, k = i, keys[i][0]
+            while True:                       # backward
+                p = partner(cur, k)
+                if not p or used[p[0]]:
+                    break
+                j, ej = p
+                used[j] = True
+                rev = ej == 0                 # must END at k in chain order
+                seq.insert(0, (j, rev))
+                k = keys[j][-1] if rev else keys[j][0]
+                cur = j
+        pts, tags, ks_all, names = [], [], [], []
+        for j, rev in seq:
+            p = list(reversed(ws[j]["points"])) if rev else list(ws[j]["points"])
+            kk = list(reversed(keys[j])) if rev else list(keys[j])
+            t = wtag(j)
+            if pts:
+                p, kk = p[1:], kk[1:]
+            pts.extend(p)
+            ks_all.extend(kk)
+            tags.extend([t] * len(p))
+            nm = ws[j].get("name")
+            if nm and nm not in names:
+                names.append(nm)
+        closed = len(pts) >= 4 and ks_all[0] == ks_all[-1]
+        chains.append({"ids": [ws[j].get("id") for j, _ in seq], "names": names,
+                       "kind": kinds[i], "closed": bool(closed),
+                       "points": pts, "wtag": tags})
+    return chains
+
+
+def osm_network(bbox, timeout: float = 90.0, log=print, use_cache: bool = True):
+    """Every `highway=raceway` way in bbox, merged into chains (merge_chains)."""
+    ways = osm_raceways(bbox, timeout=timeout, log=log, use_cache=use_cache)
+    chains = merge_chains(ways)
+    if chains:
+        kinds = {}
+        for c in chains:
+            kinds[c["kind"]] = kinds.get(c["kind"], 0) + 1
+        log("[osm] network: %d ways -> %d chains %s" % (len(ways), len(chains), kinds))
+    return chains
 
 
 # ---------------------------------------------------------------------------
@@ -1618,7 +1818,7 @@ def add_landcover(asset: dict, img, bounds: dict, log=print) -> dict:
 # ---------------------------------------------------------------------------
 # enrichment: real-world features, hi-res terrain, a centred line
 # ---------------------------------------------------------------------------
-ENRICH_VERSION = 1
+ENRICH_VERSION = 2                  # 2: + the facility track network + ground image
 ENRICH_RETRY_S = 6 * 3600           # a failed network step is not retried sooner
 _ENRICH_ACTIVE = set()
 _ENRICH_ACTIVE_LOCK = threading.Lock()
@@ -1685,6 +1885,298 @@ def _texture_bounds(tex: dict, size) -> dict:
             "lat0": b["north"], "lat1": b["south"], "lon0": b["west"], "lon1": b["east"]}
 
 
+# ---- the track network (asset["network"]) + the facility ground image -----
+ESRI_ATTRIB = "Imagery \u00a9 Esri, Maxar, Earthstar Geographics"
+NETWORK_V = 1
+NETWORK_STEP_M = 3.0
+NETWORK_MARGIN_M = 700.0          # query box = the asset line's bbox + this
+NETWORK_MIN_CHAIN_M = 15.0
+NETWORK_MAX_M = 80000.0           # total chain length kept (nearest the circuit first)
+NETWORK_TILE_BUDGET = 3000        # z18 tiles decoded for width/refine, all chains
+NETWORK_CHAIN_MAX_TILES = 400
+NETWORK_SMOOTH_M = 30.0
+WIDTH_CLAMP = {"circuit": (7.0, 16.0), "oval": (7.0, 16.0),
+               "pit": (6.0, 14.0), "kart": (4.0, 9.0)}
+WIDTH_DEFAULT = {"oval": 14.0, "pit": 9.0, "kart": 6.0}     # circuit: the asset's own
+GROUND_MARGIN_M = 250.0
+GROUND_MAX_PX = 3072
+GROUND_QUALITY = 78
+GROUND_MAX_BYTES = 1_600_000
+
+
+def _pts_bbox(pts):
+    la = [p[0] for p in pts]
+    lo = [p[1] for p in pts]
+    return (min(la), min(lo), max(la), max(lo))
+
+
+def _tile_count(bbox, z: int) -> int:
+    s, w, n, e = bbox
+    nx = int(math.floor(lon_to_x(e, z) / TILE)) - int(math.floor(lon_to_x(w, z) / TILE)) + 1
+    ny = int(math.floor(lat_to_y(s, z) / TILE)) - int(math.floor(lat_to_y(n, z) / TILE)) + 1
+    return nx * ny
+
+
+def _densify(pts, step_m: float):
+    """Linear densification (no smoothing), consecutive duplicates dropped."""
+    out = [pts[0]]
+    for b in pts[1:]:
+        a = out[-1]
+        d = _dist_m(a, b)
+        if d < 0.01:
+            continue
+        k = int(d // step_m)
+        for t in range(1, k + 1):
+            f = t * step_m / d
+            if f >= 0.999:
+                break
+            out.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f))
+        out.append(b)
+    return out
+
+
+def _station_tags(pts, tags, frame):
+    """OSM width tag per station, via the arc-length FRACTION along the chain
+    (resampling/smoothing/refinement keep the order, not the exact length)."""
+    n = len(frame["lat"])
+    if not tags or not any(t for t in tags):
+        return [None] * n
+    cum = [0.0]
+    for a, b in zip(pts, pts[1:]):
+        cum.append(cum[-1] + _dist_m(a, b))
+    tot_raw = cum[-1] or 1.0
+    tot_st = float(frame["s"][-1]) or 1.0
+    out = []
+    for s in frame["s"]:
+        target = float(s) / tot_st * tot_raw
+        k = int(np.searchsorted(cum, target, side="right"))   # segment (k-1 -> k)
+        out.append(tags[min(max(k, 1), len(tags) - 1)])
+    return out
+
+
+def _robust_median(v) -> float:
+    v = np.asarray(v, dtype=float)
+    med = float(np.median(v))
+    mad = float(np.median(np.abs(v - med))) * 1.4826
+    if mad > 0.2:
+        keep = v[np.abs(v - med) <= 2.5 * mad]
+        if len(keep) >= 3:
+            med = float(np.median(keep))
+    return med
+
+
+def _chain_widths(kind: str, frame: dict, st_tags, img, bounds, default_w: float):
+    """Per-station (left, right) half widths + per-station source.
+    OSM width tag > imagery (smoothed, clamped per kind) > default."""
+    n = len(frame["lat"])
+    lo_w, hi_w = WIDTH_CLAMP.get(kind, WIDTH_CLAMP["circuit"])
+    left = np.full(n, default_w / 2.0)
+    right = np.full(n, default_w / 2.0)
+    src = ["default"] * n
+    if img is not None and n >= 3:
+        try:
+            m = measure_width(img, bounds, frame, {"raw": True})
+            ok = np.asarray(m.get("ok") or [], dtype=bool)
+            lr = np.asarray(m.get("left_raw") or [], dtype=float)
+            rr = np.asarray(m.get("right_raw") or [], dtype=float)
+        except Exception:
+            ok = np.zeros(0, dtype=bool)
+        if len(ok) == n and ok.sum() >= max(3, 0.25 * n):
+            full = lr + rr
+            med = _robust_median(full[ok])
+            good = ok & (np.abs(full - med) <= 0.4 * max(med, 1e-6))
+            if good.sum() >= 3:
+                fill = float(min(max(med, lo_w), hi_w)) / 2.0
+                half = 3                              # +-3 stations = ~21 m
+                L = np.empty(n)
+                R = np.empty(n)
+                for i in range(n):                    # rolling median of the good ones
+                    a, b = max(0, i - half), min(n, i + half + 1)
+                    sel = good[a:b]
+                    if sel.any():
+                        L[i] = float(np.median(lr[a:b][sel]))
+                        R[i] = float(np.median(rr[a:b][sel]))
+                    else:
+                        L[i] = R[i] = fill
+                k = max(1, int(round(NETWORK_SMOOTH_M / NETWORK_STEP_M)))
+                L, R = _movavg(L, k), _movavg(R, k)
+                tot = np.maximum(L + R, 1e-6)
+                ratio = np.clip(L / tot, 0.2, 0.8)
+                tot = np.clip(tot, lo_w, hi_w)
+                left, right = tot * ratio, tot * (1.0 - ratio)
+                src = ["imagery"] * n
+    for i, t in enumerate(st_tags or []):
+        if t:
+            left[i] = right[i] = float(t) / 2.0
+            src[i] = "osm"
+    return left, right, src
+
+
+def _network_chain(c: dict, pts, kind: str, img, bounds, default_w: float) -> dict:
+    line = resample(_densify(pts, NETWORK_STEP_M / 2.0), NETWORK_STEP_M, smooth_win=5)
+    frame = line
+    refined = False
+    if img is not None:
+        try:
+            off, rep = _refine_stations(line, img, bounds)
+            if rep["applied"]:
+                n = len(off)
+                if not c.get("closed") and n > 4:
+                    # open ends meet other chains at junctions: pin them there
+                    ramp = np.clip(np.minimum(np.arange(n), np.arange(n)[::-1]) / 7.0, 0, 1)
+                    off = off * ramp
+                la, lo = _shift_along_normal(line["lat"], line["lon"], line["normal"], off)
+                frame = _line_frame(la, lo)
+                refined = True
+        except Exception:
+            refined = False
+    st_tags = _station_tags(pts, c.get("wtag"), frame)
+    left, right, src = _chain_widths(kind, frame, st_tags, img, bounds, default_w)
+    counts = {s: src.count(s) for s in set(src)}
+    ws = max(sorted(counts), key=lambda s: counts[s])
+    return {"ids": list(c.get("ids") or []), "names": list(c.get("names") or []),
+            "kind": kind, "closed": bool(c.get("closed")),
+            "p": [[round(float(a), 6), round(float(b), 6)]
+                  for a, b in zip(frame["lat"], frame["lon"])],
+            "hw": [[round(float(a), 1), round(float(b), 1)] for a, b in zip(left, right)],
+            "w": round(float(np.median(left + right)), 1), "ws": ws, "refined": refined}
+
+
+def build_network(chains, cache_dir: pathlib.Path, log=print, centre=None,
+                  default_circuit_w: float = 10.0, imagery: bool = True,
+                  max_total_m: float = NETWORK_MAX_M,
+                  tile_budget: int = NETWORK_TILE_BUDGET) -> dict:
+    """osm_network() chains -> the asset["network"] dict (see _enrich_steps)."""
+    _require_deps()
+    items = []
+    for c in chains or []:
+        pts = [(float(p[0]), float(p[1])) for p in (c.get("points") or [])]
+        if len(pts) < 2:
+            continue
+        length = way_length_m(pts)
+        if length < NETWORK_MIN_CHAIN_M:
+            continue
+        near = 0.0
+        if centre:
+            near = min(_dist_m(centre, p) for p in pts[::max(1, len(pts) // 60)])
+        items.append((near, -length, c, pts))
+    items.sort(key=lambda t: (t[0], t[1]))
+    kept, total, dropped = [], 0.0, 0
+    for near, nl, c, pts in items:
+        if total - nl > max_total_m:
+            dropped += 1
+            continue
+        kept.append((c, pts, -nl))
+        total -= nl
+    out, tiles = [], 0
+    for c, pts, length in kept:
+        kind = c.get("kind") if c.get("kind") in CHAIN_KINDS else "circuit"
+        if kind == "area":
+            out.append({"ids": list(c.get("ids") or []), "names": list(c.get("names") or []),
+                        "kind": "area", "closed": True,
+                        "p": [[round(a, 6), round(b, 6)] for a, b in pts],
+                        "hw": [], "w": 0, "ws": "osm", "refined": False})
+            continue
+        img = bounds = None
+        if imagery:
+            bb = _expand_bbox(_pts_bbox(pts), 40.0)
+            z = 18
+            nt = _tile_count(bb, z)
+            if nt > NETWORK_CHAIN_MAX_TILES:
+                z = 17
+                nt = _tile_count(bb, z)
+            if nt <= NETWORK_CHAIN_MAX_TILES and tiles + nt <= tile_budget:
+                try:
+                    img, bounds = imagery_mosaic(bb, z, cache_dir,
+                                                 max_tiles=NETWORK_CHAIN_MAX_TILES, log=log,
+                                                 max_missing=0)
+                    tiles += nt
+                except Exception as e:
+                    img = bounds = None
+                    log(f"[network] imagery for {c.get('names') or c.get('ids')} failed: "
+                        f"{type(e).__name__}: {e}")
+            else:
+                log(f"[network] tile budget: chain {c.get('names') or c.get('ids')} "
+                    f"uses default widths")
+        default_w = default_circuit_w if kind == "circuit" else WIDTH_DEFAULT[kind]
+        try:
+            out.append(_network_chain(c, pts, kind, img, bounds, default_w))
+        except Exception as e:
+            log(f"[network] chain {c.get('ids')} skipped: {type(e).__name__}: {e}")
+    allp = [p for ch in out for p in ch["p"]]
+    net = {"v": NETWORK_V, "attrib": OSM_ATTRIB, "chains": out,
+           "length_m": round(total, 1),
+           "bbox": [round(x, 6) for x in _pts_bbox(allp)] if allp else None}
+    kinds = {}
+    for ch in out:
+        kinds[ch["kind"]] = kinds.get(ch["kind"], 0) + 1
+    log(f"[network] kept {len(out)} chains, {total / 1000.0:.1f} km {kinds}"
+        + (f", dropped {dropped} over the {max_total_m / 1000:.0f} km cap" if dropped else "")
+        + f", {tiles} imagery tiles")
+    return net
+
+
+def ground_image(bbox, cache_dir: pathlib.Path, log=print, max_px: int = GROUND_MAX_PX,
+                 max_z: int = 18, min_z: int = 10):
+    """One imagery image covering bbox exactly (the tile mosaic, cropped), at the
+    highest zoom <= max_z whose long side fits max_px.
+    -> (PIL image, {"south","north","west","east"}, z)"""
+    _require_deps()
+    s, w, n, e = bbox
+    z = min_z
+    for zz in range(max_z, min_z - 1, -1):
+        wpx = lon_to_x(e, zz) - lon_to_x(w, zz)
+        hpx = lat_to_y(s, zz) - lat_to_y(n, zz)
+        if max(wpx, hpx) <= max_px:
+            z = zz
+            break
+    img, b = imagery_mosaic(bbox, z, cache_dir, max_tiles=600, log=log, max_missing=0)
+    W, H = img.size
+    y0m, y1m = lat_to_y(b["lat0"], z), lat_to_y(b["lat1"], z)
+    dlon = (b["lon1"] - b["lon0"]) or 1e-12
+    dy = (y1m - y0m) or 1e-12
+    px = lambda lon: (lon - b["lon0"]) / dlon * W            # noqa: E731
+    py = lambda lat: (lat_to_y(lat, z) - y0m) / dy * H        # noqa: E731
+    x0, x1 = max(0, int(math.floor(px(w)))), min(W, int(math.ceil(px(e))))
+    ya, yb = max(0, int(math.floor(py(n)))), min(H, int(math.ceil(py(s))))
+    if x1 - x0 < 16 or yb - ya < 16:
+        x0, x1, ya, yb = 0, W, 0, H
+    crop = img.crop((x0, ya, x1, yb))
+    gb = {"south": y_to_lat(y0m + yb / H * dy, z), "north": y_to_lat(y0m + ya / H * dy, z),
+          "west": b["lon0"] + x0 / W * dlon, "east": b["lon0"] + x1 / W * dlon}
+    return crop, gb, z
+
+
+def _save_jpeg_capped(img, path: pathlib.Path, quality: int = GROUND_QUALITY,
+                      max_bytes: int = GROUND_MAX_BYTES):
+    """Atomic JPEG write; lowers quality (to 66), then size, until <= max_bytes."""
+    q, im = int(quality), img
+    for attempt in range(10):
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=q, optimize=True)
+        if buf.tell() <= max_bytes or attempt == 9:
+            break
+        if q > 66:
+            q = max(66, q - 6)
+        else:
+            im = im.resize((max(64, int(im.width * 0.88)), max(64, int(im.height * 0.88))),
+                           Image.LANCZOS)
+    path = pathlib.Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=path.stem + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(buf.getvalue())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return im.size, q, buf.tell()
+
+
 def _enrich_missing(asset: dict, adir: pathlib.Path) -> bool:
     if not asset.get("features"):
         return True
@@ -1692,6 +2184,11 @@ def _enrich_missing(asset: dict, adir: pathlib.Path) -> bool:
         m = asset.get(k)
         if not m or not (adir / str(m.get("file") or "?")).is_file():
             return True
+    if not (asset.get("network") or {}).get("chains"):
+        return True
+    g = asset.get("ground")
+    if not g or not (adir / str(g.get("file") or "?")).is_file():
+        return True
     return False
 
 
@@ -1699,7 +2196,7 @@ def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
                   network: bool = True, refine: bool = True) -> bool:
     """Mutates `asset` (and writes <slug>.dem.bin / <slug>.demfar.bin into adir).
     Every step is independent: one failing never stops the others. Returns True
-    when a .bin file was (re)written."""
+    when a side file (.bin grid or .ground.jpg) was (re)written."""
     wrote = False
     slug = asset.get("slug") or "track"
     now = time.time()
@@ -1805,14 +2302,66 @@ def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
         except Exception as e:
             log(f"[{slug}] station elevations failed: {type(e).__name__}: {e}")
 
-    # e. record ------------------------------------------------------------------
+    # e. the facility's whole track network (every layout, pit lane, kart track)
+    if network and len(line) >= 2 and not (asset.get("network") or {}).get("chains") \
+            and now - float(asset.get("network_tried") or 0) >= ENRICH_RETRY_S:
+        try:
+            bb = _expand_bbox(_asset_bbox(asset, False), NETWORK_MARGIN_M)
+            chains = osm_network(bb, log=log)
+            if not chains:
+                raise RuntimeError("Overpass returned no raceway ways")
+            wm = [float(x) for x in (asset.get("width_m") or []) if x]
+            net = build_network(
+                chains, cache_dir, log=log,
+                centre=asset.get("centre") or [float(lats.mean()), float(lons.mean())],
+                default_circuit_w=float(np.median(wm)) if wm else 10.0)
+            if not net["chains"]:
+                raise RuntimeError("no usable raceway chains")
+            asset["network"] = net
+            asset.pop("network_error", None)
+            asset.pop("network_tried", None)
+        except Exception as e:
+            asset["network_error"] = f"{type(e).__name__}: {e}"[:200]
+            asset["network_tried"] = int(now)
+            log(f"[{slug}] network failed: {asset['network_error']}")
+
+    # f. one imagery JPEG for the whole facility (the network + a margin) ---------
+    g = asset.get("ground") or {}
+    net_bb = (asset.get("network") or {}).get("bbox")
+    g_stale = bool(net_bb) and g.get("cover") != "network"   # made before the network
+    if network and len(line) >= 2 and (g_stale or not g.get("file")
+                                       or not (adir / str(g.get("file"))).is_file()) \
+            and now - float(asset.get("ground_tried") or 0) >= ENRICH_RETRY_S:
+        try:
+            if net_bb:
+                bb, cover = _expand_bbox(net_bb, GROUND_MARGIN_M), "network"
+            else:
+                bb = _expand_bbox(_asset_bbox(asset, False), NETWORK_MARGIN_M + GROUND_MARGIN_M)
+                cover = "line"
+            img, gb, gz = ground_image(bb, cache_dir, log=log)
+            fname = f"{slug}.ground.jpg"
+            size, q, nbytes = _save_jpeg_capped(img, adir / fname)
+            asset["ground"] = {"file": fname, "px": [int(size[0]), int(size[1])], "z": gz,
+                               "bounds": gb, "attrib": ESRI_ATTRIB, "cover": cover}
+            asset.pop("ground_error", None)
+            asset.pop("ground_tried", None)
+            wrote = True
+            log(f"[{slug}] ground {size[0]}x{size[1]} z{gz} q{q} {nbytes / 1e6:.2f} MB ({cover})")
+        except Exception as e:
+            asset["ground_error"] = f"{type(e).__name__}: {e}"[:200]
+            asset["ground_tried"] = int(now)
+            log(f"[{slug}] ground failed: {asset['ground_error']}")
+
+    # g. record ------------------------------------------------------------------
     complete = bool(asset.get("features")) and not _enrich_missing(asset, adir)
     old = asset.get("enrich") or {}
     rec = {"v": ENRICH_VERSION if complete else int(old.get("v") or 0),
            "features": bool(asset.get("features")),
            "dem_hr": (asset.get("dem_hr") or {}).get("source"),
            "dem_far": (asset.get("dem_far") or {}).get("source"),
-           "refined": bool((asset.get("centreline_refine") or {}).get("applied"))}
+           "refined": bool((asset.get("centreline_refine") or {}).get("applied")),
+           "network": len((asset.get("network") or {}).get("chains") or []),
+           "ground": (asset.get("ground") or {}).get("z")}
     if {k: v for k, v in old.items() if k != "at"} != rec:
         rec["at"] = int(now)
         asset["enrich"] = rec
@@ -1824,6 +2373,13 @@ def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
         if asset.get("features"):
             src["features"] = "OpenStreetMap (Overpass)"
         asset["source"] = src
+    if asset.get("network") or asset.get("ground"):
+        src = dict(asset.get("source") or {})
+        if asset.get("network"):
+            src["network"] = "OpenStreetMap highway=raceway"
+        if asset.get("ground"):
+            src["ground"] = "Esri World Imagery z%s" % asset["ground"].get("z")
+        asset["source"] = src
     return wrote
 
 
@@ -1832,11 +2388,13 @@ def enrich_asset(asset_path: pathlib.Path, cache_dir: pathlib.Path, log=print,
     """Idempotently upgrade an EXISTING asset in place (see _enrich_steps).
 
     Adds `features`, `dem_hr` / `dem_far` (+ their .bin files next to the JSON),
-    a refined `line`, hi-res station elevations and the `enrich` record. Returns
+    the facility track `network`, the `ground` image (<slug>.ground.jpg), a refined `line`, hi-res station elevations and the `enrich` record. Returns
     the updated asset, or None when there was nothing to do (already enriched,
     nothing new possible, another thread is already on it). network=False runs
-    only the offline steps. The slow work happens WITHOUT the asset lock; only
-    the final read-merge-write is under it, so serving never waits on Overpass."""
+    only the offline steps. The per-slug lock spans the WHOLE run (the steps
+    write the .bin / .ground.jpg side files directly), so a bake of the same
+    track waits for an enrichment and vice versa; serving the asset never
+    takes that lock, so the viewer never waits on Overpass or the tiles."""
     import copy
     asset_path = pathlib.Path(asset_path)
     key = str(asset_path.resolve())
@@ -2010,7 +2568,7 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
             "bounds": {"south": bounds["lat1"], "west": bounds["lon0"],
                        "north": bounds["lat0"], "east": bounds["lon1"]},
             "px": [tex.width, tex.height],
-            "attrib": "Imagery \u00a9 Esri, Maxar, Earthstar Geographics",
+            "attrib": ESRI_ATTRIB,
         },
     }
     if refine_report is not None:
@@ -2175,6 +2733,17 @@ def main(argv=None) -> int:
                 if m:
                     print(f"    {k}: {m['cols']}x{m['rows']} {m['cell_m']} m {m['source']} "
                           f"-> {m['file']}")
+            for ch in (res.get("network") or {}).get("chains") or []:
+                print(f"    network: {ch['kind']:7} {len(ch['p']):5} pts w={ch['w']:4} "
+                      f"{ch['ws']:8} refined={ch['refined']!s:5} closed={ch['closed']!s:5} "
+                      f"{', '.join(ch['names']) or '(unnamed)'}")
+            if res.get("network_error"):
+                print(f"    network error: {res['network_error']}")
+            g = res.get("ground")
+            if g:
+                print(f"    ground: {g['file']} {g['px'][0]}x{g['px'][1]} z{g['z']}")
+            elif res.get("ground_error"):
+                print(f"    ground error: {res['ground_error']}")
         return rc
 
     if a.list_tracks:

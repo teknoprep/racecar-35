@@ -1073,6 +1073,173 @@ R.sbend = (function () {
            dirs: cs.map(function (c) { return c.dir; }) };
 })();
 
+// --- Kalman/RTS position path vs the moving average: a synthetic race drive
+R.kalman = (function () {
+  function mulberry(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  var rnd = mulberry(20260517);
+  function gauss() {
+    var u = Math.max(1e-12, rnd()), v = rnd();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  var D2R = Math.PI / 180;
+  // closed course, clockwise: straights + 90-degree right corners of 60/120/40/80 m
+  var radii = [60, 120, 40, 80], L = [400, 250, 380, 310];
+  var segs = [], x = 0, z = 0, h = 90 * D2R, s0 = 0;
+  for (var q = 0; q < 4; q++) {
+    segs.push({ s0: s0, len: L[q], r: 0, x: x, z: z, h: h });
+    x += L[q] * Math.sin(h); z -= L[q] * Math.cos(h); s0 += L[q];
+    var r = radii[q], len = r * Math.PI / 2;
+    var cx = x + r * Math.cos(h), cz = z + r * Math.sin(h);
+    segs.push({ s0: s0, len: len, r: r, x: x, z: z, h: h, cx: cx, cz: cz });
+    h += Math.PI / 2; x = cx - r * Math.cos(h); z = cz - r * Math.sin(h); s0 += len;
+  }
+  var LAP = s0, closure = Math.hypot(x, z);
+  function at(s) {
+    s = ((s % LAP) + LAP) % LAP;
+    var g = segs[segs.length - 1];
+    for (var k = 0; k < segs.length; k++) if (s < segs[k].s0 + segs[k].len) { g = segs[k]; break; }
+    var u = s - g.s0;
+    if (!g.r) return { x: g.x + u * Math.sin(g.h), z: g.z - u * Math.cos(g.h), h: g.h, seg: g };
+    var hh = g.h + u / g.r;
+    return { x: g.cx - g.r * Math.cos(hh), z: g.cz - g.r * Math.sin(hh), h: hh, seg: g };
+  }
+  // speed: corner speed sqrt(11 r) (~1.1 g), brake 7 / accelerate 5 m/s^2, cap 45
+  function vAt(s) {
+    var v = 45, sl = ((s % LAP) + LAP) % LAP;
+    segs.forEach(function (g) {
+      if (!g.r) return;
+      var vc2 = 11 * g.r, a = g.s0, b = g.s0 + g.len, dB, dA;
+      if (sl >= a && sl < b) { v = Math.min(v, Math.sqrt(vc2)); return; }
+      dB = ((a - sl) % LAP + LAP) % LAP;       // ahead of the corner: braking
+      dA = ((sl - b) % LAP + LAP) % LAP;       // after it: accelerating
+      v = Math.min(v, Math.sqrt(vc2 + 2 * 7 * dB), Math.sqrt(vc2 + 2 * 5 * dA));
+    });
+    return Math.min(v, Math.sqrt(1 + 2 * 4 * s));   // launch from the park
+  }
+  // truth table s(t) on a fine arc-length grid
+  var PARK = 8, LAPS = 3, ds = 0.05, TS = [0], SS = [0], tt = 0;
+  for (var ss = ds; ss <= LAPS * LAP; ss += ds) {
+    tt += ds / vAt(ss - ds / 2); TS.push(tt); SS.push(ss);
+  }
+  function sAtT(t) {
+    var lo = 0, hi = TS.length - 1;
+    if (t >= TS[hi]) return SS[hi];
+    while (hi - lo > 1) { var m = (lo + hi) >> 1; if (TS[m] <= t) lo = m; else hi = m - 1 < lo ? lo + 1 : m; }
+    var f = (t - TS[lo]) / ((TS[lo + 1] - TS[lo]) || 1);
+    return SS[lo] + f * (SS[lo + 1] - SS[lo]);
+  }
+  var lat0 = 39.0, lon0 = -77.0, cosL = Math.cos(lat0 * D2R), T0 = 1700000000;
+  var GAP0 = PARK + 70, GAP1 = GAP0 + 3, END = PARK + TS[TS.length - 1];
+  var rows = [], prev = null;
+  for (var k = 0; k * 0.04 < END; k++) {
+    var te = k * 0.04, parked = te < PARK, sTrue = parked ? 0 : sAtT(te - PARK);
+    var p = at(sTrue), v = parked ? 0 : vAt(sTrue);
+    if (te >= GAP0 && te < GAP1) continue;              // 3 s without fixes
+    var tl = T0 + te + (rnd() * 2 - 1) * 0.008;          // logged t jitters +/-8 ms
+    if (prev && rnd() < 0.4) {                           // the logger's repeat row
+      var rep = {}; for (var key in prev) rep[key] = prev[key];
+      rep.t = tl - 0.001; rows.push(rep);
+    }
+    var mx = p.x + 0.8 * gauss(), mz = p.z + 0.8 * gauss();
+    var row = {
+      t: tl, lat: lat0 - mz / 111320, lon: lon0 + mx / (111320 * cosL),
+      speed_mph: Math.max(0, v + 0.15 * gauss()) / 0.44704,
+      heading_deg: parked ? rnd() * 360 : (p.h / D2R + gauss()) % 360,
+      alt_m: 200, rpm: 4000,
+      _tx: p.x, _tz: p.z, _th: p.h, _v: v, _parked: parked,
+      _r: p.seg.r, _cx: p.seg.cx, _cz: p.seg.cz, _te: te
+    };
+    rows.push(row); prev = row;
+  }
+  var o = { lat: lat0, lon: lon0 };
+  var t0 = Date.now();
+  var kp = RC3D.buildPath(rows, { smooth: 5, o: o });
+  var ms = Date.now() - t0;
+  var ma = RC3D.buildPath(rows, { smooth: 5, o: o, kalman: false });
+  function stats(p) {
+    var se = 0, ne = 0, rb = 0, rn = 0, park = 0, nan = 0, gapErr = 0, stepErr = 0, i, sm;
+    for (i = 0; i < p.n; i++) {
+      sm = p.samples[i];
+      if (!isFinite(p.x[i]) || !isFinite(p.z[i])) { nan++; continue; }
+      var ex = p.x[i] - sm._tx, ez = p.z[i] - sm._tz;
+      if (sm._parked) { park = Math.max(park, Math.hypot(ex, ez)); continue; }
+      if (sm._v > 4) {
+        var lat = ex * Math.cos(sm._th) + ez * Math.sin(sm._th);
+        se += lat * lat; ne++;
+      }
+      if (sm._r === 60) { rb += Math.hypot(p.x[i] - sm._cx, p.z[i] - sm._cz) - 60; rn++; }
+      if (Math.abs(sm._te - GAP0) < 2 || Math.abs(sm._te - GAP1) < 2)
+        gapErr = Math.max(gapErr, Math.hypot(ex, ez));
+      if (i) {
+        var pr = p.samples[i - 1];
+        var dEst = Math.hypot(p.x[i] - p.x[i - 1], p.z[i] - p.z[i - 1]);
+        var dTru = Math.hypot(sm._tx - pr._tx, sm._tz - pr._tz);
+        stepErr = Math.max(stepErr, Math.abs(dEst - dTru));
+      }
+    }
+    return { latRms: Math.sqrt(se / ne), n: ne, bias60: rb / rn, n60: rn, park: park,
+             nan: nan, gapErr: gapErr, stepErr: stepErr, source: p.positionSource };
+  }
+  var noHd = rows.map(function (r) {
+    var c = {}; for (var key in r) if (key !== "heading_deg") c[key] = r[key]; return c;
+  });
+  var direct = RC3D.kalmanPath(RC3D.cleanFixes(rows), o, {});
+  return { kalman: stats(kp), avg: stats(ma), ms: ms, rows: rows.length, closure: closure,
+           noHeading: RC3D.buildPath(noHd, { smooth: 5, o: o }).positionSource,
+           direct: direct ? { nVel: direct.nVel, n: direct.x.length, ok: direct.ok } : null,
+           tooFew: RC3D.kalmanPath(rows.slice(0, 10), o, {}) };
+})();
+
+R.network = (function () {
+  // a facility in local metres (x east, z south): the circuit's straight drawn
+  // WEST-bound with asymmetric half widths, a pit lane 9 m north of it drawn
+  // east-bound, and a paddock AREA (never a road line)
+  var o = { lat: 41.0, lon: -72.0 }, M = 111320, cosl = Math.cos(o.lat * Math.PI / 180), k;
+  function ll(x, z) { return [o.lat - z / M, o.lon + x / (M * cosl)]; }
+  var circ = [], chw = [], pit = [], phw = [];
+  for (k = 0; k <= 200; k++) { circ.push(ll(300 - 3 * k, 0)); chw.push([4, 6]); }
+  for (k = 0; k <= 100; k++) { pit.push(ll(-150 + 3 * k, -9)); phw.push([3, 3]); }
+  var asset = { network: { v: 1, chains: [
+    { kind: "circuit", names: ["Main"], closed: false, p: circ, hw: chw, w: 10 },
+    { kind: "pit", names: ["Pit Lane"], closed: false, p: pit, hw: phw, w: 6 },
+    { kind: "area", names: ["Paddock"], closed: true, p: [ll(0, 50), ll(10, 50), ll(10, 60)] }
+  ] } };
+  var lines = RC3D.networkLines(asset, o);
+  var bias = function (L) { return L.kind === "pit" ? 6 : 0; };
+  var idx0 = RC3D.multiIndex(lines, 20, {}), idxB = RC3D.multiIndex(lines, 20, { bias: bias });
+  var idxS = RC3D.multiIndex(lines, 20, { skip: function (L) { return L.kind === "pit"; } });
+  // 5 m north of the circuit = 4 m from the pit lane: nearest is the pit, but
+  // the bias hands the tie to the circuit
+  var h0 = idx0.nearest(0, -5, 30), hB = idxB.nearest(0, -5, 30), hS = idxS.nearest(0, -8, 30);
+  var hc = idx0.nearest(0, 1, 30);
+  // the laps' consensus 2 m south of the circuit, driven EAST-bound
+  var cx = [], cz = [];
+  for (k = -280; k <= 280; k++) { cx.push(k); cz.push(2); }
+  var und = RC3D.blendOnto(cx, cz, null, null, { index: idxB, near: 8, blend: 30 });
+  var dir = RC3D.blendOnto(cx, cz, null, null, { index: idxB, near: 8, blend: 30, directed: true });
+  var mid = Math.floor(cx.length / 2), worst = 0;
+  for (k = 40; k < cx.length - 40; k++) worst = Math.max(worst, Math.abs(und.z[k]));
+  return {
+    n: lines.length, kinds: lines.map(function (L) { return L.kind; }),
+    len0: lines[0].len, hl0: lines[0].hl[5], hr0: lines[0].hr[5],
+    near0: h0 && h0.line, nearB: hB && hB.line, effB: hB && hB.eff, nearS: hS && hS.line,
+    hwEast: RC3D.networkHalfAt(lines, hc, 1, 0), hwWest: RC3D.networkHalfAt(lines, hc, -1, 0),
+    undMatched: und.matched, undWorst: worst, undSrc: und.src[mid] ? und.src[mid].line : null,
+    dirMatched: dir.matched, dirMidZ: dir.z[mid],
+    none: RC3D.networkLines({}, o).length,
+    // no usable lap: the consensus is the whole session, and says so (the
+    // viewer must never route that through the network as "the track")
+    wholeNoLaps: !!RC3D.consensusLine(path, []).whole
+  };
+})();
+
 console.log(JSON.stringify(R));
 """
 
@@ -1502,6 +1669,56 @@ class Track3DMathTests(unittest.TestCase):
         self.assertEqual(sorted(sb["dirs"]), [-1, 1])
         for d in sb["degs"]:
             self.assertGreater(abs(d), 55, sb)
+
+        # Kalman/RTS positions (speed + course over ground fused with the fixes)
+        # put the car where it really was across the track: a synthetic race
+        # drive with 0.8 m fix noise, +/-8 ms timestamp jitter, 1 deg heading
+        # noise, logger repeat rows, a parked start and a 3 s fix gap
+        kf = res["kalman"]
+        ka, av = kf["kalman"], kf["avg"]
+        self.assertLess(kf["closure"], 1e-6, "the synthetic course must close")
+        self.assertEqual(ka["source"], "kalman")
+        self.assertEqual(av["source"], "smooth")
+        self.assertEqual(kf["noHeading"], "smooth", "no heading -> moving average")
+        self.assertGreater(ka["n"], 3000)
+        self.assertLess(ka["latRms"], 0.35, kf)
+        self.assertLess(ka["latRms"] * 2, av["latRms"], kf)
+        # no corner cutting through the 60 m radius corner
+        self.assertGreater(ka["n60"], 100)
+        self.assertLess(abs(ka["bias60"]), 0.12, kf)
+        # parked with a random heading: no wander
+        self.assertLess(ka["park"], 1.5, kf)
+        # the 3 s gap: no NaN, no teleport, back on the line either side
+        self.assertEqual(ka["nan"], 0)
+        self.assertLess(ka["gapErr"], 1.5, kf)
+        self.assertLess(ka["stepErr"], 3.0, kf)
+        self.assertTrue(kf["direct"]["ok"])
+        self.assertGreater(kf["direct"]["nVel"], 3000)
+        self.assertIsNone(kf["tooFew"], "fewer than 20 fixes -> null")
+
+        # the facility network: every layout as a road line (areas are not),
+        # a nearest-road index over all of them where a pit lane loses a tie
+        # with the circuit beside it, half widths that follow the direction of
+        # travel, and the laps pulled onto the real centreline whichever way
+        # OpenStreetMap happened to draw it
+        nw = res["network"]
+        self.assertEqual(nw["n"], 2, nw)
+        self.assertEqual(nw["kinds"], ["circuit", "pit"])
+        self.assertAlmostEqual(nw["len0"], 600, delta=1)
+        self.assertEqual([nw["hl0"], nw["hr0"]], [4, 6])
+        self.assertEqual(nw["near0"], 1, "unbiased: the pit lane is nearer")
+        self.assertEqual(nw["nearB"], 0, "biased: the circuit wins the tie")
+        self.assertAlmostEqual(nw["effB"], 5, delta=0.01)
+        self.assertEqual(nw["nearS"], 0, "a skipped line is never returned")
+        self.assertEqual(nw["hwWest"], [4, 6], "the chain's own direction: as stored")
+        self.assertEqual(nw["hwEast"], [6, 4], "travelling the other way swaps sides")
+        self.assertGreater(nw["undMatched"], 0.98, nw)
+        self.assertLess(nw["undWorst"], 0.05, nw)
+        self.assertEqual(nw["undSrc"], 0)
+        self.assertLess(nw["dirMatched"], 0.01, "directed: a reversed chain never matches")
+        self.assertAlmostEqual(nw["dirMidZ"], 2, delta=1e-9)
+        self.assertEqual(nw["none"], 0)
+        self.assertTrue(nw["wholeNoLaps"])
 
 
 if __name__ == "__main__":

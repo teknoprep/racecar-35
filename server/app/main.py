@@ -2249,7 +2249,9 @@ async def session_coach_generate(request: Request, user: str, filename: str) -> 
         return JSONResponse({"ok": True, "already": True, "added": 0,
                             "detail": "this session has already been reviewed"})
     before = len(_coach_load(d))
-    _coach_analyze(d, p, _track_key(p.name), force=True)   # synchronous + explicit
+    # synchronous + explicit, but OFF the event loop: the model call can take
+    # RACECAR_AI_TIMEOUT_SECONDS and would freeze the whole server meanwhile
+    await asyncio.to_thread(lambda: _coach_analyze(d, p, _track_key(p.name), force=True))
     items = _coach_load(d)
     added = [i for i in items if i.get("session") == p.name]
     return JSONResponse({"ok": True, "already": False,
@@ -2511,7 +2513,8 @@ def _seed_tracks() -> int:
             tex = src.with_suffix(".jpg")
             if tex.is_file():
                 shutil.copy2(tex, TRACKS_DIR / tex.name)
-            for extra in (src.with_suffix(".dem.bin"), src.with_suffix(".demfar.bin")):
+            for extra in (src.with_suffix(".dem.bin"), src.with_suffix(".demfar.bin"),
+                          src.with_suffix(".ground.jpg")):
                 if extra.is_file():
                     shutil.copy2(extra, TRACKS_DIR / extra.name)
             shutil.copy2(src, dst)
@@ -2738,6 +2741,18 @@ async def trackasset_texture(request: Request, slug: str) -> FileResponse:
                         headers={"Cache-Control": "public, max-age=86400"})
 
 
+@app.get("/trackassets/{slug}/ground.jpg")
+async def trackasset_ground(request: Request, slug: str) -> FileResponse:
+    """Imagery of the whole FACILITY (every layout, paddock, run-off), coarser
+    than texture.jpg: the 3D view tints its ground with it."""
+    require_web_user(request)
+    p = TRACKS_DIR / (safe_name(slug, default="") + ".ground.jpg")
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="no ground image")
+    return FileResponse(p, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/trackassets/{slug}/dem/{which}")
 async def trackasset_dem(request: Request, slug: str, which: str) -> FileResponse:
     """The asset's high-resolution terrain grids (uint16 LE, south row first;
@@ -2782,9 +2797,14 @@ async def session_track_asset(request: Request, user: str, filename: str) -> JSO
 
 
 @app.post("/sessions/{user}/{filename}/track-prep")
-async def session_track_prep(request: Request, user: str, filename: str,
+def session_track_prep(request: Request, user: str, filename: str,
                              force: int = Query(0)) -> JSONResponse:
     """Kick off a pre-render for this session's track (owner-or-admin).
+
+    A plain `def` on purpose: FastAPI runs it on the thread pool. It reads the
+    session and asks Overpass for the nearby raceways (several mirrors, long
+    timeouts) - as an `async def` that froze the WHOLE server, dash uploads
+    included, for as long as Overpass took to answer.
 
     Uses OUR driven line when the session has one (best: it is the line the car
     actually takes), and falls back to the OpenStreetMap `highway=raceway` way
@@ -2805,9 +2825,14 @@ async def session_track_prep(request: Request, user: str, filename: str,
         except OSError:
             pass
     with _PREP_LOCK:
-        cur = (_PREP.get(slug) or {}).get("state")
-        if cur == "running":
-            return JSONResponse({"ok": True, "slug": slug, "state": "running",
+        st0 = _PREP.get(slug) or {}
+        cur = st0.get("state")
+        # "queued" = another request is still reading the session / asking
+        # Overpass (this handler runs on the thread pool, so two can overlap);
+        # a queued entry older than 5 min is a request that died, not a job
+        if cur == "running" or (cur == "queued" and
+                                time.time() - (st0.get("started") or 0) < 300):
+            return JSONResponse({"ok": True, "slug": slug, "state": cur,
                                  "already": True})
         _PREP[slug] = {"state": "queued", "track": track, "started": int(time.time()),
                        "log": []}
@@ -2821,7 +2846,8 @@ async def session_track_prep(request: Request, user: str, filename: str,
         try:
             lat0 = sum(x[0] for x in points) / len(points)
             lon0 = sum(x[1] for x in points) / len(points)
-            ways = tp.osm_raceways((lat0 - 0.06, lon0 - 0.08, lat0 + 0.06, lon0 + 0.08))
+            # only a width: do not wait out every Overpass mirror's 90 s for it
+            ways = tp.osm_raceways((lat0 - 0.06, lon0 - 0.08, lat0 + 0.06, lon0 + 0.08), timeout=25)
             way, dist = tp.osm_match_by_trace(points, ways, log=lambda m: _prep_log(slug, m))
             if way is not None:
                 osm_id = way["id"]
@@ -3099,7 +3125,7 @@ async def caps() -> dict:
     Armco that never crosses another section; a chevron driving line coloured
     by the driver's input; markers painted on the road, not poles in it."""
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": 11}
+            "track3d_v": 12}
 
 
 
@@ -5298,17 +5324,22 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
     except Exception:
         raise HTTPException(status_code=400, detail="region.points malformed")
 
-    samples = []
-    with open(p, "rb") as f:
-        for raw in f:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                samples.append(json.loads(raw))
-            except Exception:
-                continue
-    metrics = _region_metrics(samples, poly)
+    # every slow step (the session read, the cross-session lap library, the
+    # model's answer - up to RACECAR_AI_TIMEOUT_SECONDS) runs OFF the event
+    # loop: on it, one question froze the whole server, dash uploads included
+    def _metrics_from_file() -> dict:
+        samples = []
+        with open(p, "rb") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    samples.append(json.loads(raw))
+                except Exception:
+                    continue
+        return _region_metrics(samples, poly)
+    metrics = await asyncio.to_thread(_metrics_from_file)
     if not metrics.get("laps"):
         raise HTTPException(status_code=422,
                             detail="no lap data fell inside the selected region")
@@ -5317,12 +5348,13 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
     lib = None
     if body.get("refs", True):
         try:
-            lib = _lap_library(safe_name(user), p, poly)
+            lib = await asyncio.to_thread(_lap_library, safe_name(user), p, poly)
         except Exception as e:
             log.warning("lap library failed for %s/%s: %s", user, filename, e)
     question = str(body.get("prompt", "")).strip()
     messages = _region_prompt(metrics, question, lib=lib)
-    answer, used_model, usage = _ai_chat(messages, model=body.get("model"))
+    answer, used_model, usage = await asyncio.to_thread(
+        lambda: _ai_chat(messages, model=body.get("model")))
 
     entry = {
         "id": secrets.token_hex(8),
@@ -5373,7 +5405,7 @@ async def session_lines(request: Request, user: str, filename: str) -> JSONRespo
         raise HTTPException(status_code=400,
                             detail="region.points must be a polygon of >=3 [lat,lon] pairs")
     poly = [[float(pt[0]), float(pt[1])] for pt in poly]
-    lib = _lap_library(safe_name(user), p, poly)
+    lib = await asyncio.to_thread(_lap_library, safe_name(user), p, poly)   # off the event loop
     ideal, your_best, refs = _rank_lines(lib)
     return JSONResponse({
         "ok": True,
@@ -5439,7 +5471,7 @@ async def session_lines_ai(request: Request, user: str, filename: str) -> JSONRe
         raise HTTPException(status_code=400,
                             detail="region.points must be a polygon of >=3 [lat,lon] pairs")
     poly = [[float(pt[0]), float(pt[1])] for pt in poly]
-    lib = _lap_library(safe_name(user), p, poly)
+    lib = await asyncio.to_thread(_lap_library, safe_name(user), p, poly)   # off the event loop
     ideal, your_best, refs = _rank_lines(lib)
     hdr = "who | time_s | entry_mph | min_mph | exit_mph | brake_mph | brake_m_before_apex"
     rows = [hdr, "IDEAL " + _line_row(ideal), "YOU " + _line_row(your_best)]
@@ -5463,9 +5495,9 @@ async def session_lines_ai(request: Request, user: str, filename: str) -> JSONRe
         "You are a professional race engineer. Be concrete and numeric. "
         "Format in clean Markdown with a proper table (header + '---' row)."
     )
-    answer, used_model, usage = _ai_chat(
-        [{"role": "system", "content": system}, {"role": "user", "content": userq}],
-        model=body.get("model"))
+    answer, used_model, usage = await asyncio.to_thread(       # off the event loop
+        lambda: _ai_chat([{"role": "system", "content": system}, {"role": "user", "content": userq}],
+                         model=body.get("model")))
     entry = {
         "id": secrets.token_hex(8),
         "ts": int(time.time()),
@@ -7654,7 +7686,10 @@ _TRACK3D_HTML = (
     font:600 12px ui-monospace, Menlo, Consolas, monospace; margin-top:3px; }
   #hud .row .k { color:var(--muted); font-weight:400; }
   #legend { position:absolute; right:14px; top:14px; z-index:10; pointer-events:none;
-    background:rgba(14,16,20,0.62); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+    background:rgba(14,16,20,0.62); border:1px solid var(--line); border-radius:8px; padding:8px 12px;
+    max-width:min(470px, calc(100vw - 48px)); box-sizing:border-box; }
+  #legend #lg-track, #legend #lg-src, #legend #lg-corner { white-space:pre-line; line-height:1.35; }
+  #legend #lg-src { color:#AEB6C2; }
   #legend .li { display:flex; align-items:center; gap:7px; margin:3px 0;
     font:500 11px Inter,sans-serif; white-space:nowrap; }
   #legend .dot { width:10px; height:10px; border-radius:50%; flex:0 0 auto; border:1.5px solid #000; }
@@ -7750,6 +7785,7 @@ _TRACK3D_HTML = (
     <select id="b-scale"><option value="1">1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
   <label><input type="checkbox" id="b-markers" checked>markers</label>
   <label title="numbered brake boards (5 4 3 2 1 = hundreds of metres) before the corners that need them — tight corners get the full ladder, gentle bends get none"><input type="checkbox" id="b-brakes" checked>brake boards</label>
+  <label title="every other layout of the facility (other circuits, links, pit lanes, kart track) from OpenStreetMap + the imagery - shown, never driven on"><input type="checkbox" id="b-net" checked>all layouts</label>
   <label><input type="checkbox" id="b-ghost">other laps</label>
   <label><input type="checkbox" id="b-loop" checked>loop</label>
   <label title="lean the camera into corners (computed from the path curvature)"><input type="checkbox" id="b-bank" checked>bank</label>
@@ -8119,6 +8155,184 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     return RC3D.COAST_AMBER.slice();
   };
 
+  // ---- where the car REALLY was: Kalman filter + RTS smoother -------------
+  // A moving average of 25 Hz GPS wobbles (0.3-1 m fix noise) and cuts
+  // corners (it averages points on an arc, so it sits inside it). The u-blox
+  // Doppler speed and course over ground are far better than the fixes, so the
+  // state [x, z, vx, vz] (constant velocity, white-acceleration PSD q) takes
+  // the fixes (sigma posSigma) AND the velocity vector (speed + heading, only
+  // above minSpeed, anisotropic: along-track alongSigma, cross-track
+  // v*headingSigma) and is smoothed forward + backward (Rauch-Tung-Striebel),
+  // which removes the filter's lag. Slow/parked rows get a weak zero-velocity
+  // prior (heading is garbage there). dt <= 0 is clamped; a gap > opt.gap
+  // seconds is NOT propagated across - the covariance is blown up so each side
+  // stands alone. Plain 4x4 arithmetic into typed arrays: 40k rows in ~ms.
+  // Returns {x, z (Float64Array, local metres), nVel, nPos, ok} or null when
+  // there are fewer than 20 fixes.
+  function _kfPredict(P, dt, q) {
+    // P <- F P F^T + Q, F = [[I, dt I], [0, I]]
+    var r, c;
+    for (c = 0; c < 4; c++) { P[c] += dt * P[8 + c]; P[4 + c] += dt * P[12 + c]; }
+    for (r = 0; r < 4; r++) { P[r * 4] += dt * P[r * 4 + 2]; P[r * 4 + 1] += dt * P[r * 4 + 3]; }
+    var q3 = q * dt * dt * dt / 3, q2 = q * dt * dt / 2, q1 = q * dt;
+    P[0] += q3; P[5] += q3; P[10] += q1; P[15] += q1;
+    P[2] += q2; P[8] += q2; P[7] += q2; P[13] += q2;
+  }
+  function _kfUpdate(xs, P, i0, i1, y0, y1, r00, r01, r11, tmp) {
+    var s00 = P[i0 * 5] + r00, s01 = P[i0 * 4 + i1] + r01, s11 = P[i1 * 5] + r11;
+    var det = s00 * s11 - s01 * s01, r, c;
+    if (!(det > 1e-12)) return false;
+    var a00 = s11 / det, a01 = -s01 / det, a11 = s00 / det;
+    y0 -= xs[i0]; y1 -= xs[i1];
+    for (c = 0; c < 4; c++) { tmp[c] = P[i0 * 4 + c]; tmp[4 + c] = P[i1 * 4 + c]; }
+    for (r = 0; r < 4; r++) {
+      var k0 = P[r * 4 + i0] * a00 + P[r * 4 + i1] * a01;
+      var k1 = P[r * 4 + i0] * a01 + P[r * 4 + i1] * a11;
+      xs[r] += k0 * y0 + k1 * y1;
+      for (c = 0; c < 4; c++) P[r * 4 + c] -= k0 * tmp[c] + k1 * tmp[4 + c];
+    }
+    for (r = 0; r < 4; r++) for (c = r + 1; c < 4; c++) {
+      var m = (P[r * 4 + c] + P[c * 4 + r]) / 2;
+      P[r * 4 + c] = m; P[c * 4 + r] = m;
+    }
+    return true;
+  }
+  // Solve A y = b for a symmetric positive-definite 4x4 (Cholesky, in place:
+  // A is destroyed, b becomes y). false when not positive-definite.
+  function _chol4(A, b) {
+    var i, j, k, s;
+    for (j = 0; j < 4; j++) {
+      s = A[j * 5];
+      for (k = 0; k < j; k++) s -= A[j * 4 + k] * A[j * 4 + k];
+      if (!(s > 1e-18)) return false;
+      A[j * 5] = Math.sqrt(s);
+      for (i = j + 1; i < 4; i++) {
+        s = A[i * 4 + j];
+        for (k = 0; k < j; k++) s -= A[i * 4 + k] * A[j * 4 + k];
+        A[i * 4 + j] = s / A[j * 5];
+      }
+    }
+    for (i = 0; i < 4; i++) {
+      s = b[i];
+      for (k = 0; k < i; k++) s -= A[i * 4 + k] * b[k];
+      b[i] = s / A[i * 5];
+    }
+    for (i = 3; i >= 0; i--) {
+      s = b[i];
+      for (k = i + 1; k < 4; k++) s -= A[k * 4 + i] * b[k];
+      b[i] = s / A[i * 5];
+    }
+    return true;
+  }
+  RC3D.kalmanPath = function (samples, o, opt) {
+    opt = opt || {};
+    var n = samples.length, i, k, c, s;
+    var q = opt.q == null ? 10 : opt.q;
+    var ps = opt.posSigma == null ? 1.0 : opt.posSigma, R0 = ps * ps;
+    var sa = opt.alongSigma == null ? 0.3 : opt.alongSigma;
+    var sh = (opt.headingSigmaDeg == null ? 1.5 : opt.headingSigmaDeg) * Math.PI / 180;
+    var vMin = opt.minSpeed == null ? 4 : opt.minSpeed;
+    var gapS = opt.gap == null ? 1.0 : opt.gap;
+    var DT_MIN = 1e-3;
+    var mx = new Float64Array(n), mz = new Float64Array(n), hasP = new Uint8Array(n);
+    var vx = new Float64Array(n), vz = new Float64Array(n);
+    var w00 = new Float64Array(n), w01 = new Float64Array(n), w11 = new Float64Array(n);
+    var hasV = new Uint8Array(n), nPos = 0, nVel = 0, first = -1;
+    if (!o) {
+      var sla = 0, slo = 0, na = 0;
+      for (i = 0; i < n; i++) {
+        s = samples[i];
+        if (s && _num(s.lat) && _num(s.lon) && (s.lat || s.lon)) { sla += s.lat; slo += s.lon; na++; }
+      }
+      o = na ? { lat: sla / na, lon: slo / na } : { lat: 0, lon: 0 };
+    }
+    for (i = 0; i < n; i++) {
+      s = samples[i];
+      if (!s) continue;
+      if (_num(s.lat) && _num(s.lon) && (s.lat || s.lon)) {
+        var pp = RC3D.project(s.lat, s.lon, o);
+        mx[i] = pp.x; mz[i] = pp.z; hasP[i] = 1; nPos++;
+        if (first < 0) first = i;
+      }
+      if (_num(s.speed_mph)) {
+        var v = Math.abs(s.speed_mph) * 0.44704;
+        if (v > vMin && _num(s.heading_deg)) {
+          var h = s.heading_deg * Math.PI / 180, sn = Math.sin(h), cs = Math.cos(h);
+          var sc = Math.max(0.05, v * sh), A2 = sa * sa, C2 = sc * sc;
+          vx[i] = v * sn; vz[i] = -v * cs;
+          w00[i] = A2 * sn * sn + C2 * cs * cs;
+          w01[i] = sn * cs * (C2 - A2);
+          w11[i] = A2 * cs * cs + C2 * sn * sn;
+          hasV[i] = 1; nVel++;
+        } else if (v <= vMin) {
+          // slow / parked: heading is noise, speed says "barely moving"
+          var sz = Math.max(0.5, 1.5 * v);
+          w00[i] = sz * sz; w01[i] = 0; w11[i] = sz * sz;
+          hasV[i] = 2;
+        }
+      }
+    }
+    if (nPos < 20) return null;
+    var t = RC3D.timeline(samples);
+    var XF = new Float64Array(4 * n), PF = new Float64Array(16 * n);
+    var DT = new Float64Array(n), GAP = new Uint8Array(n);
+    var xs = new Float64Array(4), P = new Float64Array(16), tmp = new Float64Array(8);
+    xs[0] = mx[first]; xs[1] = mz[first];
+    if (hasV[first] === 1) { xs[2] = vx[first]; xs[3] = vz[first]; }
+    P[0] = P[5] = 1e4; P[10] = P[15] = 1e3;
+    for (i = 0; i < n; i++) {
+      if (i) {
+        var dt = t[i] - t[i - 1];
+        if (!(dt > DT_MIN)) dt = DT_MIN;
+        DT[i] = dt;
+        if (dt > gapS) {
+          // a long gap: do not extrapolate a corner into a straight line -
+          // keep the state, forget how sure we were
+          GAP[i] = 1;
+          for (c = 0; c < 16; c++) P[c] = 0;
+          P[0] = P[5] = 1e6; P[10] = P[15] = 1e4;
+        } else {
+          xs[0] += dt * xs[2]; xs[1] += dt * xs[3];
+          _kfPredict(P, dt, q);
+        }
+      }
+      if (hasP[i]) _kfUpdate(xs, P, 0, 1, mx[i], mz[i], R0, 0, R0, tmp);
+      if (hasV[i] === 1) _kfUpdate(xs, P, 2, 3, vx[i], vz[i], w00[i], w01[i], w11[i], tmp);
+      else if (hasV[i] === 2) _kfUpdate(xs, P, 2, 3, 0, 0, w00[i], 0, w11[i], tmp);
+      for (c = 0; c < 4; c++) XF[i * 4 + c] = xs[c];
+      for (c = 0; c < 16; c++) PF[i * 16 + c] = P[c];
+    }
+    // Rauch-Tung-Striebel: x_k|n = x_k|k + P_k F^T Pp^-1 (x_k+1|n - F x_k|k)
+    var outX = new Float64Array(n), outZ = new Float64Array(n), d = new Float64Array(4);
+    var nx0 = XF[(n - 1) * 4], nx1 = XF[(n - 1) * 4 + 1], nx2 = XF[(n - 1) * 4 + 2], nx3 = XF[(n - 1) * 4 + 3];
+    outX[n - 1] = nx0; outZ[n - 1] = nx1;
+    for (k = n - 2; k >= 0; k--) {
+      var b = k * 4, dtk = DT[k + 1];
+      var f0 = XF[b], f1 = XF[b + 1], f2 = XF[b + 2], f3 = XF[b + 3];
+      if (!GAP[k + 1]) {
+        for (c = 0; c < 16; c++) P[c] = PF[k * 16 + c];
+        _kfPredict(P, dtk, q);
+        d[0] = nx0 - (f0 + dtk * f2); d[1] = nx1 - (f1 + dtk * f3);
+        d[2] = nx2 - f2; d[3] = nx3 - f3;
+        if (_chol4(P, d)) {
+          // g = F^T y, then x += P_k g
+          var g0 = d[0], g1 = d[1], g2 = d[2] + dtk * d[0], g3 = d[3] + dtk * d[1], pb = k * 16;
+          f0 += PF[pb] * g0 + PF[pb + 1] * g1 + PF[pb + 2] * g2 + PF[pb + 3] * g3;
+          f1 += PF[pb + 4] * g0 + PF[pb + 5] * g1 + PF[pb + 6] * g2 + PF[pb + 7] * g3;
+          var u2 = PF[pb + 8] * g0 + PF[pb + 9] * g1 + PF[pb + 10] * g2 + PF[pb + 11] * g3;
+          var u3 = PF[pb + 12] * g0 + PF[pb + 13] * g1 + PF[pb + 14] * g2 + PF[pb + 15] * g3;
+          f2 += u2; f3 += u3;
+        }
+      }
+      if (!(isFinite(f0) && isFinite(f1) && isFinite(f2) && isFinite(f3))) {
+        f0 = XF[b]; f1 = XF[b + 1]; f2 = XF[b + 2]; f3 = XF[b + 3];
+      }
+      nx0 = f0; nx1 = f1; nx2 = f2; nx3 = f3;
+      outX[k] = f0; outZ[k] = f1;
+    }
+    return { x: outX, z: outZ, nVel: nVel, nPos: nPos, ok: true };
+  };
+
   // The drivable path: smoothed positions, cumulative arc length, and a dense
   // (~denseStep m) centreline with its own arc-length table + XZ tangents.
   // Repeated logger rows are dropped first (opts.keepRepeats opts out); the
@@ -8168,9 +8382,31 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     for (i = 0; i < n; i++) if (Y[i] < yMin) yMin = Y[i];
     if (!isFinite(yMin)) yMin = 0;
     for (i = 0; i < n; i++) Y[i] -= yMin;
-    // lateral smoothing is the whole point: GPS noise is 1-2 m at 25 Hz
-    X = RC3D.smooth(X, win);
-    Z = RC3D.smooth(Z, win);
+    // lateral smoothing is the whole point: GPS noise is 1-2 m at 25 Hz.
+    // With real course-over-ground data (at least half the moving rows carry a
+    // heading) the Kalman/RTS path puts the car where it really was across the
+    // track; the smooth slider maps onto how far a single fix is trusted.
+    // Otherwise (old logs, synthetic rows) the centred moving average.
+    var posSource = "smooth";
+    if (opts.kalman !== false) {
+      var nMov = 0, nHd = 0;
+      for (i = 0; i < n; i++) {
+        var sk = samples[i];
+        if (sk && _num(sk.speed_mph) && Math.abs(sk.speed_mph) * 0.44704 > 4) {
+          nMov++;
+          if (_num(sk.heading_deg)) nHd++;
+        }
+      }
+      if (nMov > 0 && nHd * 2 >= nMov) {
+        var psg = Math.min(3, Math.max(0.5, 0.5 + 0.125 * (Math.max(1, win) - 1)));
+        var kp = RC3D.kalmanPath(samples, o, { posSigma: psg });
+        if (kp) { X = Array.from(kp.x); Z = Array.from(kp.z); posSource = "kalman"; }
+      }
+    }
+    if (posSource === "smooth") {
+      X = RC3D.smooth(X, win);
+      Z = RC3D.smooth(Z, win);
+    }
     mphRaw = mph.slice();
     mph = RC3D.smooth(RC3D.fillNulls(mph, 0), Math.max(3, win));
 
@@ -8254,7 +8490,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var out = {
       o: o, n: n, x: X, y: Y, z: Z, t: t, speed: mph, accel: acc, cum: cum, total: total,
       accelSource: acc.source, imuR: acc.imuR, samples: samples, rpm: rpmA,
-      srcIndex: srcIdx,
+      srcIndex: srcIdx, positionSource: posSource,
       yRef: yMin, dense: { x: dx2, y: dy2, z: dz2, s: ds2, total: dTotal, tan: tan,
                            knC: knC, knS: knS }
     };
@@ -9361,7 +9597,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         rx.push(d.x[i]); rz.push(d.z[i]); rs.push(d.s[i] - dA);
       }
     }
-    if (rx.length < 4) return { x: d.x.slice(), z: d.z.slice() };
+    if (rx.length < 4) return { x: d.x.slice(), z: d.z.slice(), whole: true };   // no usable lap
     var refOut = { x: rx.slice(), z: rz.slice() };
     if (good.length < 2) return refOut;
     var idx = _lineIndex(rx, rz, near), total = rs[rs.length - 1];
@@ -9525,10 +9761,17 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     if (asset.landcover && asset.landcover.bounds) {
       out.landcover = Object.assign({}, asset.landcover, { bounds: sb(asset.landcover.bounds) });
     }
-    if (asset.texture && asset.texture.bounds) {
-      var tb = asset.texture.bounds;
-      out.texture = Object.assign({}, asset.texture, { bounds: {
+    ["texture", "ground"].forEach(function (k) {
+      if (!asset[k] || !asset[k].bounds) return;
+      var tb = asset[k].bounds;
+      out[k] = Object.assign({}, asset[k], { bounds: {
         south: tb.south + dLat, north: tb.north + dLat, west: tb.west + dLon, east: tb.east + dLon } });
+    });
+    if (asset.network && asset.network.chains) {
+      out.network = Object.assign({}, asset.network, {
+        chains: asset.network.chains.map(function (c) {
+          var c2 = Object.assign({}, c); c2.p = (c.p || []).map(sp); return c2;
+        }) });
     }
     if (asset.features) {
       var F = {};
@@ -9655,16 +9898,23 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   RC3D.blendOnto = function (cx, cz, lx, lz, opt) {
     opt = opt || {};
     var near = opt.near || 8, blendM = opt.blend || 40, n = cx.length, i;
-    var idx = RC3D.lineIndex(lx, lz, Math.max(near, 10));
+    // opt.index: a ready index (e.g. RC3D.multiIndex over a whole network).
+    // OSM ways run either way round, so by default a parallel line matches in
+    // both directions; opt.directed demands the same direction of travel.
+    var idx = opt.index || RC3D.lineIndex(lx, lz, Math.max(near, 10));
+    var directed = !!opt.directed, src = new Array(n);
     var ox = new Float64Array(n), oz = new Float64Array(n), w = new Float64Array(n), hit = 0;
     for (i = 0; i < n; i++) {
       var a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
       var tx = cx[b] - cx[a], tz = cz[b] - cz[a], L = Math.sqrt(tx * tx + tz * tz) || 1;
       var h = idx.nearest(cx[i], cz[i], near);
       if (!h) continue;
-      // the line's own direction at that point: its normal is (-tz, tx)
-      if (Math.abs((-h.nz) * tx / L + h.nx * tz / L) < 0.9) continue;
+      // the line's own direction at that point is (nz, -nx) (lineIndex's
+      // normal is the direction turned left)
+      var dot = (h.nz * tx - h.nx * tz) / L;
+      if ((directed ? dot : Math.abs(dot)) < 0.9) continue;
       ox[i] = h.px - cx[i]; oz[i] = h.pz - cz[i]; w[i] = 1; hit++;
+      src[i] = h;
     }
     // stations are ~1 m apart: a moving window of `blend` stations
     var half = Math.max(1, Math.round(blendM / 2));
@@ -9683,7 +9933,66 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       if (w[i] && k2 > 0.9) { mx = ox[i]; mz = oz[i]; }
       outX[i] = cx[i] + mx * f; outZ[i] = cz[i] + mz * f;
     }
-    return { x: outX, z: outZ, matched: n ? hit / n : 0 };
+    return { x: outX, z: outZ, matched: n ? hit / n : 0, src: src };
+  };
+
+  // ---- the facility's whole track network (asset.network, every layout) ----
+  // OSM raceway chains re-centred on the imagery, with measured half widths
+  // per point ("left" = left of the direction the chain's points run). Area
+  // polygons are skipped. -> [{x, z, hl, hr, kind, closed, names, len}]
+  RC3D.networkLines = function (asset, o) {
+    var net = asset && asset.network, out = [];
+    if (!net || !net.chains) return out;
+    net.chains.forEach(function (c) {
+      if (!c || c.kind === "area" || !c.p || c.p.length < 2) return;
+      var x = [], z = [], hl = [], hr = [], k, len = 0, w0 = (c.w > 0 ? c.w : 9) / 2;
+      for (k = 0; k < c.p.length; k++) {
+        var q = RC3D.project(c.p[k][0], c.p[k][1], o);
+        if (k) len += Math.hypot(q.x - x[k - 1], q.z - z[k - 1]);
+        x.push(q.x); z.push(q.z);
+        var h = c.hw && c.hw[k];
+        hl.push(h && h[0] > 0.5 ? h[0] : w0);
+        hr.push(h && h[1] > 0.5 ? h[1] : w0);
+      }
+      out.push({ x: x, z: z, hl: hl, hr: hr, kind: c.kind || "circuit", closed: !!c.closed,
+                 names: c.names || [], len: len });
+    });
+    return out;
+  };
+
+  // nearest point over SEVERAL polylines. opt.bias(line) adds metres to a
+  // line's distance (a pit lane loses a tie with the circuit beside it);
+  // opt.skip(line) leaves a line out. Result as lineIndex's, plus `line`
+  // (its index) and `eff` (the biased distance).
+  RC3D.multiIndex = function (lines, cell, opt) {
+    opt = opt || {};
+    cell = cell || 20;
+    var parts = lines.map(function (L, k) {
+      return (opt.skip && opt.skip(L, k)) ? null : RC3D.lineIndex(L.x, L.z, cell);
+    });
+    var bias = lines.map(function (L, k) { return opt.bias ? (opt.bias(L, k) || 0) : 0; });
+    return {
+      nearest: function (x, z, maxD) {
+        var best = null, k;
+        for (k = 0; k < parts.length; k++) {
+          if (!parts[k] || bias[k] >= maxD) continue;
+          var h = parts[k].nearest(x, z, maxD - bias[k]);
+          if (!h) continue;
+          var eff = h.d + bias[k];
+          if (!best || eff < best.eff) { h.line = k; h.eff = eff; best = h; }
+        }
+        return best;
+      }
+    };
+  };
+
+  // [left, right] half widths of network line h.line at hit h, as seen
+  // travelling along (tx, tz): a chain drawn the other way round swaps sides
+  RC3D.networkHalfAt = function (lines, h, tx, tz) {
+    var L = lines[h.line], a = h.seg, b = Math.min(L.x.length - 1, a + 1), f = h.f || 0;
+    var hl = L.hl[a] + (L.hl[b] - L.hl[a]) * f, hr = L.hr[a] + (L.hr[b] - L.hr[a]) * f;
+    var lx = L.x[b] - L.x[a], lz = L.z[b] - L.z[a];
+    return (lx * tx + lz * tz) >= 0 ? [hl, hr] : [hr, hl];
   };
 
   // Burn OpenStreetMap areas into a land-cover grid (rows NORTH first, codes
@@ -9866,7 +10175,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
                  gantry: null, ground: null, signs: null, car: null,
                  barriers: null, trees: null, labels: null, wash: null,
                  line: null, edges: null, buildings: null, water: null,
-                 roads: null, fences: null, events: null };
+                 roads: null, fences: null, events: null, network: null };
   var ASSET = null, TEX = null, assetSample = null;   // prepared-track data
   var BOOTED = false;                                 // first world build done
   var look = { yaw: 0, pitch: 0 };
@@ -9876,7 +10185,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   var CORNERS = [];                                       // detected corners
   var TRACK_SEED = "track";                               // stable per-track scatter
   var opts = { smooth: 5, eye: 1.15, road: 12, speedColour: true, markers: true,
-               ghost: false, ground: "sim", brakes: true, dressing: true };
+               ghost: false, ground: "sim", brakes: true, dressing: true, network: true };
 
   function tryRenderer() {
     try {
@@ -10192,10 +10501,26 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     } else {
       terrain = RC3D.pathTerrain(d);
     }
-    var groundY = RC3D.groundField(d, field, { halfWidth: hw, terrain: terrain,
-                                              maxHalf: maxHalf, drop: 0.1, shoulder: 4 });
-    var gb = RC3D.denseBox(d, 320), gstep = Math.max(5, ext / 560);
-    var xs = axisNodes(gb.minX, gb.maxX, gstep, 6000), zs = axisNodes(gb.minZ, gb.maxZ, gstep, 6000);
+    var trackGround = RC3D.groundField(d, field, { halfWidth: hw, terrain: terrain,
+                                                  maxHalf: maxHalf, drop: 0.1, shoulder: 4 });
+    // every other layout of the facility, seated on that ground and flattening
+    // it in turn
+    var net = null;
+    if (opts.network && NET.length) {
+      try { net = buildNet({ d: d, field: field, hw: hw }, trackGround); }
+      catch (e) { console.warn("[track3d] network:", e && e.message ? e.message : e); net = null; }
+    }
+    var groundY = net ? net.groundY : trackGround;
+    // fine cells across the circuit you drove, twice as coarse over the rest
+    // of the facility, then growing out to the fogged horizon
+    var tb = RC3D.denseBox(d, 320), gb = tb;
+    if (net) {
+      gb = { minX: Math.min(tb.minX, net.box.minX - 120), maxX: Math.max(tb.maxX, net.box.maxX + 120),
+             minZ: Math.min(tb.minZ, net.box.minZ - 120), maxZ: Math.max(tb.maxZ, net.box.maxZ + 120) };
+    }
+    var gstep = Math.max(5, ext / 560);
+    var xs = axisNodes(tb.minX, tb.maxX, gstep, 6000, gb.minX, gb.maxX, gstep * 2);
+    var zs = axisNodes(tb.minZ, tb.maxZ, gstep, 6000, gb.minZ, gb.maxZ, gstep * 2);
     var nodeY = new Map();
     var nodeAt = function (c, r) {
       var k = r * xs.length + c, v = nodeY.get(k);
@@ -10223,9 +10548,137 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       var y3 = nodeAt(c + 1, r + 1);
       return y3 + (1 - u) * (y2 - y3) + (1 - v) * (y1 - y3);
     };
+    // distance from (x, z) to the nearest road EDGE of any layout (negative =
+    // on the tarmac): what OSM roads, fences and trees keep clear of
+    var edgeDist = function (x, z) {
+      var best, q, a = field.approx(x, z);
+      if (a < maxHalf + 60) { q = field.nearest(x, z); best = q ? q.d - hw(q.i) : a - maxHalf; }
+      else best = a - maxHalf;
+      if (net) {
+        var a2 = net.field.approx(x, z);
+        if (a2 < net.maxHalf + 60) {
+          q = net.field.nearest(x, z);
+          if (q) best = Math.min(best, q.d - net.hw(q.i));
+        } else best = Math.min(best, a2 - net.maxHalf);
+      }
+      return best;
+    };
+    // the track's own edge lines and kerbs stop at the mouth of a pit lane or
+    // a link (a point on another layout's tarmac)
+    var veto = net ? function (x, z) {
+      if (net.field.approx(x, z) > net.maxHalf + 4) return false;
+      var q = net.field.nearest(x, z);
+      return !!(q && q.d < net.hw(q.i) - 0.15);
+    } : null;
     return { base: base, d: d, hw: hw, half: half, field: field, box: box,
              terrain: terrain, groundY: surfaceY, idealY: groundY, maxHalf: maxHalf,
-             xs: xs, zs: zs, nodeAt: nodeAt };
+             xs: xs, zs: zs, nodeAt: nodeAt, net: net, edgeDist: edgeDist, veto: veto };
+  }
+
+  // The network minus the stretches that ARE the track (on its tarmac and
+  // running parallel): what is left is every other layout, pit lane and kart
+  // track. Each piece runs 2 stations on into the cut so it tucks under the
+  // track's tarmac at a junction instead of stopping short of it. Heights come
+  // from the track's ground (terrain, flattened at the track), so a pit lane or
+  // a link meets the circuit at the circuit's height.
+  function buildNet(W0, trackGround) {
+    var pieces = [], X = [], Z = [], Y = [], HW = [], PI = [], k;
+    NET.forEach(function (L, li) {
+      var n = L.x.length, keep = new Uint8Array(n);
+      for (k = 0; k < n; k++) {
+        var a = Math.max(0, k - 1), b = Math.min(n - 1, k + 1);
+        var tx = L.x[b] - L.x[a], tz = L.z[b] - L.z[a], tl = Math.hypot(tx, tz) || 1;
+        var same = false;
+        if (W0.field.approx(L.x[k], L.z[k]) < 40) {
+          var q = W0.field.nearest(L.x[k], L.z[k]);
+          same = !!q && q.d < W0.hw(q.i) + 1.5 &&
+                 Math.abs((W0.d.tan[q.i][0] * tx + W0.d.tan[q.i][1] * tz) / tl) > 0.85;
+        }
+        keep[k] = same ? 0 : 1;
+      }
+      var runs = [], s0 = -1;
+      for (k = 0; k <= n; k++) {
+        if (k < n && keep[k]) { if (s0 < 0) s0 = k; }
+        else if (s0 >= 0) { runs.push([s0, k - 1]); s0 = -1; }
+      }
+      var whole = runs.length === 1 && runs[0][0] === 0 && runs[0][1] === n - 1;
+      // a closed chain (no repeated end point) whose kept stretch runs through
+      // its seam is ONE piece, not two with a gap in the edge lines
+      if (L.closed && !whole && runs.length > 1 && runs[0][0] === 0 &&
+          runs[runs.length - 1][1] === n - 1) {
+        var last = runs.pop();
+        runs[0] = [last[0], runs[0][1] + n];
+      }
+      runs.forEach(function (r) {
+        var a = r[0] - 2, b = r[1] + 2, j, ids = [];
+        if (!L.closed || whole) { a = Math.max(0, a); b = Math.min(n - 1, b); }
+        for (j = a; j <= b && ids.length < n; j++) ids.push(((j % n) + n) % n);
+        if (ids.length < 4) return;
+        var xs = ids.map(function (q) { return L.x[q]; }), zs = ids.map(function (q) { return L.z[q]; });
+        var HL = ids.map(function (q) { return L.hl[q]; }), HR = ids.map(function (q) { return L.hr[q]; });
+        var cum = [0];
+        for (j = 1; j < xs.length; j++) cum.push(cum[j - 1] + Math.hypot(xs[j] - xs[j - 1], zs[j] - zs[j - 1]));
+        if (cum[cum.length - 1] < 12) return;
+        var ys = RC3D.smooth(xs.map(function (x, jj) { return trackGround(x, zs[jj]); }), 7);
+        var P = RC3D.linePath(xs, zs, ys, { closed: whole && L.closed, step: 1, o: PATH.o });
+        var D = P.dense, m = D.x.length, hl = new Float64Array(m), hr = new Float64Array(m);
+        var sc = cum[cum.length - 1] / (D.total || 1), seg = 0;
+        for (j = 0; j < m; j++) {
+          var sv = D.s[j] * sc;
+          while (seg < cum.length - 2 && cum[seg + 1] < sv) seg++;
+          var s1 = Math.min(seg + 1, cum.length - 1);
+          var f = cum[s1] > cum[seg] ? Math.max(0, Math.min(1, (sv - cum[seg]) / (cum[s1] - cum[seg]))) : 0;
+          hl[j] = HL[seg] + (HL[s1] - HL[seg]) * f;
+          hr[j] = HR[seg] + (HR[s1] - HR[seg]) * f;
+          X.push(D.x[j]); Z.push(D.z[j]); Y.push(D.y[j]); HW.push(Math.max(hl[j], hr[j]));
+          PI.push(pieces.length);
+        }
+        pieces.push({ path: P, hl: hl, hr: hr, kind: L.kind, names: L.names, line: li });
+      });
+    });
+    if (!X.length) return null;
+    var nd = { x: X, z: Z, y: Y }, box = RC3D.denseBox(nd, 0);
+    var nbox = RC3D.denseBox(nd, 120), ext = Math.max(nbox.maxX - nbox.minX, nbox.maxZ - nbox.minZ);
+    var nfield = RC3D.roadField(nd, nbox, Math.max(4, Math.ceil(ext / 1800)));
+    var nhw = function (i) { return HW[i]; }, maxH = 0;
+    for (k = 0; k < HW.length; k++) if (HW[k] > maxH) maxH = HW[k];
+    var gy = RC3D.groundField(nd, nfield, { halfWidth: nhw, terrain: trackGround,
+                                           maxHalf: maxH, drop: 0.1, shoulder: 3 });
+    return { pieces: pieces, d: nd, field: nfield, hw: nhw, pieceOf: PI, maxHalf: maxH,
+             groundY: gy, box: box };
+  }
+
+  // the other layouts: tarmac at their measured width, edge lines that stop
+  // where they would cross another road, kerbs through their bends (not on
+  // pit lanes or ovals). Drawn a few cm under the track at every junction.
+  function makeNetwork(W) {
+    var net = W.net;
+    if (!net || !net.pieces.length) return null;
+    var grp = new THREE.Group();
+    net.pieces.forEach(function (pc, k) {
+      var D = pc.path.dense;
+      var veto = function (x, z) {
+        if (W.field.approx(x, z) < W.maxHalf + 6) {
+          var q = W.field.nearest(x, z);
+          if (q && q.d < W.hw(q.i) - 0.15) return true;
+        }
+        var q2 = net.field.nearest(x, z);
+        return !!(q2 && net.pieceOf[q2.i] !== k && q2.d < net.hw(q2.i) - 0.15);
+      };
+      grp.add(makeRoad(pc.path, 9, 0.02, false, null, 1,
+                       { asphalt: true, half: [pc.hl, pc.hr], o: PATH.o }));
+      var pw = { d: D, half: [pc.hl, pc.hr], veto: veto,
+                 hw: function (i) { return Math.max(pc.hl[i], pc.hr[i]); } };
+      var el2 = makeEdgeLines(pw);
+      if (el2) grp.add(el2);
+      if (pc.kind !== "pit" && pc.kind !== "oval" && D.x.length > 20) {
+        pw.field = RC3D.roadField(D, RC3D.denseBox(D, 40), 4);
+        var kb = makeKerbs(pw);
+        if (kb) grp.add(kb);
+      }
+    });
+    grp.userData.count = net.pieces.length;
+    return grp;
   }
 
   // A strip along the centreline between two lateral offsets (metres; + is the
@@ -10285,15 +10738,27 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
      flattened under the road. Shaded by a splat of the imagery's land cover —
      grass, woods floor, paved (paddock, other circuits), dirt — with grass
      forced near the road so a misregistered image cannot paint a ghost road. */
-  function axisNodes(min, max, step, outer) {
+  // fine `step` over [min, max]; optionally `midStep` out to [lo, hi] (the
+  // rest of the facility); then geometric growth to `outer` beyond that
+  function axisNodes(min, max, step, outer, lo, hi, midStep) {
     var a = [], v;
     for (v = min; v < max; v += step) a.push(v);
     a.push(max);
     var left = [], right = [], s = step;
     v = min;
-    while (v > min - outer) { s *= 1.2; v -= s; left.push(v); }
+    if (lo != null && lo < min - midStep) {
+      while (v - midStep > lo) { v -= midStep; left.push(v); }
+      s = midStep;
+    }
+    var edgeL = v;
+    while (v > edgeL - outer) { s *= 1.2; v -= s; left.push(v); }
     s = step; v = max;
-    while (v < max + outer) { s *= 1.2; v += s; right.push(v); }
+    if (hi != null && hi > max + midStep) {
+      while (v + midStep < hi) { v += midStep; right.push(v); }
+      s = midStep;
+    }
+    var edgeR = v;
+    while (v < edgeR + outer) { s *= 1.2; v += s; right.push(v); }
     return left.reverse().concat(a, right);
   }
 
@@ -10335,8 +10800,20 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       rcDirt: { value: T.dirt }, rcMacro: { value: T.macro },
       rcSplat: { value: null }, rcSplatXf: { value: new THREE.Vector4() },
       rcHasSplat: { value: 0 },
-      rcSat: { value: null }, rcSatXf: { value: new THREE.Vector4() }, rcUseSat: { value: 0 }
+      rcSat: { value: null }, rcSatXf: { value: new THREE.Vector4() }, rcUseSat: { value: 0 },
+      rcImg: { value: null }, rcImgXf: { value: new THREE.Vector4() }, rcUseImg: { value: 0 }
     };
+    // the facility imagery as the ground's COLOUR (where it is mown, worn, dirt,
+    // paddock, run-off), the procedural textures as its close-up DETAIL
+    // (satellite mode: the same imagery, uncorrected, wherever the track's
+    // own sharper texture does not reach - the rest of the facility)
+    if ((opts.ground === "sim" || opts.ground === "satellite") &&
+        GROUND_TEX && ASSET && ASSET.ground && ASSET.ground.bounds) {
+      var gbd = ASSET.ground.bounds;
+      u.rcImg.value = GROUND_TEX;
+      u.rcImgXf.value = boundsXf(gbd.south, gbd.west, gbd.north, gbd.east);
+      u.rcUseImg.value = opts.ground === "satellite" ? 2 : 1;
+    }
     if (LC) {
       var st = splatTexture(LC);
       if (st) {
@@ -10366,6 +10843,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
           "uniform sampler2D rcMacro; uniform sampler2D rcSplat; uniform sampler2D rcSat;",
           "uniform vec4 rcSplatXf; uniform vec4 rcSatXf;",
           "uniform float rcHasSplat; uniform float rcUseSat;",
+          "uniform sampler2D rcImg; uniform vec4 rcImgXf; uniform float rcUseImg;",
           "varying vec2 vRcXZ; varying float vRcNear;"].join("\\n"))
         .replace("#include <map_fragment>", [
           "vec3 rcG = texture2D(rcGrass, vRcXZ * 0.22).rgb;",
@@ -10389,6 +10867,23 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
           "    rcCol = rcGrassC * wg + paved * wp + floorC * ww + dirt * wo;",
           "  }",
           "}",
+          "if (rcUseImg > 0.5) {",
+          "  vec2 iuv = vec2((vRcXZ.x - rcImgXf.x) * rcImgXf.y, (rcImgXf.z - vRcXZ.y) * rcImgXf.w);",
+          "  if (iuv.x > 0.0 && iuv.x < 1.0 && iuv.y > 0.0 && iuv.y < 1.0) {",
+          "    float ie = min(min(iuv.x, 1.0 - iuv.x), min(iuv.y, 1.0 - iuv.y));",
+          "    vec3 im = texture2D(rcImg, iuv).rgb;",
+          "    if (rcUseImg > 1.5) {",
+          "      rcCol = mix(rcCol, im, smoothstep(0.0, 0.08, ie));",
+          "    } else {",
+          "      float dl = dot(rcG, vec3(0.333)) / max(0.04, dot(rcG2, vec3(0.333)));",
+          "      float il = dot(im, vec3(0.299, 0.587, 0.114));",
+          "      im = mix(vec3(il), im, 1.18) * 1.32;",
+          "      vec3 hyb = im * mix(1.0, clamp(dl, 0.55, 1.5), 0.7) * (0.9 + 0.2 * rcM2);",
+          "      float kk = 0.82 * smoothstep(0.0, 0.16, ie) * mix(0.45, 1.0, clamp(vRcNear, 0.0, 1.0));",
+          "      rcCol = mix(rcCol, hyb, kk);",
+          "    }",
+          "  }",
+          "}",
           "if (rcUseSat > 0.5) {",
           "  vec2 tuv = vec2((vRcXZ.x - rcSatXf.x) * rcSatXf.y, (rcSatXf.z - vRcXZ.y) * rcSatXf.w);",
           "  if (tuv.x > 0.0 && tuv.x < 1.0 && tuv.y > 0.0 && tuv.y < 1.0) {",
@@ -10397,7 +10892,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
           "}",
           "diffuseColor.rgb *= rcCol;"].join("\\n"));
     };
-    mat.customProgramCacheKey = function () { return "rc-ground-v1"; };
+    mat.customProgramCacheKey = function () { return "rc-ground-v2"; };
     mat.userData.owned = [u.rcSplat.value];
     return mat;
   }
@@ -10576,10 +11071,14 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         var h = W.half ? (side > 0 ? W.half[0][i] : W.half[1][i]) : null;
         return (h > 1 ? h : W.hw(i));
       };
+      var okE = W.veto ? function (i) {
+        var o = side * (edge(i) - 0.2);
+        return !W.veto(d.x[i] + d.tan[i][1] * o, d.z[i] - d.tan[i][0] * o);
+      } : null;
       var geo = stripGeo(d, 0, n - 1,
         function (i) { return side * (edge(i) - 0.32); },
         function (i) { return side * (edge(i) - 0.08); },
-        function (i) { return d.y[i] + 0.045; }, 10, null);
+        function (i) { return d.y[i] + 0.045; }, 10, okE);
       if (geo) { var m = new THREE.Mesh(geo, mat); m.receiveShadow = true; grp.add(m); }
     });
     return grp;
@@ -10590,10 +11089,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   function makeKerbs(W) {
     var d = W.d, n = d.x.length, i, on = new Uint8Array(n);
     if (n < 10) return null;
-    for (i = 3; i < n - 3; i++) {
-      var t0 = d.tan[i - 3], t1 = d.tan[i + 3];
-      var ds = Math.max(0.5, d.s[i + 3] - d.s[i - 3]);
-      if (Math.abs(t0[0] * t1[1] - t0[1] * t1[0]) / ds > 1 / 600) on[i] = 1;
+    // real circuits kerb their CORNERS (radius under ~250 m), not the gently
+    // curving straights between them; tangents +-8 stations apart (a 16 m span)
+    // so the centreline's centimetre wiggles never read as a bend
+    for (i = 8; i < n - 8; i++) {
+      var t0 = d.tan[i - 8], t1 = d.tan[i + 8];
+      var ds = Math.max(0.5, d.s[i + 8] - d.s[i - 8]);
+      if (Math.abs(t0[0] * t1[1] - t0[1] * t1[0]) / ds > 1 / 250) on[i] = 1;
     }
     // dilate 6 m, drop runs shorter than 10 m
     var dil = new Uint8Array(n), j;
@@ -10619,6 +11121,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
           function (i2) {
             var px = d.x[i2] + d.tan[i2][1] * side * (edge(i2) + 1.0);
             var pz = d.z[i2] - d.tan[i2][0] * side * (edge(i2) + 1.0);
+            if (W.veto) {
+              var ix = d.x[i2] + d.tan[i2][1] * side * edge(i2);
+              var iz = d.z[i2] - d.tan[i2][0] * side * edge(i2);
+              if (W.veto(px, pz) || W.veto(ix, iz)) return false;
+            }
             return ownSection(W, i2, px, pz, 0.5);
           });
         if (geo) {
@@ -10796,6 +11303,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       o: PATH.o, seed: seedStr || "track", max: 9000, maxDist: 760,
       extra: osmTreeSpots(ASSET && ASSET.features)
     });
+    if (W.net) {
+      // the same clearance from every other layout, pit lane and kart track
+      spots = spots.filter(function (t) { return W.edgeDist(t.x, t.z) > 14; });
+    }
     var geos = treeGeometries();
     var mat = new THREE.MeshLambertMaterial({ vertexColors: true });
     var chunks = {}, CH = 320;
@@ -11107,6 +11618,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
      road. Built on boot, when the prepared track arrives and when the
      smoothing changes. */
   var RAW_ASSET = null, TRACK = null, TRACK_HALF = null, TRACK_INFO = null;
+  // the facility's whole network (every layout, pit lanes, kart track) in the
+  // session frame, and an index over it; GROUND_TEX = imagery of the facility
+  var NET = [], NET_IDX = null, GROUND_TEX = null, GROUND_TOK = null;
+  var netBias = function (L) { return L.kind === "pit" ? 6 : (L.kind === "kart" ? 8 : 0); };
   var DEM_HR = null, DEM_FAR = null, DEMFN = null, YREF = 0, EVENTS = null, BOARDS = [];
 
   function shiftGrid(g, dLat, dLon) {
@@ -11139,7 +11654,17 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var nb = T.dense.x.length, hl = new Float64Array(nb), hr = new Float64Array(nb);
     var sum = 0, cnt = 0, bi;
     var fallback = opts.road / 2;
-    if (ASSET && assetSample) {
+    if (NET_IDX) {
+      // the layout the track runs on, measured edge by edge off the imagery
+      for (bi = 0; bi < nb; bi++) {
+        var tn = T.dense.tan[bi], hn = NET_IDX.nearest(T.dense.x[bi], T.dense.z[bi], 5);
+        if (!hn || Math.abs(hn.nz * tn[0] - hn.nx * tn[1]) < 0.8) continue;
+        var lr = RC3D.networkHalfAt(NET, hn, tn[0], tn[1]);
+        hl[bi] = lr[0]; hr[bi] = lr[1]; sum += lr[0] + lr[1]; cnt++;
+      }
+    }
+    if (cnt < nb * 0.3 && ASSET && assetSample) {
+      sum = 0; cnt = 0;
       for (bi = 0; bi < nb; bi++) {
         var r2 = assetSample(T.dense.x[bi], T.dense.z[bi]);
         var w2 = (r2 && r2.width_m && r2.dist < 25) ? r2.width_m : 0;
@@ -11179,6 +11704,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     ASSET = plain ? null : RAW_ASSET;
     TRACK_INFO = { source: "laps" };
     var demHr = plain ? null : DEM_HR, demFar = plain ? null : DEM_FAR, line = null, closed = false;
+    var CL = null;                              // the laps' consensus, computed once
+    var consensus = function () { return CL || (CL = RC3D.consensusLine(P0, LAPS)); };
     if (!plain && RAW_ASSET && RAW_ASSET.line && RAW_ASSET.line.length > 20) {
       var lx = [], lz = [];
       RAW_ASSET.line.forEach(function (p) {
@@ -11206,7 +11733,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         // if the laps leave the prepared line anywhere, the track follows the
         // laps there and the prepared line everywhere else.
         if (LAPS.length) {
-          var cl0 = RC3D.consensusLine(P0, LAPS), aidx = RC3D.lineIndex(line.x, line.z, 20);
+          var cl0 = consensus(), aidx = RC3D.lineIndex(line.x, line.z, 20);
           var off0 = 0, tot0 = 0;
           for (i = 0; i < cl0.x.length; i += 3) {
             tot0++;
@@ -11214,7 +11741,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
           }
           var cover = tot0 ? 1 - off0 / tot0 : 1;
           TRACK_INFO.cover = Math.round(cover * 100);
-          if (cover < 0.97 && cl0.x.length > 50) {
+          if (cover < 0.97 && cl0.x.length > 50 && !cl0.whole) {
             var bl = RC3D.blendOnto(cl0.x, cl0.z, line.x, line.z, { near: 8, blend: 40 });
             var nC = bl.x.length;
             var e2 = Math.sqrt((bl.x[0] - bl.x[nC - 1]) * (bl.x[0] - bl.x[nC - 1]) +
@@ -11235,10 +11762,41 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     assetSample = ASSET ? RC3D.assetSampler(ASSET, o) : null;
     DEMFN = plain ? null : RC3D.demStack([demHr, demFar, ASSET && ASSET.dem]);
 
+    // The WHOLE facility: every layout OpenStreetMap knows, re-centred on the
+    // imagery. The track you drove is your laps' route THROUGH that network,
+    // on the real centrelines wherever they agree - never a road built from
+    // your own average line (that drew you dead centre the whole lap).
+    // (not when the prepared track was REJECTED as a different place/layout:
+    // its network would sit unregistered beside the track)
+    NET = (!plain && ASSET && ASSET.network && !TRACK_INFO.rejected) ? RC3D.networkLines(ASSET, o) : [];
+    NET_IDX = NET.length ? RC3D.multiIndex(NET, 20, { bias: netBias }) : null;
+    if (NET_IDX) {
+      // only REAL laps are routed: with none, the "consensus" is the whole
+      // session (every lap stacked, pit lane, paddock) - never a track
+      var clN = consensus();
+      if (clN.x.length > 50 && !clN.whole) {
+        var bn = RC3D.blendOnto(clN.x, clN.z, null, null, { index: NET_IDX, near: 12, blend: 30 });
+        if (bn.matched >= 0.5) {
+          var nN = bn.x.length, used = {};
+          line = { x: bn.x, z: bn.z };
+          closed = LAPS.length > 0 &&
+                   Math.hypot(bn.x[0] - bn.x[nN - 1], bn.z[0] - bn.z[nN - 1]) < 30;
+          bn.src.forEach(function (h) {
+            if (h) (NET[h.line].names || []).forEach(function (nm) { used[nm] = 1; });
+          });
+          TRACK_INFO.source = "network";
+          TRACK_INFO.matched = Math.round(bn.matched * 100);
+          TRACK_INFO.laps = LAPS.length;
+          TRACK_INFO.layouts = Object.keys(used);
+        }
+      }
+      TRACK_INFO.network = NET.length;
+    }
+
     if (!line && plain) {
       line = { x: P0.dense.x.slice(), z: P0.dense.z.slice() };
     } else if (!line) {
-      var cl = RC3D.consensusLine(P0, LAPS);
+      var cl = consensus();
       line = { x: cl.x, z: cl.z };
       var n0 = line.x.length;
       var e1 = n0 > 2 ? Math.sqrt((line.x[0] - line.x[n0 - 1]) * (line.x[0] - line.x[n0 - 1]) +
@@ -11681,13 +12239,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var list = (F && F.roads) || [];
     if (!list.length) return null;
     var buckets = { asph: [], dirt: [], foot: [] };
-    var near = function (x, z) { return W.field.nearest(x, z); };
+    var near = function (x, z) { return { i: 0, d: W.edgeDist(x, z) }; };
     list.forEach(function (r) {
       if (!r.p || r.p.length < 2) return;
       var k = r.k || "service";
       var w = (r.w > 1 && r.w < 30) ? r.w : (ROAD_W[k] || 4);
       var segs = RC3D.cutNearRoad(r.p.map(fxz), 3, near,
-                                  function (i) { return W.hw(i) + w / 2 + 0.8; });
+                                  function () { return w / 2 + 0.8; });
       var b = k === "track" ? buckets.dirt
         : (/^(path|footway|cycleway|bridleway|steps)$/.test(k) ? buckets.foot : buckets.asph);
       segs.forEach(function (sg) { b.push({ pts: sg, w: w }); });
@@ -11761,14 +12319,14 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   function buildBarriers(W, F) {
     var list = (F && F.barriers) || [];
     if (!list.length) return null;
-    var near = function (x, z) { return W.field.nearest(x, z); };
+    var near = function (x, z) { return { i: 0, d: W.edgeDist(x, z) }; };
     var kinds = { wall: [], fence: [], rail: [], hedge: [] };
     list.forEach(function (b) {
       if (!b.p || b.p.length < 2) return;
       var k = String(b.k || "fence");
       var bucket = /^(wall|retaining_wall|city_wall|jersey_barrier)$/.test(k) ? kinds.wall
         : k === "guard_rail" ? kinds.rail : k === "hedge" ? kinds.hedge : kinds.fence;
-      RC3D.cutNearRoad(b.p.map(fxz), 2, near, function (i) { return W.hw(i) + 0.45; })
+      RC3D.cutNearRoad(b.p.map(fxz), 2, near, function () { return 0.45; })
         .forEach(function (sg) { bucket.push(sg); });
     });
     var grp = new THREE.Group(), g;
@@ -11973,6 +12531,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         ? { half: half, uvBounds: ASSET.texture.bounds, tex: TEX, o: PATH.o }
         : { asphalt: true, half: half, o: PATH.o }));
       if (!sat) addMesh("edges", makeEdgeLines(W));
+      // (over satellite ground the imagery already shows the other layouts)
+      if (W.net && !(sat && GROUND_TEX)) {
+        try { addMesh("network", makeNetwork(W)); }
+        catch (e) { console.warn("[track3d] network:", e && e.message ? e.message : e); }
+      }
       // 3. what the driver did: a chevron line (driving view) and a full-width
       //    wash (plan view), both coloured by the classified input
       addMesh("line", makeInputRibbon(base, 1.05, 0.09, "line", null));
@@ -12045,7 +12608,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var lg = el("lg-src");
     if (!lg || !TRACK_INFO) return;
     var t = TRACK_INFO, parts = [];
-    if (t.source === "asset") {
+    if (t.source === "network") {
+      parts.push("track: your route through the facility (" +
+                 ((t.layouts && t.layouts.length) ? t.layouts.slice(0, 3).join(" + ") : "OpenStreetMap") +
+                 "), real centrelines for " + t.matched + "% of it");
+      var others = (WORLD && WORLD.net) ? WORLD.net.pieces.length : 0;
+      if (others) parts.push(others + " other layout pieces shown");
+    } else if (t.source === "asset") {
       parts.push("track shape: OpenStreetMap + imagery, aligned to your GPS (moved " + t.shift + " m)");
     } else if (t.source === "blend") {
       parts.push("track shape: the layout you drove (" + t.laps + " laps), on OpenStreetMap + imagery for " +
@@ -12057,8 +12626,28 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     if (t.dem) parts.push("terrain: " + t.dem);
     if (ASSET && ASSET.features) parts.push("buildings/roads: OpenStreetMap");
     if (PATH && PATH.accelSource) parts.push("input: " + (PATH.accelSource === "gps+imu" ? "GPS speed + IMU" : "GPS speed"));
+    if (PATH && PATH.positionSource === "kalman") parts.push("position: GPS fixes + speed + heading (Kalman)");
     lg.style.display = "flex";
-    lg.textContent = parts.join(" \u00b7 ");
+    lg.textContent = parts.join("\\n");
+    window.__rc3dStats = function () {
+      var g = meshes.ground && meshes.ground.geometry;
+      return { calls: renderer.info.render.calls, tris: renderer.info.render.triangles,
+               ground: g ? g.attributes.position.count : 0,
+               net: meshes.network ? meshes.network.children.length : 0 };
+    };
+    // where the car runs across the road, metres from the track centreline
+    // (+ = left): percentiles over the whole session
+    window.__rc3dOffsets = function () {
+      if (!PATH || !TRACK) return null;
+      var ix = RC3D.lineIndex(TRACK.dense.x, TRACK.dense.z, 20), out = [], tot = PATH.dense.total, s;
+      for (s = 0; s < tot; s += Math.max(2, tot / 3000)) {
+        var c = RC3D.pointAtS(PATH, s), q = ix.nearest(c.x, c.z, 60);
+        if (q) out.push(q.signed);
+      }
+      out.sort(function (a, b) { return a - b; });
+      var L = out.length, pc = function (f) { return Math.round(out[Math.min(L - 1, Math.floor(L * f))] * 10) / 10; };
+      return { n: L, p5: pc(0.05), p25: pc(0.25), p50: pc(0.5), p75: pc(0.75), p95: pc(0.95) };
+    };
     window.__rc3dWhere = function () {
       if (!PATH || !TRACK) return null;
       var c0 = RC3D.pointAtS(PATH, RC3D.sAtTime(PATH, NOW));
@@ -12069,6 +12658,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     // read-only state for debugging / automated checks (no behaviour hangs on it)
     window.__rc3dInfo = {
       track: TRACK_INFO, boards: BOARDS.length, corners: CORNERS.length,
+      pieces: (WORLD && WORLD.net) ? WORLD.net.pieces.length : 0,
+      position: PATH && PATH.positionSource,
       boardAt: BOARDS.map(function (b) { return [Math.round(b.s), b.m, b.corner]; }),
       cornerAt: CORNERS.map(function (c) { return [Math.round(c.s0), Math.round(c.s1), Math.round(c.deg)]; }),
       total: TRACK && TRACK.dense ? Math.round(TRACK.dense.total) : 0,
@@ -12420,6 +13011,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     if (el("b-brakes")) el("b-brakes").addEventListener("change", function () {
       opts.brakes = el("b-brakes").checked; rebuild();
     });
+    if (el("b-net")) el("b-net").addEventListener("change", function () {
+      opts.network = el("b-net").checked; rebuild();
+    });
     if (el("b-groundsel")) {
       el("b-groundsel").value = opts.ground;
       el("b-groundsel").addEventListener("change", function () {
@@ -12630,7 +13224,32 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         el("lg-track").textContent += " · " + attr;
       }
     }
-    return dems.then(function () {
+    // a (re-)applied asset starts without the previous one's imagery, and a
+    // late image for an older asset is ignored
+    GROUND_TEX = null;
+    var gtok = GROUND_TOK = {};
+    var groundImg = (asset.ground && asset.ground.file) ? new Promise(function (res) {
+      var done = false, fin = function () { if (!done) { done = true; res(); } };
+      new THREE.TextureLoader().load("/trackassets/" + encodeURIComponent(asset.slug) +
+        "/ground.jpg?v=" + encodeURIComponent((asset.enrich && asset.enrich.at) || asset.generated || 0),
+        function (t) {
+          if (gtok !== GROUND_TOK) { t.dispose(); fin(); return; }
+          t.colorSpace = THREE.SRGBColorSpace;
+          t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+          t.generateMipmaps = true;
+          t.minFilter = THREE.LinearMipmapLinearFilter;
+          t.magFilter = THREE.LinearFilter;
+          try { t.anisotropy = renderer.capabilities.getMaxAnisotropy(); } catch (e) {}
+          t.needsUpdate = true;
+          GROUND_TEX = t;
+          // arrived after the first build: re-shade the ground (only the modes
+          // that draw it)
+          if (done && BOOTED && (opts.ground === "sim" || opts.ground === "satellite")) rebuild();
+          fin();
+        }, undefined, fin);
+      setTimeout(fin, 2500);                 // never hold the first render for long
+    }) : Promise.resolve();
+    return Promise.all([dems, groundImg]).then(function () {
       try { setupTrack(); }
       catch (e) { console.warn("[track3d] track setup:", e && e.message ? e.message : e); }
       if (BOOTED) setLap(LAPNO);

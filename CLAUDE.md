@@ -533,6 +533,44 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
+### 3D view v12 — the WHOLE facility, and the car where it really was across the road (`track3d_v` 12)
+The user: the car sat in the middle of the track the whole time; render every configuration/layout of the
+facility, drive only on the one the session used, and look real.
+- **Why the car was centred:** the track had been built FROM the laps (consensus/blend), so it was centred on
+  the driver's own average line by construction. Now the road is the facility's real centreline and the laps
+  are only ROUTED through it, so where the car sits across the road is data again (measured p5..p95 lateral
+  offset ≈ ±5 m on 9–11 m circuits; `window.__rc3dOffsets()` reports the percentiles).
+- **`asset.network`** (`trackprep.build_network`, `ENRICH_VERSION` 2): every OSM `highway=raceway` way merged
+  into chains (`merge_chains`; node ids kept, cache key `raceway2`), classified circuit / pit / kart / oval /
+  area (`raceway_kind`), resampled every 3 m, re-centred on the imagery, with per-point LEFT/RIGHT half widths
+  (`hw`) and `ws` = osm | imagery | default. Plus **`asset.ground`** = `<slug>.ground.jpg`, one z18 image of
+  the WHOLE facility (served at `/trackassets/<slug>/ground.jpg`, copied by `_seed_tracks`).
+- **Routing** (`setupTrackFrom`): `RC3D.networkLines` → `RC3D.multiIndex` (pit +6 m / kart +8 m bias so a pit
+  lane loses a tie with the circuit beside it) → the laps' `consensusLine` is `blendOnto`'d with
+  `opt.index` = the whole network (12 m, undirected — OSM draws ways either way round; `opt.directed` exists).
+  `TRACK_INFO.source = "network"` when ≥ 50 % matches; the legend names the layouts used. Half widths come from
+  the network first (`RC3D.networkHalfAt` orients a chain's left/right to the direction of travel).
+- **Every other layout is drawn** (`buildNet` + `makeNetwork`, toggle **all layouts**): the network minus the
+  stretches that ARE the track (on its tarmac AND parallel), each piece run 2 stations into the cut so it
+  tucks under the track at a junction, 2 cm below it, heights from the track's ground. Edge lines and kerbs
+  are vetoed where they would lie on another road; no kerbs on pit lanes or ovals. The ground mesh covers the
+  union (fine over the driven circuit, 2× coarser over the rest — `axisNodes(..., lo, hi, midStep)`); trees,
+  OSM roads and fences keep clear of EVERY layout via `W.edgeDist`.
+- **Ground colour = the facility imagery** in simulated mode (low-frequency colour from `ground.jpg`, the
+  procedural textures as close-up detail, faded near road edges and over the image's outer 16 %); satellite
+  mode uses the same image uncorrected wherever the track's sharper texture does not reach, and skips the
+  network ribbons (the imagery already shows those roads).
+- **Car position = Kalman/RTS** over fixes + GPS speed + course (`RC3D.kalmanPath`; u-blox Doppler speed and
+  heading are the trustworthy channels — position-difference speeds are ±25 % off from logged `t` jitter).
+- **Kerbs only at real corners:** radius < 250 m on an 8 m baseline (was 600 m on 3 m, which kerbed most
+  of every gently curving straight).
+- **Server freeze fixed (affects production):** `POST …/track-prep` was an `async def` that ran the Overpass
+  query ON the event loop — the WHOLE server (dash uploads included) froze for as long as Overpass took (minutes
+  when a mirror is slow). It is a plain `def` now (thread pool) and the optional width lookup is capped at 25 s.
+  Same class of bug fixed in the AI corner-analysis / lines / lines-AI handlers: `_ai_chat` (up to
+  `RACECAR_AI_TIMEOUT_SECONDS`) and `_lap_library` now run via `asyncio.to_thread`. **Never call blocking I/O
+  from an `async def` handler.**
+
 ### 3D view v11 — the real place, the layout you drove, what your feet did (`track3d_v` 11)
 Follow-up to v10 ("much better… really close"): more real data, better brake markers, clear brake/throttle/
 coast, and a track shape from GPS + imagery + map together.
