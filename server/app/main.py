@@ -3188,7 +3188,7 @@ load();
 # Bumps whenever the 3D drive view changes materially (documented at length in
 # the /caps docstring below). Kept as a constant because /caps and /version both
 # report it — two literals would drift.
-TRACK3D_V = 12
+TRACK3D_V = 13
 
 
 @app.get("/caps")
@@ -3241,7 +3241,13 @@ async def caps() -> dict:
     flattened under the road (it used to float over a flat disc on a hilly
     track) and shaded by land cover; kerbs, white edge lines, gravel traps,
     Armco that never crosses another section; a chevron driving line coloured
-    by the driver's input; markers painted on the road, not poles in it."""
+    by the driver's input; markers painted on the road, not poles in it.
+    11/12 = see CLAUDE.md (the real place; the whole facility network).
+    13 = the REAL track surface: every layout's edges traced in 2-D off the
+    imagery (trackprep.trace_edges, network v2) instead of a squeezed
+    near-constant width; straight centrelines; the road widened wherever the
+    session's own fixes ran past an edge, so the driving line is on the tarmac
+    (Summit Point: 65 % of fixes on the old road, 99 % now)."""
     v = server_version()
     return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
             "track3d_v": TRACK3D_V,
@@ -9861,6 +9867,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // and (half + 4.0) m -> +/-(half - 0.4). Farther fixes (pit lane, run-off)
   // are untouched. halfAt(station index) = the half width there. `o` = the
   // RC3D.project origin of the line. Returns {samples: copy, moved: count}.
+  // halfAt(i) -> a half width, or [left, right] for an asymmetric road
+  // (lineIndex's `signed` is + to the RIGHT of travel: (-dz, dx) is the
+  // ribbon's right-hand perpendicular)
   RC3D.snapSamples = function (samples, o, lineX, lineZ, halfAt, opt) {
     opt = opt || {};
     var inset = opt.inset == null ? 0.4 : opt.inset, outer = opt.outer == null ? 4.0 : opt.outer;
@@ -9874,7 +9883,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       var p = RC3D.project(s.lat, s.lon, o);
       var h = idx.nearest(p.x, p.z, 60);
       if (!h) continue;
-      var half = halfAt ? halfAt(h.i) : 5;
+      var hv = halfAt ? halfAt(h.i) : 5;
+      var half = (typeof hv === "number") ? hv : (h.signed >= 0 ? hv[1] : hv[0]);
       if (!(half > inset)) continue;
       var ad = Math.abs(h.signed), target = half - inset;
       if (!(ad > target) || ad > half + outer) continue;
@@ -9889,6 +9899,123 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     return { samples: out, moved: moved };
   };
 
+
+  // Bridge the unmeasured stations of a per-station array (have[i] = 0) by
+  // linear interpolation between their measured neighbours (round the seam
+  // of a closed loop). Nothing measured -> left as is.
+  RC3D.fillGaps = function (arr, have, closed) {
+    var n = arr.length, idx = [], i, k;
+    for (i = 0; i < n; i++) if (have[i]) idx.push(i);
+    if (!idx.length || idx.length === n) return arr;
+    var m = idx.length;
+    for (k = 0; k < m; k++) {
+      var a = idx[k], b = idx[(k + 1) % m], last = (k === m - 1);
+      if (last && !closed) break;
+      var gap = last ? (n - a + b) : (b - a);
+      for (var g = 1; g < gap; g++) {
+        var j = (a + g) % n, f = g / gap;
+        arr[j] = arr[a] + (arr[b] - arr[a]) * f;
+      }
+    }
+    if (!closed) {
+      for (i = 0; i < idx[0]; i++) arr[i] = arr[idx[0]];
+      for (i = idx[m - 1] + 1; i < n; i++) arr[i] = arr[idx[m - 1]];
+    }
+    return arr;
+  };
+
+  // The car was ON the road. Widen [hl, hr] (in place) wherever the session's
+  // own fixes run past an edge: per ~4 m of track, the 97th percentile of the
+  // fixes' lateral offset on each side + `margin`, spread over ~10 m. Fixes
+  // more than `maxOver` metres past the edge are the pit lane or a real trip
+  // through the grass, and never widen anything. Slow fixes (< 15 mph:
+  // paddock, pit box) are ignored. Returns {inside, insideAfter, widened}
+  // = shares of the fixes on the road before / after, stations widened.
+  RC3D.containEnvelope = function (T, hl, hr, samples, o, opt) {
+    opt = opt || {};
+    var margin = opt.margin == null ? 0.5 : opt.margin, maxOver = opt.maxOver || 7;
+    var n = T.dense.x.length, BIN = 4, nbin = Math.ceil(n / BIN), i;
+    if (n < 10 || !o) return null;
+    var idx = _lineIndex(T.dense.x, T.dense.z, 20);
+    var L = [], R = [], tot = 0, inside = 0;
+    for (i = 0; i < nbin; i++) { L.push([]); R.push([]); }
+    for (i = 0; i < samples.length; i++) {
+      var s = samples[i];
+      if (!s || !_num(s.lat) || !_num(s.lon) || !(s.speed_mph > 15)) continue;
+      var p = RC3D.project(s.lat, s.lon, o), h = idx.nearest(p.x, p.z, 30);
+      if (!h) continue;
+      var right = h.signed >= 0, edge = right ? hr[h.i] : hl[h.i], ad = Math.abs(h.signed);
+      if (ad > edge + maxOver) continue;
+      tot++;
+      if (ad <= edge) inside++;
+      (right ? R : L)[Math.floor(h.i / BIN)].push(ad);
+    }
+    var p97 = function (a) {
+      if (a.length < 6) return 0;
+      a.sort(function (x, y) { return x - y; });
+      return a[Math.min(a.length - 1, Math.floor(a.length * 0.97))];
+    };
+    var eL = new Float64Array(n), eR = new Float64Array(n);
+    for (i = 0; i < n; i++) {
+      var bi = Math.floor(i / BIN);
+      eL[i] = p97(L[bi]); eR[i] = p97(R[bi]);
+    }
+    // spread: a running max over +-5 m, then a 9 m mean (no notches)
+    var spread = function (e) {
+      var mx = new Float64Array(n), k, j;
+      for (k = 0; k < n; k++) {
+        var v = 0;
+        for (j = -5; j <= 5; j++) {
+          var q = k + j;
+          if (T.closed) q = (q + n) % n; else if (q < 0 || q >= n) continue;
+          if (e[q] > v) v = e[q];
+        }
+        mx[k] = v;
+      }
+      return RC3D.smooth(Array.prototype.slice.call(mx), 9);
+    };
+    var sL = spread(eL), sR = spread(eR), widened = 0;
+    for (i = 0; i < n; i++) {
+      var nl = sL[i] > 0 ? sL[i] + margin : 0, nr = sR[i] > 0 ? sR[i] + margin : 0, w = false;
+      if (nl > hl[i]) { hl[i] = nl; w = true; }
+      if (nr > hr[i]) { hr[i] = nr; w = true; }
+      if (w) widened++;
+    }
+    var after = 0;
+    for (i = 0; i < samples.length; i++) {
+      var s2 = samples[i];
+      if (!s2 || !_num(s2.lat) || !_num(s2.lon) || !(s2.speed_mph > 15)) continue;
+      var p2 = RC3D.project(s2.lat, s2.lon, o), h2 = idx.nearest(p2.x, p2.z, 30);
+      if (!h2) continue;
+      var e2 = h2.signed >= 0 ? hr[h2.i] : hl[h2.i];
+      if (Math.abs(h2.signed) > e2 + maxOver) continue;
+      if (Math.abs(h2.signed) <= e2) after++;
+    }
+    return { inside: tot ? inside / tot : 1, insideAfter: tot ? after / tot : 1,
+             widened: widened / n, fixes: tot };
+  };
+
+  // The inside edge of a tight corner must stay inside the corner's own
+  // centre of curvature, or the ribbon folds over itself (a black bow-tie at
+  // a hairpin). Clamps the INSIDE half width to 85 % of the local radius.
+  RC3D.foldGuard = function (T, hl, hr) {
+    var d = T.dense, n = d.x.length, i, K = 4, clamped = 0;
+    for (i = 0; i < n; i++) {
+      var a = i - K, b = i + K;
+      if (T.closed) { a = (a + n) % n; b = b % n; }
+      else { a = Math.max(0, a); b = Math.min(n - 1, b); }
+      var t1 = d.tan[a], t2 = d.tan[b];
+      var ds = Math.abs((T.closed && b < a) ? (d.s[n - 1] - d.s[a] + d.s[b]) : (d.s[b] - d.s[a])) || 1;
+      var cr = t1[0] * t2[1] - t1[1] * t2[0], dt = Math.asin(Math.max(-1, Math.min(1, cr)));
+      if (Math.abs(dt) < 1e-4) continue;
+      var r = ds / Math.abs(dt), lim = 0.85 * r;
+      // the tangent turns TOWARDS the inside: left perpendicular is (tz, -tx)
+      var lx = t1[1], lz = -t1[0], toLeft = ((t2[0] - t1[0]) * lx + (t2[1] - t1[1]) * lz) > 0;
+      if (toLeft && hl[i] > lim) { hl[i] = Math.max(1.5, lim); clamped++; }
+      if (!toLeft && hr[i] > lim) { hr[i] = Math.max(1.5, lim); clamped++; }
+    }
+    return clamped;
+  };
 
   // ---- prepared-track terrain grids (lidar / far) --------------------------
   // dem_hr / dem_far bins: uint16 little-endian, value = base + q * scale,
@@ -11847,12 +11974,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       .then(function (g) { DEM_HR = g[0]; DEM_FAR = g[1]; });
   }
 
-  // per-station [left, right] half widths of a track path, from the prepared
-  // asset where it has a measurement (smoothed: raw stations step), else the
-  // width slider
+  // per-station [left, right] half widths of a track path: the prepared
+  // network's traced edges (the real surface, station by station), widened
+  // wherever this session's own driving shows the tarmac is wider, else the
+  // width slider. Gaps are bridged from their measured neighbours.
   function trackHalfWidths(T) {
     var nb = T.dense.x.length, hl = new Float64Array(nb), hr = new Float64Array(nb);
-    var sum = 0, cnt = 0, bi;
+    var have = new Uint8Array(nb), sum = 0, cnt = 0, bi;
     var fallback = opts.road / 2;
     if (NET_IDX) {
       // the layout the track runs on, measured edge by edge off the imagery
@@ -11860,7 +11988,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         var tn = T.dense.tan[bi], hn = NET_IDX.nearest(T.dense.x[bi], T.dense.z[bi], 5);
         if (!hn || Math.abs(hn.nz * tn[0] - hn.nx * tn[1]) < 0.8) continue;
         var lr = RC3D.networkHalfAt(NET, hn, tn[0], tn[1]);
-        hl[bi] = lr[0]; hr[bi] = lr[1]; sum += lr[0] + lr[1]; cnt++;
+        hl[bi] = lr[0]; hr[bi] = lr[1]; have[bi] = 1; sum += lr[0] + lr[1]; cnt++;
       }
     }
     if (cnt < nb * 0.3 && ASSET && assetSample) {
@@ -11869,19 +11997,32 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         var r2 = assetSample(T.dense.x[bi], T.dense.z[bi]);
         var w2 = (r2 && r2.width_m && r2.dist < 25) ? r2.width_m : 0;
         hl[bi] = hr[bi] = w2 / 2;
+        have[bi] = w2 ? 1 : 0;
         if (w2) { sum += w2; cnt++; }
       }
     }
     var real = cnt > nb * 0.3 ? sum / cnt : null;
-    for (bi = 0; bi < nb; bi++) {
-      if (!(hl[bi] > 1)) { hl[bi] = hr[bi] = real ? real / 2 : fallback; }
+    if (real) {
+      RC3D.fillGaps(hl, have, T.closed);
+      RC3D.fillGaps(hr, have, T.closed);
+      // light smoothing only (9 m): these are MEASURED per station. The old
+      // two passes of 31 m flattened every circuit to one number.
+      var a1 = RC3D.smooth(Array.prototype.slice.call(hl), 9);
+      var a2 = RC3D.smooth(Array.prototype.slice.call(hr), 9);
+      for (bi = 0; bi < nb; bi++) { hl[bi] = a1[bi]; hr[bi] = a2[bi]; }
+    } else {
+      for (bi = 0; bi < nb; bi++) hl[bi] = hr[bi] = fallback;
     }
-    var sm = function (arr) {
-      var out = RC3D.smooth(RC3D.smooth(Array.prototype.slice.call(arr), 31), 31);
-      for (var q = 0; q < arr.length; q++) arr[q] = out[q];
-    };
-    if (real) { sm(hl); sm(hr); }
-    return { half: [hl, hr], real: real };
+    // the car WAS on the tarmac: where the session's fixes run past an edge
+    // (GPS vs imagery registration, an edge the imagery could not see) the
+    // road is wider there - never the driving line on the grass
+    var env = null;
+    if (real && S.length) {
+      env = RC3D.containEnvelope(T, hl, hr, S, T.o, { margin: 0.5, maxOver: 7 });
+    }
+    // and the inside edge of a tight corner must never fold over itself
+    RC3D.foldGuard(T, hl, hr);
+    return { half: [hl, hr], real: real, env: env };
   }
 
   // Never let the track shape take the viewer down: the full build (asset
@@ -12041,8 +12182,22 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 
     // the driven line, kept on that road (a fix a metre or two over the edge
     // is GPS error; one 20 m away is the pit lane and stays where it is)
-    var mid = function (k) { return (TRACK_HALF[0][k] + TRACK_HALF[1][k]) / 2; };
-    var sn = plain ? { samples: S, moved: 0 } : RC3D.snapSamples(S, o, T.dense.x, T.dense.z, mid, {});
+    var mid = function (k) { return Math.max(TRACK_HALF[0][k], TRACK_HALF[1][k]); };
+    var sides = function (k) { return [TRACK_HALF[0][k], TRACK_HALF[1][k]]; };
+    var sn = plain ? { samples: S, moved: 0 } : RC3D.snapSamples(S, o, T.dense.x, T.dense.z, sides, {});
+    if (hw.real) {
+      // the drawn surface's own width, station by station (p10 / median / p90)
+      var wsum = [];
+      for (i = 0; i < TRACK_HALF[0].length; i += 3) wsum.push(TRACK_HALF[0][i] + TRACK_HALF[1][i]);
+      wsum.sort(function (a, b) { return a - b; });
+      var wq = function (f) { return Math.round(wsum[Math.min(wsum.length - 1, Math.floor(wsum.length * f))]); };
+      if (wsum.length) { TRACK_INFO.wP10 = wq(0.1); TRACK_INFO.wMed = wq(0.5); TRACK_INFO.wP90 = wq(0.9); }
+    }
+    if (hw.env) {
+      TRACK_INFO.onRoad = Math.round(hw.env.inside * 1000) / 10;
+      TRACK_INFO.onRoadAfter = Math.round(hw.env.insideAfter * 1000) / 10;
+      TRACK_INFO.widened = Math.round(hw.env.widened * 100);
+    }
     PATH = RC3D.buildPath(sn.samples, { smooth: opts.smooth, denseStep: 1, o: o });
     TRACK_INFO.snapped = sn.moved;
     // ...and seated on it: the car, the camera and the input line ride the
@@ -12814,6 +12969,17 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
                  "), real centrelines for " + t.matched + "% of it");
       var others = (WORLD && WORLD.net) ? WORLD.net.pieces.length : 0;
       if (others) parts.push(others + " other layout pieces shown");
+      if (t.wMed) {
+        parts.push("surface: " + t.wP10 + "\u2013" + t.wP90 + " m wide (median " + t.wMed +
+                   " m), traced edge by edge from the imagery" +
+                   (t.widened ? "; widened on " + t.widened + "% of it to fit your laps" : "") +
+                   (t.onRoadAfter ? " \u00b7 " + t.onRoadAfter + "% of your fixes on the tarmac" : ""));
+        var lt = el("lg-track");
+        if (lt && lt.dataset && lt.dataset.head) {
+          lt.textContent = lt.dataset.head + " \u2014 " + t.wP10 + "\u2013" + t.wP90 +
+            " m wide (traced from imagery)" + (lt.dataset.tail || "");
+        }
+      }
     } else if (t.source === "asset") {
       parts.push("track shape: OpenStreetMap + imagery, aligned to your GPS (moved " + t.shift + " m)");
     } else if (t.source === "blend") {
@@ -12836,7 +13002,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
                net: meshes.network ? meshes.network.children.length : 0 };
     };
     // where the car runs across the road, metres from the track centreline
-    // (+ = left): percentiles over the whole session
+    // (+ = RIGHT of travel - lineIndex.signed): percentiles over the session
     window.__rc3dOffsets = function () {
       if (!PATH || !TRACK) return null;
       var ix = RC3D.lineIndex(TRACK.dense.x, TRACK.dense.z, 20), out = [], tot = PATH.dense.total, s;
@@ -13391,6 +13557,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       (asset.length_m ? " (" + (asset.length_m / 1000).toFixed(2) + " km)" : "") +
       " — " + (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide (" +
       (asset.width_source || "?") + "), line from " + src;
+    // updateTrackLegend() swaps the one-number width for the traced range
+    el("lg-track").dataset.head = asset.track +
+      (asset.length_m ? " (" + (asset.length_m / 1000).toFixed(2) + " km)" : "");
+    el("lg-track").dataset.tail = ", line from " + src;
     var note = el("notice");
     if (note && asset.width_agreement === false) {
       notice("track " + asset.track + ": imagery says " + asset.width_imagery_m +

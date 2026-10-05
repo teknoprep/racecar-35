@@ -527,10 +527,12 @@ class SeedTrackTests(unittest.TestCase):
                              "treats them as stale and re-prepares")
             self.assertTrue((d / a["texture"]["file"]).is_file(), a["texture"]["file"])
             self.assertIn("Esri", a["texture"]["attrib"])
-            # v2 enrichment: the whole facility's track network + a ground image
-            self.assertEqual((a.get("enrich") or {}).get("v"), 2, a["slug"])
+            # current enrichment: the whole facility's track network + a ground
+            # image; network v2 = edges traced in 2-D (a stale seed would be
+            # re-enriched on every server it lands on)
+            self.assertEqual((a.get("enrich") or {}).get("v"), _tp().ENRICH_VERSION, a["slug"])
             net = a.get("network") or {}
-            self.assertEqual(net.get("v"), 1)
+            self.assertEqual(net.get("v"), _tp().NETWORK_V)
             self.assertTrue(net.get("chains"), a["slug"])
             kinds = {c["kind"] for c in net["chains"]}
             self.assertIn("circuit", kinds, a["slug"])
@@ -539,7 +541,7 @@ class SeedTrackTests(unittest.TestCase):
                 if c["kind"] != "area":
                     self.assertEqual(len(c["p"]), len(c["hw"]))
                     lo_w, hi_w = (3.0, 30.0) if c["ws"] == "osm" else \
-                        self.tp_clamp(c["kind"])
+                        self.tp_clamp(c["kind"], c.get("edges"))
                     self.assertGreaterEqual(c["w"], lo_w - 0.1, c)
                     self.assertLessEqual(c["w"], hi_w + 0.1, c)
             g = a.get("ground") or {}
@@ -557,14 +559,25 @@ class SeedTrackTests(unittest.TestCase):
         names = {n for c in sp["network"]["chains"] for n in c["names"]}
         for want in ("Summit Point Circuit", "Jefferson Circuit", "Kart Track", "Pit Lane"):
             self.assertIn(want, names)
+        # ...and the circuits' real edges were traced, not defaulted: a width that
+        # VARIES along the lap (a constant is the v1 failure)
+        for want in ("Summit Point Circuit", "Jefferson Circuit", "Shennandoah Circuit"):
+            c = max((c for c in sp["network"]["chains"] if want in c["names"]),
+                    key=lambda c: len(c["p"]))
+            self.assertEqual(c.get("edges"), "trace2d", want)
+            self.assertGreaterEqual(c.get("conf") or 0, 0.85, want)
+            tot = [l + r for l, r in c["hw"]]
+            self.assertGreater(max(tot) - min(tot), 3.0, want)
+            self.assertTrue(8.0 <= sorted(tot)[len(tot) // 2] <= 14.0, want)
         wg = json.loads((d / "watkins-glen-grand-prix.json").read_text())
         names = {n for c in wg["network"]["chains"] for n in c["names"]}
         for want in ("Pit Lane", "The Boot"):
             self.assertIn(want, names)
 
     @staticmethod
-    def tp_clamp(kind):
-        return _tp().WIDTH_CLAMP[kind]
+    def tp_clamp(kind, edges=None):
+        tp = _tp()
+        return (tp.TRACE_WIDTH_CLAMP if edges == "trace2d" else tp.WIDTH_CLAMP)[kind]
 
 
 class FixtureSchemaTests(unittest.TestCase):
@@ -1183,18 +1196,25 @@ class NetworkWidthTests(unittest.TestCase):
         self.assertAlmostEqual(c["w"], 10.0, delta=1.2)
         l, r = np.array(c["hw"]).T
         self.assertAlmostEqual(float(np.median(l)), float(np.median(r)), delta=1.0)
-        # an OSM width tag wins over the imagery
+        # traced edges (network v2) BEAT a plausible OSM width tag: a tag is ONE
+        # number for a whole way, the imagery is the surface station by station
+        self.assertEqual(c.get("edges"), "trace2d")
         net = self._net([self._chain(pts, tag=12.0)], img, bounds)
         c = net["chains"][0]
-        self.assertEqual((c["ws"], c["w"]), ("osm", 12.0))
-        self.assertTrue(all(h == [6.0, 6.0] for h in c["hw"]))
+        self.assertEqual(c["ws"], "imagery")
+        self.assertAlmostEqual(c["w"], 10.0, delta=1.2)
+        # ...but a tag overrides stations where the imagery is absurd against it
+        net = self._net([self._chain(pts, tag=30.0)], img, bounds)
+        c = net["chains"][0]
+        self.assertEqual((c["ws"], c["w"]), ("osm", 30.0))
+        self.assertTrue(all(h == [15.0, 15.0] for h in c["hw"]))
         # a tag on only part of the chain: those stations only
-        tags = [12.0] * 30 + [None] * (len(pts) - 30)
+        tags = [30.0] * 30 + [None] * (len(pts) - 30)
         ch = dict(self._chain(pts), wtag=tags)
         c = self._net([ch], img, bounds)["chains"][0]
         self.assertEqual(c["ws"], "imagery")
-        self.assertEqual(c["hw"][0], [6.0, 6.0])
-        self.assertNotEqual(c["hw"][-1], [6.0, 6.0])
+        self.assertEqual(c["hw"][0], [15.0, 15.0])
+        self.assertNotEqual(c["hw"][-1], [15.0, 15.0])
 
     def test_defaults_when_imagery_fails(self):
         pts, img, bounds = self._scene(10.0)
@@ -1212,16 +1232,19 @@ class NetworkWidthTests(unittest.TestCase):
         self.assertEqual((c["ws"], c["w"]), ("osm", 7.0))
 
     def test_imagery_width_is_clamped_per_kind(self):
+        # traced widths are MEASURED - only physical limits per kind apply (the
+        # v1 7-16 m squeeze is what turned a 12 m circuit into 8 m)
+        lim = self.tp.TRACE_WIDTH_CLAMP
         pts, img, bounds = self._scene(12.0)
         c = self._net([self._chain(pts, "kart")], img, bounds)["chains"][0]
-        self.assertEqual(c["ws"], "imagery")
-        self.assertAlmostEqual(c["w"], 9.0, delta=0.05)          # kart max 9
-        self.assertTrue(all(l + r <= 9.0 + 0.11 for l, r in c["hw"]))
+        self.assertEqual((c["ws"], c.get("edges")), ("imagery", "trace2d"))
+        self.assertAlmostEqual(c["w"], 12.0, delta=1.2)          # a 12 m kart track is 12 m
+        self.assertTrue(all(l + r <= lim["kart"][1] + 0.02 for l, r in c["hw"]))
         pts, img, bounds = self._scene(5.0)
         c = self._net([self._chain(pts, "circuit")], img, bounds)["chains"][0]
-        self.assertAlmostEqual(c["w"], 7.0, delta=0.05)          # circuit min 7
+        self.assertAlmostEqual(c["w"], lim["circuit"][0], delta=0.05)    # circuit min
         c = self._net([self._chain(pts, "pit")], img, bounds)["chains"][0]
-        self.assertAlmostEqual(c["w"], 6.0, delta=0.05)          # pit min 6
+        self.assertAlmostEqual(c["w"], 5.0, delta=1.0)           # a 5 m pit lane is 5 m
 
     def test_refined_centreline_and_short_chains_and_cap(self):
         pts, img, bounds = self._scene(10.0, offset=3.0)
@@ -1434,29 +1457,31 @@ class EnrichTests(unittest.TestCase):
         self.assertIn("USGS 3DEP", res["source"]["dem"])
         e = res["enrich"]
         self.assertEqual(e["v"], tp.ENRICH_VERSION)
-        self.assertEqual(tp.ENRICH_VERSION, 2)
+        self.assertEqual(tp.ENRICH_VERSION, 3)
         self.assertTrue(e["features"] and e["refined"])
         self.assertEqual(e["network"], 3)
         # the network: schema
         net = res["network"]
-        self.assertEqual(net["v"], 1)
+        self.assertEqual(net["v"], tp.NETWORK_V)
         self.assertIn("OpenStreetMap", net["attrib"])
         self.assertEqual([c["kind"] for c in net["chains"]], ["circuit", "pit", "area"])
         for c in net["chains"]:
-            self.assertEqual(set(c), {"ids", "names", "kind", "closed", "p", "hw", "w",
-                                      "ws", "refined"})
+            base = {"ids", "names", "kind", "closed", "p", "hw", "w", "ws", "refined"}
+            # a chain whose edges were traced in 2-D says so (and how sure it is)
+            self.assertIn(set(c), (base, base | {"edges", "conf"}))
             self.assertIn(c["ws"], ("osm", "imagery", "default"))
+            places = 7 if c.get("edges") == "trace2d" else 6
             for p in c["p"]:
                 self.assertEqual(len(p), 2)
-                self.assertEqual(p[0], round(p[0], 6))
+                self.assertEqual(p[0], round(p[0], places))
             if c["kind"] == "area":
                 self.assertEqual((c["hw"], c["w"], c["closed"]), ([], 0, True))
                 continue
             self.assertEqual(len(c["p"]), len(c["hw"]))
             steps = [tp._dist_m(a, b) for a, b in zip(c["p"], c["p"][1:])]
             self.assertAlmostEqual(float(np.median(steps)), 3.0, delta=0.3)
-            for l, r in c["hw"]:
-                self.assertEqual(l, round(l, 1))
+            for l, r in c["hw"]:          # traced edges carry cm, v1 widths dm
+                self.assertEqual(l, round(l, 2 if c.get("edges") == "trace2d" else 1))
         main, pit = net["chains"][0], net["chains"][1]
         self.assertEqual((main["ws"], main["names"], main["ids"]), ("imagery", ["Main"], [1, 2]))
         self.assertAlmostEqual(main["w"], 10.0, delta=1.5)
@@ -1515,8 +1540,33 @@ class EnrichTests(unittest.TestCase):
         (self.d / "e.json").write_text(json.dumps(v1))
         before = dict(self.calls)
         up = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
-        self.assertEqual(up["enrich"]["v"], 2)
+        self.assertEqual(up["enrich"]["v"], tp.ENRICH_VERSION)
         self.assertEqual(self.calls, before)
+
+    def test_a_v1_network_is_rebuilt_with_traced_edges(self):
+        """Network v1 widths were a squeezed near-constant; an asset carrying one
+        must be re-enriched (rebuilt), never kept forever as 'complete'."""
+        tp = self.tp
+        res = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+        self.assertFalse(tp._network_stale(res))
+        self.assertFalse(tp._enrich_missing(res, self.d))
+        old = json.loads(json.dumps(res))
+        old["network"]["v"] = 1
+        old["enrich"]["v"] = 2
+        for ch in old["network"]["chains"]:
+            ch.pop("edges", None)
+            ch.pop("conf", None)
+        self.assertTrue(tp._network_stale(old))
+        self.assertTrue(tp._enrich_missing(old, self.d))
+        (self.d / "e.json").write_text(json.dumps(old))
+        osm_before, before = self.net_calls["osm"], dict(self.calls)
+        up = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
+        self.assertEqual(up["network"]["v"], tp.NETWORK_V)
+        self.assertEqual(up["enrich"]["v"], tp.ENRICH_VERSION)
+        self.assertEqual(self.net_calls["osm"], osm_before + 1)     # the network, rebuilt
+        self.assertEqual(self.calls, before)                        # nothing else refetched
+        main = up["network"]["chains"][0]
+        self.assertEqual(main.get("edges"), "trace2d")
 
     def test_network_failure_is_recorded_and_rate_limited(self):
         tp = self.tp
@@ -1534,7 +1584,7 @@ class EnrichTests(unittest.TestCase):
         a["network_tried"] = int(time.time()) - 7 * 3600
         (self.d / "e.json").write_text(json.dumps(a))
         res = tp.enrich_asset(self.d / "e.json", self.cache, log=lambda *_: None)
-        self.assertEqual(res["enrich"]["v"], 2)
+        self.assertEqual(res["enrich"]["v"], tp.ENRICH_VERSION)
         self.assertNotIn("network_error", res)
         self.assertEqual(res["ground"]["cover"], "network")      # remade for the network
 

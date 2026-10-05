@@ -418,6 +418,27 @@ cd /docker/racecar.api.blueuc.com && sudo ./server/host_updater.sh --install   #
 ./server/host_updater.sh --now        # force an update now
 ```
 
+**Server version next to the update button.** The server has no semver: its identity is the
+**commit the running image was built from**. `server_version()` (main.py) reports it, from
+(1) `RACECAR_BUILD_SHA/_SUBJECT/_TIME` baked into the image (Dockerfile `ARG GIT_SHA…`;
+`host_updater.sh` EXPORTS them before `compose up -d --build`; both compose files pass them as
+build args), else (2) the host checkout's `.git` bind-mounted read-only at `/repo/.git`
+(`../.git:/repo/.git:ro`, parsed with no git binary: HEAD / refs / packed-refs, subject from
+the loose zlib object). `source` says which won; `deploy_pending` = the checkout is NEWER than
+the stamped image (pulled, never rebuilt). Exposed by **public `GET /version`** (one curl
+verifies a deploy), `GET /caps` (`server`, `server_sha`, `server_source`, `deploy_pending`)
+and `/admin/update/status` (`version`). The `/admin` label shows `v <sha> · <subject>` when
+idle, the host's state while updating, and `v <new> ✓ updated` once `running_since` jumps
+(only status written AFTER the click counts — the file still holds the previous run's result).
+The running watcher is the ALREADY-PARSED old script, so the first deploy of this falls back to
+the `.git` mount; run `sudo systemctl restart racecar-updater` once so later builds are stamped.
+`TRACK3D_V` is now one constant shared by `/caps` and `/version`. Tests:
+`tests/test_server_version.py` (incl. `node --check` of the admin page's scripts — the page is a
+NON-raw Python string, so a JS `'\n'` must be written `'\\n'`; one backslash kills the header).
+```bash
+curl -s https://racecar.api.blueuc.com/version     # sha, subject, source, deploy_pending
+```
+
 **Redeploying the server** (only when `server/app/main.py` etc. change; on the box hosting
 `racecar.api.blueuc.com`, external nginx `proxy_default` already routes `/firmware/*`):
 ```bash
@@ -532,6 +553,45 @@ Endpoints: `/trackassets` (list), `/trackassets/<slug>/{asset,texture.jpg}`,
 absent) so the payoff is visible without clicking anything: Summit Point, Jefferson, Shenandoah.
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
+
+### 3D view v13 — the REAL track surface: edges traced in 2-D (`track3d_v` 13, network v2, `ENRICH_VERSION` 3)
+The user: "the line goes through the grass… the track should be wider like the real tracks… straights should
+be straight… consistent track width is dumb." Measured first: at Summit Point only **65 %** of the car's own
+GPS fixes lay on the drawn road. v1 network widths came from `measure_width()`'s ONE colour profile per
+station (a painted edge line / shadow / dry grass ends or extends the run), then were squeezed into a 7-16 m
+clamp and two 31 m moving averages in the viewer → a near-constant 8 m on a 10-13 m circuit; per-station
+`refine_centreline` shifts made straights wobble.
+- **`trackprep.trace_edges()`**: UNROLLS the corridor (stations × lateral offset, ±22 m @ 0.25 m, bilinear
+  from uint8 imagery — never a float copy of a whole mosaic), per-stretch Gaussian asphalt model (seeded from
+  the line ±1.5 m, then RE-LEARNT from the first pass's own road — no GPS needed at prep) vs a 4-cluster
+  k-means background (one background blob made dry grass look like tarmac), white edge lines ATTRACT the
+  boundary to their outer side and are a BARRIER (pavement beyond the track's own edge line = run-off),
+  each edge = the cheapest SMOOTH path along the whole track (`_edge_dp`, closed loops wrapped), short
+  outward bulges beyond the ~90 m median cut back. `conf` = share of stations with a clear edge;
+  < `TRACE_MIN_CONF` (0.45) → the v1 path. Physical clamps only (`TRACE_WIDTH_CLAMP`, circuit 6-26 m).
+- `_traced_chain()`: the chain is re-centred on the traced corridor with `_straight_offset()` (~45 m median
+  + 2×45 m mean) so **straights stay straight**; `hw` relative to the new centre (asymmetric, cm), `p` at
+  **7 decimals** (6 = ~10 cm = ~2° heading noise at 3 m stations → rippling edges). An OSM width tag is ONE
+  number per way: it only overrides stations where the imagery is absurd (outside 0.6-1.8× the tag).
+  Chains carry `edges: "trace2d"` + `conf`. `NETWORK_V` 2; `_network_stale()` makes enrichment REBUILD a v1
+  network (`_enrich_missing` → True); deployed servers re-enrich in the background on first view, and the
+  shipped seeds (re-enriched to v3) replace stale copies via `_seed_tracks`.
+- **Viewer** `trackHalfWidths()`: network widths as measured (9 m smoothing, gaps bridged by
+  `RC3D.fillGaps`, never one global number); `RC3D.containEnvelope()` widens each side to the 97th
+  percentile of the session's own fixes (+0.5 m, spread ±5 m) — fixes > 7 m past an edge (pit lane / real
+  off) or < 15 mph never widen; `RC3D.foldGuard()` clamps the INSIDE half width to 85 % of the local
+  radius; `RC3D.snapSamples` takes `[left, right]` (**`lineIndex.signed` is + to the RIGHT of travel**).
+  Legend: "N–M m wide (traced from imagery) · X % of your fixes on the tarmac"; `__rc3dInfo.track` has
+  `wP10/wMed/wP90/onRoad/onRoadAfter/widened`.
+- Results (fixes on the road, traced → after containment): Summit Point 92.9 → 99.3 % (was ~65 %),
+  Watkins Glen 96.1 → 99.6 %, Thompson 97.1 → 100 %; Summit Point Main 7-14 m (median 10), Jefferson
+  10.6 m (was clamped to 16); straight-stretch deviation from a chord, median 0.57 → 0.10 m (Watkins
+  0.37 → 0.08). Full 29-chain Summit Point network rebuilds in ~7 s. Tests: `tests/test_track3d.py`
+  `Track3DWidthTests`, `tests/test_trackprep.py` (seed edges traced + varying, v1 → v2 rebuild).
+- Local harness (not in the repo): `/tmp/rc3d/restart.sh` (uvicorn on :8765, data `/tmp/rc3d/data`,
+  `/home/chris/racecar-tools/servervenv`) + `shotv.py` (Playwright/SwiftShader screenshots, actions
+  `scrub/select/eval/shot`). Red-white kerbs are NOT visible in Summit Point's z18 imagery, so kerbs are
+  still placed by curvature.
 
 ### 3D view v12 — the WHOLE facility, and the car where it really was across the road (`track3d_v` 12)
 The user: the car sat in the middle of the track the whole time; render every configuration/layout of the

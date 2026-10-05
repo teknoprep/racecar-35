@@ -1723,3 +1723,105 @@ class Track3DMathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+WIDTH_DRIVER = r"""
+// ---- network v2 widths: gap fill, the driven envelope, asymmetric snap, fold guard
+const R = {};
+(function () {
+  var o = { lat: 39, lon: -77 }, k;
+  // a straight 400 m track heading NORTH (local z = -north): right of travel = +x
+  var xs = [], zs = [];
+  for (k = 0; k <= 400; k += 2) { xs.push(0); zs.push(-k); }
+  var T = RC3D.linePath(xs, zs, null, { closed: false, step: 1, o: o });
+  var n = T.dense.x.length;
+  R.n = n;
+  // 1. gaps are bridged from their measured neighbours, not set to one number
+  var a = new Float64Array(n), have = new Uint8Array(n);
+  for (k = 0; k < n; k++) if (k < 100 || k > 300) { a[k] = k < 100 ? 4 : 6; have[k] = 1; }
+  RC3D.fillGaps(a, have, false);
+  R.gapMid = a[200]; R.gapEnd0 = a[0]; R.gapEndN = a[n - 1];
+  var c = new Float64Array(10), hc = new Uint8Array(10);
+  c[2] = 2; hc[2] = 1; c[7] = 7; hc[7] = 1;
+  RC3D.fillGaps(c, hc, true);                     // closed: across the seam too
+  R.seam = Array.prototype.slice.call(c);
+  // 2. the driven envelope: fixes 5.5 m RIGHT of a 4+4 m road for s 100..200
+  var hl = new Float64Array(n).fill(4), hr = new Float64Array(n).fill(4), samples = [], s, ll;
+  for (s = 0; s < 400; s += 0.5) {
+    ll = RC3D.localToLatLon((s > 100 && s < 200) ? 5.5 : 0, -s, o);
+    samples.push({ lat: ll[0], lon: ll[1], speed_mph: 60 });
+  }
+  for (s = 250; s < 300; s += 0.5) {               // the pit lane, 20 m left: never widens
+    ll = RC3D.localToLatLon(-20, -s, o); samples.push({ lat: ll[0], lon: ll[1], speed_mph: 40 });
+  }
+  for (s = 320; s < 360; s += 0.5) {               // crawling in the paddock: ignored
+    ll = RC3D.localToLatLon(-6, -s, o); samples.push({ lat: ll[0], lon: ll[1], speed_mph: 8 });
+  }
+  R.env = RC3D.containEnvelope(T, hl, hr, samples, o, { margin: 0.5, maxOver: 7 });
+  R.hr150 = hr[150]; R.hl150 = hl[150]; R.hr40 = hr[40]; R.hl275 = hl[275]; R.hl340 = hl[340];
+  // 3. snapping an ASYMMETRIC road (2 m left, 8 m right): 5 m right is on the
+  //    tarmac (untouched), 3 m left is GPS error (pulled in to 1.6 m)
+  var pr = RC3D.localToLatLon(5, -200, o), pl = RC3D.localToLatLon(-3, -210, o);
+  var sn = RC3D.snapSamples([{ lat: pr[0], lon: pr[1] }, { lat: pl[0], lon: pl[1] }], o,
+                            T.dense.x, T.dense.z, function () { return [2, 8]; }, {});
+  var q0 = RC3D.project(sn.samples[0].lat, sn.samples[0].lon, o);
+  var q1 = RC3D.project(sn.samples[1].lat, sn.samples[1].lon, o);
+  R.snap = { moved: sn.moved, x0: q0.x, x1: q1.x };
+  // 4. a 10 m radius hairpin with 9 m half widths: the INSIDE edge would fold
+  var cx = [], cz = [];
+  for (k = 0; k < 72; k++) { cx.push(10 * Math.cos(k * Math.PI / 36)); cz.push(10 * Math.sin(k * Math.PI / 36)); }
+  var C = RC3D.linePath(cx, cz, null, { closed: true, step: 1, o: o });
+  var m = C.dense.x.length, fl = new Float64Array(m).fill(9), fr = new Float64Array(m).fill(9);
+  R.foldClamped = RC3D.foldGuard(C, fl, fr);
+  var mx = function (v) { return Math.max.apply(null, Array.prototype.slice.call(v)); };
+  var mn = function (v) { return Math.min.apply(null, Array.prototype.slice.call(v)); };
+  R.fold = { lMax: mx(fl), lMin: mn(fl), rMax: mx(fr), rMin: mn(fr) };
+})();
+console.log(JSON.stringify(R));
+"""
+
+
+class Track3DWidthTests(unittest.TestCase):
+    """track3d_v 13: the road is the REAL surface - per-station widths with gaps
+    bridged, widened to the session's own driving (the line on the tarmac),
+    snapped asymmetrically, never folded at a hairpin."""
+
+    @unittest.skipIf(NODE is None, "node not available")
+    def test_widths_envelope_snap_and_fold(self):
+        import re
+        html = _page_html()
+        m = re.search(r"<script type=\"module\">(.*?)</script>", html, re.S)
+        body = re.sub(r"^\s*import .*$", "", m.group(1), count=1, flags=re.M)
+        three = next((p for p in THREE_CANDIDATES if p.exists()), None)
+        header = (("import * as THREE from '%s';\n" % three.as_uri()) if three
+                  else "const THREE = {};\n")
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "rc3d_width.mjs"
+            f.write_text(PRELUDE + header + body + "\n" + WIDTH_DRIVER)
+            proc = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr[-4000:])
+            r = json.loads(proc.stdout.strip().splitlines()[-1])
+        # 1. gap fill: linear between neighbours, ends held, closed across the seam
+        self.assertAlmostEqual(r["gapMid"], 5.0, delta=0.05)
+        self.assertEqual((r["gapEnd0"], r["gapEndN"]), (4, 6))
+        self.assertAlmostEqual(r["seam"][0], 7 + (2 - 7) * 3 / 5, delta=1e-9)   # 7 -> 2 via 8,9,0,1
+        self.assertAlmostEqual(r["seam"][4], 2 + (7 - 2) * 2 / 5, delta=1e-9)
+        # 2. the right edge moved out to the fixes (+ the 0.5 m margin)...
+        self.assertAlmostEqual(r["hr150"], 6.0, delta=0.15)
+        self.assertEqual(r["hl150"], 4)
+        self.assertAlmostEqual(r["hr40"], 4.0, delta=0.01)            # untouched far away
+        self.assertEqual(r["hl275"], 4)                                # pit lane: no
+        self.assertEqual(r["hl340"], 4)                                # paddock crawl: no
+        self.assertLess(r["env"]["inside"], 0.85)
+        self.assertGreater(r["env"]["insideAfter"], 0.99)
+        # 3. asymmetric snap: right fix kept at +5, left fix pulled to -(2 - 0.4)
+        self.assertEqual(r["snap"]["moved"], 1)
+        self.assertAlmostEqual(r["snap"]["x0"], 5.0, delta=0.05)
+        self.assertAlmostEqual(r["snap"]["x1"], -1.6, delta=0.05)
+        # 4. the hairpin: one side (the inside) clamped under 85 % of the radius,
+        #    the outside untouched
+        self.assertGreater(r["foldClamped"], 0)
+        inside = min(r["fold"]["lMax"], r["fold"]["rMax"])
+        outside = max(r["fold"]["lMin"], r["fold"]["rMin"])
+        self.assertLessEqual(inside, 0.85 * 10 + 0.3)
+        self.assertEqual(outside, 9)

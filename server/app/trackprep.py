@@ -1605,6 +1605,312 @@ def refine_centreline(line_points, img, bounds, opts=None):
 
 
 # ---------------------------------------------------------------------------
+# the track's EDGES, traced in 2D off the imagery (network v2)
+# ---------------------------------------------------------------------------
+# measure_width() reads ONE colour profile per station and walks outward until
+# the colour changes. Measured at Summit Point that put only 65 % of the car's
+# own GPS fixes on the drawn road: a painted edge line, a tree shadow or a
+# patch of bleached grass ends (or extends) a 1-D run, so the published width
+# was squeezed into a 7-16 m clamp and smoothed into a near-constant 8 m on a
+# 10-13 m circuit, and the per-station re-centring made straights wobble.
+#
+# This instead UNROLLS the corridor - stations down, lateral offset across -
+# and segments it as an image:
+#   1. per stretch of track, an asphalt colour model (seeded from the line,
+#      then re-learnt from the first pass's own road: no GPS needed) against a
+#      MULTI-cluster background (grass, trees, sand and dirt are not one
+#      colour, and a single background blob made dry grass look like tarmac);
+#   2. white edge lines ATTRACT the boundary to their outer side, and act as a
+#      barrier (pavement beyond the track's own edge line is run-off);
+#   3. each edge is the globally best SMOOTH path along the whole track
+#      (dynamic programming), so a shadow, a junction or a gap in the paint
+#      cannot make it jump;
+#   4. short outward bulges beyond the local median are cut back.
+# Same Summit Point session: 95 % of fixes inside (98 % within 1 m), width
+# 8.5-14 m (median 10.4) instead of a constant 8 m.
+TRACE_REACH_M = 22.0        # corridor sampled each side of the line
+TRACE_STEP_M = 0.25         # lateral sampling
+TRACE_SEED_M = 1.5          # first-pass asphalt seed: the line +- this
+TRACE_FAR_M = 13.0          # background samples: beyond this
+TRACE_EDGE_MAX_M = 18.0     # an edge is searched for within this of the line
+TRACE_MAX_JUMP = 3          # DP: max lateral move per station, in columns
+TRACE_LAMBDA = 0.35         # DP: cost per column moved
+TRACE_MIN_CONF = 0.45       # share of stations with a clear edge to trust it
+TRACE_WIDTH_CLAMP = {"circuit": (6.0, 26.0), "oval": (8.0, 30.0),
+                     "pit": (4.0, 20.0), "kart": (4.0, 14.0)}
+
+
+def _mosaic_px_np(bounds: dict, lat, lon):
+    """Vectorised mosaic_px (same maths, numpy arrays in and out)."""
+    z = bounds["z"]
+    k = bounds.get("scale", 1.0)
+    world = float(TILE << z)
+    x = (np.asarray(lon, dtype=float) + 180.0) / 360.0 * world
+    r = np.radians(np.clip(np.asarray(lat, dtype=float), -85.05112878, 85.05112878))
+    y = (1.0 - np.arcsinh(np.tan(r)) / math.pi) / 2.0 * world
+    return ((x - bounds["x0"] * TILE) * k,
+            (y - bounds["y0"] * TILE) * bounds.get("scale_y", k))
+
+
+def _bilinear_u8(arr, x, y):
+    """Bilinear read of a uint8 HxWx3 array at float pixel coords -> float32;
+    outside the image -> NaN (the caller treats that as 'unknown')."""
+    h, w = arr.shape[:2]
+    inside = (x >= 0) & (y >= 0) & (x <= w - 1.001) & (y <= h - 1.001)
+    xc = np.clip(x, 0, w - 1.001)
+    yc = np.clip(y, 0, h - 1.001)
+    x0 = np.floor(xc).astype(np.int64)
+    y0 = np.floor(yc).astype(np.int64)
+    fx = (xc - x0)[..., None].astype(np.float32)
+    fy = (yc - y0)[..., None].astype(np.float32)
+    a = arr[y0, x0].astype(np.float32)
+    b = arr[y0, x0 + 1].astype(np.float32)
+    c = arr[y0 + 1, x0].astype(np.float32)
+    d = arr[y0 + 1, x0 + 1].astype(np.float32)
+    out = a * (1 - fx) * (1 - fy) + b * fx * (1 - fy) + c * (1 - fx) * fy + d * fx * fy
+    out[~inside] = np.nan
+    return out
+
+
+def _roll_median(a, h: int, closed: bool):
+    a = np.asarray(a, dtype=float)
+    n = len(a)
+    if n == 0 or h <= 0:
+        return a.copy()
+    pad = (np.concatenate([a[-h:], a, a[:h]]) if closed and n > 2 * h
+           else np.pad(a, h, mode="edge"))
+    win = np.lib.stride_tricks.sliding_window_view(pad, 2 * h + 1)
+    return np.median(win, axis=1)[:n]
+
+
+def _roll_mean(a, h: int, closed: bool):
+    a = np.asarray(a, dtype=float)
+    n = len(a)
+    if n == 0 or h <= 0:
+        return a.copy()
+    pad = (np.concatenate([a[-h:], a, a[:h]]) if closed and n > 2 * h
+           else np.pad(a, h, mode="edge"))
+    return np.convolve(pad, np.ones(2 * h + 1) / (2 * h + 1), "valid")[:n]
+
+
+def _kmeans(X, k: int, rng, iters: int = 8):
+    """Tiny k-means -> [(mean, std)] of the clusters that kept members."""
+    if len(X) < k * 10:
+        return [(X.mean(0), X.std(0) + 5.0)]
+    C = X[rng.choice(len(X), k, replace=False)].copy()
+    for _ in range(iters):
+        a = ((X[:, None, :] - C[None]) ** 2).sum(-1).argmin(1)
+        for q in range(k):
+            if (a == q).sum() > 5:
+                C[q] = X[a == q].mean(0)
+    a = ((X[:, None, :] - C[None]) ** 2).sum(-1).argmin(1)
+    return [(X[a == q].mean(0), X[a == q].std(0) + 5.0)
+            for q in range(k) if (a == q).sum() > 20]
+
+
+def _edge_dp(cost, closed: bool, lam: float = TRACE_LAMBDA,
+             max_jump: int = TRACE_MAX_JUMP):
+    """Cheapest path down the rows of `cost` (n x m), moving at most max_jump
+    columns per row at lam per column. A closed loop is run with a wrapped
+    margin so the seam is as smooth as anywhere else."""
+    n, m = cost.shape
+    big = 1e9
+    wrap = min(60, n // 2) if closed else 0
+    C = np.concatenate([cost[-wrap:], cost, cost[:wrap]]) if wrap else cost
+    N = len(C)
+    cols = np.arange(m)
+    acc = C[0].copy()
+    back = np.zeros((N, m), dtype=np.int32)
+    for i in range(1, N):
+        best = np.full(m, big)
+        arg = np.zeros(m, dtype=np.int32)
+        for d in range(-max_jump, max_jump + 1):
+            sh = np.full(m, big)
+            if d > 0:
+                sh[d:] = acc[:m - d]
+            elif d == 0:
+                sh = acc.copy()
+            else:
+                sh[:d] = acc[-d:]
+            v = sh + lam * abs(d)
+            bt = v < best
+            best[bt] = v[bt]
+            arg[bt] = (cols - d)[bt]
+        acc = best + C[i]
+        back[i] = arg
+    path = np.zeros(N, dtype=np.int64)
+    path[-1] = int(np.argmin(acc))
+    for i in range(N - 1, 0, -1):
+        path[i - 1] = back[i, path[i]]
+    return path[wrap:wrap + n]
+
+
+def trace_edges(img, bounds: dict, frame: dict, closed: bool = False, opts=None) -> dict:
+    """Left/right half widths (m) of the paved track along `frame` (resample()/
+    _line_frame() output: lat, lon, normal), traced in 2D - see the notes above.
+
+    Returns {left, right (arrays, along -normal / +normal from the line), ok
+    (stations with a clear edge on both sides), conf (share ok), classifier}.
+    `left`/`right` are filled everywhere (unclear stations are interpolated
+    from their clear neighbours); judge the result by `conf`."""
+    _require_deps()
+    opts = opts or {}
+    reach = float(opts.get("reach_m") or TRACE_REACH_M)
+    step = float(opts.get("step_m") or TRACE_STEP_M)
+    lat = np.asarray(frame["lat"], dtype=float)
+    lon = np.asarray(frame["lon"], dtype=float)
+    nrm = np.asarray(frame["normal"], dtype=float)
+    n = len(lat)
+    empty = {"left": np.zeros(n), "right": np.zeros(n), "ok": np.zeros(n, dtype=bool),
+             "conf": 0.0, "classifier": "none"}
+    if n < 8:
+        return empty
+    offs = np.arange(-reach, reach + 1e-9, step)
+    m = len(offs)
+    c0 = int(np.argmin(np.abs(offs)))
+    coslat = math.cos(math.radians(float(lat.mean())))
+    la = lat[:, None] + offs[None, :] * nrm[:, 1][:, None] / M_PER_DEG_LAT
+    lo = lon[:, None] + offs[None, :] * nrm[:, 0][:, None] / (M_PER_DEG_LAT * coslat)
+    X, Y = _mosaic_px_np(bounds, la, lo)
+    arr = np.asarray(img.convert("RGB") if hasattr(img, "convert") else img, dtype=np.uint8)
+    U = _bilinear_u8(arr, X, Y)                           # n x m x 3, NaN outside
+    known = np.isfinite(U[..., 0])
+    if known.mean() < 0.6:
+        return empty
+    U = np.where(known[..., None], U, np.nanmedian(U[known], axis=0))
+    # texture: local luminance spread in a 3x3 pixel neighbourhood of each
+    # sample, read straight from the uint8 mosaic (never a float copy of the
+    # whole image, so a big mosaic cannot silently lose this feature)
+    h, w = arr.shape[:2]
+    xi = np.clip(np.round(X).astype(np.int64), 1, w - 2)
+    yi = np.clip(np.round(Y).astype(np.int64), 1, h - 2)
+    wts = np.array([0.299, 0.587, 0.114], np.float32)
+    nb = np.stack([arr[yi + dy, xi + dx].astype(np.float32) @ wts
+                   for dy in (-1, 0, 1) for dx in (-1, 0, 1)], -1)
+    tex = nb.std(-1)
+    del nb
+    R_, G_, B_ = U[..., 0], U[..., 1], U[..., 2]
+    mx = U.max(-1)
+    sat = (mx - U.min(-1)) / np.maximum(mx, 1.0)
+    lum = U @ np.array([0.299, 0.587, 0.114], np.float32)
+    F = np.stack([R_, G_, B_, sat * 255.0, (G_ - R_) * 3.0,
+                  ((R_ + G_) / 2.0 - B_) * 2.0, tex * 2.0], -1).astype(np.float64)
+    k = F.shape[-1]
+    far = np.abs(offs) >= float(opts.get("far_m") or TRACE_FAR_M)
+    rng = np.random.default_rng(1234)                    # deterministic bakes
+
+    def logn(x, mu, sd):
+        return -0.5 * (((x - mu) / sd) ** 2).sum(-1) - np.log(sd).sum()
+
+    def classify(seed):
+        score = np.zeros((n, m))
+        blk, win = 8, 24
+        for b0 in range(0, n, blk):
+            a, b = max(0, b0 - win), min(n, b0 + blk + win)
+            A = F[a:b][seed[a:b]]
+            if len(A) < 40:
+                A = F[a:b, max(0, c0 - 6):c0 + 7].reshape(-1, k)
+            ma, sa = np.median(A, 0), A.std(0) + 5.0
+            Bk = F[a:b][:, far].reshape(-1, k)
+            if len(Bk) > 3000:
+                Bk = Bk[rng.choice(len(Bk), 3000, replace=False)]
+            # background samples that ARE asphalt (another road 13 m out) go
+            la_b = logn(Bk, ma, sa)
+            Bk = Bk[la_b < np.percentile(logn(A, ma, sa), 10)]
+            comps = _kmeans(Bk, 4, rng) if len(Bk) > 100 else \
+                [(F[a:b][:, far].reshape(-1, k).mean(0), F[a:b][:, far].reshape(-1, k).std(0) + 5.0)]
+            rows = F[b0:b0 + blk]
+            score[b0:b0 + blk] = logn(rows, ma, sa) - np.max(
+                np.stack([logn(rows, mu, sd) for mu, sd in comps]), 0)
+        return score
+
+    J = np.arange(m)
+    lim = float(opts.get("edge_max_m") or TRACE_EDGE_MAX_M)
+
+    def costs(score, asph_lum):
+        paint = (lum > asph_lum + 22.0) & (sat < 0.24)
+        S = np.clip(score, -6.0, 6.0)
+        S[paint] = 3.0
+        W = 6
+        cs = np.concatenate([np.zeros((n, 1)), np.cumsum(S, 1)], 1)
+        lo_, hi_ = np.clip(J - W, 0, m), np.clip(J + W, 0, m)
+        cL = -((cs[:, hi_] - cs[:, J]) / np.maximum(hi_ - J, 1)
+               - (cs[:, J] - cs[:, lo_]) / np.maximum(J - lo_, 1))
+        J1 = np.clip(J + 1, 0, m)
+        hi1, lo1 = np.clip(J + 1 + W, 0, m), np.clip(J + 1 - W, 0, m)
+        cR = -((cs[:, J1] - cs[:, lo1]) / np.maximum(J1 - lo1, 1)
+               - (cs[:, hi1] - cs[:, J1]) / np.maximum(hi1 - J1, 1))
+        # edge lines: the boundary sits at the OUTER side of one...
+        pc = np.concatenate([np.zeros((n, 1)), np.cumsum(paint, 1)], 1)
+        pin_l = (pc[:, np.clip(J + 3, 0, m)] - pc[:, J]) > 0
+        pout_l = (pc[:, J] - pc[:, np.clip(J - 2, 0, m)]) > 0
+        pin_r = (pc[:, J1] - pc[:, np.clip(J - 2, 0, m)]) > 0
+        pout_r = (pc[:, np.clip(J + 3, 0, m)] - pc[:, J1]) > 0
+        cL = cL - 1.5 * (pin_l & ~pout_l)
+        cR = cR - 1.5 * (pin_r & ~pout_r)
+        # ...and pavement beyond the track's own edge line is run-off: penalise a
+        # boundary with paint >= 0.5 m inside it (rows that are mostly paint - a
+        # start/finish line - and paint by the line itself do not count)
+        rowpaint = paint.mean(1) > 0.35
+        pb = paint & ~rowpaint[:, None]
+        pbc = np.concatenate([np.zeros((n, 1)), np.cumsum(pb, 1)], 1)
+        core_l, core_r = max(0, c0 - 8), min(m, c0 + 8)
+        in_l = pbc[:, core_l][:, None] - pbc[:, np.clip(J + 4, 0, core_l)]
+        in_r = pbc[:, np.clip(J - 3, core_r, m)] - pbc[:, core_r][:, None]
+        cL = cL + 2.5 * ((in_l >= 2) & (J + 4 < core_l))
+        cR = cR + 2.5 * ((in_r >= 2) & (J - 3 > core_r))
+        cL[:, ~((offs >= -lim) & (offs <= 0.5))] = 1e9
+        cR[:, ~((offs >= -0.5) & (offs <= lim))] = 1e9
+        return cL, cR
+
+    seed = np.zeros((n, m), dtype=bool)
+    sd = max(1, int(round(TRACE_SEED_M / step)))
+    seed[:, max(0, c0 - sd):c0 + sd + 1] = True
+    asph_lum = float(np.median(lum[:, max(0, c0 - 4):c0 + 5]))
+    cL, cR = costs(classify(seed), asph_lum)
+    pl, pr = _edge_dp(cL, closed), _edge_dp(cR, closed)
+    # second pass: re-learn the asphalt from the inner 70 % of the first road
+    seed = np.zeros((n, m), dtype=bool)
+    for i in range(n):
+        a, b = int(pl[i]), int(pr[i])
+        q = int((b - a) * 0.15)
+        if b - a > 16:
+            seed[i, a + q:b - q] = True
+    if seed.any():
+        asph_lum = float(np.median(lum[seed]))
+    cL, cR = costs(classify(seed), asph_lum)
+    pl, pr = _edge_dp(cL, closed), _edge_dp(cR, closed)
+    rows = np.arange(n)
+    # a clear edge = a real contrast at the chosen boundary
+    ok = (-cL[rows, pl] > 1.0) & (-cR[rows, pr] > 1.0)
+    left = -offs[pl].astype(float)                       # distance along -normal
+    right = offs[pr].astype(float)
+    conf = float(ok.mean())
+    if ok.sum() >= 3:
+        idx = np.arange(n)
+        left = np.interp(idx, idx[ok], left[ok], period=n if closed else None)
+        right = np.interp(idx, idx[ok], right[ok], period=n if closed else None)
+    # short outward bulges beyond the local (~90 m) median: aprons, shadows
+    for arr_ in (left, right):
+        med = _roll_median(arr_, 15, closed)
+        bulge = arr_ - med > 2.0
+        arr_[bulge] = med[bulge] + 1.0
+    left = _roll_mean(left, 3, closed)
+    right = _roll_mean(right, 3, closed)
+    return {"left": left, "right": right, "ok": ok, "conf": round(conf, 3),
+            "classifier": "trace2d"}
+
+
+def _straight_offset(raw, closed: bool, max_shift: float = 6.0):
+    """The lateral re-centring of a line onto its traced corridor, smoothed
+    hard (~45 m median, then ~45 m mean) so a straight STAYS straight: the old
+    per-station re-centring followed every pixel of edge noise and made the
+    road wobble."""
+    off = _roll_median(np.clip(np.asarray(raw, dtype=float), -max_shift, max_shift), 7, closed)
+    return _roll_mean(_roll_mean(off, 7, closed), 7, closed)
+
+
+# ---------------------------------------------------------------------------
 # the asset
 # ---------------------------------------------------------------------------
 LANDCOVER_CODES = "pgwo"        # paved/built, grass, woods, other (dirt, water, gravel)
@@ -1818,7 +2124,8 @@ def add_landcover(asset: dict, img, bounds: dict, log=print) -> dict:
 # ---------------------------------------------------------------------------
 # enrichment: real-world features, hi-res terrain, a centred line
 # ---------------------------------------------------------------------------
-ENRICH_VERSION = 2                  # 2: + the facility track network + ground image
+ENRICH_VERSION = 3                  # 2: + the facility track network + ground image
+                                    # 3: network v2 (2-D traced edges) replaces v1
 ENRICH_RETRY_S = 6 * 3600           # a failed network step is not retried sooner
 _ENRICH_ACTIVE = set()
 _ENRICH_ACTIVE_LOCK = threading.Lock()
@@ -1887,7 +2194,7 @@ def _texture_bounds(tex: dict, size) -> dict:
 
 # ---- the track network (asset["network"]) + the facility ground image -----
 ESRI_ATTRIB = "Imagery \u00a9 Esri, Maxar, Earthstar Geographics"
-NETWORK_V = 1
+NETWORK_V = 2                     # 2: edges traced in 2D (trace_edges), straight centrelines
 NETWORK_STEP_M = 3.0
 NETWORK_MARGIN_M = 700.0          # query box = the asset line's bbox + this
 NETWORK_MIN_CHAIN_M = 15.0
@@ -2012,10 +2319,62 @@ def _chain_widths(kind: str, frame: dict, st_tags, img, bounds, default_w: float
     return left, right, src
 
 
+def _traced_chain(c: dict, line: dict, kind: str, img, bounds, st_tags):
+    """trace_edges() for one chain -> (frame, left, right, src) re-centred on the
+    traced corridor, or None when the imagery does not show its edges clearly."""
+    closed = bool(c.get("closed"))
+    tr = trace_edges(img, bounds, line, closed=closed)
+    if tr["conf"] < TRACE_MIN_CONF:
+        return None
+    L, R = np.asarray(tr["left"], float), np.asarray(tr["right"], float)
+    n = len(L)
+    off = _straight_offset((R - L) / 2.0, closed)
+    if not closed and n > 4:
+        # open ends meet other chains at junctions: pin them there
+        ramp = np.clip(np.minimum(np.arange(n), np.arange(n)[::-1]) / 7.0, 0, 1)
+        off = off * ramp
+    la, lo = _shift_along_normal(line["lat"], line["lon"], line["normal"], off)
+    frame = _line_frame(la, lo)
+    left, right = L + off, R - off            # the same edges, from the new centre
+    lo_w, hi_w = TRACE_WIDTH_CLAMP.get(kind, TRACE_WIDTH_CLAMP["circuit"])
+    left = np.maximum(left, 2.0)
+    right = np.maximum(right, 2.0)
+    tot = left + right
+    k = np.clip(tot, lo_w, hi_w) / np.maximum(tot, 1e-6)
+    left, right = left * k, right * k
+    src = ["imagery"] * n
+    # an OSM width tag is ONE number for a whole way; the traced edges are the
+    # real surface. The tag only overrides a station the imagery got absurd.
+    for i, t in enumerate(st_tags or []):
+        if t and not (0.6 * float(t) <= left[i] + right[i] <= 1.8 * float(t)):
+            left[i] = right[i] = float(t) / 2.0
+            src[i] = "osm"
+    return frame, left, right, src, tr["conf"]
+
+
 def _network_chain(c: dict, pts, kind: str, img, bounds, default_w: float) -> dict:
     line = resample(_densify(pts, NETWORK_STEP_M / 2.0), NETWORK_STEP_M, smooth_win=5)
     frame = line
     refined = False
+    if img is not None:
+        try:
+            got = _traced_chain(c, line, kind, img, bounds,
+                                _station_tags(pts, c.get("wtag"), line))
+        except Exception:
+            got = None
+        if got:
+            frame, left, right, src, conf = got
+            counts = {s: src.count(s) for s in set(src)}
+            ws = max(sorted(counts), key=lambda s: counts[s])
+            return {"ids": list(c.get("ids") or []), "names": list(c.get("names") or []),
+                    "kind": kind, "closed": bool(c.get("closed")),
+                    # 7 decimals (~1 cm): at 3 m stations, 6 decimals (~10 cm) is
+                    # ~2 degrees of heading noise, a visible ripple on the edges
+                    "p": [[round(float(a), 7), round(float(b), 7)]
+                          for a, b in zip(frame["lat"], frame["lon"])],
+                    "hw": [[round(float(a), 2), round(float(b), 2)] for a, b in zip(left, right)],
+                    "w": round(float(np.median(left + right)), 1), "ws": ws,
+                    "refined": True, "edges": "trace2d", "conf": conf}
     if img is not None:
         try:
             off, rep = _refine_stations(line, img, bounds)
@@ -2177,6 +2536,11 @@ def _save_jpeg_capped(img, path: pathlib.Path, quality: int = GROUND_QUALITY,
     return im.size, q, buf.tell()
 
 
+def _network_stale(asset: dict) -> bool:
+    net = asset.get("network") or {}
+    return bool(net.get("chains")) and int(net.get("v") or 0) < NETWORK_V
+
+
 def _enrich_missing(asset: dict, adir: pathlib.Path) -> bool:
     if not asset.get("features"):
         return True
@@ -2185,6 +2549,8 @@ def _enrich_missing(asset: dict, adir: pathlib.Path) -> bool:
         if not m or not (adir / str(m.get("file") or "?")).is_file():
             return True
     if not (asset.get("network") or {}).get("chains"):
+        return True
+    if _network_stale(asset):
         return True
     g = asset.get("ground")
     if not g or not (adir / str(g.get("file") or "?")).is_file():
@@ -2303,7 +2669,10 @@ def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
             log(f"[{slug}] station elevations failed: {type(e).__name__}: {e}")
 
     # e. the facility's whole track network (every layout, pit lane, kart track)
-    if network and len(line) >= 2 and not (asset.get("network") or {}).get("chains") \
+    #    - also REBUILT when it was made by an older NETWORK_V (v1 widths were a
+    #    squeezed near-constant; v2 traces the real edges)
+    if network and len(line) >= 2 and (not (asset.get("network") or {}).get("chains")
+                                       or _network_stale(asset)) \
             and now - float(asset.get("network_tried") or 0) >= ENRICH_RETRY_S:
         try:
             bb = _expand_bbox(_asset_bbox(asset, False), NETWORK_MARGIN_M)
