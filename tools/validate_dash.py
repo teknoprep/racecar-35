@@ -24,8 +24,8 @@ parses the sketch as text (stdlib only) and asserts:
      MON_SRC_MASK has one entry per MonItem (v0.1.156 per-item source)
  12. every item's src[] / can_bus[] is seeded in monDefaults() and range-checked in monCfgValid()
  13. the item page draws a Source row and (for CANBUS) a CAN-bus row, and handles taps on both
- 14. the AFR item page HAS an AEM input row (MIR_AEM / "AEM input") that writes s.aem_afr,
-     the AFR Source row still drives it (monAfrSyncAem), and Settings hides the AEM row
+ 14. AEM is folded INTO the AFR Source selector (v0.1.171): the AFR DIRECT source is labelled
+     "AEM" (monSrcName), the Source row drives s.aem_afr (monAfrSyncAem), Settings hides the row
 
 Usage: tools/validate_dash.py [path/to/RaceDash.ino]   (exit 0 = ok, 1 = failures)
 """
@@ -278,19 +278,19 @@ def main():
         fail("13: could not locate drawMonItem() / monItemRows() / handleMonItemTap()")
     else:
         if not (re.search(r"\bMIR_SRC\b", rows_fn) and re.search(r'"Source"', mi_body)
-                and re.search(r"\bMON_SRC_NAMES\b", mi_body) and re.search(r"\bcase\s+MIR_SRC\b", tap_body)):
-            fail("13: the item page does not draw/handle a Source row (MIR_SRC / \"Source\" / MON_SRC_NAMES)")
+                and re.search(r"\b(?:MON_SRC_NAMES|monSrcName)\b", mi_body) and re.search(r"\bcase\s+MIR_SRC\b", tap_body)):
+            fail("13: the item page does not draw/handle a Source row (MIR_SRC / \"Source\" / source label)")
         if not (re.search(r"\bMON_SRC_CAN\b[^;]*\)?\s*kinds\s*\[[^\]]*\]\s*=\s*MIR_CAN", rows_fn)
                 and re.search(r'"CAN bus"', mi_body) and re.search(r"\bMON_CAN_NAMES\b", mi_body)
                 and re.search(r"\bcase\s+MIR_CAN\b", tap_body)):
             fail("13: the item page does not draw/handle a CAN-bus row shown only for src == MON_SRC_CAN")
-        # v0.1.157: the AEM option is ON the AFR item page as its own "AEM input" row; the
-        # AFR Source row still drives s.aem_afr (monAfrSyncAem); the Settings row is gone.
-        if not (re.search(r"\bMIR_AEM\b", rows_fn) and re.search(r'"AEM input"', mi_body)
-                and re.search(r"\bcase\s+MIR_AEM\b", tap_body)):
-            fail("14: the AFR item page has no AEM input row (MIR_AEM / \"AEM input\")")
-        if not re.search(r"\bs\.aem_afr\s*=", tap_body):
-            fail("14: the AEM input row does not write s.aem_afr")
+        # v0.1.171: AEM is folded INTO the AFR Source selector — no separate MIR_AEM row.
+        # The AFR item's DIRECT source is labelled "AEM" via monSrcName, and the Source row
+        # still drives s.aem_afr (monAfrSyncAem). The Settings AEM row stays hidden.
+        if re.search(r"\bMIR_AEM\b", rows_fn) or re.search(r'"AEM input"', mi_body):
+            fail("14: the item page still has a separate AEM input row (AEM must be a Source option)")
+        if not re.search(r'monSrcName\s*\([^)]*\)\s*\{[^}]*MON_AFR[^}]*MON_SRC_DIRECT[^}]*"AEM"', code, re.S):
+            fail("14: the AFR DIRECT source is not labelled \"AEM\" (monSrcName)")
         if not re.search(r"MON_AFR[^;]*\)\s*monAfrSyncAem|item\s*==\s*MON_AFR\)\s*monAfrSyncAem", tap_body):
             fail("14: the Source row does not drive the AEM input for the AFR item (monAfrSyncAem)")
         if not re.search(r"ST_AEM_STATUS:\s*return false", code):
@@ -337,7 +337,7 @@ def main():
     print(" 11 MON_SRC_NAMES / MON_CAN_NAMES / MON_SRC_MASK lengths match their enums")
     print(" 12 per-item src + can_bus seeded in monDefaults(), validated in monCfgValid()")
     print(" 13 item page: Source row + CAN-bus row (CANBUS only), draw + tap")
-    print(" 14 AFR has an AEM input row (writes s.aem_afr); Source drives it; hidden in Settings")
+    print(" 14 AEM is an AFR Source option (labelled AEM); Source drives s.aem_afr; hidden in Settings")
     print(" 15 OIL has a CAN source bit; ECU parse reads oil_x10; monitor cap <= 20 ms")
     print(" 16 RPM carries no monitor warn rows (shift alerts own RPM)")
     return 0

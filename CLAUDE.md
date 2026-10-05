@@ -1437,7 +1437,7 @@ now the **Bluetooth OBD-II** pairing page reached from Settings.
 | TEMP | `eng.direct_coolant_f_x10` (NTC ADC) | `obd::coolantF_x10()` | `ecu.coolant_f_x10` |
 | OIL  | `eng.oil_psi_x10` (A2) | — | `ecu.oil_x10` — RC35 bench frames ONLY |
 | VOLT | — (this board has no battery ADC) | `obd::voltX10()` (ATRV) | `ecu.bat_x10` |
-| AFR  | the AEM analogue input | — | `ecu.afr_x10` |
+| AFR  | the AEM analogue input (Source shows **AEM**) | — | `ecu.afr_x10` |
 | IAT  | — | `obd::iatF_x10()` | `ecu.iat_f_x10` |
 | MAP  | — | — (no MAP PID is polled) | `ecu.map_x10` |
 | TPS  | — | `obd::tpsX10()` (PID 0111) | `ecu.tps_x10` |
@@ -1466,11 +1466,12 @@ log*.
   `VOLT: ---` when its source has no data instead of vanishing: a row you asked for that simply
   isn't there is indistinguishable from a bug.
 
-### AEM lives in the monitor menu, and BLE may own the radio there (v0.1.157)
-- **AEM 30-0300 input** is now an option **inside the menu** — the `AEM input` row on the AFR
-  item page (the Settings row is hidden). It is an *input* switch: it tells the Teensy to read
-  and log the gauge (`CFG,afraem`), while the AFR row's **Source = DIRECT** is what displays it.
-  Enabling it therefore also sets the AFR source to DIRECT, so the two can never disagree.
+### AEM is an AFR Source option, and BLE may own the radio in the monitor menu (v0.1.171)
+- **AEM 30-0300 input** is the AFR item's **Source = AEM** option (it was a separate `AEM input`
+  row through v0.1.170) — so it sits in the SAME selector as CANBUS, not on its own row. The
+  AFR item's DIRECT source IS the gauge, so the pill reads `AEM` (`monSrcName()`), and picking
+  it tells the Teensy to read and log the gauge (`CFG,afraem`, driven by `monAfrSyncAem()` from
+  the source). Picking BLUETOOTH/CANBUS turns the gauge input off. One control, not two.
 - **BLE is allowed to own the radio while you are in the monitor menu**: `monBtMenuTick()`
   (called right after `netOwnerTick()`, 2 Hz) brings BLE up when `currentPage` is
   PAGE_MON_CFG/PAGE_MON_ITEM **and** `monWantsBt()` **and** a dongle is paired — so OBD settings
@@ -1631,7 +1632,7 @@ Remaining levers if it ever returns: `DASH_FREQ_WRITE` 15 → 13–14 MHz (panel
 | `PAGE_SENSOR` | Settings → **Bluetooth OBD-II** | **Bluetooth OBD-II pairing/status (v0.1.170)** — the global source picker is gone. Shows the paired dongle + live BLE status + SCAN + COOLANT PID; BACK saves and releases the radio. Set an item's Source to BLUETOOTH on Sensor monitoring to actually use it. |
 | `PAGE_BT_SCAN` | tap SCAN on PAGE_SENSOR | BLE scan for OBD-II dongles; tap a row to pair (saves `bt_addr`/`bt_atype`/`bt_name`, connects). Drag-scrollable. RESCAN / BACK. |
 | `PAGE_PID_SCAN` | tap COOLANT PID on PAGE_SENSOR | Mode-01 PID scan (needs connected dongle + ignition); tap a row to map it as COOLANT (`btpid`). Drag-scrollable. RESCAN / BACK. |
-| `PAGE_MON_ITEM` | tap an item's **name** on PAGE_MON_CFG | **Per-item editor** (v0.1.155, sources v0.1.156): Display (ALWAYS/WARN ONLY/HIDDEN), **Source** (DIRECT / BLUETOOTH / CANBUS), **CAN bus** (only when the source is CANBUS — "MegaSquirt"), **AEM input** (AFR only, v0.1.157 — writes `s.aem_afr`; switching it on also points the AFR row at DIRECT so the pill can never read ON while the row shows a CAN number), Warn low, Warn high, Colour. The ▲▼ on the list page still reorder. A tap on a pill/button never opens this page — only the name area does. The row pitch shrinks for the 7-row AFR list (7 × 48 = 336 = the body height). |
+| `PAGE_MON_ITEM` | tap an item's **name** on PAGE_MON_CFG | **Per-item editor** (v0.1.155, sources v0.1.156, keypad+AEM v0.1.171): Display (ALWAYS/WARN ONLY/HIDDEN), **Source** (DIRECT / BLUETOOTH / CANBUS; for AFR the DIRECT source reads **AEM** — the 30-0300 gauge is a Source option in the same selector, not a separate row), **CAN bus** (only when the source is CANBUS — "MegaSquirt"), Warn low, Warn high, Colour. **Tap a Warn value to open a numeric keypad** (with `.` and an **OFF** button that disables that threshold) for quick entry — the `-`/`+` buttons still work. The ▲▼ on the list page still reorder. A tap on a pill/button never opens this page — only the name area does. RPM has Display+Source only (shift alerts own RPM). |
 | `PAGE_MON_CFG` | Settings → **Sensor monitoring** | **Order + display editor for the bottom-left monitor block** (v0.1.154): one row per item (TEMP/OIL/VOLT/AFR/IAT/MAP/TPS) with ▲▼ reordering and a tappable mode cell cycling **ALWAYS → WARN ONLY → HIDDEN**. Footer CANCEL (restores the snapshot taken on entry) / RESET (defaults) / DONE (saves the `mon` blob). Warnings still fire for every item that isn't HIDDEN. |
 | `PAGE_TZ_PICKER` | Settings → **Time zone** row | **Scrollable standard-timezone list** (v0.1.152): drag to scroll, tap a row to highlight, footer **CANCEL / AUTO / DONE**. AUTO (green while GPS owns the zone) re-derives immediately and sets `atz` ON; DONE saves + sends `TZ,<id>` to the Teensy and sets `atz` OFF. Replaced the old "tap the row to cycle" enum. |
 | `PAGE_TEST_SRC` | Tools → **Start test mode** (when idle) | **"TEST DATA SOURCE"** (v0.1.147): **TEENSY** = existing `TESTSTART` (Teensy synthesizes + RECORDS a real SD session; exercises SD + upload) / **SCREEN** = dash-local simulator, **no Teensy needed** / CANCEL. Tap-only modal, returns to Tools. |

@@ -28,7 +28,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.170"
+#define FIRMWARE_VERSION "0.1.171"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2005,7 +2005,7 @@ enum Page : uint8_t {
     PAGE_TEST_SRC      = 19,  // "Start test mode": TEENSY (records real SD session) or SCREEN (local sim) (v0.1.147)
     PAGE_TZ_PICKER     = 20,  // scrollable standard-timezone picker, opened from Settings (v0.1.152)
     PAGE_MON_CFG       = 21,  // sensor monitor: reorder + per-item ALWAYS/WARN ONLY/HIDDEN (v0.1.154)
-    PAGE_MON_ITEM      = 22,  // one monitor item: display mode, warn low/high, colour (+ AEM input on AFR) (v0.1.155)
+    PAGE_MON_ITEM      = 22,  // one monitor item: display mode, source, warn low/high, colour (v0.1.155)
 };
 static Page    currentPage     = PAGE_DASH;
 static bool    pageJustEntered = true;
@@ -2022,6 +2022,12 @@ struct KeyboardState {
     bool      keys_dirty  = true;        // full key grid re-render needed (shift toggle)
 };
 static KeyboardState kb;
+// Monitor-threshold keypad state: while mon_kb_item >= 0 the numeric keypad edits
+// mon_cfg.warn_lo/hi[mon_kb_item] (natural unit, one decimal) instead of a Settings
+// number. mon_kb_off means the OFF key was pressed -> set the threshold to MON_WARN_OFF.
+static int8_t mon_kb_item = -1;
+static bool   mon_kb_hi   = false;
+static bool   mon_kb_off  = false;
 // (LastDrawn struct below tracks per-element cached values; bg lives there.)
 
 // ---------------------------------------------------------------------------
@@ -8658,6 +8664,7 @@ constexpr char K_BACK = 0x01;
 constexpr char K_CLR  = 0x02;
 constexpr char K_DONE = 0x03;
 constexpr char K_CXL  = 0x04;
+constexpr char K_OFF  = 0x05;
 constexpr char K_SPC  = ' ';
 
 // Numeric keypad: 3 cols × 4 key rows + action row.
@@ -8670,6 +8677,19 @@ static const KbKey NUM_KEYS[] = {
     { 70, 392, 354, 60, "DONE",   K_DONE }, { 432, 392, 314, 60, "CANCEL", K_CXL },
 };
 constexpr int N_NUM_KEYS = sizeof(NUM_KEYS) / sizeof(NUM_KEYS[0]);
+
+// Monitor-threshold keypad (v0.1.171): the same dialpad plus a '.', and an OFF
+// button that disables the threshold. Used when mon_kb_item >= 0 (tapping a Warn
+// low/high VALUE on PAGE_MON_ITEM) so an alert can be typed or turned off fast.
+static const KbKey MON_KEYS[] = {
+    { 70,  96, 220, 56, "1", '1' }, { 290,  96, 220, 56, "2", '2' }, { 510,  96, 220, 56, "3", '3' },
+    { 70, 160, 220, 56, "4", '4' }, { 290, 160, 220, 56, "5", '5' }, { 510, 160, 220, 56, "6", '6' },
+    { 70, 224, 220, 56, "7", '7' }, { 290, 224, 220, 56, "8", '8' }, { 510, 224, 220, 56, "9", '9' },
+    { 70, 288, 220, 56, ".", '.' }, { 290, 288, 220, 56, "0", '0' }, { 510, 288, 220, 56, "CLR", K_CLR },
+    { 70, 352, 220, 56, "BACK", K_BACK }, { 290, 352, 220, 56, "OFF", K_OFF }, { 510, 352, 220, 56, "CANCEL", K_CXL },
+    { 70, 416, 660, 56, "DONE", K_DONE },
+};
+constexpr int N_MON_KEYS = sizeof(MON_KEYS) / sizeof(MON_KEYS[0]);
 
 // Text keyboard: 10 cols × 4 letter/digit rows + action row. Tight at 75x55
 // per key for finger-tap.
@@ -8722,7 +8742,47 @@ static char shiftedChar(char c) {
 }
 constexpr int N_TEXT_KEYS = sizeof(TEXT_KEYS) / sizeof(TEXT_KEYS[0]);
 
+// ---------------------------------------------------------------------------
+// Monitor-threshold keypad (v0.1.171). Entry is in the item's NATURAL unit with at
+// most one decimal ("12.8" V, "220" F, "14.7" AFR, "6000" rpm); mon_cfg stores x10.
+// ---------------------------------------------------------------------------
+static void monFmtKeypadX10(int32_t x10, char* out, size_t n) {
+    if (x10 % 10 == 0) snprintf(out, n, "%d", (int)(x10 / 10));
+    else               snprintf(out, n, "%d.%d", (int)(x10 / 10), (int)(x10 % 10));
+}
+
+static int32_t monParseKeypadX10(const char* buf) {
+    long whole = 0; int frac = 0; bool dot = false, fracSet = false;
+    for (const char* p = buf; *p; ++p) {
+        if (*p >= '0' && *p <= '9') {
+            if (!dot) whole = whole * 10 + (*p - '0');
+            else if (!fracSet) { frac = *p - '0'; fracSet = true; }
+        } else if (*p == '.' && !dot) {
+            dot = true;
+        }
+    }
+    return (int32_t)(whole * 10 + frac);
+}
+
+static void openMonThresholdKeypad(uint8_t item, bool hi) {
+    mon_kb_item = (int8_t)item;
+    mon_kb_hi   = hi;
+    mon_kb_off  = false;
+    const int32_t v = hi ? mon_cfg.warn_hi[item] : mon_cfg.warn_lo[item];
+    // OFF (or empty) -> start from the item's default so DONE gives a real value;
+    // the OFF key is the explicit way to disable it again.
+    monFmtKeypadX10(v == MON_WARN_OFF ? monItemDefaultX10(item) : v,
+                    kb.editBuf, sizeof(kb.editBuf));
+    kb.editLen    = strlen(kb.editBuf);
+    kb.shift      = false;
+    kb.dirty      = true;
+    kb.keys_dirty = true;
+    currentPage   = PAGE_NUM_KB;
+    pageJustEntered = true;
+}
+
 static void openNumericKeyboard(SettingId target) {
+    mon_kb_item = -1;
     kb.target = target;
     snprintf(kb.editBuf, sizeof(kb.editBuf), "%u", (unsigned)getNum(target));
     kb.editLen = strlen(kb.editBuf);
@@ -8732,6 +8792,7 @@ static void openNumericKeyboard(SettingId target) {
 }
 
 static void openTextKeyboard(SettingId target) {
+    mon_kb_item = -1;
     kb.target = target;
     const char* src = "";
     switch (target) {
@@ -8751,6 +8812,30 @@ static void openTextKeyboard(SettingId target) {
 }
 
 static void closeKeyboard(bool commit) {
+    // Monitor-threshold keypad: commit into mon_cfg.warn_lo/hi instead of a Settings
+    // number, then return to the item page (the list page's DONE still saves the blob).
+    if (mon_kb_item >= 0) {
+        const uint8_t item = (uint8_t)mon_kb_item;
+        if (commit) {
+            int32_t* w = mon_kb_hi ? &mon_cfg.warn_hi[item] : &mon_cfg.warn_lo[item];
+            if (mon_kb_off) {
+                *w = MON_WARN_OFF;
+            } else {
+                int32_t v = monParseKeypadX10(kb.editBuf);
+                const int32_t mx = monItemMaxX10(item);
+                if (v < 0)  v = 0;
+                if (v > mx) v = mx;
+                *w = v;
+            }
+            ld.sens_tag = 0;   // the bottom-left block must repaint with the new threshold
+        }
+        mon_kb_item = -1;
+        mon_kb_off  = false;
+        currentPage     = PAGE_MON_ITEM;
+        pageJustEntered = true;
+        moni.dirty      = true;
+        return;
+    }
     if (commit) {
         switch (kb.target) {
             case ST_CL_PORT: {
@@ -8807,10 +8892,13 @@ static void closeKeyboard(bool commit) {
 static void drawKey(const KbKey& k) {
     const bool isAction = (k.action == K_DONE || k.action == K_CXL ||
                            k.action == K_BACK || k.action == K_CLR  ||
-                           k.action == K_SPC  || k.action == K_SHIFT);
+                           k.action == K_SPC  || k.action == K_SHIFT ||
+                           k.action == K_OFF);
     const bool isShiftKey = (k.action == K_SHIFT);
-    // SHIFT key glows blue when active so the state is unambiguous.
+    // SHIFT key glows blue when active so the state is unambiguous; OFF is maroon
+    // ("turn this alert off") and the other action keys are grey.
     const uint16_t fill = isShiftKey && kb.shift ? TFT_BLUE
+                        : k.action == K_OFF      ? TFT_MAROON
                         : isAction               ? TFT_DARKGREY
                                                  : TFT_NAVY;
     const uint16_t txtC = TFT_WHITE;
@@ -8869,8 +8957,19 @@ static const char* kbTitleFor(SettingId id) {
 
 static void drawNumKeyboard() {
     if (pageJustEntered) {
-        drawKeyboardChrome(kbTitleFor(kb.target));
-        for (int i = 0; i < N_NUM_KEYS; ++i) drawKey(NUM_KEYS[i]);
+        char tbuf[48];
+        const char* title;
+        if (mon_kb_item >= 0) {
+            snprintf(tbuf, sizeof(tbuf), "%s warn %s", MON_LABELS[mon_kb_item],
+                     mon_kb_hi ? "high" : "low");
+            title = tbuf;
+        } else {
+            title = kbTitleFor(kb.target);
+        }
+        drawKeyboardChrome(title);
+        const KbKey* keys = (mon_kb_item >= 0) ? MON_KEYS : NUM_KEYS;
+        const int    nk   = (mon_kb_item >= 0) ? N_MON_KEYS : N_NUM_KEYS;
+        for (int i = 0; i < nk; ++i) drawKey(keys[i]);
         pageJustEntered = false;
         kb.dirty = true;
     }
@@ -8921,6 +9020,13 @@ static bool applyKey(char action, bool& commit) {
     }
     // Insert printable char (space included). Apply shift if active.
     const char ch = kb.shift ? shiftedChar(action) : action;
+    // Numeric keypads accept digits and a SINGLE decimal point (the monitor
+    // threshold keypad has '.'; the cloud-port keypad does not, but the guard is
+    // harmless there).
+    if (currentPage == PAGE_NUM_KB) {
+        if (!((ch >= '0' && ch <= '9') || ch == '.')) return true;
+        if (ch == '.' && strchr(kb.editBuf, '.') != nullptr) return true;
+    }
     if (kb.editLen < sizeof(kb.editBuf) - 1) {
         kb.editBuf[kb.editLen++] = ch;
         kb.editBuf[kb.editLen]   = '\0';
@@ -8930,11 +9036,13 @@ static bool applyKey(char action, bool& commit) {
 }
 
 static void handleKeyboardTap(int x, int y) {
-    const KbKey* keys = (currentPage == PAGE_NUM_KB) ? NUM_KEYS : TEXT_KEYS;
-    const int    n    = (currentPage == PAGE_NUM_KB) ? N_NUM_KEYS : N_TEXT_KEYS;
+    const bool numPage = (currentPage == PAGE_NUM_KB);
+    const KbKey* keys = numPage ? ((mon_kb_item >= 0) ? MON_KEYS : NUM_KEYS) : TEXT_KEYS;
+    const int    n    = numPage ? ((mon_kb_item >= 0) ? N_MON_KEYS : N_NUM_KEYS) : N_TEXT_KEYS;
     for (int i = 0; i < n; ++i) {
         const KbKey& k = keys[i];
         if (x >= k.x && x < k.x + k.w && y >= k.y && y < k.y + k.h) {
+            if (k.action == K_OFF) { mon_kb_off = true; closeKeyboard(true); return; }
             bool commit = false;
             if (!applyKey(k.action, commit)) {
                 closeKeyboard(commit);
@@ -9179,18 +9287,18 @@ static void saveMonCfg() {
 
 // ---------------------------------------------------------------------------
 // Sensor monitor ITEM page (v0.1.155) - opened by tapping an item's name on the list.
-// Rows: Display (ALWAYS / WARN ONLY / HIDDEN), Source (DIRECT / BLUETOOTH / CANBUS, v0.1.156),
-// CAN bus (only while the source is CANBUS; cycles MON_CAN_NAMES), Warn low, Warn high (each
-// - / value / +, in the item's natural unit or OFF) and Color (cycles the palette). The AFR
-// item's Source row also drives the AEM 30-0300 input (s.aem_afr - see monAfrSyncAem). Edits go
-// straight into mon_cfg; the LIST page's CANCEL restores its snapshot and DONE saves,
-// so there is no second save path here. BACK returns to the list.
+// Rows: Display (ALWAYS / WARN ONLY / HIDDEN), Source (DIRECT / BLUETOOTH / CANBUS; the
+// AFR item's DIRECT source reads "AEM" - v0.1.171, the AEM 30-0300 gauge is a Source option
+// in the SAME selector, not a separate row), CAN bus (only while the source is CANBUS; cycles
+// MON_CAN_NAMES), Warn low, Warn high (each - / value / +, in the item's natural unit or OFF;
+// tap the value for the keypad) and Color (cycles the palette). The AFR Source row drives
+// s.aem_afr (monAfrSyncAem). Edits go straight into mon_cfg; the LIST page's CANCEL restores
+// its snapshot and DONE saves, so there is no second save path here. BACK returns to the list.
 // ---------------------------------------------------------------------------
-enum { MIR_DISPLAY, MIR_SRC, MIR_CAN, MIR_AEM, MIR_LO, MIR_HI, MIR_COLOR };
-// Rows (six normally; the AFR item can have seven when it also shows the CAN-bus row and
-// the AEM option) must fit between the header (MON_BODY_TOP = 72) and the footer
-// (MON_FOOT_Y = 408): 7 x 48 = 336 = exactly that gap, so monItemPitch() shrinks the pitch
-// for the longest list and rows are drawn 4 px shorter than the pitch.
+enum { MIR_DISPLAY, MIR_SRC, MIR_CAN, MIR_LO, MIR_HI, MIR_COLOR };
+// Rows (up to six: Display, Source, CAN-bus, Warn low, Warn high, Color) must fit between the
+// header (MON_BODY_TOP = 72) and the footer (MON_FOOT_Y = 408); monItemPitch() shrinks the
+// pitch for a long list and rows are drawn 4 px shorter than the pitch.
 static constexpr int MI_ROW_H = 56;                                  // row pitch (rows are drawn 52 tall)
 static constexpr int MI_PILL_X = 330, MI_PILL_W = 420;               // tap-to-cycle pills
 static constexpr int MI_MINUS_X = 330, MI_BTN_W = 90;                // - button
@@ -9202,11 +9310,10 @@ static int monItemRows(uint8_t item, uint8_t* kinds) {
     int n = 0;
     kinds[n++] = MIR_DISPLAY; kinds[n++] = MIR_SRC;
     if (mon_cfg.src[item] == MON_SRC_CAN) kinds[n++] = MIR_CAN;
-    // v0.1.157: the AEM 30-0300 analogue gauge is an OPTION IN THIS MENU, not only a
-    // Settings row (that row is now hidden). It stays visible for AFR whatever the display
-    // source is, because switching it on also tells the Teensy to READ and LOG the gauge
-    // (CFG,afraem) — an input decision, not only a display one.
-    if (item == MON_AFR) kinds[n++] = MIR_AEM;
+    // v0.1.171: the AEM 30-0300 gauge is NO LONGER a separate "AEM input" row — it is the
+    // AFR item's DIRECT Source option (labelled "AEM" by monSrcName), sitting in the SAME
+    // selector as CANBUS. Picking AEM turns the Teensy's read/log of the gauge on
+    // (monAfrSyncAem drives s.aem_afr from the source).
     // v0.1.160: RPM gets NO warn rows. Its alerting already lives in the main Settings menu as
     // the shift alerts (Alerts on/off, Alert RPM + colour + blink Hz, MAX RPM + colour + Hz)
     // and those drive the whole-bar flash. A generic warn-low/high pair here would be a second,
@@ -9218,14 +9325,21 @@ static int monItemRows(uint8_t item, uint8_t* kinds) {
 }
 
 // Row pitch for this item's list. The page must fit every row between the header and the
-// footer, so an 7-row item (AFR, which also has the CAN-bus row and the AEM option) shrinks
-// the pitch instead of running into the footer.
+// footer, so a long list shrinks the pitch instead of running into the footer.
 static int monItemPitch(uint8_t item) {
     uint8_t kinds[7];
     const int n = monItemRows(item, kinds);
     int p = (MON_FOOT_Y - MON_BODY_TOP) / (n > 0 ? n : 1);
     if (p > MI_ROW_H) p = MI_ROW_H;
     return p;
+}
+
+// Source label shown on the item page's Source pill. For the AFR item the DIRECT source IS
+// the AEM 30-0300 analogue gauge, so it reads "AEM" — in the SAME selector as CANBUS
+// (v0.1.171; it used to be a separate "AEM input" row).
+static const char* monSrcName(uint8_t item, uint8_t src) {
+    if (item == MON_AFR && src == MON_SRC_DIRECT) return "AEM";
+    return MON_SRC_NAMES[src % MON_SRC_COUNT];
 }
 
 // One control, not two: the AFR item's DIRECT source IS the AEM analogue input, and
@@ -9346,7 +9460,7 @@ static void drawMonItem() {
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
         const uint8_t kind = kinds[i];
         const char* lbl = kind == MIR_DISPLAY ? "Display" : kind == MIR_SRC ? "Source"
-                        : kind == MIR_CAN ? "CAN bus" : kind == MIR_AEM ? "AEM input"
+                        : kind == MIR_CAN ? "CAN bus"
                         : kind == MIR_LO ? "Warn low"
                         : kind == MIR_HI ? "Warn high" : "Color";
         tft.drawString(lbl, 24, cy);
@@ -9365,7 +9479,7 @@ static void drawMonItem() {
             const uint8_t sv = mon_cfg.src[item] % MON_SRC_COUNT;
             const bool has = (MON_SRC_MASK[item] & MON_SRCBIT(sv)) != 0;
             const uint16_t sbg = has ? TFT_DARKGREEN : TFT_MAROON;
-            char sb[28]; snprintf(sb, sizeof(sb), has ? "%s" : "%s (no data)", MON_SRC_NAMES[sv]);
+            char sb[28]; snprintf(sb, sizeof(sb), has ? "%s" : "%s (no data)", monSrcName(item, (uint8_t)sv));
             tft.fillRect(MI_PILL_X, ry, MI_PILL_W, rh, sbg);
             tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
             tft.setTextColor(TFT_WHITE, sbg);
@@ -9376,14 +9490,6 @@ static void drawMonItem() {
             tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
             tft.setTextColor(TFT_WHITE, TFT_NAVY);
             tft.drawString(MON_CAN_NAMES[cb], MI_PILL_X + MI_PILL_W / 2, cy);
-        } else if (kind == MIR_AEM) {
-            // AEM 30-0300 analogue input: an INPUT enable (the Teensy reads + logs it, and
-            // the AFR row's DIRECT source is what displays it). Green when on.
-            const uint16_t abg = s.aem_afr ? TFT_DARKGREEN : TFT_DARKGREY;
-            tft.fillRect(MI_PILL_X, ry, MI_PILL_W, rh, abg);
-            tft.drawRect(MI_PILL_X, ry, MI_PILL_W, rh, TFT_WHITE);
-            tft.setTextColor(TFT_WHITE, abg);
-            tft.drawString(s.aem_afr ? "ON" : "OFF", MI_PILL_X + MI_PILL_W / 2, cy);
         } else if (kind == MIR_LO || kind == MIR_HI) {
             const int32_t w = (kind == MIR_LO) ? mon_cfg.warn_lo[item] : mon_cfg.warn_hi[item];
             for (int b = 0; b < 2; b++) {
@@ -9407,7 +9513,7 @@ static void drawMonItem() {
         }
         tft.setTextDatum(textdatum_t::top_left);
     }
-    // The CAN-bus / AEM rows come and go, so rows below shift: blank whatever is left
+    // The CAN-bus row comes and goes, so rows below shift: blank whatever is left
     // under the last drawn row (one strip, only on a change — never a body-wide wipe).
     const int used = MON_BODY_TOP + nrows * pitch;
     if (used < MON_FOOT_Y) tft.fillRect(0, used, 800, MON_FOOT_Y - used, TFT_BLACK);
@@ -9456,23 +9562,14 @@ static void handleMonItemTap(int x, int y) {
             moni.dirty = true;
         }
         break;
-    case MIR_AEM:
-        if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
-            s.aem_afr = !s.aem_afr;
-            // Switching the gauge on also points the AFR row at it, otherwise the pill
-            // would read ON while the row still showed a CAN number.
-            if (s.aem_afr) mon_cfg.src[MON_AFR] = MON_SRC_DIRECT;
-            aem_reading = aemafr::Reading{}; aem_seen = false;
-            Serial.printf("CFG,afraem,%d\n", (int)s.aem_afr);   // Teensy reads + logs it
-            ld.sens_tag = 0;
-            moni.dirty = true;
-        }
-        break;
     case MIR_LO:
     case MIR_HI: {
         int32_t* w = (kinds[i] == MIR_LO) ? &mon_cfg.warn_lo[item] : &mon_cfg.warn_hi[item];
+        const bool isHi = (kinds[i] == MIR_HI);
         if      (x >= MI_MINUS_X && x < MI_MINUS_X + MI_BTN_W) { monItemAdjust(item, w, -1); moni.dirty = true; }
         else if (x >= MI_PLUS_X  && x < MI_PLUS_X  + MI_BTN_W) { monItemAdjust(item, w, +1); moni.dirty = true; }
+        // Tap the value itself -> the numeric keypad ('.' + OFF) for quick entry (v0.1.171).
+        else if (x >= MI_VAL_X   && x < MI_VAL_X   + MI_VAL_W) { openMonThresholdKeypad(item, isHi); }
         break; }
     case MIR_COLOR:
         if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
