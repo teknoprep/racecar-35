@@ -1,0 +1,40 @@
+Subject: Re: Quotation T-2SJ3W1113248A - Racecar-35, 5 units - answers, two part changes, and a revision correction
+
+Hi,
+
+Thanks for the updated quotation. We have filled in the Customer Reply column for every note and summarised our answers and the changes below.
+
+Parts we are changing:
+
+1. J8 (item 37) - Change: 901-143 -> 901-143-6RFX (Amphenol RF)
+Why: Same SMA right-angle THT PCB jack, same footprint and the same PCB hole pattern (centre 1.5 mm + 4x 1.7 mm at +/-2.54 mm), same 50 ohm / 500 mating cycles - it is the brass-body variant of the same jack. Your $41.123 each is ~1.5-2x the distributor price for the stainless version; the -6RFX is ~$6.84 at 5 pcs. Please re-price.
+
+2. D23 (item 7) - Change: SS56 -> an SMB (DO-214AA) 5 A / 60 V Schottky, e.g. BORN SS56 SMB (LCSC C2687867) or Diotec SK56
+Why: You are right: the bare SS56 is normally supplied as SMA (DO-214AC) and will not fit our DO-214AA (SMB) land pattern. Please supply the SMB-packaged part only - not the DO-214AC one.
+
+3. U1 (item 27) - Change: Re-add 2x SSW-124-01-G-S (1x24, 2.54 mm, THT female socket)
+Why: This line was dropped from the revised quotation. The Teensy 4.1 is customer-supplied - we buy it with pins and plug it in. You source and fit the two sockets only.
+
+4. H1-H4 (item 75), TP1-TP5 (item 76) - Change: Mark "no part - do not source, do not place"
+Why: These are not components, which is why your system cannot find a part number or brand. H1-H4 are 3.2 mm mounting holes in the PCB; TP are 2.0 mm plated through-hole test pads (bare copper). Nothing to buy, nothing to place, no assembly cost.
+
+5. D24 (item 3) - Change: Accept your BZX84-C15,215
+Why: Correct - that is Nexperia's orderable MPN (same device).
+
+6. BT1 (item 28) - No change: 1058 is correct.
+Why: 1058 is the Keystone SMD 20 mm coin-cell HOLDER. "CR2032" in the description is the cell, which is not in the BOM. Please supply the holder and do NOT fit the cell (primary lithium cell - we fit it by hand after reflow and cleaning).
+
+7. U8 (item 36) - Price accepted, no change.
+
+On the "Actual Purchase Mfg Part #" column: only item 3 (BZX84-C15,215) is populated on our copy and it is correct. No other supplier part numbers have been proposed.
+
+Important: This quotation is built from our Rev E BOM; the board we need built is Rev F. Rev E is superseded, and the CAN interface is the entire reason Rev F exists (this quotation still has the deleted J7 footprint and no CAN transceiver at all). The two BOMs are otherwise identical. Please send a revised quotation from the Rev F BOM/CPL/Gerbers (attached), 5 units, with the changes above applied.
+
+What we need back:
+
+1. The revised quotation from the Rev F BOM, with J8 re-priced, D23 as an SMB part, and the U1 socket line restored.
+2. Lead times for the items you flagged (7-10 working days).
+3. Confirmation that H1-H4 and TP1-TP5 carry no part and no assembly charge.
+
+Thanks,
+Chris

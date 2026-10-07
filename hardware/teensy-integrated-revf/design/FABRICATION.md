@@ -64,7 +64,9 @@ not an impedance certificate; coupon/VNA measurement remains outstanding.
   antenna tip. **No copper, vias, traces, screws, battery, cable or metal enclosure
   may intrude into the antenna region.** Use a plastic enclosure or an
   RF-transparent window; a closed metal trunk/enclosure can still block the signal.
-- The **SMA is GPS only**, Amphenol 901-143. Inspect its mechanical drawing against
+- The **SMA is GPS only**, Amphenol **901-143-6RFX** (the brass-body variant of the 901-143: same
+  PCB hole pattern and same SMA interface at ~1/3 the price; its body is ~0.65 mm longer). Inspect its
+  mechanical drawing against
   the actual board edge, solder tails and enclosure hole before assembly.
 - Active GPS antenna: **3.3 V bias**, current limited by a TPS2553 whose ILIM is tied
   to IN → datasheet-limited to **50 / 75 / 100 mA** (min/typ/max). Specify an antenna

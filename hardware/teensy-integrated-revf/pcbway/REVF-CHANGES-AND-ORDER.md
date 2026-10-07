@@ -66,7 +66,7 @@ It is replaced by a converter we designed from parts you can buy from stock:
 |---|---|---|---|
 | U2 | 5 V / 5 A buck regulator, 400 kHz | `TPS54560BDDAR` | Texas Instruments |
 | L2 | 6.8 µH, 13.5 A sat / 8 A RMS shielded inductor | `IHLP4040DZER6R8M01` | Vishay |
-| D23 | 5 A / 60 V catch diode (SMB) | `SS56` | MDD |
+| D23 | 5 A / 60 V catch diode (**SMB / DO-214AA only**) | `SS56` (BORN, SMB) — LCSC C2687867; alternate Diotec `SK56` | BORN |
 | Q3 | P-channel reverse-polarity protection, 40 V, 15 mΩ | `AO4485` | Alpha & Omega |
 | C41 C42 | 10 µF 50 V X7R 1210 input ceramics | `GRM32ER71H106KA12L` | Murata |
 | C44 C45 C46 | 47 µF 16 V X5R 1210 output ceramics | `GRM32ER61C476KE15L` | Murata |

@@ -122,8 +122,8 @@ for vx,vy in [(70.2,97.0),(71.4,97.0),(72.6,97.0),(73.8,97.0),(76.0,97.0),(81.5,
 for ref,x in [('C_IN1',68.5),('C_IN2',73.5)]:
  part(ref,'10uF 50V X7R 1210','Capacitor_SMD:C_1210_3225Metric',x,105.8,{1:'VIN_PROTECTED',2:'GND'},
       'GRM32ER71H106KA12L','Murata','power',notes='50V rating on a 10-20V rail; a 5A buck input needs ceramic close to the VIN pin, not only C1 bulk.')
-part('D_MAIN','SS56 catch diode','Diode_SMD:D_SMB',79,99,{1:'SW_MAIN',2:'GND'},'SS56','MDD','power',angle=270,
- names={1:'K',2:'A'},notes='Asynchronous buck catch diode: 5A, 60V vs the 32V clamp. Carries the full inductor current during off-time.')
+part('D_MAIN','SS56 catch diode','Diode_SMD:D_SMB',79,99,{1:'SW_MAIN',2:'GND'},'SS56','BORN','power',angle=270,
+ names={1:'K',2:'A'},notes='Asynchronous buck catch diode: 5A, 60V vs the 32V clamp. Carries the full inductor current during off-time. MUST be the SMB (DO-214AA) part - the bare SS56 is normally SMA (DO-214AC) and will not fit this D_SMB land pattern; LCSC C2687867 (BORN SS56 SMB) or Diotec SK56.')
 part('L_MAIN','6.8uH 8A RMS SHIELDED','Inductor_SMD:L_Vishay_IHLP-4040',88,94.5,{1:'SW_MAIN',2:'+5V_MAIN'},
  'IHLP4040DZER6R8M01','Vishay','power',names={1:'1',2:'2'},types={2:'power_out'},
  notes='6.8uH, 23.3mOhm, 13.5A saturation / 8A RMS vs 5A DC and 5.7A peak. Lmin for 20V in / 400kHz / 5A is 6.25uH.')
@@ -264,7 +264,7 @@ part('U_GPS','NEO-M9N-00B','RF_GPS:ublox_NEO',125,45,
 c('C_GPS1','100n',115,51,'+3V3_AUX','GND','gps',90)
 c('C_GPS2','10u',105,56,'+3V3_AUX','GND','gps')   # moved west in Rev F: the new J14 sits at (110,61)
 part('J_ANT','GPS SMA FEMALE','Connector_Coaxial:SMA_Amphenol_901-143_Horizontal',125,24.5,{1:'RF_ANT',2:'GND'},
-     '901-143','Amphenol RF','gps',notes='Active GPS antenna 3.3V bias, never WiFi. Supplier drawing/board-edge fit must be inspected.')
+     '901-143-6RFX','Amphenol RF','gps',notes='Active GPS antenna 3.3V bias, never WiFi. Brass-body variant of the Amphenol 901-143: same PCB hole pattern (1x 1.5mm + 4x 1.7mm at +/-2.54mm) and same 50 ohm SMA interface, ~1/3 the price. Supplier drawing/board-edge fit must be inspected (body is ~0.65mm longer).')
 part('C_RF','100pF C0G','Capacitor_SMD:C_0402_1005Metric',125,33,{1:'RF_ANT',2:'RF_GNSS'},'GRM1555C1H101JA01D','Murata','gps',270)
 part('L_RF','27nH RF choke','Inductor_SMD:L_0402_1005Metric',131,29,{1:'RF_ANT',2:'ANT_BIAS'},'LQG15HS27NJ02D','Murata','gps')
 part('D_RF','RF ESD','Diode_SMD:D_SOD-882',122,28,{1:'RF_ANT',2:'GND'},'PESD5V0F1BL,315','Nexperia','gps',notes='BOM-REV1: 5.5V standoff / 0.4pF bidirectional (PESD3V3U1UL was 3.3V/2.6pF and is out of stock). Same SOD-882/DFN1006-2 footprint; antenna bias is 3.3V so the higher standoff is also correct. Verify capacitance/S-parameter budget at GNSS bands.')

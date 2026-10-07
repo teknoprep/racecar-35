@@ -2,7 +2,7 @@
 <export version="E">
   <design>
     <source>/home/chris/coding/racecar-35/hardware/teensy-integrated-revf/design/racecar-integrated-revf.kicad_sch</source>
-    <date>2026-10-04T14:58:22-0400</date>
+    <date>2026-10-07T08:28:08-0400</date>
     <tool>Eeschema 9.0.8+dfsg-1</tool>
     <sheet number="1" name="/POWER-1/" tstamps="/51f2fb91-65ae-5a10-91d3-f05f9fda52da/">
       <title_block>

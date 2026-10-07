@@ -236,12 +236,12 @@
       "2": "passive"
     },
     "mpn": "SS56",
-    "maker": "MDD",
+    "maker": "BORN",
     "group": "power",
     "x": 79,
     "y": 99,
     "angle": 270,
-    "notes": "Asynchronous buck catch diode: 5A, 60V vs the 32V clamp. Carries the full inductor current during off-time.",
+    "notes": "Asynchronous buck catch diode: 5A, 60V vs the 32V clamp. Carries the full inductor current during off-time. MUST be the SMB (DO-214AA) part - the bare SS56 is normally SMA (DO-214AC) and will not fit this D_SMB land pattern. Use LCSC C2687867 (BORN SS56, SMB) or Diotec SK56.",
     "alias": "D_MAIN"
   },
   {
@@ -1930,7 +1930,7 @@
       "1": "passive",
       "2": "passive"
     },
-    "mpn": "901-143",
+    "mpn": "901-143-6RFX",
     "maker": "Amphenol RF",
     "group": "gps",
     "x": 125,

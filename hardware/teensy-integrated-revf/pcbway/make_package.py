@@ -61,6 +61,16 @@ FIXUPS = {
                         'VIO pin (pin 5); a non-V TCAN1042 has pin 5 = NC and would put 5V on the 3.3V '
                         'Teensy. Approved alternates only: TCAN1042VDRQ1, then NXP TJA1051T/3/1J (its '
                         'pin 8 S must also go to GND).', None, None),
+    # NOT A COMPONENT - the bare SS56 is normally SMA (DO-214AC).
+    'SS56': ('SMB (DO-214AA) 5 A / 60 V Schottky ONLY - e.g. LCSC C2687867 (BORN SS56 SMB) or '
+             'Diotec SK56. Do NOT fit the DO-214AC (SMA) SS56: it does not fit this land pattern.',
+             None, None),
+    # PCB FEATURES, NOT PARTS - there is nothing to buy or place.
+    'M3 insulated hardware': ('NO PART - do not source and do not place. H1-H4 are 3.2mm non-plated '
+                              'mounting holes in the PCB; the M3 hardware is customer-fitted.',
+                              'N/A', 'N/A'),
+    'PCB test pad': ('NO PART - do not source and do not place. TP1-TP7 are 2.0mm plated through-hole '
+                     'pads (bare copper) in the PCB.', 'N/A', 'N/A'),
 }
 for r in rows:
     if r['mpn'] in FIXUPS:
