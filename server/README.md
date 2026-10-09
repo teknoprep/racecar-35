@@ -20,7 +20,7 @@ LAN IP of the host running the container.
 | GET    | `/sessions/<user>/<file>`   | Download one session file.                     |
 | GET    | `/sessions/<user>/<file>/laps` | Auto-detected lap list + times for the review UI (JSON). Start/finish is detected from the GPS trace — no track table needed. |
 | POST   | `/sessions/<user>/<file>/ai` | **AI corner analysis.** Body `{prompt, region:{points:[[lat,lon],…]}, model?}`. Extracts the telemetry inside the drawn polygon, computes per-lap metrics (entry/min/exit/max speed, time, distance, peak lateral/longitudinal g, max rpm), and asks the LLM for coaching. Returns `{ok, model, metrics, answer}`. Requires `RACECAR_AI_API_KEY`. |
-| GET    | `/ai/models`                | `{enabled, default, models:[{id,name}]}` — the model picker for the review UI (fetched live from Open WebUI). |
+| GET    | `/ai/models`                | `{enabled, default, models:[{id,name}]}` — the model picker for the review UI. `default` is the resolved analysis model (Haiku 5.5) and is always included in `models`; the gateway catalogue is fetched on a worker thread (cached ~10 min). |
 | GET    | `/health`                   | Healthcheck for Docker / nginx. Returns `{"ok":true}`. |
 | GET    | `/account`                  | Per-user account page (any signed-in user): view + copy + refresh your upload API key. |
 | GET    | `/account/apikey`           | JSON `{email, api_key}` for the signed-in user (creates a key if missing). |
@@ -248,13 +248,26 @@ How it works:
 | --- | --- |
 | `RACECAR_AI_API_KEY` | Open WebUI API key. **Blank = the AI card is hidden entirely.** |
 | `RACECAR_AI_BASE_URL` | Open WebUI base (default `https://ai.blueuc.com`). |
-| `RACECAR_AI_MODEL` | **Default model id.** Open WebUI hosts many models, so this names the one used when a request doesn't override it. Must match an id from `GET {base}/api/models` (e.g. `gpt-4o-mini`, `llama3.1:8b`). |
+| `RACECAR_AI_ANALYSIS_MODEL` | Model for **AI corner analysis + the ideal-line AI** (and the model the review dropdown preselects). **Blank = Haiku 5.5.** |
+| `RACECAR_AI_COACH_MODEL` | Model for the **automatic coach checklist** (runs on every upload). **Blank = Haiku 5.5.** |
+| `RACECAR_AI_HAIKU_MODEL` | The built-in Haiku id used by the two vars above (default `anthropic.anthropic/claude-haiku-5.5`). |
+| `RACECAR_AI_MODEL` | **Legacy/allowlist seed only** — it no longer selects the model for the checklist or the analysis. It seeds `RACECAR_AI_MODELS` when that is unset. |
+| `RACECAR_AI_MODELS` | CSV ALLOWLIST: the only models the UI may offer and the server will accept. Unset ⇒ full live catalogue. |
 | `RACECAR_AI_TIMEOUT_SECONDS` | Upstream timeout (default 120). |
 
+The two SURFACES (checklist, analysis) default to **Haiku 5.5** because the
+checklist runs on every upload and the analysis card is used many times a
+session. Their configured id is matched against the gateway's live catalogue, so
+a naming variant (`anthropic.anthropic/claude-haiku-5.5` vs `…claude-haiku-5-5`,
+provider prefix, date suffix) still resolves; if nothing matches, the configured
+id is sent as-is — never silently swapped for another model. `GET /caps` reports
+both (`ai_models`) so one curl proves a switch landed.
+
 The review UI also fetches the live model list (`GET /ai/models`) into a
-dropdown, so a user can override the default model per question; `RACECAR_AI_MODEL`
-is the fallback. After setting these, recreate the container (`docker compose
-… up -d`) — no rebuild needed since it's just env.
+dropdown, so a user can override the model per question; the analysis model is
+the fallback (and is always present in the list). After setting these, recreate
+the container (`docker compose … up -d`) — no rebuild needed since it's just
+env.
 
 **Persistent history + cascade delete.** Every question + answer is saved per
 session under `RACECAR_DATA_DIR/ai_history/<user>/<sessionfile>.json` and shown

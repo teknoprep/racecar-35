@@ -348,8 +348,13 @@ This is the default release contract for this repo. When code is changed and the
    version) to confirm the right firmware landed. NEVER flash without checking what's connected
    first — boards get swapped on the bench, and Basic firmware on the Advance kills touch +
    garbles the display. Confirm new UI with the user when the serial log alone can't.
-5. **Commit + push** to `origin/main` (HTTPS token; `HOME=/root` or an explicit token URL), then
-   curl the raw manifest to confirm GitHub serves the new version + matching hashes.
+5. **ASK FOR A GITHUB KEY, then commit + push** to `origin/main`. The stored `gh` token on this
+   host is DEAD, so a push without a key cannot succeed — ask the user in chat for a token
+   (see "git push from this host" below for the exact push + verify), never write it into a
+   file. Then curl the raw manifest to confirm GitHub serves the new version + matching hashes.
+   This applies to ANY change (server, docs, hardware), not just firmware: if you made changes
+   and they are meant to be kept, ask for the key and push — never leave work unpushed while
+   reporting it done.
 6. **Keep CLAUDE.md current** — if the change adds a board, a setting/NVS key, a wire-protocol
    line, or a maintenance step, update the relevant section here in the same commit.
 7. **board_config.h is the seam** — anything panel-specific goes there or behind a
@@ -831,13 +836,35 @@ oncoming car (canvas-drawn digits — no font, no glyph server); the "1" board i
 A board is dropped if it would fall inside a corner or the previous corner's braking zone, or before the
 start of the lap. Toggle: **brake boards** in the 3D bar; the legend reports `N corners · M with brake boards`.
 
-### Sessions list: wider, with best lap per session
-`main { max-width: 2400px }` on the index page and a **best lap** column (click the header to sort;
-un-timed sessions sort last). Lap detection reads whole session files, so it is **never** computed inline
+### Sessions list: sortable columns, opened newest-first across users
+`main { max-width: 2400px }` on the index page. **Every column header sorts** (server change
+2026-10-09): click a header to order by it, click it again to reverse. The list **OPENS
+newest-first by `started (UTC)` as ONE time list across every user an admin can see** — not
+grouped by user directory — because with several drivers' sessions in view the newest session
+has to be the top row (the `user` column is there to sort/group on when you want that).
+- Server: rows are collected as `(epoch, html)` per user dir and re-ordered with
+  `sorted(rows, key=lambda t: t[0], reverse=True)` before rendering, so the order is right
+  with no JS at all.
+- The client sorter (`RC_SORT` in `_INDEX_JS`) is GENERIC: each `<th class="sortable"
+  data-key="<k>">` carries a `<span class="ind">` arrow, each `<td>` carries `data-k="<k>"`,
+  and — where the RENDERED text does not sort correctly — a `data-sort` machine value
+  (`started` = epoch, `size` = raw bytes). Numeric columns (started / size / best) open
+  DESCENDING, text columns A-Z; **a missing value (best lap not detected yet) always sorts
+  last, in both directions**; ties keep their previous order (stable).
+- ⚠️ Adding a column means the th + `<span class="ind">` + the td's `data-k` (plus `data-sort`
+  if the text is formatted). `tests/test_index_sort.py` pins that contract and executes the
+  real sorter under a DOM stub (direction toggle, numeric-vs-text, blanks last, stability).
+- Verified in a real browser (Playwright + uvicorn against a fixture data dir, 2026-10-09):
+  time asc/desc, size numeric, user/track/filename alphabetical, blanks last both ways, filter
+  and the combine checkboxes unaffected.
+
+**Best lap per session.** Lap detection reads whole session files, so it is **never** computed inline
 for the list: `_lap_summary()` caches per file in `DATA_DIR/lapcache/<user>/<name>.json` keyed on
 (mtime, size) — and in memory — the row renders whatever is cached (else "…") and the page fills the rest
 through `GET /laps/summary?files=u/f,…`, which computes at most 4 cold files per call, off the event loop.
-Values honour stored lap exclusions (`_apply_lap_meta`), so the list and the review page agree.
+Values honour stored lap exclusions (`_apply_lap_meta`), so the list and the review page agree. The fill
+writes `td.best.dataset.sort` and re-runs the sorter when the live column is `best`, so a column sorted
+while it was still filling ends up in the right order — and a lap-less session lands last, never first.
 
 ### Every channel logged, and every channel displayed (v0.1.171 firmware + server)
 The Teensy sample writer now logs **everything the system holds**, not just the dash's display
@@ -865,6 +892,14 @@ that is MISSING from the table had no live source — that is the intended signa
 ### AI coach checklist (auto on upload) — server + dash (v0.1.137)
 Every successful session upload kicks a **background** AI review (daemon thread, so the dash's
 upload response is never delayed) that distils the session into **1-3 short actionable items**.
+- **Model: Haiku 5.5 by default** (`RACECAR_AI_COACH_MODEL`, blank ⇒ the built-in
+  `anthropic.anthropic/claude-haiku-5.5`). The checklist is the one AI surface nobody asks for,
+  so it must be the cheap/fast one. `_ai_chat(..., feature="coach")` picks it and BYPASSES the
+  user-model allowlist (operator config, not user input) — otherwise a dropdown-defaulted model
+  would drag the automatic checklist onto the expensive model. `RACECAR_AI_MODEL` is
+  deliberately NOT read for this (it used to be, and pinned the old default).
+  Configured in `server/.env.example`; see "Model selection" under the corner-analysis section
+  below (the variant-resolution rules live there — they are shared).
 - `_coach_facts()` builds a compact sheet from the SAME lap detection the review UI uses (lap
   exclusions honoured): lap count/best/median/worst/**spread**, per-lap times, speed envelope,
   peak lateral + longitudinal g, max rpm. Strict prompt: only `- ` lines, ≤14 words each.
@@ -929,11 +964,34 @@ exit speed, brake zones, best line, consistency). Server side (`server/app/main.
   uses), builds a race-engineer prompt, and calls Open WebUI's OpenAI-compatible
   `POST {base}/api/chat/completions` (Bearer key). Returns `{ok, model, metrics, answer}`.
 - `GET /ai/models` → `{enabled, default, models[]}` feeds the review UI's model dropdown.
+  `default` is the RESOLVED analysis model and is always inserted into `models` (else the
+  browser falls through to the first catalogue entry and the next question runs on the wrong
+  model). The catalogue GET runs via `asyncio.to_thread` — it is blocking HTTP, and on the
+  event loop it could freeze EVERY in-flight request for up to 20 s (same bug class as the
+  old `track-prep` freeze).
+- **Model selection (2026-10-09): both AI surfaces default to Haiku 5.5**, each with its own
+  env knob — `RACECAR_AI_ANALYSIS_MODEL` (corner analysis + ideal-line + the dropdown default)
+  and `RACECAR_AI_COACH_MODEL` (the checklist) — plus `RACECAR_AI_HAIKU_MODEL` for the built-in
+  id. **`RACECAR_AI_MODEL` no longer selects either** (it only seeds `RACECAR_AI_MODELS`, so a
+  stale Sonnet pin in a deployed `.env` cannot silently override the switch).
+  The configured id is matched against the gateway's LIVE catalogue (`_ai_catalogue_ids`, cached
+  10 min): Open WebUI aggregates providers, so the same model is
+  `anthropic.anthropic/claude-haiku-5.5`, `…/claude-haiku-5-5`, `…-5.5-20260219` … —
+  `_ai_haiku_id()` tolerates prefix/separator/suffix variants, prefers the configured provider
+  prefix, and returns the configured id UNCHANGED when nothing matches (a clear upstream
+  "model not found" beats silently coaching on a different model). A model id that IS in the
+  allowlist is an explicit operator pin and is never second-guessed. **Never let a forced
+  fallback send an unresolved id** — `ai_resolve_model(requested, fallback=…)` takes the
+  caller's resolved feature model, which is what closes that hole (a disallowed pick used to
+  fall through to the raw configured spelling).
+  Verified end-to-end against a stub gateway advertising a VARIANT id: coach + analysis + the
+  dropdown default all resolve to `…/claude-haiku-5-5`, even with `RACECAR_AI_MODEL` pinned to
+  Sonnet. `tests/test_ai_models.py` pins the resolution + defaults; `curl <host>/caps` now
+  reports `ai_models {analysis, coach}` so one probe proves a switch landed.
 - **Config is env-only** (no rebuild, just `docker compose … up -d`): `RACECAR_AI_API_KEY`
   (blank → the whole AI card is hidden), `RACECAR_AI_BASE_URL` (default `https://ai.blueuc.com`),
-  **`RACECAR_AI_MODEL` = the DEFAULT model id** (Open WebUI hosts many models, so this is
-  required to name the fallback; users can override per-question from the dropdown),
-  `RACECAR_AI_TIMEOUT_SECONDS` (120). Keys documented in `server/.env.example` + `server/README.md`.
+  the three model vars above, `RACECAR_AI_MODELS` (CSV allowlist), `RACECAR_AI_TIMEOUT_SECONDS`
+  (120). Keys documented in `server/.env.example` + `server/README.md`.
 - **AI cost is captured + ADMIN-ONLY visible**: `_ai_chat` returns `(answer, model, usage)` —
   usage harvested from the payload `usage` block AND the Open WebUI `<details>` footer (parsed
   BEFORE stripping). Stored in every history entry; `_hist_public()` strips it for non-admins
@@ -968,10 +1026,31 @@ exit speed, brake zones, best line, consistency). Server side (`server/app/main.
   footer (admin-only) to replies — `_ai_chat()` strips ALL `<details>…</details>` blocks before
   storing/returning, so only coaching text is kept.
 
-**git push from this host:** remote is `https://github.com/teknoprep/racecar-35.git` (HTTPS token
-auth). `$HOME=/home/chris` here; push with an explicit token URL
-`https://teknoprep:<token>@github.com/teknoprep/racecar-35.git` (the token is supplied in chat by
-the user each session — do not hardcode it into files).
+**git push from this host — ⚠️ ALWAYS ASK FOR A GITHUB KEY FIRST (standing rule, no exceptions).**
+Remote is `https://github.com/teknoprep/racecar-35.git`. **The token stored on this host is DEAD**
+(verified 2026-10-09: `git push` → `fatal: Authentication failed … Password authentication is not
+supported for Git operations`, `gh auth status` → `The token in keyring is invalid`). `$HOME` is
+`/home/chris` and `~/.gitconfig` routes git at `gh auth git-credential`, so **there is no
+credential that works without the user's help**. Therefore:
+1. **Whenever changes are ready to publish — a release, a server change, a docs/CLAUDE.md edit,
+hardware — ASK THE USER FOR A GITHUB KEY IN CHAT.** Do not "just try the push and see"; do not
+assume a key from an earlier session still works (it may have been rotated); do not leave the work
+unpushed while telling the user it is done. If a key was already supplied in THIS session and it
+worked, that key is fine for this session's pushes — don't nag twice for the same thing.
+2. Push with the explicit token URL (never hardcode it into a file or `remote.origin.url`,
+   never commit it):
+
+```bash
+git push https://teknoprep:<token>@github.com/teknoprep/racecar-35.git main
+```
+
+3. **Verify the push independently** — `git ls-remote origin main` (or curl the raw manifest) must
+   show the new sha. Trusting the local staging dir is exactly how a bad release shipped before.
+   Fetch the tracking ref with the same token URL
+   (`… main:refs/remotes/origin/main`) so `git status` doesn't keep saying "ahead 1" afterwards.
+
+An explicit token URL is per-command: `remote.origin.url` stays clean, so a later push still asks
+for a key instead of silently using a stale credential.
 
 **Two channels, deliberately:** the GitHub `firmware/manifest.json` is a **frozen
 bridge** so any panel still on ≤0.1.72 can OTA from GitHub and then hop to the

@@ -209,9 +209,29 @@ AI_TEMPERATURE = float(_ai_temp_raw) if _ai_temp_raw else None
 AI_MODELS = [x.strip() for x in os.environ.get("RACECAR_AI_MODELS", "").split(",") if x.strip()]
 if not AI_MODELS and AI_MODEL:
     AI_MODELS = [AI_MODEL]
-# The default/preselected model: explicit RACECAR_AI_MODEL wins, else first of
-# the allowlist, else empty (full-catalogue mode with no preselection).
-AI_DEFAULT_MODEL = AI_MODEL or (AI_MODELS[0] if AI_MODELS else "")
+
+# ---- per-FEATURE models: the checklist and the analysis default to Haiku ----
+# The coach checklist runs AUTOMATICALLY on every upload and the corner analysis
+# is used many times a session, so both default to the cheap/fast Haiku 5.5
+# rather than whatever the biggest model on the gateway is. Each surface has its
+# OWN override so one is retargeted without the other, and both take effect from
+# .env alone (edit + `docker compose up -d`, no rebuild):
+#     RACECAR_AI_ANALYSIS_MODEL   corner analysis + ideal-line commentary
+#                                 (also the model the review dropdown preselects)
+#     RACECAR_AI_COACH_MODEL      the automatic coach checklist
+# ⚠️ RACECAR_AI_MODEL is deliberately NOT consulted for these two — it pinned the
+# old default and would silently win over the Haiku switch. It still seeds the
+# allowlist above (and stays documented for back-compat).
+AI_HAIKU_MODEL = (os.environ.get("RACECAR_AI_HAIKU_MODEL", "").strip()
+                  or "anthropic.anthropic/claude-haiku-5.5")
+AI_ANALYSIS_MODEL = os.environ.get("RACECAR_AI_ANALYSIS_MODEL", "").strip() or AI_HAIKU_MODEL
+AI_COACH_MODEL = os.environ.get("RACECAR_AI_COACH_MODEL", "").strip() or AI_HAIKU_MODEL
+# The default/preselected model the UI shows (and the one used when a request
+# names none): the analysis model, else the first allowlist entry.
+AI_DEFAULT_MODEL = AI_ANALYSIS_MODEL or (AI_MODELS[0] if AI_MODELS else "")
+# feature name -> configured model id, for the server-side surfaces that pick
+# their own model instead of inheriting the user's dropdown choice.
+AI_FEATURE_MODELS = {"analysis": AI_ANALYSIS_MODEL, "coach": AI_COACH_MODEL}
 
 
 # ---------------------------------------------------------------------------
@@ -276,15 +296,119 @@ def ai_enabled() -> bool:
     return bool(AI_API_KEY)
 
 
-def ai_resolve_model(requested: Optional[str]) -> str:
+def ai_resolve_model(requested: Optional[str], fallback: Optional[str] = None) -> str:
     """Enforce the allowlist. Returns an allowed model id (or raises 503 if none
-    is configured). A disallowed/blank request is forced to the default so a
-    stale UI can never sneak a non-allowed model past the server."""
+    is configured). A disallowed/blank request falls back to `fallback` — the
+    caller's RESOLVED feature default, so a forced fallback can never send an id
+    the gateway does not know — else to the configured default."""
     req = (requested or "").strip()
     if AI_MODELS:
-        return req if req in AI_MODELS else (AI_DEFAULT_MODEL or AI_MODELS[0])
-    # Unrestricted mode: honor the request, else the default.
-    return req or AI_DEFAULT_MODEL
+        return req if req in AI_MODELS else (fallback or AI_DEFAULT_MODEL or AI_MODELS[0])
+    # Unrestricted mode: honor the request, else the fallback / default.
+    return req or (fallback or AI_DEFAULT_MODEL)
+
+
+# ---------------------------------------------------------------------------
+# Live model catalogue (Open WebUI GET /api/models), cached.
+#
+# Two users: the review page's dropdown, and resolving a CONFIGURED model id
+# (Haiku 5.5) onto the id the gateway actually exposes. Open WebUI aggregates
+# several providers, so one model appears as "anthropic.anthropic/
+# claude-haiku-5.5", "claude-haiku-5-5", "…:latest", … — a hardcoded guess
+# would either 404 the request or silently coach on the wrong model, so the id
+# is checked against the live list once and cached.
+# ⚠️ Blocking HTTP: call it from a worker thread, never from an async handler
+# (the old inline catalogue fetch could freeze the whole server for 20 s).
+# ---------------------------------------------------------------------------
+_AI_CAT_LOCK = threading.Lock()
+_AI_CAT_TTL_S = 600
+_AI_CAT: dict = {"at": 0.0, "ids": []}
+
+
+def _ai_catalogue_ids() -> list:
+    """LIVE model ids from the gateway (cached ~10 min; [] when there is no key
+    or the fetch failed). Deliberately independent of the allowlist: the
+    allowlist decides what the UI may OFFER, while resolving a configured
+    feature model (Haiku) is about how the gateway NAMES it."""
+    if not AI_API_KEY:
+        return []
+    now = time.monotonic()
+    with _AI_CAT_LOCK:
+        if _AI_CAT["at"] and now - _AI_CAT["at"] < _AI_CAT_TTL_S:
+            return list(_AI_CAT["ids"])
+    ids: list = []
+    try:
+        req = urllib.request.Request(
+            AI_BASE_URL + "/api/models",
+            headers={"Authorization": "Bearer " + AI_API_KEY},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            payload = json.loads(r.read().decode("utf-8", "replace"))
+        data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(data, list):
+            for m in data:
+                if isinstance(m, dict):
+                    mid = m.get("id") or m.get("name")
+                elif isinstance(m, str):
+                    mid = m
+                else:
+                    mid = None
+                if mid:
+                    ids.append(str(mid))
+    except Exception as e:
+        log.warning("AI model catalogue fetch failed: %s", e)
+    with _AI_CAT_LOCK:
+        _AI_CAT["ids"], _AI_CAT["at"] = ids, now
+    return ids
+
+
+def _ai_haiku_id(configured: str) -> str:
+    """`configured` (a Haiku 5.5 id) resolved onto the gateway's OWN id for it.
+
+    Tolerates the provider prefix / separator / suffix variants above. If no
+    catalogue entry looks like Haiku 5.5 the configured id is returned
+    UNCHANGED — a clear upstream "model not found" is better than silently
+    coaching with a different model."""
+    configured = (configured or "").strip()
+    if not configured:
+        return ""
+    # An explicit allowlist entry is a deliberate operator PIN — honour it
+    # exactly and never second-guess it against the catalogue.
+    if configured in AI_MODELS:
+        return configured
+    ids = _ai_catalogue_ids()
+    if not ids or configured in ids:
+        return configured
+
+    def norm(s: str) -> str:
+        return s.lower().replace("_", "-").replace(" ", "-")
+
+    def is_haiku55(s: str) -> bool:
+        n = norm(s)
+        return "haiku" in n and ("5.5" in n or "5-5" in n or "55" in n)
+
+    cands = [i for i in ids if is_haiku55(i)]
+    if not cands:
+        return configured
+    # Prefer the same provider prefix as configured, then the plainest id
+    # (no date/size suffixes), then alphabetical — deterministic.
+    want_provider = configured.split("/")[0].lower()
+    cands.sort(key=lambda i: (0 if i.split("/")[0].lower() == want_provider else 1,
+                              len(i), i))
+    pick = cands[0]
+    if pick != configured:
+        log.info("AI: resolved model %r -> %r", configured, pick)
+    return pick
+
+
+def _ai_feature_model(feature: Optional[str]) -> str:
+    """The model a server-side surface ("coach" / "analysis") should use.
+
+    Operator configuration, NOT user input — so it is deliberately not filtered
+    by the user-model allowlist (that governs what the UI may OFFER)."""
+    name = AI_FEATURE_MODELS.get((feature or "").strip())
+    return _ai_haiku_id(name) if name else ""
 
 
 # Per-session AI Q&A history lives in a parallel tree so it survives rebuilds
@@ -2249,7 +2373,8 @@ def _coach_analyze(user_dir: str, p: pathlib.Path, track: str,
         user_msg = f"Track: {track or 'unknown'}\n{facts}"
         answer, model, usage = _ai_chat(
             [{"role": "system", "content": system},
-             {"role": "user", "content": user_msg}])
+             {"role": "user", "content": user_msg}],
+            feature="coach")
         texts = []
         for ln in (answer or "").splitlines():
             ln = ln.strip()
@@ -3249,15 +3374,20 @@ async def caps() -> dict:
     session's own fixes ran past an edge, so the driving line is on the tarmac
     (Summit Point: 65 % of fixes on the old road, 99 % now)."""
     v = server_version()
-    return {"ok": True, "zblocks": True, "coach": True, "track3d": True,
-            "track3d_v": TRACK3D_V,
-            # Which build is RUNNING (the same identity the admin page shows
-            # next to its update button, and what `curl <host>/version`
-            # reports) — so one probe answers both "is this image new enough?"
-            # and "which commit is it?". Extra keys: an old dash only looks for
-            # its own capability flags here.
-            "server": v["display"], "server_sha": v["short"],
-            "server_source": v["source"], "deploy_pending": v["deploy_pending"]}
+    out = {"ok": True, "zblocks": True, "coach": True, "track3d": True,
+           "track3d_v": TRACK3D_V,
+           # Which build is RUNNING (the same identity the admin page shows
+           # next to its update button, and what `curl <host>/version`
+           # reports) — so one probe answers both "is this image new enough?"
+           # and "which commit is it?". Extra keys: an old dash only looks for
+           # its own capability flags here.
+           "server": v["display"], "server_sha": v["short"],
+           "server_source": v["source"], "deploy_pending": v["deploy_pending"]}
+    # Which model each AI surface is CONFIGURED to use (no resolution, no
+    # network: one curl proves a Haiku switch landed). Only when AI is on.
+    if ai_enabled():
+        out["ai_models"] = {"analysis": AI_ANALYSIS_MODEL, "coach": AI_COACH_MODEL}
+    return out
 
 
 
@@ -4454,13 +4584,26 @@ def _region_prompt(metrics: dict, question: str, lib: Optional[dict] = None) -> 
     ]
 
 
-def _ai_chat(messages: list, model: Optional[str] = None) -> tuple:
+def _ai_chat(messages: list, model: Optional[str] = None,
+             feature: Optional[str] = None) -> tuple:
     """Call the Open WebUI OpenAI-compatible chat endpoint. Returns
-    (reply_text, model_used), or raises HTTPException on config/upstream errors."""
+    (reply_text, model_used), or raises HTTPException on config/upstream errors.
+
+    `model` is a USER pick (allowlist-enforced). `feature` names a server-side
+    surface ("coach" / "analysis") whose own configured model is used when the
+    request names none — that model is operator configuration, so it is used
+    as-is rather than forced onto the allowlist default (the checklist must stay
+    on Haiku even when the dropdown default is something else)."""
     if not AI_API_KEY:
         raise HTTPException(status_code=503,
                             detail="AI is not configured (set RACECAR_AI_API_KEY)")
-    use_model = ai_resolve_model(model)   # allowlist-enforced
+    # Every path ends on a model the gateway KNOWS: an explicit, permitted pick
+    # is used verbatim; anything else falls back to this surface's configured
+    # model, resolved onto the live catalogue id (so the coach/analysis can
+    # never 404 on a naming variant and never silently run on another model).
+    fallback = (_ai_feature_model(feature) or _ai_feature_model("analysis")
+                or AI_DEFAULT_MODEL)
+    use_model = ai_resolve_model(model, fallback=fallback)
     if not use_model:
         raise HTTPException(status_code=503,
                             detail="No AI model selected and RACECAR_AI_MODEL is unset")
@@ -4600,35 +4743,14 @@ def _ai_history_delete_file(user: str, session_name: str) -> None:
 
 
 def _ai_model_list() -> list:
-    """Models the UI may offer. If an allowlist is configured (RACECAR_AI_MODELS
+    """Models the UI may OFFER. If an allowlist is configured (RACECAR_AI_MODELS
     or RACECAR_AI_MODEL), it is authoritative and we do NOT expose the live
-    100+ catalogue. Only with NO allowlist do we fetch the full list."""
+    100+ catalogue. Only with NO allowlist do we fetch (and cache) the live list."""
     if not AI_API_KEY:
         return []
     if AI_MODELS:
         return [{"id": mid, "name": mid} for mid in AI_MODELS]
-    req = urllib.request.Request(
-        AI_BASE_URL + "/api/models",
-        headers={"Authorization": "Bearer " + AI_API_KEY},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            payload = json.loads(r.read().decode("utf-8", "replace"))
-    except Exception as e:
-        log.warning("AI model list fetch failed: %s", e)
-        return []
-    data = payload.get("data", payload) if isinstance(payload, dict) else payload
-    out = []
-    if isinstance(data, list):
-        for m in data:
-            if isinstance(m, dict):
-                mid = m.get("id") or m.get("name")
-                if mid:
-                    out.append({"id": mid, "name": m.get("name") or mid})
-            elif isinstance(m, str):
-                out.append({"id": m, "name": m})
-    return out
+    return [{"id": mid, "name": mid} for mid in _ai_catalogue_ids()]
 
 
 @app.get("/sessions/{user}/{filename}")
@@ -5439,10 +5561,19 @@ async def session_debug_raw(request: Request, user: str, filename: str) -> Respo
 async def ai_models(request: Request) -> JSONResponse:
     """Model catalogue for the review UI's picker + the configured default."""
     require_web_user(request)
+    # to_thread: this GETs the gateway catalogue (blocking HTTP) — calling it on
+    # the event loop froze EVERY request in flight for up to 20 s.
+    models = await asyncio.to_thread(_ai_model_list)
+    default = await asyncio.to_thread(lambda: _ai_feature_model("analysis"))
+    default = default or AI_DEFAULT_MODEL
+    # The configured default must be SELECTABLE, or the browser jumps to the
+    # first option and the next question is asked on the wrong model.
+    if default and all(m.get("id") != default for m in models):
+        models.insert(0, {"id": default, "name": default + " (configured)"})
     return JSONResponse({
         "enabled": ai_enabled(),
-        "default": AI_DEFAULT_MODEL,
-        "models": _ai_model_list(),
+        "default": default,
+        "models": models,
     })
 
 
@@ -5508,7 +5639,7 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
     question = str(body.get("prompt", "")).strip()
     messages = _region_prompt(metrics, question, lib=lib)
     answer, used_model, usage = await asyncio.to_thread(
-        lambda: _ai_chat(messages, model=body.get("model")))
+        lambda: _ai_chat(messages, model=body.get("model"), feature="analysis"))
 
     entry = {
         "id": secrets.token_hex(8),
@@ -5651,7 +5782,7 @@ async def session_lines_ai(request: Request, user: str, filename: str) -> JSONRe
     )
     answer, used_model, usage = await asyncio.to_thread(       # off the event loop
         lambda: _ai_chat([{"role": "system", "content": system}, {"role": "user", "content": userq}],
-                         model=body.get("model")))
+                         model=body.get("model"), feature="analysis"))
     entry = {
         "id": secrets.token_hex(8),
         "ts": int(time.time()),
@@ -6839,8 +6970,12 @@ _INDEX_HEAD = f"""<!doctype html>
 <style>{_BASE_CSS}
  /* The sessions list is a table of numbers: it wants the width. */
  main {{ max-width: 2400px; }}
- th.best {{ cursor: pointer; white-space: nowrap; }}
- th.best span {{ color: var(--muted); font-weight: 400; }}
+ /* EVERY column header sorts (click = order by it, click again = reverse). */
+ th.sortable {{ cursor: pointer; white-space: nowrap; user-select: none; }}
+ th.sortable:hover, th.sortable.on {{ color: var(--text); }}
+ th.sortable .ind {{ color: var(--muted); font-weight: 400; margin-left: 5px; }}
+ th.sortable.on .ind {{ color: var(--primary); }}
+ th.num {{ text-align: right; }}
  td.best {{ white-space: nowrap; font-variant-numeric: tabular-nums; }}
  td.best.sortkey {{ color: var(--primary); }}
  table {{ width: 100%; border-collapse: separate; border-spacing: 0;
@@ -6896,6 +7031,57 @@ _INDEX_JS = """
   const nomatch = $('nomatch');
   const result = $('uploadResult');
 
+  // ---- column sorting --------------------------------------------------
+  // Every header sorts: click a column to order by it, click it again to
+  // reverse. The table OPENS newest-first ("started" descending) — the same
+  // order the server renders, so the list is already right before any JS runs
+  // and an admin viewing several users gets ONE time-ordered list.
+  // Numeric columns (time / size / best lap) open descending; text opens A-Z.
+  // A value that doesn't exist yet (best lap not detected) always sorts last.
+  const RC_SORT = (function(){
+    const tb = document.getElementById('rows');
+    const heads = Array.from(document.querySelectorAll('th.sortable'));
+    const NUMERIC = {started: 1, size: 1, best: 1};
+    let key = 'started', dir = -1;             // dir < 0 = descending
+    function cellVal(tr, k){
+      const td = tr.querySelector('td[data-k="' + k + '"]');
+      if (!td) return '';
+      return td.dataset.sort !== undefined ? td.dataset.sort : td.textContent.trim();
+    }
+    function num(v){ if (v === '' || v === null || v === undefined) return NaN;
+      const n = Number(v); return isFinite(n) ? n : NaN; }
+    function absent(v, k){ return NUMERIC[k] ? isNaN(num(v)) : String(v).trim() === ''; }
+    function apply(){
+      if (!tb || !heads.length) return;
+      const list = Array.from(tb.querySelectorAll('tr')).map((tr, i) => [tr, i]);
+      list.sort((A, B) => {
+        const va = cellVal(A[0], key), vb = cellVal(B[0], key);
+        const ma = absent(va, key), mb = absent(vb, key);
+        if (ma !== mb) return ma ? 1 : -1;     // n/a last, either direction
+        let c;
+        if (NUMERIC[key]) c = num(va) - num(vb);
+        else c = String(va).toLowerCase().localeCompare(String(vb).toLowerCase());
+        if (c === 0) return A[1] - B[1];       // stable within equal keys
+        return dir * c;
+      });
+      list.forEach(p => tb.appendChild(p[0]));
+      heads.forEach(h => {
+        const on = h.dataset.key === key;
+        h.classList.toggle('on', on);
+        const ind = h.querySelector('.ind');
+        if (ind) ind.textContent = on ? (dir < 0 ? '\u25be' : '\u25b4') : '';
+      });
+    }
+    heads.forEach(h => h.addEventListener('click', () => {
+      const k = h.dataset.key;
+      if (k === key) dir = -dir;               // same header: just reverse it
+      else { key = k; dir = NUMERIC[k] ? -1 : 1; }
+      apply();
+    }));
+    return {apply: apply, key: function(){ return key; }};
+  })();
+  RC_SORT.apply();   // paints the \u25be on "started"; rows are already in that order
+
   // ---- best lap per session -------------------------------------------
   // The list must never wait on lap detection (it reads whole session files),
   // so cells render "…", the server answers with whatever is already cached,
@@ -6928,37 +7114,19 @@ _INDEX_JS = """
                       + (d.source ? ' \u00b7 ' + d.source : '')
                       + (d.error ? ' \u00b7 ' + d.error : '');
             c.dataset.done = '1';
-            c.dataset.secs = (d.best_s == null ? '' : d.best_s);
+            // dataset.sort (not secs) is what the column sorter reads.
+            c.dataset.sort = (d.best_s == null ? '' : d.best_s);
             any = true;
           }
         } catch(e){}
       }
+      // Values landed while we're showing the best-lap column: keep it true.
+      if (any && RC_SORT.key() === 'best') RC_SORT.apply();
       if (!any){ cells.forEach(c => { if (!c.dataset.done){ c.dataset.done='1';
         if (!c.textContent.trim() || c.textContent.trim() === '\u2026') c.textContent = '\u2014'; } }); }
       else setTimeout(fill, 400);
     }
     fill();
-
-    // sort by best lap (click the header); un-timed sessions sort last
-    const head = document.querySelector('th.best');
-    if (head){
-      let dir = 1;
-      head.addEventListener('click', () => {
-        const tb = document.getElementById('rows');
-        const rows = Array.from(tb.querySelectorAll('tr'));
-        rows.sort((a, b) => {
-          const ka = a.querySelector('td.best'), kb = b.querySelector('td.best');
-          const va = parseFloat(ka?.dataset.secs || ''), vb = parseFloat(kb?.dataset.secs || '');
-          const na = isFinite(va), nb = isFinite(vb);
-          if (na !== nb) return na ? -1 : 1;
-          if (!na) return 0;
-          return dir * (va - vb);
-        });
-        dir = -dir;
-        rows.forEach(r => tb.appendChild(r));
-        head.querySelector('span').textContent = dir > 0 ? '\u25b4' : '\u25be';
-      });
-    }
   })();
 
   function apiKey(){ return ($('apiKey')?.value || '').trim(); }
@@ -7118,7 +7286,10 @@ async def index(request: Request) -> Response:
         return login_redirect(request)
     viewer_email = str((user or {}).get("email", ""))
     sessions_root = DATA_DIR / "sessions"
-    rows: list[str] = []
+    # (epoch, row html): collected per user, re-ordered into ONE time list at the
+    # end. An admin viewing several users wants newest-first across all of them,
+    # not grouped by directory — the "user" column is right there to sort on.
+    rows: list[tuple[int, str]] = []
     total = 0
     total_bytes = 0
     if sessions_root.exists():
@@ -7134,9 +7305,10 @@ async def index(request: Request) -> Response:
                 if not f.is_file() or not f.name.endswith(".ndjson"):
                     continue
                 st = f.stat()
+                epoch = display_epoch_for(f)
                 when = time.strftime(
                     "%Y-%m-%d %H:%M:%S UTC",
-                    time.gmtime(display_epoch_for(f)),
+                    time.gmtime(epoch),
                 )
                 size_str = _human_bytes(st.st_size)
                 # Track name = filename middle bit: <sid>_<track>.ndjson
@@ -7157,21 +7329,25 @@ async def index(request: Request) -> Response:
                 best_str = (f'<span title="{cached.get("laps", 0)} laps">'
                             f"{_fmt_lap_s(cached.get('best_s'))}</span>"
                             if cached else "\u2026")
-                rows.append(
+                # data-k identifies the column; data-sort is the machine-sortable
+                # value where the RENDERED text would sort wrong (a formatted date,
+                # "1.5 MB"). The client sorter reads these, not the text.
+                rows.append((epoch,
                     f'<tr><td><input type="checkbox" class="cmb" '
                     f'data-user="{user_h}" data-file="{file_h}"></td>'
-                    f"<td>{user_h}</td>"
-                    f"<td class=mono>{when_h}</td>"
-                    f"<td>{track_h}</td>"
-                    f'<td class="num best" data-best="{user_h}/{file_h}">'
+                    f'<td data-k="user">{user_h}</td>'
+                    f'<td class="mono" data-k="started" data-sort="{epoch}">{when_h}</td>'
+                    f'<td data-k="track">{track_h}</td>'
+                    f'<td class="num best" data-k="best" data-best="{user_h}/{file_h}">'
                     f"{best_str}</td>"
-                    f'<td class=mono><a href="/review/{user_h}/{file_h}">{file_h}</a></td>'
-                    f"<td class=num>{size_str}</td>"
+                    f'<td class="mono" data-k="filename">'
+                    f'<a href="/review/{user_h}/{file_h}">{file_h}</a></td>'
+                    f'<td class="num" data-k="size" data-sort="{st.st_size}">{size_str}</td>'
                     f'<td><div class="actions">'
                     f'<a class="btn" href="/sessions/{user_h}/{file_h}">download</a>'
                     f'{delete_btn}'
                     f'</div></td></tr>'
-                )
+                ))
                 total += 1
                 total_bytes += st.st_size
 
@@ -7182,10 +7358,15 @@ async def index(request: Request) -> Response:
             '</div><button id="combine-btn" class="btn" '
             'title="select 2+ sessions of the same user, oldest+newest are joined in time order">'
             'combine selected</button><span class="pill" id="vis"></span></div>'
-            "<table><thead><tr><th></th><th>user</th><th>started (UTC)</th>"
-            "<th>track</th><th>best lap <span>\u25b4\u25be</span></th>"
-            "<th>filename</th><th>size</th><th>actions</th></tr></thead><tbody id=\"rows\">"
-            + "\n".join(rows)
+            "<table><thead><tr><th></th>"
+            '<th class="sortable" data-key="user">user<span class="ind"></span></th>'
+            '<th class="sortable" data-key="started">started (UTC)<span class="ind"></span></th>'
+            '<th class="sortable" data-key="track">track<span class="ind"></span></th>'
+            '<th class="sortable" data-key="best">best lap<span class="ind"></span></th>'
+            '<th class="sortable" data-key="filename">filename<span class="ind"></span></th>'
+            '<th class="sortable num" data-key="size">size<span class="ind"></span></th>'
+            '<th>actions</th></tr></thead><tbody id="rows">'
+            + "\n".join(r for _, r in sorted(rows, key=lambda t: t[0], reverse=True))
             + "</tbody></table>"
             + '<div class="no-match" id="nomatch">no sessions match that filter.</div>'
             + f'<p class="summary">{total} session(s), {_human_bytes(total_bytes)} total</p>'
