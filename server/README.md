@@ -15,6 +15,7 @@ LAN IP of the host running the container.
 | ------ | --------------------------- | ---------------------------------------------- |
 | POST   | `/upload`                   | Whole-file AfterRace upload (NDJSON). Overwrites by `X-Session-Id` so retries are idempotent. |
 | POST   | `/stream`                   | Live-stream append (NDJSON). Reserved for the future Ethernet-mode live path. |
+| POST   | `/upload/aim`               | **Import AiM Race Studio files.** Body = the raw `.xrk` or AiM `.csv`; name via the `X-File-Name` header or `?filename=`. Converted to session NDJSON server-side and filed exactly like a dash upload, so laps/map/replay/coaching all work. The untouched original is archived under `/data/aim/<user>/`. `?coach=0` skips the auto-coach pass. |
 | GET    | `/`                         | HTML index of the sessions you're allowed to see (see *Session visibility*). |
 | GET    | `/sessions`                 | JSON listing of the sessions you're allowed to see. |
 | GET    | `/sessions/<user>/<file>`   | Download one session file.                     |
@@ -113,12 +114,47 @@ X-Track-Name:  Lime_Rock_Park     (used in the saved filename)
 
 ```
 /data/sessions/<email>/<session_id>_<track>.ndjson
+/data/aim/<email>/<session_id>_<original name>.xrk|.csv
 ```
 
 Where:
 
 - `<email>`, `<track>` are sanitized — anything outside `[A-Za-z0-9._@+-]` becomes `_`.
 - `<session_id>` is whatever the dash put in `X-Session-Id` (the start unix epoch).
+- `/data/aim/` holds the **unmodified original** of every AiM import, so the
+  logger file survives even if a conversion is later found wanting.
+
+## Importing AiM Race Studio files
+
+Race Studio gives you a run in two containers and `POST /upload/aim` takes both:
+
+| | `.xrk` | AiM `.csv` |
+| --- | --- | --- |
+| how it is read | `libxrk` (chunked, per-channel timecodes, laps table, metadata) | stdlib `csv` |
+| units | **metric** — altitude m, speed m/s, WATER_TEMP C, OIL_PRESSURE bar | **imperial** — altitude ft, speed mph, WATER TEMP °F, OIL PRESSURE psi |
+| lap boundaries | `laps` table | `Beacon Markers` preamble row |
+| sample rate | resampled to 20 Hz | native (20 Hz) |
+
+The two containers do **not** agree on units, so every mapping is driven by the
+file's own declaration — Arrow field metadata for `.xrk`, the units row for
+`.csv` — and a mismatch aborts the import instead of silently writing wrong
+numbers. Cross-check on the reference files: the same run reads 515.25 ft
+(CSV) and 157.04 m (XRK) of altitude. (One quirk: AiM labels the `.xrk` AFR
+channel `lambda` while the samples are actually A/F, so that channel is
+disambiguated from its own values rather than from the label.)
+
+Imported sessions then go through the ordinary `validate_ndjson_body` gate, and
+the server's own lap detection reproduces AiM's segment times to within 50 ms.
+
+```bash
+# import an .xrk for a given user
+curl -X POST 'http://HOST:8089/upload/aim' \
+     -H 'X-File-Name: JJ_Summit Main_20261009_152404_a_0318.xrk' \
+     -H 'X-User-Email: user@example.com' \
+     --data-binary @JJ_Summit_Main.xrk
+# {"ok":true,"source":"xrk","session":"1791559444_Summit_Main.ndjson",
+#  "samples":30678,"laps":16,...}
+```
 
 ## Run with Docker
 

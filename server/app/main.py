@@ -3933,6 +3933,164 @@ async def stream(
     )
 
 
+# ---------------------------------------------------------------------------
+# AiM import — POST /upload/aim
+# ---------------------------------------------------------------------------
+# Race Studio hands you a run as either a .xrk (binary) or an AiM .csv export.
+# Both are accepted here, converted to the very same NDJSON the dash uploads,
+# and then take the identical path: validate_ndjson_body ->
+# _resolve_upload_target -> sessions/<email>/<sid>_<track>.ndjson. Nothing
+# downstream can tell an imported session from a recorded one, so laps, the
+# map, replay and coaching all work unchanged.
+#
+# The untouched original is archived under /data/aim/<email>/ first, so the
+# logger file is never lost even if a conversion is later found wanting.
+AIM_EXTS = (".xrk", ".csv")
+# Reference files are 7-11 MB each and a long enduro export is bigger, so this
+# gets its own ceiling rather than the 64 MB NDJSON guard.
+AIM_MAX_BYTES = int(os.environ.get("RACECAR_AIM_MAX_BYTES", str(192 * 1024 * 1024)))
+
+
+def _aim_requested_name(x_file_name: Optional[str], filename_q: Optional[str]) -> str:
+    """Original filename (for sniffing + archiving), always sanitized."""
+    raw = (x_file_name or filename_q or "").strip()
+    raw = pathlib.PurePosixPath(raw.replace("\\", "/")).name   # drop any path
+    return safe_name(raw, default="upload", maxlen=120)
+
+
+@app.post("/upload/aim")
+async def upload_aim(
+    request: Request,
+    filename: str = Query(""),
+    coach: int = Query(1),
+    x_api_key: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None),
+    x_session_id: Optional[str] = Header(None),
+    x_track_name: Optional[str] = Header(None),
+    x_file_name: Optional[str] = Header(None),
+) -> JSONResponse:
+    """Import an AiM .xrk or AiM .csv as a normal session. Body = the raw file."""
+    import tempfile   # only used here; leaves the module import block untouched
+
+    _client_host = request.client.host if request.client else "?"
+    name = _aim_requested_name(x_file_name, filename)
+    _upload_event({"ev": "start", "ip": _client_host, "kind": "aim",
+                   "file": name, "has_key": bool(x_api_key),
+                   "user": x_user_email,
+                   "content_length": request.headers.get("content-length")})
+
+    # Same auth as _save_body: master key, per-user key, or logged-in web user.
+    web_user = None
+    if API_KEY and x_api_key != API_KEY:
+        web_user = current_user(request) if oauth_enabled() else None
+        if not web_user and not (x_api_key and email_for_api_key(x_api_key)):
+            raise HTTPException(status_code=401, detail="invalid api key")
+    elif oauth_enabled():
+        web_user = current_user(request)
+
+    ext = pathlib.PurePosixPath(name).suffix.lower()
+    if ext not in AIM_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported file type {ext or name!r} — send an AiM .xrk or "
+                   f"an 'AiM CSV File' .csv")
+
+    body = await request.body()
+    if not body:
+        _upload_event({"ev": "reject", "ip": _client_host, "kind": "aim",
+                       "file": name, "reason": "empty body"})
+        raise HTTPException(status_code=400, detail="empty body")
+    if len(body) > AIM_MAX_BYTES:
+        _upload_event({"ev": "reject", "ip": _client_host, "kind": "aim",
+                       "file": name, "reason": "too large", "bytes": len(body)})
+        raise HTTPException(status_code=413, detail="body too large")
+
+    import aim_import            # app/aim_import.py (libxrk imported lazily inside)
+
+    # Signature beats extension: a renamed .xrk still imports, and a file that
+    # is neither container is rejected instead of being parsed as the wrong one.
+    sniffed = aim_import.sniff_format(body[:512])
+    if sniffed is None:
+        _upload_event({"ev": "reject", "ip": _client_host, "kind": "aim",
+                       "file": name, "reason": "unrecognised container"})
+        raise HTTPException(
+            status_code=400,
+            detail="not an AiM file: expected an AiM .xrk or a file beginning "
+                   'with "Format","AiM CSV File"')
+
+    tmpdir = DATA_DIR / "tmp"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(dir=tmpdir, suffix=f".{sniffed}", delete=False)
+    tmp_path = tmp.name
+    try:
+        tmp.write(body)
+        tmp.close()
+        try:
+            conv = aim_import.import_aim(tmp_path, filename=name)
+        except Exception as e:
+            _upload_event({"ev": "reject", "ip": _client_host, "kind": "aim",
+                           "file": name,
+                           "reason": f"convert: {type(e).__name__}: {e}"})
+            raise HTTPException(
+                status_code=422,
+                detail=f"could not read {name}: {type(e).__name__}: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    # Converted output obeys exactly the same ingest rules as the dash.
+    validation = validate_ndjson_body(conv.ndjson)
+
+    # Caller headers win; otherwise the file's own metadata names the session.
+    email, sid, sid_int, sid_overridden, track, filename_out, out_path = \
+        _resolve_upload_target(
+            x_user_email,
+            x_session_id or str(conv.session_id),
+            x_track_name or conv.track,
+            x_api_key, web_user, "")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        f.write(conv.ndjson)
+
+    # Archive the untouched original.
+    orig_dir = DATA_DIR / "aim" / email
+    orig_dir.mkdir(parents=True, exist_ok=True)
+    stem = pathlib.PurePosixPath(name).stem
+    archive = orig_dir / f"{sid}_{safe_name(stem, default='aim', maxlen=100)}.{sniffed}"
+    with open(archive, "wb") as f:
+        f.write(body)
+
+    _upload_event({"ev": "ok", "ip": _client_host, "kind": "aim", "file": name,
+                   "source": conv.source, "session": sid, "track": track,
+                   "bytes": len(conv.ndjson), "lines": conv.samples,
+                   "laps": conv.laps,
+                   "path": str(out_path.relative_to(DATA_DIR)),
+                   "archive": str(archive.relative_to(DATA_DIR))})
+    if coach:
+        _coach_kick(email, out_path, track)
+    log.info("aim import %s format=%s email=%s session=%s track=%s %d samples %d laps -> %s",
+             name, conv.source, email, sid, track, conv.samples, conv.laps,
+             out_path.relative_to(DATA_DIR))
+
+    return JSONResponse({
+        "ok": True,
+        "source": conv.source,
+        "session": filename_out,
+        "path": str(out_path.relative_to(DATA_DIR)),
+        "archive": str(archive.relative_to(DATA_DIR)),
+        "user": email,
+        "track": track,
+        "samples": conv.samples,
+        "laps": conv.laps,
+        "bytes": len(conv.ndjson),
+        "validation": validation,
+        "ts": int(time.time()),
+    })
+
+
 @app.get("/sessions")
 async def list_sessions(request: Request) -> dict:
     """JSON listing of saved sessions. Useful for tooling/cli inspection."""
@@ -7259,6 +7417,60 @@ _UPLOAD_PANEL_HTML = """
 """
 
 
+# AiM import sits next to the NDJSON uploader because it lands in the same
+# place. The heavy lifting is server-side (/upload/aim -> app/aim_import.py);
+# this is just a file picker that reports the resulting session.
+_AIM_PANEL_HTML = """
+<section class="panel">
+  <div class="panel-head">
+    <div>
+      <div class="t-label">Import AiM &mdash; Race Studio</div>
+      <div class="upload-help">Drop in a Race Studio <span class="mono">.xrk</span> or an AiM CSV export (one starting <span class="mono">"Format","AiM CSV File"</span>). It is converted server-side into the same NDJSON the dash uploads, so laps, map, replay and coaching work exactly as for a recorded session. Units, altitude and lap boundaries are taken from the file itself &mdash; the two containers disagree (<span class="mono">.xrk</span> is metric, the CSV is imperial) and the importer reconciles them. The untouched original is archived under <span class="mono">/data/aim/</span>.</div>
+    </div>
+    <span class="pill">.xrk .csv</span>
+  </div>
+  <form id="aimForm" class="upload-grid">
+    <div><label for="aimFile">file</label><input id="aimFile" type="file" accept=".xrk,.csv"></div>
+    <div><label for="aimEmail">user email</label><input id="aimEmail" type="text" value="__CURRENT_EMAIL__" placeholder="driver@example.com"></div>
+    <div><label for="aimTrack">track</label><input id="aimTrack" type="text" placeholder="from the file"></div>
+    <div><label for="aimKey">api key</label><input id="aimKey" type="text" placeholder="optional"></div>
+    <button class="btn primary" type="submit">import</button>
+  </form>
+  <pre id="aimResult" class="upload-result"></pre>
+</section>
+<script>
+(function(){
+  var form = document.getElementById('aimForm');
+  if (!form) return;
+  var out = document.getElementById('aimResult');
+  form.addEventListener('submit', async function(ev){
+    ev.preventDefault();
+    var f = document.getElementById('aimFile').files[0];
+    if (!f) { out.textContent = 'Choose a .xrk or an AiM .csv first.'; return; }
+    out.textContent = 'Importing ' + f.name + '  (a large .xrk takes a few seconds)\u2026';
+    var h = {'X-File-Name': f.name};
+    var em = document.getElementById('aimEmail').value.trim(); if (em) h['X-User-Email'] = em;
+    var tk = document.getElementById('aimTrack').value.trim(); if (tk) h['X-Track-Name'] = tk;
+    var k  = document.getElementById('aimKey').value.trim();  if (k)  h['X-API-Key'] = k;
+    try {
+      var buf = await f.arrayBuffer();
+      var r = await fetch('/upload/aim', {method:'POST', headers:h, body:buf});
+      var d = await r.json().catch(function(){ return {}; });
+      if (!r.ok) { out.textContent = 'Import failed: ' + JSON.stringify(d.detail || d); return; }
+      out.textContent = 'OK  ' + d.session +
+        '\nuser    ' + d.user + '\ntrack   ' + d.track +
+        '\nsource  ' + d.source + '\nsamples ' + d.samples + '\nlaps    ' + d.laps +
+        '\narchive ' + d.archive + '\n\nreloading\u2026';
+      setTimeout(function(){ location.reload(); }, 1200);
+    } catch(e) {
+      out.textContent = 'Import failed: ' + e.message;
+    }
+  });
+})();
+</script>
+"""
+
+
 def _human_bytes(n: int) -> str:
     if n < 1024:
         return f"{n} B"
@@ -7376,6 +7588,7 @@ async def index(request: Request) -> Response:
 
     current_email = html.escape((user or {}).get("email", ""))
     upload_panel = _UPLOAD_PANEL_HTML.replace("__CURRENT_EMAIL__", current_email)
+    upload_panel += _AIM_PANEL_HTML.replace("__CURRENT_EMAIL__", current_email)
     user_chip = _user_chip_html(user)
     return _INDEX_HEAD.replace("__USER_CHIP__", user_chip) + upload_panel + listing + _INDEX_JS + _COMBINE_JS + "</main></body></html>"
 
