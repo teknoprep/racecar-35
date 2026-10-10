@@ -7340,32 +7340,56 @@ _INDEX_JS = """
   if (form) form.addEventListener('submit', async ev => {
     ev.preventDefault();
     const f = fileEl.files && fileEl.files[0];
-    if (!f) { showResult('Choose an .ndjson file first.', false); return; }
+    if (!f) { showResult('Choose a file first (.ndjson, .xrk or .csv).', false); return; }
     const user = ($('userEmail').value || 'manual@upload.local').trim();
-    const sid  = ($('sessionId').value || Math.floor(Date.now()/1000).toString()).trim();
-    const trk  = ($('trackName').value || 'UNKNOWN').trim();
+    // Blank session-id / track mean "take them from the file" on an AiM import;
+    // plain NDJSON keeps the old defaults.
+    const sid  = ($('sessionId').value || '').trim();
+    const trk  = ($('trackName').value || '').trim();
+    // The FILENAME decides the path: an AiM logger file (.xrk, or an AiM .csv)
+    // is converted server-side, session NDJSON is validated as-is. One control,
+    // nothing to pick.
+    const ext = (f.name.split('.').pop() || '').toLowerCase();
+    const isAim = (ext === 'xrk' || ext === 'csv');
     try {
-      showResult('Validating + uploading ' + f.name + ' ...', true);
+      showResult((isAim ? 'Importing ' : 'Validating + uploading ') + f.name + ' ...', true);
       const body = await f.arrayBuffer();
-      const headers = Object.assign({
-        'Content-Type': 'application/x-ndjson',
-        'X-User-Email': user,
-        'X-Session-Id': sid,
-        'X-Track-Name': trk
-      }, authHeaders());
-      const resp = await fetch('/upload', { method: 'POST', headers, body });
+      const headers = Object.assign({'X-User-Email': user}, authHeaders());
+      if (isAim) {
+        headers['X-File-Name'] = f.name;
+        if (sid) headers['X-Session-Id'] = sid;
+        if (trk) headers['X-Track-Name'] = trk;
+      } else {
+        headers['Content-Type'] = 'application/x-ndjson';
+        headers['X-Session-Id'] = sid || Math.floor(Date.now()/1000).toString();
+        headers['X-Track-Name'] = trk || 'UNKNOWN';
+      }
+      const resp = await fetch(isAim ? '/upload/aim' : '/upload', { method: 'POST', headers, body });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) {
         const d = data.detail || data;
-        const errors = d.errors ? ('\\n' + d.errors.join('\\n')) : '';
+        const errors = d.errors ? ('\\n' + d.errors.join('\\n')) :
+                       (typeof d === 'string' ? '\\n' + d : '');
         throw new Error((d.message || data.detail || ('HTTP ' + resp.status)) + errors);
       }
-      const v = data.validation || {};
-      showResult('OK: saved ' + data.path + '\\n' + (v.samples || '?') + ' samples, '
-                 + (v.geo_samples || '?') + ' GPS samples', true);
-      setTimeout(() => location.reload(), 900);
+      // Deliberately NO auto-reload here: the old 900 ms timer wiped the result
+      // before it could be read, which made a successful import look like
+      // nothing happened at all.
+      if (isAim) {
+        showResult('OK \u2014 imported ' + data.session + '\\n'
+          + 'track    ' + data.track + '\\n'
+          + 'samples  ' + data.samples + '\\n'
+          + 'laps     ' + data.laps + '\\n'
+          + 'source   ' + data.source + '   (original archived as ' + data.archive + ')\\n'
+          + '\\nReload this page to see it in the list.', true);
+      } else {
+        const v = data.validation || {};
+        showResult('OK \u2014 saved ' + data.path + '\\n'
+          + (v.samples || '?') + ' samples, ' + (v.geo_samples || '?') + ' GPS samples\\n'
+          + '\\nReload this page to see it in the list.', true);
+      }
     } catch(e) {
-      showResult('Upload rejected: ' + e.message, false);
+      showResult((isAim ? 'Import' : 'Upload') + ' rejected: ' + e.message, false);
     }
   });
 
@@ -7400,77 +7424,21 @@ _UPLOAD_PANEL_HTML = """
   <div class="panel-head">
     <div>
       <div class="t-label">Manual Session Upload</div>
-      <div class="upload-help">Uploads are validated server-side before they are saved. Expected format: newline-delimited JSON, one telemetry object per line, with numeric <span class="mono">t</span>, <span class="mono">lat</span>, and <span class="mono">lon</span>.</div>
+      <div class="upload-help">Uploads are validated server-side before they are saved. Accepted: a racecar session <span class="mono">.ndjson</span> (one telemetry object per line, numeric <span class="mono">t</span>, <span class="mono">lat</span>, <span class="mono">lon</span>), or an AiM Race Studio file &mdash; <span class="mono">.xrk</span>, or an AiM <span class="mono">.csv</span> (one starting <span class="mono">"Format","AiM CSV File"</span>) &mdash; which is converted on import. The type comes from the filename, so there is nothing to choose.</div>
     </div>
-    <span class="pill">.ndjson</span>
+    <span class="pill">.ndjson .xrk .csv</span>
   </div>
   <form id="uploadForm" class="upload-grid">
-    <div><label for="sessionFile">file</label><input id="sessionFile" type="file" accept=".ndjson,application/x-ndjson,text/plain"></div>
+    <div><label for="sessionFile">file</label><input id="sessionFile" type="file" accept=".ndjson,.xrk,.csv,application/x-ndjson,text/plain"></div>
     <div><label for="userEmail">user email</label><input id="userEmail" type="text" value="__CURRENT_EMAIL__" placeholder="driver@example.com"></div>
-    <div><label for="sessionId">session id</label><input id="sessionId" type="text" placeholder="unix epoch"></div>
-    <div><label for="trackName">track</label><input id="trackName" type="text" placeholder="UNKNOWN"></div>
+    <div><label for="sessionId">session id</label><input id="sessionId" type="text" placeholder="blank = from file"></div>
+    <div><label for="trackName">track</label><input id="trackName" type="text" placeholder="blank = from file"></div>
     <div><label for="apiKey">api key</label><input id="apiKey" type="text" placeholder="optional"></div>
     <button class="btn primary" type="submit">upload</button>
   </form>
   <pre id="uploadResult" class="upload-result"></pre>
 </section>
 """
-
-
-# AiM import sits next to the NDJSON uploader because it lands in the same
-# place. The heavy lifting is server-side (/upload/aim -> app/aim_import.py);
-# this is just a file picker that reports the resulting session.
-_AIM_PANEL_HTML = """
-<section class="panel">
-  <div class="panel-head">
-    <div>
-      <div class="t-label">Import AiM &mdash; Race Studio</div>
-      <div class="upload-help">Drop in a Race Studio <span class="mono">.xrk</span> or an AiM CSV export (one starting <span class="mono">"Format","AiM CSV File"</span>). It is converted server-side into the same NDJSON the dash uploads, so laps, map, replay and coaching work exactly as for a recorded session. Units, altitude and lap boundaries are taken from the file itself &mdash; the two containers disagree (<span class="mono">.xrk</span> is metric, the CSV is imperial) and the importer reconciles them. The untouched original is archived under <span class="mono">/data/aim/</span>.</div>
-    </div>
-    <span class="pill">.xrk .csv</span>
-  </div>
-  <form id="aimForm" class="upload-grid">
-    <div><label for="aimFile">file</label><input id="aimFile" type="file" accept=".xrk,.csv"></div>
-    <div><label for="aimEmail">user email</label><input id="aimEmail" type="text" value="__CURRENT_EMAIL__" placeholder="driver@example.com"></div>
-    <div><label for="aimTrack">track</label><input id="aimTrack" type="text" placeholder="from the file"></div>
-    <div><label for="aimKey">api key</label><input id="aimKey" type="text" placeholder="optional"></div>
-    <button class="btn primary" type="submit">import</button>
-  </form>
-  <pre id="aimResult" class="upload-result"></pre>
-</section>
-<script>
-(function(){
-  var form = document.getElementById('aimForm');
-  if (!form) return;
-  var out = document.getElementById('aimResult');
-  form.addEventListener('submit', async function(ev){
-    ev.preventDefault();
-    var f = document.getElementById('aimFile').files[0];
-    if (!f) { out.textContent = 'Choose a .xrk or an AiM .csv first.'; return; }
-    out.textContent = 'Importing ' + f.name + '  (a large .xrk takes a few seconds)\u2026';
-    var h = {'X-File-Name': f.name};
-    var em = document.getElementById('aimEmail').value.trim(); if (em) h['X-User-Email'] = em;
-    var tk = document.getElementById('aimTrack').value.trim(); if (tk) h['X-Track-Name'] = tk;
-    var k  = document.getElementById('aimKey').value.trim();  if (k)  h['X-API-Key'] = k;
-    try {
-      var buf = await f.arrayBuffer();
-      var r = await fetch('/upload/aim', {method:'POST', headers:h, body:buf});
-      var d = await r.json().catch(function(){ return {}; });
-      if (!r.ok) { out.textContent = 'Import failed: ' + JSON.stringify(d.detail || d); return; }
-      out.textContent = 'OK  ' + d.session +
-        '\nuser    ' + d.user + '\ntrack   ' + d.track +
-        '\nsource  ' + d.source + '\nsamples ' + d.samples + '\nlaps    ' + d.laps +
-        '\narchive ' + d.archive + '\n\nreloading\u2026';
-      setTimeout(function(){ location.reload(); }, 1200);
-    } catch(e) {
-      out.textContent = 'Import failed: ' + e.message;
-    }
-  });
-})();
-</script>
-"""
-
-
 def _human_bytes(n: int) -> str:
     if n < 1024:
         return f"{n} B"
@@ -7588,7 +7556,6 @@ async def index(request: Request) -> Response:
 
     current_email = html.escape((user or {}).get("email", ""))
     upload_panel = _UPLOAD_PANEL_HTML.replace("__CURRENT_EMAIL__", current_email)
-    upload_panel += _AIM_PANEL_HTML.replace("__CURRENT_EMAIL__", current_email)
     user_chip = _user_chip_html(user)
     return _INDEX_HEAD.replace("__USER_CHIP__", user_chip) + upload_panel + listing + _INDEX_JS + _COMBINE_JS + "</main></body></html>"
 
