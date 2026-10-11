@@ -1825,3 +1825,141 @@ class Track3DWidthTests(unittest.TestCase):
         outside = max(r["fold"]["lMin"], r["fold"]["rMin"])
         self.assertLessEqual(inside, 0.85 * 10 + 0.3)
         self.assertEqual(outside, 9)
+
+
+GHOST_DRIVER = r"""
+// ---- v14 compare ghost: track progress + the gap
+const R = {};
+(function () {
+  var o = { lat: 39, lon: -77 }, k, RAD = 200;
+  var xs = [], zs = [];
+  for (k = 0; k < 360; k++) { xs.push(RAD * Math.cos(k * Math.PI / 180)); zs.push(RAD * Math.sin(k * Math.PI / 180)); }
+  var T = RC3D.linePath(xs, zs, null, { closed: true, step: 1, o: o });
+  var d = T.dense, tot = d.total, idx = RC3D.lineIndex(d.x, d.z, 30);
+  R.tot = tot;
+  // a car that covers `v` metres of CENTRELINE per second on a line `off`
+  // metres outside it, starting 100 m before the loop's seam (it crosses it)
+  function lap(v, off, dur, jitterAt) {
+    var p = { t: [], x: [], z: [] }, t, a, r = RAD + off, a0 = (tot - 100) / RAD;
+    for (t = 0; t <= dur + 1e-9; t += 0.04) {
+      a = a0 + v * t / RAD;
+      if (jitterAt !== undefined && Math.abs(t - jitterAt) < 0.02) a -= 6 / RAD;   // a fix 6 m BACK
+      p.t.push(100 + t); p.x.push(r * Math.cos(a)); p.z.push(r * Math.sin(a));
+    }
+    return p;
+  }
+  var me = lap(40, 0, 30, 12.0), gh = lap(42, 3.5, 30);
+  var own = RC3D.trackProgress(idx, d, true, me, 100, 130, null);
+  var ghost = RC3D.trackProgress(idx, d, true, gh, 100, 130, own.zero);
+  var dec = 0;
+  for (k = 1; k < own.s.length; k++) if (own.s[k] < own.s[k - 1]) dec++;
+  R.own = { n: own.t.length, first: own.s[0], last: own.s[own.s.length - 1], dec: dec };
+  R.ghost = { first: ghost.s[0], last: ghost.s[ghost.s.length - 1] };
+  R.g10 = RC3D.ghostGap(own, ghost, 10);
+  R.g25 = RC3D.ghostGap(own, ghost, 25);
+  R.gEnd = RC3D.ghostGap(own, ghost, 31);
+  // the same lap as its own ghost: no gap anywhere
+  var self = RC3D.trackProgress(idx, d, true, lap(40, 0, 30), 100, 130, own.zero);
+  R.gSelf = RC3D.ghostGap(own, self, 17.3);
+  R.none = RC3D.ghostGap(own, { t: [0], s: [0] }, 5);
+  R.interp = [RC3D.interp([0, 1, 1, 2], [0, 10, 10, 20], 1), RC3D.interp([0, 2], [0, 4], 3),
+              RC3D.interp([0, 2], [0, 4], 0.5), RC3D.interp([], [], 1)];
+})();
+console.log(JSON.stringify(R));
+"""
+
+
+class Track3DGhostTests(unittest.TestCase):
+    """track3d_v 14: the compare ghost - both laps measured on ONE ruler (the
+    track centreline), so the gap is the lap delta at the place you are."""
+
+    @unittest.skipIf(NODE is None, "node not available")
+    def test_progress_and_gap(self):
+        import re
+        html = _page_html()
+        m = re.search(r"<script type=\"module\">(.*?)</script>", html, re.S)
+        body = re.sub(r"^\s*import .*$", "", m.group(1), count=1, flags=re.M)
+        three = next((p for p in THREE_CANDIDATES if p.exists()), None)
+        header = (("import * as THREE from '%s';\n" % three.as_uri()) if three
+                  else "const THREE = {};\n")
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "rc3d_ghost.mjs"
+            f.write_text(PRELUDE + header + body + "\n" + GHOST_DRIVER)
+            proc = subprocess.run([NODE, str(f)], capture_output=True, text=True, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr[-4000:])
+            r = json.loads(proc.stdout.strip().splitlines()[-1])
+        # progress starts at 0, runs 1200 m straight THROUGH the loop's seam
+        # (unwrapped, not folded back to 0) and never decreases despite the
+        # fix that jumped 6 m backwards
+        self.assertAlmostEqual(r["own"]["first"], 0, delta=0.5)
+        self.assertAlmostEqual(r["own"]["last"], 1200, delta=3)
+        self.assertEqual(r["own"]["dec"], 0)
+        # the ghost drove a line 3.5 m wide of yours: same ruler regardless
+        self.assertAlmostEqual(r["ghost"]["first"], 0, delta=0.5)
+        self.assertAlmostEqual(r["ghost"]["last"], 1260, delta=3)
+        # 10 s in: you are at 400 m, the ghost got there at 400/42 s -> +0.476 s
+        # (you are slower), and it is 20 m up the road
+        self.assertAlmostEqual(r["g10"]["gap"], 10 - 400 / 42, delta=0.02)
+        self.assertAlmostEqual(r["g10"]["metres"], 20, delta=1.0)
+        self.assertFalse(r["g10"]["finished"])
+        self.assertAlmostEqual(r["g25"]["gap"], 25 - 1000 / 42, delta=0.03)
+        self.assertAlmostEqual(r["g25"]["metres"], 50, delta=1.5)
+        self.assertTrue(r["gEnd"]["finished"])
+        self.assertAlmostEqual(r["gSelf"]["gap"], 0, delta=0.01)
+        self.assertAlmostEqual(r["gSelf"]["metres"], 0, delta=0.1)
+        self.assertIsNone(r["none"])
+        self.assertEqual(r["interp"][:3], [10, 4, 1])
+        self.assertIsNone(r["interp"][3])
+
+
+class ReviewGhostLinkTests(unittest.TestCase):
+    """The review page hands its comparison to the 3D view, and the session
+    search is a wide dropdown (a native <datalist> is as narrow as its input,
+    which truncated every session name)."""
+
+    def _review(self):
+        import sys
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        import test_server_version as tsv
+        return tsv._evaluated("_REVIEW_HTML")
+
+    def test_3d_button_carries_lap_and_ghost(self):
+        html = self._review()
+        for frag in ("q.push('lap='+primLap.lap)", "q.push('ghost='+encodeURIComponent(",
+                     "q.push('glap='+ref.lap.lap)", "glabel=",
+                     "sess: sess || { user: USER, file: FILE }",
+                     "{ user: cmpSess.user, file: cmpSess.file }"):
+            self.assertIn(frag, html)
+        # comparing a lap with ITSELF (or the default best lap with nothing
+        # clicked) must not put a ghost on top of you
+        self.assertIn("ref.ctx===selfCtx && primLap && ref.lap.lap===primLap.lap", html)
+        self.assertIn("ref===defaultRef && !primLap", html)
+
+    def test_session_search_is_a_wide_dropdown(self):
+        html = self._review()
+        self.assertNotIn("<datalist id=\"cmp-sessions\"", html)
+        self.assertNotIn("list=\"cmp-sessions\"", html)
+        self.assertIn('id="cmp-session"', html)
+        self.assertIn("Math.max(r.width, 640)", html)
+        self.assertIn("words.every(w=>e.hay.indexOf(w)>=0)", html)
+        self.assertIn("position: fixed", html)
+
+    @unittest.skipIf(NODE is None, "node not available")
+    def test_review_scripts_parse(self):
+        import re
+        html = self._review()
+        blocks = [b for b in re.findall(r"<script[^>]*>(.*?)</script>", html, re.S) if b.strip()]
+        self.assertGreater(len(blocks), 0)
+        with tempfile.TemporaryDirectory() as td:
+            for i, js in enumerate(blocks):
+                f = pathlib.Path(td) / ("r%d.js" % i)
+                f.write_text(js)
+                proc = subprocess.run([NODE, "--check", str(f)], capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+
+    def test_3d_page_reads_the_ghost_params(self):
+        html = _page_html()
+        for frag in ('q.get("ghost")', 'q.get("glap")', 'q.get("lap")', 'id="b-cmp"',
+                     'id="h-ghost"', 'id="lg-cmp"', "initGhost();", "placeGhostLine();",
+                     "updateGhost(view === \"plan\")", "ghostSync();"):
+            self.assertIn(frag, html)

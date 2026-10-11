@@ -3313,7 +3313,7 @@ load();
 # Bumps whenever the 3D drive view changes materially (documented at length in
 # the /caps docstring below). Kept as a constant because /caps and /version both
 # report it — two literals would drift.
-TRACK3D_V = 13
+TRACK3D_V = 14
 
 
 @app.get("/caps")
@@ -3372,7 +3372,12 @@ async def caps() -> dict:
     imagery (trackprep.trace_edges, network v2) instead of a squeezed
     near-constant width; straight centrelines; the road widened wherever the
     session's own fixes ran past an edge, so the driving line is on the tarmac
-    (Summit Point: 65 % of fixes on the old road, 99 % now)."""
+    (Summit Point: 65 % of fixes on the old road, 99 % now).
+    14 = the compare GHOST: the review page's 3D button carries the lap you
+    picked (?lap=) and the comparison lap (?ghost=user/file&glap=&glabel=),
+    and the 3D view drives a see-through violet car + its line on your clock,
+    with the gap (lap delta at the place you are) in the HUD; the ghost
+    picker in the bar also offers every lap of this session."""
     v = server_version()
     out = {"ok": True, "zblocks": True, "coach": True, "track3d": True,
            "track3d_v": TRACK3D_V,
@@ -8305,12 +8310,14 @@ _TRACK3D_HTML = (
   <div class="row"><span class="k">best</span><span id="h-best">—</span></div>
   <div class="row"><span class="k">altitude</span><span id="h-alt">—</span></div>
   <div class="row"><span class="k">long g</span><span id="h-g">—</span></div>
+  <div class="row" id="h-ghost-row" style="display:none"><span class="k" style="color:#C084FC">ghost</span><span id="h-ghost">—</span></div>
 </div>
 <div id="legend">
   <div class="li"><span class="sw" style="background:#5CE07F"></span>on the throttle</div>
   <div class="li"><span class="sw" style="background:#FBC72E"></span>coasting (off throttle, off brake)</div>
   <div class="li"><span class="sw" style="background:#FF4D4D"></span>braking (brighter = harder)</div>
   <div class="li" id="lg-ideal" style="display:none"><span class="sw" style="background:#3FD8FF"></span>ideal line (fastest real lap)</div>
+  <div class="li" id="lg-cmp" style="display:none"><span class="sw" style="background:#C084FC"></span><span id="lg-cmp-t">ghost</span></div>
   <div class="li"><span class="sw" style="background:#FF3B30"></span>BRAKE bar: where you braked (+m = later than your best lap)</div>
   <div class="li"><span class="sw" style="background:repeating-linear-gradient(90deg,#fff 0 6px,transparent 6px 10px)"></span>your best lap's brake point</div>
   <div class="li"><span class="dot" style="background:#FFB020"></span>MIN: slowest point \u00b7 <span class="dot" style="background:#34D058;margin-left:6px"></span>GAS: back on the throttle</div>
@@ -8329,6 +8336,7 @@ _TRACK3D_HTML = (
     <option value="0.25">¼×</option><option value="0.5">½×</option>
   </select>
   <select id="b-lap" title="which lap to drive"></select>
+  <select id="b-cmp" title="GHOST: another lap driven on the same clock as yours - a see-through car, its line on the road and the live gap. Pick a comparison lap on the pit wall to bring another driver's lap here"><option value="">no ghost</option></select>
   <span class="sep"></span>
   <label title="smoothing window over the 25 Hz GPS — higher is smoother but rounds off real detail">
     <span class="meta">smooth</span>
@@ -8396,6 +8404,15 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   var pts = (q.get("pts") || "").split("|").map(function (s) {
     return s.split(",").map(Number);
   }).filter(function (a) { return a.length === 2 && isFinite(a[0]) && isFinite(a[1]); });
+  // ?lap=<n> = the lap to drive; ?ghost=<user>/<file>&glap=<n>[&glabel=...] =
+  // the comparison lap picked on the pit wall, driven alongside as a GHOST
+  var LAP_REQ = Number(q.get("lap")) || 0;
+  var GHOST_REQ = (function () {
+    var g = q.get("ghost") || "", k = g.indexOf("/"), lap = Number(q.get("glap"));
+    if (k <= 0 || k >= g.length - 1 || !(lap > 0)) return null;
+    return { user: g.slice(0, k), file: g.slice(k + 1), lap: lap,
+             label: (q.get("glabel") || "").slice(0, 60) };
+  })();
 
   function el(id) { return document.getElementById(id); }
   function notice(msg, err) {
@@ -10359,6 +10376,55 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // The inside edge of a tight corner must stay inside the corner's own
   // centre of curvature, or the ribbon folds over itself (a black bow-tie at
   // a hairpin). Clamps the INSIDE half width to 85 % of the local radius.
+  // ---- compare ghost (v14): progress along the track, and the gap ----------
+  // linear interpolation on a non-decreasing xs (plateaus are fine)
+  RC3D.interp = function (xs, ys, x) {
+    var n = xs.length, lo = 0, hi = n - 1;
+    if (!n) return null;
+    if (x <= xs[0]) return ys[0];
+    if (x >= xs[n - 1]) return ys[n - 1];
+    while (hi - lo > 1) { var m = (lo + hi) >> 1; if (xs[m] <= x) lo = m; else hi = m; }
+    var dx = xs[hi] - xs[lo];
+    return dx > 0 ? ys[lo] + (ys[hi] - ys[lo]) * (x - xs[lo]) / dx : ys[lo];
+  };
+  // How far along the TRACK centreline `path` is, against time into [t0, t1]:
+  // metres from `zero` (null = wherever the window starts), unwrapped round a
+  // closed loop and NEVER decreasing (GPS jitter must not run a car backwards).
+  // Two laps measured this way share one ruler whatever line each one drove,
+  // which is what makes "the same place on track" comparable.
+  RC3D.trackProgress = function (idx, dense, closed, path, t0, t1, zero) {
+    var tot = dense.total, ts = [], ss = [], prev = null, i;
+    for (i = 0; i < path.t.length; i++) {
+      var t = path.t[i];
+      if (t < t0 || t > t1) continue;
+      var h = idx.nearest(path.x[i], path.z[i], 40);
+      if (!h) continue;
+      var a = h.seg, b = Math.min(dense.s.length - 1, a + 1);
+      var sv = dense.s[a] + (dense.s[b] - dense.s[a]) * (h.f || 0);
+      if (zero == null) zero = sv;
+      var rel = sv - zero;
+      if (closed && tot > 0) {
+        if (prev === null) { rel = ((rel % tot) + tot) % tot; if (rel > tot / 2) rel -= tot; }
+        else { while (rel < prev - tot / 2) rel += tot; while (rel > prev + tot / 2) rel -= tot; }
+      }
+      if (prev !== null && rel < prev) rel = prev;
+      ts.push(t - t0); ss.push(rel); prev = rel;
+    }
+    return { t: ts, s: ss, zero: zero };
+  };
+  // The ghost against you at `tInto` seconds into your lap. gap = your time
+  // minus the ghost's time AT THE PLACE YOU ARE (+ = you are slower, the
+  // number a lap-delta shows); metres = how far ahead (+) the ghost is now.
+  RC3D.ghostGap = function (own, ghost, tInto) {
+    if (!own || !ghost || own.t.length < 2 || ghost.t.length < 2) return null;
+    var sMe = RC3D.interp(own.t, own.s, tInto);
+    return {
+      gap: tInto - RC3D.interp(ghost.s, ghost.t, sMe),
+      metres: RC3D.interp(ghost.t, ghost.s, tInto) - sMe,
+      finished: tInto > ghost.t[ghost.t.length - 1]
+    };
+  };
+
   RC3D.foldGuard = function (T, hl, hr) {
     var d = T.dense, n = d.x.length, i, K = 4, clamped = 0;
     for (i = 0; i < n; i++) {
@@ -12163,7 +12229,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 
   function placeCar(p) {
     if (!meshes.car) return;
-    var pos = RC3D.pointAtS(PATH, p);
+    var pos = RC3D.pointAtS(PATH, p), k = PLAN.k || 1;
+    meshes.car.scale.set(k, 1, k);
     meshes.car.position.set(pos.x, pos.y + 0.6, pos.z);
     meshes.car.rotation.y = Math.atan2(pos.tan[0], pos.tan[1]);
     meshes.car.children[0].position.y = 0;
@@ -13307,6 +13374,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       }
       addMesh("car", makeCarMarker());
       placeIdeal();
+      placeGhostLine();
       applyViewVisibility();
       updateTrackLegend();
       if (t0) console.info("[track3d] world built in " + Math.round(performance.now() - t0) +
@@ -13461,6 +13529,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var fov = camera.fov * Math.PI / 180;
     var h = (span / 2) / Math.tan(fov / 2) * 1.12 / planZoom;   // fit, with a margin
     PLAN.up = null;
+    // markers drawn from above grow with the view: a 7 m arrow is ~6 px when
+    // the whole facility is on screen (yours and the ghost's both vanished)
+    PLAN.k = Math.max(1, span / (350 * planZoom));
     return { c: { x: cx, y: y0, z: cz }, h: h, span: span };
   }
 
@@ -13522,6 +13593,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       camera.fov = Math.max(60, Math.min(84, 66 + st.mph * 0.09));
     }
     camera.updateProjectionMatrix();
+    try { updateGhost(view === "plan"); }
+    catch (e) {
+      if (!render.ghostWarned) { render.ghostWarned = true; console.warn("[track3d] ghost:", e && e.message ? e.message : e); }
+    }
     renderer.render(scene, camera);
 
     el("h-mph").textContent = Math.round(st.mph);
@@ -13621,6 +13696,14 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     miniCtx.moveTo(px(p.x), pz(p.z));
     miniCtx.lineTo(px(p.x + hdg[0] * 14), pz(p.z + hdg[1] * 14));
     miniCtx.stroke();
+    if (GHOST && GHOST.last) {                // the ghost: violet, ringed
+      miniCtx.fillStyle = "#C084FC";
+      miniCtx.strokeStyle = "#1B1226";
+      miniCtx.lineWidth = 2;
+      miniCtx.beginPath();
+      miniCtx.arc(px(GHOST.last.x), pz(GHOST.last.z), 5, 0, Math.PI * 2);
+      miniCtx.fill(); miniCtx.stroke();
+    }
   }
 
   function advance(dt) {
@@ -13664,6 +13747,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     look.yaw = 0; look.pitch = 0;      // a lap change always re-centres the view
     rebuild();
     miniPrepare();
+    ghostSync();                       // the ghost runs against the NEW lap's clock
     render();
   }
 
@@ -13689,6 +13773,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     }
     sel.value = String(LAPS[0].lap);
     for (i = 0; i < LAPS.length; i++) if (LAPS[i].seconds === best) sel.value = String(LAPS[i].lap);
+    // the lap picked on the pit wall wins (?lap=<n>)
+    for (i = 0; i < LAPS.length; i++) if (LAP_REQ && LAPS[i].lap === LAP_REQ) sel.value = String(LAP_REQ);
   }
 
   function wire() {
@@ -13836,6 +13922,333 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       notice("ideal line loaded — fastest real lap through the circled section");
       setTimeout(hideNotice, 3500);
     }).catch(function () {});
+  }
+
+  // ---- COMPARE GHOST --------------------------------------------------------
+  // Another lap driven on the SAME clock as yours: a see-through car, its own
+  // line on the road, a tag with the live gap and a dot on the mini-map. It
+  // comes from the pit wall's comparison picker (?ghost=<user>/<file>&glap=<n>)
+  // - another driver, another session - or from any of this session's own laps
+  // (the bar's ghost selector). The gap is measured along the TRACK centreline,
+  // not along each car's own line: an inside line is shorter, so lap-distance
+  // deltas drift by tens of metres over a lap.
+  var GHOST = null, GHOST_GRP = null, GHOST_LINE = null, GHOST_TAG = null;
+  var OWN_PROG = null, TRACK_PIDX = null, GHOST_SEQ = 0, ghostCache = {};
+  var GHOST_COLOUR = 0xC084FC;
+
+  function absT(s) {
+    if (s && typeof s.t === "number" && isFinite(s.t)) return s.t;
+    if (s && typeof s.t_ms === "number" && isFinite(s.t_ms)) return s.t_ms / 1000;
+    return null;
+  }
+  function trackIdx() {
+    if (!TRACK) return null;
+    if (!TRACK_PIDX || TRACK_PIDX.track !== TRACK) {
+      TRACK_PIDX = { track: TRACK, idx: RC3D.lineIndex(TRACK.dense.x, TRACK.dense.z, 30) };
+    }
+    return TRACK_PIDX.idx;
+  }
+  function progressSeries(path, t0, t1, zero) {
+    return RC3D.trackProgress(trackIdx(), TRACK.dense, !!TRACK.closed, path, t0, t1, zero);
+  }
+  // {samples (fixes), laps (seconds from the first FIX - the viewer's own basis)}
+  function ghostSource(user, file) {
+    if (user === USER && file === FILE) return Promise.resolve({ samples: S, laps: LAPS });
+    var key = user + "/" + file;
+    if (ghostCache[key]) return ghostCache[key];
+    var base = "/sessions/" + encodeURIComponent(user) + "/" + encodeURIComponent(file);
+    ghostCache[key] = Promise.all([
+      fetch(base + "/data?target=30000&fixes=1").then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }),
+      fetch(base + "/laps").then(function (r) { return r.ok ? r.json() : {}; })
+        .catch(function () { return {}; })
+    ]).then(function (res) {
+      var all = (res[0] && res[0].samples) || [];
+      var fx = all.filter(function (s) {
+        return typeof s.lat === "number" && typeof s.lon === "number" &&
+               (s.lat || s.lon) && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180;
+      });
+      var tFile = null, tFix = null, k;
+      for (k = 0; k < all.length && tFile === null; k++) tFile = absT(all[k]);
+      for (k = 0; k < fx.length && tFix === null; k++) tFix = absT(fx[k]);
+      var shift = (tFile !== null && tFix !== null && tFix > tFile) ? tFix - tFile : 0;
+      var laps = ((res[1] && res[1].laps) || []).map(function (L) {
+        var c = {}, q2;
+        for (q2 in L) c[q2] = L[q2];
+        c.t_start = L.t_start - shift; c.t_end = L.t_end - shift;
+        return c;
+      });
+      return { samples: fx, laps: laps };
+    });
+    ghostCache[key].catch(function () { delete ghostCache[key]; });
+    return ghostCache[key];
+  }
+  function buildGhost(src, lapNo, label) {
+    var L = null, i;
+    for (i = 0; i < src.laps.length; i++) if (src.laps[i].lap === lapNo) L = src.laps[i];
+    if (!L || !TRACK || !PATH || !TRACK_HALF) return null;
+    var t0abs = null;
+    for (i = 0; i < src.samples.length && t0abs === null; i++) t0abs = absT(src.samples[i]);
+    if (t0abs === null) return null;
+    var win = src.samples.filter(function (s) {
+      var t = absT(s);
+      if (t === null) return false;
+      t -= t0abs;
+      return t >= L.t_start - 2 && t <= L.t_end + 2;
+    });
+    if (win.length < 20) return null;
+    // on THIS track? A lap picked from another circuit must not be drawn
+    // driving through the grass of this one.
+    var idx = trackIdx(), on = 0, chk = 0;
+    for (i = 0; i < win.length; i += 5) {
+      var p = RC3D.project(win[i].lat, win[i].lon, PATH.o);
+      chk++;
+      if (idx.nearest(p.x, p.z, 30)) on++;
+    }
+    if (!chk || on / chk < 0.7) return { offTrack: true };
+    var sides = function (k) { return [TRACK_HALF[0][k], TRACK_HALF[1][k]]; };
+    var sn = RC3D.snapSamples(win, PATH.o, TRACK.dense.x, TRACK.dense.z, sides, {});
+    var gp = RC3D.buildPath(sn.samples, { smooth: opts.smooth, denseStep: 1, o: PATH.o });
+    var shift = absT(win[0]) - t0abs;              // gp's clock starts at win[0]
+    // seated on the road surface, like your own path
+    var d = gp.dense, h;
+    for (i = 0; i < d.x.length; i++) {
+      h = idx.nearest(d.x[i], d.z[i], 30);
+      if (h) d.y[i] = TRACK.dense.y[h.i];
+    }
+    for (i = 0; i < gp.x.length; i++) {
+      h = idx.nearest(gp.x[i], gp.z[i], 30);
+      if (h) gp.y[i] = TRACK.dense.y[h.i];
+    }
+    return { path: gp, lap: L, t0: L.t_start - shift, t1: L.t_end - shift,
+             seconds: L.seconds || (L.t_end - L.t_start), label: label, prog: null, last: null };
+  }
+  // your lap's progress + the ghost's, in ONE frame (zero = your lap's start)
+  function ghostSync() {
+    OWN_PROG = null;
+    if (!GHOST || !GHOST.path || !TRACK || !PATH) return;
+    OWN_PROG = progressSeries(PATH, TA, TB, null);
+    GHOST.prog = progressSeries(GHOST.path, GHOST.t0, GHOST.t1, OWN_PROG.zero);
+  }
+  function makeGhostCar() {
+    var grp = new THREE.Group(), car = new THREE.Group();
+    var mat = new THREE.MeshLambertMaterial({ color: GHOST_COLOUR, emissive: 0x3A1D5C,
+      transparent: true, opacity: 0.5, depthWrite: false });
+    var body = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.62, 4.3), mat);
+    body.position.y = 0.55;
+    var cabin = new THREE.Mesh(new THREE.BoxGeometry(1.45, 0.5, 1.9), mat);
+    cabin.position.set(0, 1.1, -0.35);
+    car.add(body); car.add(cabin);
+    var wm = new THREE.MeshLambertMaterial({ color: 0x241634, transparent: true,
+      opacity: 0.55, depthWrite: false });
+    var wg = new THREE.CylinderGeometry(0.33, 0.33, 0.26, 14);
+    [[-0.86, 1.35], [0.86, 1.35], [-0.86, -1.35], [0.86, -1.35]].forEach(function (w) {
+      var wh = new THREE.Mesh(wg, wm);
+      wh.rotation.z = Math.PI / 2;
+      wh.position.set(w[0], 0.33, w[1]);
+      car.add(wh);
+    });
+    car.userData.mats = [mat, wm];
+    grp.add(car);
+    // from above: a violet arrow, like the amber "you are here"
+    var plan = new THREE.Group();
+    var cone = new THREE.Mesh(new THREE.ConeGeometry(2.6, 7.0, 4),
+      new THREE.MeshBasicMaterial({ color: GHOST_COLOUR, toneMapped: false,
+                                    transparent: true, opacity: 0.9 }));
+    cone.rotation.x = Math.PI / 2;
+    plan.add(cone);
+    grp.add(plan);
+    grp.userData = { car: car, plan: plan };
+    return grp;
+  }
+  function ghostTag() {
+    var cv = document.createElement("canvas");
+    cv.width = 512; cv.height = 96;
+    var tex = new THREE.CanvasTexture(cv);
+    var sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true,
+      depthWrite: false, depthTest: false }));
+    sp.material.toneMapped = false;
+    sp.scale.set(5.2, 0.975, 1);
+    sp.renderOrder = 10;
+    sp.userData = { cv: cv, tex: tex, key: null };
+    return sp;
+  }
+  function setTag(sp, text, col) {
+    if (sp.userData.key === text + col) return;       // redraw only on a change
+    sp.userData.key = text + col;
+    var cv = sp.userData.cv, c = cv.getContext("2d");
+    c.clearRect(0, 0, cv.width, cv.height);
+    c.font = "600 42px Inter, sans-serif";
+    var w = Math.min(cv.width - 8, c.measureText(text).width + 40);
+    c.fillStyle = "rgba(22,14,34,0.78)";
+    c.fillRect((cv.width - w) / 2, 12, w, 72);
+    c.fillStyle = col; c.textAlign = "center"; c.textBaseline = "middle";
+    c.fillText(text, cv.width / 2, 49);
+    sp.userData.tex.needsUpdate = true;
+  }
+  // the ghost's own line, a slim violet ribbon on the ground (re-seated after
+  // every rebuild, like the ideal line - it is not one of the rebuilt meshes)
+  function placeGhostLine() {
+    if (GHOST_LINE) {
+      scene.remove(GHOST_LINE);
+      GHOST_LINE.geometry.dispose(); GHOST_LINE.material.dispose();
+      GHOST_LINE = null;
+    }
+    if (!GHOST || !GHOST.path || !scene) return;
+    var sub = slicePath(GHOST.path, GHOST.t0, GHOST.t1);
+    if (!sub) return;
+    var d = sub.dense, i;
+    for (i = 0; i < d.x.length; i++) d.y[i] = (WORLD ? WORLD.groundY(d.x[i], d.z[i]) : d.y[i]) + 0.11;
+    // slim + see-through: it must never hide YOUR line (the chevrons)
+    var r = RC3D.ribbon(sub, 0.2, 0.05, {});
+    var g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(r.position, 3));
+    g.setIndex(new THREE.BufferAttribute(r.index, 1));
+    var m = new THREE.MeshBasicMaterial({ color: GHOST_COLOUR, transparent: true, opacity: 0.6,
+      depthWrite: false, side: THREE.DoubleSide, polygonOffset: true,
+      polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
+    m.toneMapped = false;
+    GHOST_LINE = new THREE.Mesh(g, m);
+    GHOST_LINE.renderOrder = 4;
+    scene.add(GHOST_LINE);
+  }
+  function disposeTree(o) {
+    if (!o) return;
+    scene.remove(o);
+    o.traverse(function (c) {
+      if (c.geometry) c.geometry.dispose();
+      if (c.material) { if (c.material.map) c.material.map.dispose(); c.material.dispose(); }
+    });
+  }
+  function clearGhost() {
+    GHOST = null; OWN_PROG = null;
+    disposeTree(GHOST_GRP); GHOST_GRP = null;
+    disposeTree(GHOST_TAG); GHOST_TAG = null;
+    placeGhostLine();
+    el("h-ghost-row").style.display = "none";
+    el("lg-cmp").style.display = "none";
+  }
+  // the ghost's own notices: it only ever hides a message IT put up (never,
+  // say, "preparing this track" that arrived in the meantime)
+  var GHOST_MSG = null;
+  function ghostNotice(msg, err, ms) {
+    GHOST_MSG = msg; notice(msg, err);
+    if (ms) setTimeout(ghostHide, ms);
+  }
+  function ghostHide() {
+    var n = el("notice");
+    if (GHOST_MSG !== null && n.textContent === GHOST_MSG) hideNotice();
+    GHOST_MSG = null;
+  }
+  function ghostFailed(msg) {
+    ghostNotice(msg, true, 5000);
+    var sel = el("b-cmp"); if (sel) sel.value = "";    // the picker tells the truth
+  }
+  function setGhost(user, file, lapNo, label) {
+    var seq = ++GHOST_SEQ;
+    clearGhost();
+    if (!user || !scene) { ghostHide(); return; }
+    ghostNotice("loading ghost: " + label + "\u2026");
+    ghostSource(user, file).then(function (src) {
+      if (seq !== GHOST_SEQ) return;
+      var g = buildGhost(src, lapNo, label);
+      if (!g) { ghostFailed("ghost: lap " + lapNo + " is not in that session"); return; }
+      if (g.offTrack) { ghostFailed("ghost: that lap was driven somewhere else - it is not on this track"); return; }
+      GHOST = g;
+      GHOST_GRP = makeGhostCar(); scene.add(GHOST_GRP);
+      GHOST_TAG = ghostTag(); scene.add(GHOST_TAG);
+      ghostSync();
+      placeGhostLine();
+      el("h-ghost-row").style.display = "flex";
+      el("lg-cmp").style.display = "flex";
+      el("lg-cmp-t").textContent = "ghost: " + label + " (" + fmtLap(g.seconds) +
+        ") \u2014 its line + the see-through car, on your clock";
+      ghostHide();
+    }).catch(function (e) {
+      if (seq !== GHOST_SEQ) return;
+      ghostFailed("ghost failed to load: " + (e && e.message ? e.message : e));
+    });
+  }
+  // per frame: the ghost car where that lap was at the same time into the lap,
+  // the gap (+ = you are slower) and how far apart on track
+  function updateGhost(plan) {
+    if (!GHOST || !GHOST_GRP) return;
+    var tInto = NOW - TA;
+    var gT = Math.min(GHOST.t1, GHOST.t0 + Math.max(0, tInto));
+    var p = RC3D.pointAtS(GHOST.path, RC3D.sAtTime(GHOST.path, gT));
+    GHOST.last = p;
+    GHOST_GRP.position.set(p.x, p.y + (plan ? 0.6 : 0), p.z);
+    GHOST_GRP.rotation.y = Math.atan2(p.tan[0], p.tan[1]);
+    var u = GHOST_GRP.userData, pk = plan ? (PLAN.k || 1) : 1;
+    u.plan.visible = plan;
+    u.plan.scale.set(pk, 1, pk);
+    u.car.visible = !plan;
+    if (!plan) {
+      // fade out when it is (nearly) where the camera is: never a violet screen
+      var dx = camera.position.x - p.x, dz = camera.position.z - p.z;
+      var k = Math.max(0, Math.min(1, (Math.sqrt(dx * dx + dz * dz) - 2.5) / 6));
+      u.car.userData.mats[0].opacity = 0.5 * k;
+      u.car.userData.mats[1].opacity = 0.55 * k;
+      u.car.visible = k > 0.02;
+    }
+    var tag = GHOST.label, col = "#E9D5FF";
+    var gg = RC3D.ghostGap(OWN_PROG, GHOST.prog, tInto);
+    if (gg) {
+      var gap = gg.gap, dm = gg.metres, fin = tInto > GHOST.t1 - GHOST.t0;
+      col = gap > 0.05 ? "#FF8A8A" : (gap < -0.05 ? "#7CF0A0" : "#E9D5FF");
+      var g2 = (gap >= 0 ? "+" : "\u2212") + Math.abs(gap).toFixed(2) + " s";
+      el("h-ghost").textContent = g2 + " \u00b7 " + (fin ? "ghost finished"
+        : Math.abs(Math.round(dm)) + " m " + (dm >= 0 ? "ahead" : "behind"));
+      el("h-ghost").style.color = col;
+      tag += "  " + (gap >= 0 ? "+" : "\u2212") + Math.abs(gap).toFixed(1) + " s";
+      GHOST.now = { gap: Math.round(gap * 100) / 100, metres: Math.round(dm), finished: fin };
+    }
+    if (GHOST_TAG) {
+      var kk = plan ? 7 * pk : 1;           // readable from above at any zoom
+      GHOST_TAG.position.set(p.x, p.y + (plan ? 12 * pk : 2.9), p.z);
+      if (plan) GHOST_TAG.center.set(0.5, -0.35);   // sit beside the cone, not on it
+      else GHOST_TAG.center.set(0.5, 0.5);
+      GHOST_TAG.scale.set(5.2 * kk, 0.975 * kk, 1);
+      setTag(GHOST_TAG, tag, col);
+    }
+  }
+  // read-only state for checks (nothing hangs on it)
+  window.__rc3dGhost = function () {
+    if (!GHOST) return null;
+    return { label: GHOST.label, lap: GHOST.lap && GHOST.lap.lap, seconds: GHOST.seconds,
+             now: GHOST.now || null, pos: GHOST.last ? [Math.round(GHOST.last.x), Math.round(GHOST.last.z)] : null,
+             progN: GHOST.prog ? GHOST.prog.s.length : 0, ownN: OWN_PROG ? OWN_PROG.s.length : 0,
+             visible: !!(GHOST_GRP && (GHOST_GRP.userData.car.visible || GHOST_GRP.userData.plan.visible)) };
+  };
+  function ghostReqLabel() {
+    return GHOST_REQ.label || (GHOST_REQ.user.split("@")[0] + " lap " + GHOST_REQ.lap);
+  }
+  function initGhost() {
+    var sel = el("b-cmp");
+    if (!sel || initGhost.done) return;
+    initGhost.done = true;
+    sel.innerHTML = "";
+    var add = function (v, t) {
+      var o = document.createElement("option"); o.value = v; o.textContent = t; sel.appendChild(o);
+    };
+    add("", "no ghost");
+    var foreign = GHOST_REQ && !(GHOST_REQ.user === USER && GHOST_REQ.file === FILE);
+    if (foreign) add("req", "ghost: " + ghostReqLabel());
+    LAPS.forEach(function (L) { add("own:" + L.lap, "ghost: my lap " + L.lap + "  " + fmtLap(L.seconds)); });
+    sel.addEventListener("change", function () {
+      var v = sel.value;
+      if (!v) { setGhost(null); return; }
+      if (v === "req") { setGhost(GHOST_REQ.user, GHOST_REQ.file, GHOST_REQ.lap, ghostReqLabel()); return; }
+      var n = Number(v.slice(4));
+      setGhost(USER, FILE, n, "my lap " + n);
+    });
+    if (foreign) {
+      sel.value = "req";
+      setGhost(GHOST_REQ.user, GHOST_REQ.file, GHOST_REQ.lap, ghostReqLabel());
+    } else if (GHOST_REQ) {
+      sel.value = "own:" + GHOST_REQ.lap;
+      setGhost(USER, FILE, GHOST_REQ.lap, GHOST_REQ.label || ("my lap " + GHOST_REQ.lap));
+    }
   }
 
   // ---- prepared track (real width / real terrain / real imagery) ----------
@@ -14105,6 +14518,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
               if (BOOTED) return;
               BOOTED = true;
               setLap(Number(el("b-lap").value) || 0);
+              initGhost();
             };
             loadAsset().then(first, first);
             setTimeout(first, 6000);            // a slow asset must not hold the view
@@ -14505,6 +14919,24 @@ _REVIEW_HTML = (
     padding: 7px 9px; font: 13px var(--ff-ui); min-width: 0; }
   .cmp-sub { color: var(--bad); font: 600 12px/1 var(--ff-mono);
     margin-top: 5px; min-height: 13px; }
+  /* the comparison-session search: a WIDE dropdown (a native <datalist> is
+     as narrow as its input, which truncated every session name). Fixed-
+     positioned on <body> so the card's overflow:hidden cannot clip it. */
+  .cmp-drop { position: fixed; z-index: 2000; display: none; overflow: auto;
+    max-height: min(60vh, 480px); background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--r-md);
+    box-shadow: 0 14px 36px rgba(0,0,0,0.55); padding: 4px 0; }
+  .cmp-drop .opt { display: grid; grid-template-columns: 132px minmax(0,1fr) auto;
+    gap: 14px; align-items: baseline; padding: 7px 14px; cursor: pointer;
+    font: 13px var(--ff-ui); color: var(--text); }
+  .cmp-drop .opt .d { color: var(--muted); font: 12px var(--ff-mono); white-space: nowrap; }
+  .cmp-drop .opt .f { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cmp-drop .opt .u { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .cmp-drop .opt.same .f::after { content: "same track"; margin-left: 8px;
+    color: var(--good, #34D058); font: 600 10px var(--ff-ui); letter-spacing: 0.05em;
+    text-transform: uppercase; }
+  .cmp-drop .opt.act, .cmp-drop .opt:hover { background: rgba(255,176,32,0.14); }
+  .cmp-drop .empty { padding: 10px 14px; color: var(--muted); font: 13px var(--ff-ui); }
   /* ---- AI corner analysis ---------------------------------------- */
   /* Composer layout: section tools on one line, the model picker as a
      labelled field (it is a setting, not an action), the quick-ask chips on
@@ -14740,9 +15172,9 @@ _REVIEW_HTML = (
         </div>
         <div class="lap-delta">
           <div class="cmp-row">
-            <input id="cmp-session" class="cmp-input" list="cmp-sessions"
+            <input id="cmp-session" class="cmp-input" autocomplete="off" spellcheck="false"
+                   role="combobox" aria-expanded="false" aria-controls="cmp-drop"
                    placeholder="compare vs another session (type to filter)">
-            <datalist id="cmp-sessions"></datalist>
             <select id="cmp-lap" class="cmp-input"></select>
           </div>
           <div class="cmp-row2">
@@ -15282,8 +15714,8 @@ _REVIEW_HTML = (
     return tm[i-1]+(tm[i]-tm[i-1])*(dq-d0)/(d1-d0);
   }
   // a reference (ghost) lap, with its sample window + series precomputed
-  function makeRef(ctx, lap, label){
-    return { ctx, lap, label,
+  function makeRef(ctx, lap, label, sess){
+    return { ctx, lap, label, sess: sess || { user: USER, file: FILE },
              i0: ctxIdxAt(ctx, lap.t_start), i1: ctxIdxAt(ctx, lap.t_end),
              series: ctxSeries(ctx, lap) };
   }
@@ -15529,30 +15961,120 @@ _REVIEW_HTML = (
     const sameSelf=(cmpSess.user===USER && cmpSess.file===FILE);
     const who=cmpSess.user.split('@')[0].split('_')[0];
     const label=sameSelf ? ('lap '+lap.lap) : (who+' lap '+lap.lap);
-    setRef(makeRef(cmpEntry.ctx, lap, label));
+    setRef(makeRef(cmpEntry.ctx, lap, label, { user: cmpSess.user, file: cmpSess.file }));
   }
+  // the track part of a session file name, for "same track first"
+  function trackKey(fn){
+    return String(fn||'').replace(/\\.ndjson$/,'').replace(/^\\d+_/,'')
+      .replace(/-combined$/,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  }
+  let compList=[];
   async function loadCompList(){
     let j;
     try { const r=await fetch('/sessions'); if (!r.ok) return; j=await r.json(); }
     catch(e){ return; }
-    const dl=el('cmp-sessions'); dl.innerHTML=''; compSessions={};
+    compSessions={}; compList=[];
+    const mine=trackKey(FILE);
     for (const s of (j.sessions||[])){
       const ep=(s.display_epoch||s.mtime||0)*1000;
       const date=ep ? new Date(ep).toISOString().slice(0,16).replace('T',' ') : '';
-      const label=s.user+' \u00b7 '+date+' \u00b7 '+s.filename.replace(/\\.ndjson$/,'');
+      const name=s.filename.replace(/\\.ndjson$/,'');
+      const label=s.user+' \u00b7 '+date+' \u00b7 '+name;
+      const tk=trackKey(s.filename);
+      const e={ user:s.user, file:s.filename, date, name, label, ep,
+                // "summit point" is the same place as "summit point main"
+                same: !!mine && !!tk && (tk===mine || tk.startsWith(mine+' ') || mine.startsWith(tk+' ')),
+                hay: label.toLowerCase() };
       compSessions[label]={ user:s.user, file:s.filename };
-      const o=document.createElement('option'); o.value=label; dl.appendChild(o);
+      compList.push(e);
     }
+    // same track first, then newest
+    compList.sort((a,b)=> (b.same-a.same) || (b.ep-a.ep));
   }
-  el('cmp-session').addEventListener('change', async ()=>{
-    const val=el('cmp-session').value.trim();
-    const sess=compSessions[val];
+  async function pickCompSession(sess){
     el('cmp-lap').innerHTML='';
     if (!sess) return;
     try { cmpEntry=await loadCompSession(sess.user, sess.file); cmpSess=sess; }
     catch(e){ return; }
     fillLapPicker(cmpEntry);
     applyCompLap();
+  }
+  // ---- the wide session search ----------------------------------------
+  const cmpIn=el('cmp-session');
+  const cmpDrop=document.createElement('div');
+  cmpDrop.id='cmp-drop'; cmpDrop.className='cmp-drop'; cmpDrop.setAttribute('role','listbox');
+  document.body.appendChild(cmpDrop);
+  let cmpShown=[], cmpAct=-1;
+  function placeDrop(){
+    const r=cmpIn.getBoundingClientRect(), vw=window.innerWidth, vh=window.innerHeight;
+    const w=Math.min(vw-16, Math.max(r.width, 640));
+    cmpDrop.style.width=w+'px';
+    cmpDrop.style.left=Math.max(8, Math.min(r.left, vw-w-8))+'px';
+    const below=vh-r.bottom-12, above=r.top-12;
+    if (below>=220 || below>=above){
+      cmpDrop.style.top=(r.bottom+4)+'px'; cmpDrop.style.bottom='';
+      cmpDrop.style.maxHeight=Math.max(160, Math.min(480, below))+'px';
+    } else {
+      cmpDrop.style.top=''; cmpDrop.style.bottom=(vh-r.top+4)+'px';
+      cmpDrop.style.maxHeight=Math.max(160, Math.min(480, above))+'px';
+    }
+  }
+  function renderDrop(){
+    const words=cmpIn.value.toLowerCase().split(/\\s+/).filter(Boolean);
+    cmpShown=compList.filter(e=>words.every(w=>e.hay.indexOf(w)>=0)).slice(0,300);
+    cmpDrop.innerHTML='';
+    if (!cmpShown.length){
+      const d=document.createElement('div'); d.className='empty';
+      d.textContent=compList.length ? 'no session matches' : 'loading sessions\u2026';
+      cmpDrop.appendChild(d);
+    }
+    cmpShown.forEach((e,i)=>{
+      const o=document.createElement('div');
+      o.className='opt'+(e.same?' same':'')+(i===cmpAct?' act':'');
+      o.setAttribute('role','option'); o.title=e.label;
+      const d=document.createElement('span'); d.className='d'; d.textContent=e.date;
+      const f=document.createElement('span'); f.className='f'; f.textContent=e.name;
+      const u=document.createElement('span'); u.className='u'; u.textContent=e.user;
+      o.append(d,f,u);
+      o.addEventListener('mousedown', ev=>{ ev.preventDefault(); chooseDrop(i); });
+      cmpDrop.appendChild(o);
+    });
+  }
+  function openDrop(){
+    if (cmpDrop.style.display!=='block'){ cmpAct=-1; }
+    renderDrop(); placeDrop();
+    cmpDrop.style.display='block'; cmpIn.setAttribute('aria-expanded','true');
+  }
+  function closeDrop(){
+    cmpDrop.style.display='none'; cmpIn.setAttribute('aria-expanded','false'); cmpAct=-1;
+  }
+  function chooseDrop(i){
+    const e=cmpShown[i]; if (!e) return;
+    cmpIn.value=e.label; closeDrop();
+    pickCompSession({ user:e.user, file:e.file });
+  }
+  function moveAct(k){
+    if (!cmpShown.length) return;
+    cmpAct=(cmpAct+k+cmpShown.length)%cmpShown.length;
+    [...cmpDrop.querySelectorAll('.opt')].forEach((o,i)=>o.classList.toggle('act', i===cmpAct));
+    const a=cmpDrop.querySelectorAll('.opt')[cmpAct]; if (a) a.scrollIntoView({block:'nearest'});
+  }
+  cmpIn.addEventListener('focus', openDrop);
+  cmpIn.addEventListener('click', openDrop);
+  cmpIn.addEventListener('input', ()=>{ cmpAct=-1; openDrop(); });
+  cmpIn.addEventListener('blur', ()=>setTimeout(closeDrop, 120));
+  cmpIn.addEventListener('keydown', ev=>{
+    if (ev.key==='ArrowDown'){ ev.preventDefault(); if (cmpDrop.style.display!=='block') openDrop(); moveAct(1); }
+    else if (ev.key==='ArrowUp'){ ev.preventDefault(); moveAct(-1); }
+    else if (ev.key==='Enter'){ ev.preventDefault(); chooseDrop(cmpAct>=0 ? cmpAct : 0); }
+    else if (ev.key==='Escape'){ closeDrop(); }
+  });
+  window.addEventListener('resize', ()=>{ if (cmpDrop.style.display==='block') placeDrop(); });
+  window.addEventListener('scroll', ()=>{ if (cmpDrop.style.display==='block') placeDrop(); }, true);
+  // an exact label typed/pasted in full still works
+  cmpIn.addEventListener('change', ()=>{
+    const sess=compSessions[cmpIn.value.trim()];
+    if (sess) pickCompSession(sess);
   });
   el('cmp-lap').addEventListener('change', applyCompLap);
   el('cmp-reset').addEventListener('click', ()=>{
@@ -15904,14 +16426,30 @@ _REVIEW_HTML = (
     // With a circled section we pass the SAME decimated polygon, so the 3D
     // window can draw the ideal line / your best line on the ground next to
     // the line you actually drove — the "us vs the computer" comparison.
+    // ...and the LAPS card's selection: the lap you clicked is the one you
+    // drive, and the comparison lap (another lap, session or driver) rides
+    // alongside as a GHOST car on the same clock.
     el('map3d').addEventListener('click', (ev)=>{
-      if (pts.length<3) return;
+      const q = [];
+      if (pts.length>=3){
+        const step = Math.max(1, Math.ceil(pts.length/50));
+        q.push('pts='+encodeURIComponent(pts.filter((_,i)=> i%step===0 )
+                     .map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join('|')));
+      }
+      if (primLap) q.push('lap='+primLap.lap);
+      const ref = currentRef;
+      // (no lap clicked + the default best-lap reference = the very lap the 3D
+      //  view drives by default: no ghost on top of you)
+      if (ref && ref.sess && ref.lap && !(ref===defaultRef && !primLap) &&
+          !(ref.ctx===selfCtx && primLap && ref.lap.lap===primLap.lap)){
+        q.push('ghost='+encodeURIComponent(ref.sess.user+'/'+ref.sess.file));
+        q.push('glap='+ref.lap.lap);
+        if (ref.label) q.push('glabel='+encodeURIComponent(ref.label));
+      }
+      if (!q.length) return;                 // the plain link is fine
       ev.preventDefault();
-      const step = Math.max(1, Math.ceil(pts.length/50));
-      const enc = pts.filter((_,i)=> i%step===0 )
-                     .map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join('|');
       window.open('/track3d/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+
-                  '?pts='+encodeURIComponent(enc), 'track3d');
+                  '?'+q.join('&'), 'track3d');
     });
     document.querySelectorAll('.ai-preset').forEach(b=>{
       b.addEventListener('click', ()=>{ el('ai-prompt').value=b.dataset.q; ask(); });

@@ -559,6 +559,33 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
+### 3D view v14 — the compare GHOST, and a wide comparison search (`track3d_v` 14)
+The user: when a lap or session is picked for comparison on the review page, the 3D view should show where
+that driver is.
+- **Review page → 3D:** the **3D drive view** button now ALWAYS carries the LAPS card's state:
+  `?lap=<the lap you clicked>` + `?ghost=<user>/<file>&glap=<n>&glabel=<text>` for the comparison lap
+  (`currentRef`; refs now remember their session as `ref.sess`, default = this session), plus `?pts=` when a
+  section is circled. No ghost when the comparison IS the lap you drive (a lap vs itself, or nothing clicked
+  with the default best-lap reference).
+- **3D view:** a see-through **violet car** (a cone + tag in plan view, scaled with the view like your own
+  arrow, `PLAN.k`) and its **line** (slim violet ribbon, re-seated after every rebuild like the ideal line),
+  driven on YOUR clock: at `t` seconds into your lap the ghost is where its lap was `t` seconds in. HUD row
+  `ghost ±x.xx s · N m ahead/behind`, red when you are slower, green when faster; violet dot on the mini-map.
+  The bar's ghost picker offers `no ghost`, the requested foreign lap, and every lap of this session.
+- **The gap is a lap delta on ONE ruler:** both laps are measured as progress along the TRACK centreline
+  (`RC3D.trackProgress`: unwrapped round the loop, never decreasing), so laps on different lines compare at the
+  same place. `RC3D.ghostGap(own, ghost, t)`: `gap = t − ghost's time at YOUR progress` (+ = slower),
+  `metres = ghost progress − yours`. Host test `Track3DGhostTests` pins it analytically (two laps on lines
+  3.5 m apart, 40 vs 42 m/s, across the loop's seam, with a backwards GPS jitter).
+- Another session's lap is fetched with the SAME `/data?target=30000&fixes=1` + `/laps` the page uses and
+  shifted to the first-FIX time basis. If fewer than 70 % of its fixes are within 30 m of this track it is
+  REFUSED ("driven somewhere else"), never drawn across the scenery. Ghost notices only ever hide a message
+  the ghost itself put up. Debug: `window.__rc3dGhost()` (read-only).
+- **Comparison search:** the review page's native `<datalist>` (as narrow as its input; truncated every name)
+  became a **fixed-position dropdown at least 640 px wide** (clamped to the viewport, flips above when there
+  is no room): date · session · user columns, **every typed word must match**, same-track sessions first (then
+  newest) with a SAME TRACK tag, ↑↓/Enter/Esc. Pasting an exact label still works (`change` handler).
+
 ### 3D view v13 — the REAL track surface: edges traced in 2-D (`track3d_v` 13, network v2, `ENRICH_VERSION` 3)
 The user: "the line goes through the grass… the track should be wider like the real tracks… straights should
 be straight… consistent track width is dumb." Measured first: at Summit Point only **65 %** of the car's own
