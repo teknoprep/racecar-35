@@ -13863,8 +13863,14 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     return v;
   }
 
-  function makeEventMarkers(list, refList, W) {
+  // opt: {side: +1 (driver's left, default) | -1, alpha: 0..1, scale: label size}
+  // so the GHOST's numbers can sit on the other side of the road, faded, instead
+  // of landing on top of yours.
+  function makeEventMarkers(list, refList, W, opt) {
     if (!list || !list.length || !W) return null;
+    opt = opt || {};
+    var fade = opt.alpha == null ? 1 : opt.alpha;
+    var lscale = opt.scale == null ? 1 : opt.scale;
     var grp = new THREE.Group(), d = W.d, n = d.x.length;
     var sprites = [];
     var hL = function (k) { return W.half && W.half[0][k] > 1 ? W.half[0][k] : W.hw(k); };
@@ -13879,7 +13885,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         var b0 = function (k) { var L = hL(k), R = hR(k); return L - (L + R) * (p + 1) / pieces; };
         var geo = stripGeo(d, j0, j1, a0, b0, function (k) { return d.y[k] + 0.075; }, 1, null);
         if (!geo) continue;
-        var m = new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: alpha,
+        var m = new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: alpha * fade,
           depthWrite: false, side: THREE.DoubleSide, polygonOffset: true,
           polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
         m.toneMapped = false;
@@ -13896,8 +13902,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       var off = side * ((side > 0 ? hL(ti) : hR(ti)) + 1.2);
       var x = d.x[ti] + tz * off, z = d.z[ti] - tx * off;
       var spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, toneMapped: false,
-                                                            depthWrite: false }));
-      var h = 1.3 * (size || 1), asp = (tex.userData && tex.userData.aspect) || 2.5;
+                                                            depthWrite: false, transparent: true,
+                                                            opacity: fade }));
+      var h = 1.3 * (size || 1) * lscale, asp = (tex.userData && tex.userData.aspect) || 2.5;
       spr.scale.set(h * asp, h, 1);
       spr.userData.base = [h * asp, h];
       spr.position.set(x, W.groundY(x, z) + height, z);
@@ -13917,7 +13924,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     };
     list.forEach(function (e) {
       if (e.min_ti < 0) return;
-      var turnSide = 1;                     // labels on the driver's left...
+      var turnSide = opt.side || 1;         // labels on the driver's left...
       var ti = e.brake_ti;
       if (e.kind === "brake") {
         bar(ti, 0.5, 0xFF3B30, 0.88, 0);
@@ -13942,7 +13949,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         var tex = labelTexture("MIN " + Math.round(e.min_mph), "rgba(255,176,32,0.95)", "#1A1300");
         if (tex) {
           var spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, toneMapped: false,
-                                                                depthWrite: false }));
+                                                                depthWrite: false, transparent: true,
+                                                                opacity: fade }));
           var asp = (tex.userData && tex.userData.aspect) || 2.5;
           spr.scale.set(1.1 * asp, 1.1, 1);
           spr.userData.base = [1.1 * asp, 1.1];
@@ -15117,7 +15125,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // (the bar's ghost selector). The gap is measured along the TRACK centreline,
   // not along each car's own line: an inside line is shorter, so lap-distance
   // deltas drift by tens of metres over a lap.
-  var GHOST = null, GHOST_GRP = null, GHOST_LINE = null, GHOST_TAG = null;
+  var GHOST = null, GHOST_GRP = null, GHOST_LINE = null, GHOST_TAG = null, GHOST_MARKERS = null;
   var OWN_PROG = null, TRACK_PIDX = null, GHOST_SEQ = 0, ghostCache = {};
   var GHOST_COLOUR = 0xC084FC;
 
@@ -15273,29 +15281,37 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   }
   // the ghost's own line, a slim violet ribbon on the ground (re-seated after
   // every rebuild, like the ideal line - it is not one of the rebuilt meshes)
+  // The ghost's OWN driving on the road: the same chevron line you get, coloured
+  // by ITS throttle / coast / brake (so the two are directly comparable), faded,
+  // plus its brake / apex / gas numbers parked on the other side of the road.
   function placeGhostLine() {
     if (GHOST_LINE) {
       scene.remove(GHOST_LINE);
       GHOST_LINE.geometry.dispose(); GHOST_LINE.material.dispose();
       GHOST_LINE = null;
     }
+    if (GHOST_MARKERS) { disposeTree(GHOST_MARKERS); GHOST_MARKERS = null; }
     if (!GHOST || !GHOST.path || !scene) return;
     var sub = slicePath(GHOST.path, GHOST.t0, GHOST.t1);
     if (!sub) return;
     var d = sub.dense, i;
     for (i = 0; i < d.x.length; i++) d.y[i] = (WORLD ? WORLD.groundY(d.x[i], d.z[i]) : d.y[i]) + 0.11;
-    // slim + see-through: it must never hide YOUR line (the chevrons)
-    var r = RC3D.ribbon(sub, 0.2, 0.05, {});
-    var g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(r.position, 3));
-    g.setIndex(new THREE.BufferAttribute(r.index, 1));
-    var m = new THREE.MeshBasicMaterial({ color: GHOST_COLOUR, transparent: true, opacity: 0.6,
-      depthWrite: false, side: THREE.DoubleSide, polygonOffset: true,
-      polygonOffsetFactor: -4, polygonOffsetUnits: -8 });
-    m.toneMapped = false;
-    GHOST_LINE = new THREE.Mesh(g, m);
+    // the ghost's line is YOUR line style (it is the same classification), half
+    // transparent so yours still reads on top where the two coincide
+    GHOST_LINE = makeInputRibbon(sub, 1.05, 0.10, "line", null);
+    GHOST_LINE.material.opacity = 0.55;
     GHOST_LINE.renderOrder = 4;
     scene.add(GHOST_LINE);
+    // its numbers, on the OTHER side of the road and a size down (side -1 is the
+    // opposite of the driver's labels, which sit on the left)
+    try {
+      var evs = RC3D.cornerEvents(sub, {});
+      if (evs && evs.length && WORLD) {
+        GHOST_MARKERS = makeEventMarkers(evs, null, WORLD,
+                                         { side: -1, alpha: 0.6, scale: 0.85 });
+        if (GHOST_MARKERS) scene.add(GHOST_MARKERS);
+      }
+    } catch (e) { console.warn("[track3d] ghost markers:", e && e.message ? e.message : e); }
   }
   function disposeTree(o) {
     if (!o) return;
@@ -15347,7 +15363,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       el("h-ghost-row").style.display = "flex";
       el("lg-cmp").style.display = "flex";
       el("lg-cmp-t").textContent = "ghost: " + label + " (" + fmtLap(g.seconds) +
-        ") \u2014 its line + the see-through car, on your clock";
+        ") \u2014 its line + car, coloured by ITS own throttle/coast/brake, with its " +
+        "brake/apex/gas numbers on the far side of the road";
       ghostHide();
     }).catch(function (e) {
       if (seq !== GHOST_SEQ) return;
@@ -15364,6 +15381,15 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     GHOST.last = p;
     GHOST_GRP.position.set(p.x, p.y + (plan ? 0.6 : 0), p.z);
     GHOST_GRP.rotation.y = Math.atan2(p.tan[0], p.tan[1]);
+    // shaded by the GHOST's input: green on the gas, grey coasting, red on the
+    // brakes — the same classification that colours its line
+    var gk = RC3D.indexOfTime(GHOST.path.t, gT);
+    var ginp = GHOST.path.input;
+    if (ginp && ginp.state && gk >= 0 && gk < ginp.state.length) {
+      var gcol = RC3D.inputColour(ginp.state[gk], ginp.level ? ginp.level[gk] : 0);
+      GHOST_GRP.userData.car.userData.mats[0].color.setRGB(gcol[0], gcol[1], gcol[2]);
+      GHOST_GRP.userData.plan.children[0].material.color.setRGB(gcol[0], gcol[1], gcol[2]);
+    }
     var u = GHOST_GRP.userData, pk = plan ? (PLAN.k || 1) : 1;
     u.plan.visible = plan;
     u.plan.scale.set(pk, 1, pk);

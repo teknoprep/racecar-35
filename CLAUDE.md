@@ -603,11 +603,16 @@ that driver is.
   (`currentRef`; refs now remember their session as `ref.sess`, default = this session), plus `?pts=` when a
   section is circled. No ghost when the comparison IS the lap you drive (a lap vs itself, or nothing clicked
   with the default best-lap reference).
-- **3D view:** a see-through **violet car** (a cone + tag in plan view, scaled with the view like your own
-  arrow, `PLAN.k`) and its **line** (slim violet ribbon, re-seated after every rebuild like the ideal line),
-  driven on YOUR clock: at `t` seconds into your lap the ghost is where its lap was `t` seconds in. HUD row
-  `ghost ±x.xx s · N m ahead/behind`, red when you are slower, green when faster; violet dot on the mini-map.
-  The bar's ghost picker offers `no ghost`, the requested foreign lap, and every lap of this session.
+- **3D view:** the ghost is driven on YOUR clock — at `t` seconds into your lap it is where its lap was `t`
+  seconds in. It is drawn as **its own driving, faded**: the same chevron line you get, coloured by **ITS**
+  throttle / coast / brake (green / grey / red — so the two lines compare directly, `makeInputRibbon` at
+  55 % opacity), a see-through car (a cone + tag in plan view, scaled with the view like your own arrow,
+  `PLAN.k`) whose colour follows what the ghost is doing at that instant, and **its brake / apex / gas
+  numbers parked on the OTHER side of the road** (`makeEventMarkers(events, null, W, {side: -1, alpha: 0.6,
+  scale: 0.85})` — the driver's own labels sit on the left, so the two sets never land on each other).
+  Both are re-seated after every rebuild like the ideal line. HUD row `ghost ±x.xx s · N m ahead/behind`,
+  red when you are slower, green when faster; violet dot on the mini-map. The bar's ghost picker offers
+  `no ghost`, the requested foreign lap, and every lap of this session.
 - **The gap is a lap delta on ONE ruler:** both laps are measured as progress along the TRACK centreline
   (`RC3D.trackProgress`: unwrapped round the loop, never decreasing), so laps on different lines compare at the
   same place. `RC3D.ghostGap(own, ghost, t)`: `gap = t − ghost's time at YOUR progress` (+ = slower),
