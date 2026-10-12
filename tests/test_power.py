@@ -136,5 +136,113 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(len(P.wheel_series([], [], [], [], LB)["whp"]), 0)
 
 
+def simulate_pulls(n_pulls=20, hp=100.0, ratio=65.0, weight_lb=LB, outlier=None, heading_rate=0.0):
+    """Repeated straight full-throttle pulls in one gear at a known constant wheel power.
+    Speed is integrated from (P - road load) / (m v); rpm = ratio x mph; a hard stop
+    between pulls. Returns t, mph, rpm, heading."""
+    m = weight_lb * P.LB_KG
+    t, mph, rpm, hd = [], [], [], []
+    now, v = 0.0, 30 * P.MPH_MS
+    for k in range(n_pulls):
+        pw = hp * P.HP_W * (outlier if (outlier and k == 0) else 1.0)
+        while v / P.MPH_MS * ratio < 7000:
+            load = m * P.G * P.CRR * v + 0.5 * P.RHO * P.CDA * v ** 3
+            v += (pw - load) / (m * v) * DT
+            t.append(now); mph.append(v / P.MPH_MS); rpm.append(v / P.MPH_MS * ratio)
+            hd.append((now * heading_rate) % 360); now += DT
+        for _ in range(int(3.0 / DT)):                       # brake back down, foot off
+            v = max(30 * P.MPH_MS, v - 0.9 * P.G * DT)
+            t.append(now); mph.append(v / P.MPH_MS); rpm.append(v / P.MPH_MS * ratio)
+            hd.append((now * heading_rate) % 360); now += DT
+    return np.array(t), mph, rpm, hd
+
+
+class VirtualDynoTests(unittest.TestCase):
+    def lap(self, t):
+        return [{"lap": 1, "t_start": 0.0, "t_end": float(t[-1])}]
+
+    def test_flat_100hp_car_reads_100hp_across_the_curve(self):
+        t, mph, rpm, hd = simulate_pulls()
+        d = P.dyno(t, mph, rpm, LB, np.zeros(len(t)), self.lap(t), heading=hd)
+        self.assertTrue(d["straight_only"])
+        self.assertGreaterEqual(len(d["curve"]), 8)
+        for c in d["curve"]:
+            self.assertAlmostEqual(c["whp"], 100.0, delta=3.0, msg=c)
+        self.assertAlmostEqual(d["peak"]["whp"], 100.0, delta=3.0)
+        # torque is the same power over rpm, so it peaks at the bottom of the curve
+        lo = d["curve"][0]
+        self.assertAlmostEqual(d["peak"]["wtq"], lo["whp"] * 5252 / lo["rpm"], places=6)
+
+    def test_one_wild_pull_cannot_move_the_curve(self):
+        t, mph, rpm, hd = simulate_pulls(outlier=1.6)          # one pull reads 60 % high
+        d = P.dyno(t, mph, rpm, LB, np.zeros(len(t)), self.lap(t), heading=hd)
+        self.assertAlmostEqual(d["peak"]["whp"], 100.0, delta=4.0)
+
+    def test_cornering_pulls_fall_back_and_say_so(self):
+        # turning hard the whole time (> 0.35 g): no straight pulls, so every pull is used
+        t, mph, rpm, hd = simulate_pulls(heading_rate=40.0)
+        d = P.dyno(t, mph, rpm, LB, np.zeros(len(t)), self.lap(t), heading=hd)
+        self.assertFalse(d["straight_only"])
+        self.assertAlmostEqual(d["peak"]["whp"], 100.0, delta=3.0)
+
+    def test_no_weight_no_curve(self):
+        t, mph, rpm, hd = simulate_pulls(n_pulls=6)
+        self.assertEqual(P.dyno(t, mph, rpm, 0, None, self.lap(t))["curve"], [])
+
+
+class GearTests(unittest.TestCase):
+    def test_two_gears_are_found(self):
+        mph = np.concatenate([np.linspace(20, 60, 2000), np.linspace(40, 90, 2000)])
+        rpm = np.concatenate([mph[:2000] * 100.0, mph[2000:] * 70.0])
+        g = sorted(np.exp(P.gear_centres(rpm, mph)))
+        self.assertEqual(len(g), 2)
+        self.assertAlmostEqual(g[0], 70.0, delta=1.5)
+        self.assertAlmostEqual(g[1], 100.0, delta=2.0)
+
+    def test_shift_samples_are_not_pull_samples(self):
+        t = np.arange(0.0, 20.0, DT)
+        mph = 30 + 3.0 * t                                     # steady pull
+        rpm = np.where(t < 10, mph * 100.0, mph * 70.0)        # upshift at t = 10 s
+        a = np.full(len(t), 3.0 * P.MPH_MS)
+        pull, gears = P.pull_mask(t, mph, rpm, a)
+        near = np.abs(t - 10.0) < P.SHIFT_GUARD_S
+        self.assertFalse(pull[near].any())
+        self.assertTrue(pull[(t > 2) & (t < 9)].all())
+
+
+class GradeProfileTests(unittest.TestCase):
+    def laps(self, n=6, offsets=None, seed=1):
+        rng = np.random.default_rng(seed)
+        L, v = 2000.0, 30.0                                    # 2 km lap at 30 m/s
+        per = L / v
+        t = np.arange(0.0, n * per, DT)
+        frac = (t % per) / per
+        true_el = 8.0 * np.sin(2 * np.pi * frac)               # +/- 8 m hill
+        el = true_el + rng.normal(0, 1.0, len(t))              # 1 m sideways-wander noise
+        if offsets is not None:
+            el = el + np.array(offsets)[np.minimum((t // per).astype(int), n - 1)]
+        wins = [(k * per, (k + 1) * per - DT) for k in range(n)]
+        true_grade = 8.0 * 2 * np.pi / L * np.cos(2 * np.pi * frac)
+        return t, [v / P.MPH_MS] * len(t), el, wins, true_grade
+
+    def test_consensus_recovers_the_hill_through_noise(self):
+        t, mph, el, wins, true_g = self.laps()
+        g, info = P.grade_profile(t, mph, el, wins)
+        self.assertTrue(info["used"], info)
+        mid = slice(len(t) // 6, 5 * len(t) // 6)
+        self.assertLess(np.median(np.abs(g[mid] - true_g[mid])), 0.004)   # < 0.4 % grade
+
+    def test_laps_that_disagree_are_rejected(self):
+        t, mph, el, wins, _ = self.laps(offsets=[0, 3, 0, 3, 0, 3])
+        g, info = P.grade_profile(t, mph, el, wins)
+        self.assertFalse(info["used"])
+        self.assertTrue(np.all(g == 0))
+
+    def test_too_few_laps_is_flat(self):
+        t, mph, el, wins, _ = self.laps(n=2)
+        g, info = P.grade_profile(t, mph, el, wins)
+        self.assertFalse(info["used"])
+
+
 if __name__ == "__main__":
     unittest.main()

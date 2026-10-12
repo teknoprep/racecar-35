@@ -5980,17 +5980,9 @@ _LAP_SUMMARY_LOCK = threading.Lock()
 _LAP_SUMMARY_MAX_PER_CALL = 4        # uncached files one /laps/summary may do
 
 
+
+
 def _lap_summary_cached(user: str, p: pathlib.Path) -> Optional[dict]:
-    """Cached summary, but ONLY while it was computed for this session's current car
-    weight. A changed weight is a cache miss, so the list recomputes it lazily and
-    never shows a stale number."""
-    hit = _lap_summary_cached_raw(user, p)
-    if hit is None or hit.get("whp_lb", 0) != _weight_lb_of(user, p.name):
-        return None
-    return hit
-
-
-def _lap_summary_cached_raw(user: str, p: pathlib.Path) -> Optional[dict]:
     """Cached summary if (mtime, size) still match, else None."""
     try:
         st = p.stat()
@@ -6067,12 +6059,68 @@ def _power_series(samples: list, weight_lb: float) -> dict:
         weight_lb)
 
 
-def _session_power_maxima(samples: list, laps: list, weight_lb: float) -> tuple:
-    """Peak est WHP and WTQ over the INCLUDED laps. No laps (or no weight) = no answer:
-    a whole-file peak would count the out-lap and pit-lane junk."""
-    if not laps or not weight_lb:
-        return None, None
-    return _power_mod().session_maxima(_power_series(samples, weight_lb), laps)
+_DEM_GRID_CACHE: dict = {}
+
+
+def _dem_grid_for(track: str) -> Optional[dict]:
+    """The prepared track's lidar/terrain grid (dem_hr), cached per slug+file."""
+    try:
+        asset = _track_asset_for(track)
+    except Exception:
+        asset = None
+    meta = (asset or {}).get("dem_hr")
+    if not asset or not meta or not meta.get("file"):
+        return None
+    path = _track_asset_path(asset["slug"]).parent / meta["file"]
+    try:
+        key = (asset["slug"], str(path), path.stat().st_mtime)
+    except OSError:
+        return None
+    hit = _DEM_GRID_CACHE.get(key)
+    if hit is None:
+        try:
+            tp = _trackprep()
+            hit = dict(meta, values=tp.read_dem_bin(meta, path))
+        except Exception:
+            return None
+        _DEM_GRID_CACHE.clear()                  # one track at a time is plenty
+        _DEM_GRID_CACHE[key] = hit
+    return hit
+
+
+def _power_grade(samples: list, rel: list, laps: list, track: str) -> tuple:
+    """Grade per sample from the best elevation source that passes the lap-consensus
+    quality gate: the track's lidar DEM, then logged GPS altitude, else flat (0).
+    Returns (grade, info, median elevation or None)."""
+    pw = _power_mod()
+    wins = [(float(lp["t_start"]), float(lp["t_end"])) for lp in laps]
+    mph = [_num_or_none(s.get("speed_mph")) for s in samples]
+    tried = []
+    grid = _dem_grid_for(track)
+    if grid is not None:
+        try:
+            tp = _trackprep()
+            el = tp.dem_sample(grid, [_num_or_none(s.get("lat")) or float("nan") for s in samples],
+                               [_num_or_none(s.get("lon")) or float("nan") for s in samples])
+            g, info = pw.grade_profile(rel, mph, el, wins)
+            info["source"] = "track lidar / terrain model"
+            if info.get("used"):
+                import numpy as _np
+                return g, info, float(_np.nanmedian(el))
+            tried.append(info)
+        except Exception as e:
+            tried.append({"source": "track lidar / terrain model", "why": str(e)[:80]})
+    alt = [_num_or_none(s.get("alt_m")) for s in samples]
+    if sum(a is not None for a in alt) >= len(alt) * 0.5:
+        g, info = pw.grade_profile(rel, mph, alt, wins)
+        info["source"] = "GPS altitude"
+        if info.get("used"):
+            vals = sorted(a for a in alt if a is not None)
+            return g, info, vals[len(vals) // 2]
+        tried.append(info)
+    info = {"used": False, "source": "none (flat)",
+            "why": "; ".join(f"{x.get('source')}: {x.get('why')}" for x in tried) or "no elevation data"}
+    return [0.0] * len(samples), info, None
 
 
 def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
@@ -6098,13 +6146,6 @@ def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
         summary.update(best_s=secs, best_lap=best, laps=len(laps),
                        excluded=len(payload.get("excluded_laps") or []),
                        source=payload.get("source"))
-        # est wheel power for THIS session's car weight. whp_lb records which weight
-        # it was computed for, so a changed weight is recomputed, never shown stale.
-        weight = _weight_lb_of(user, p.name)
-        wmax, qmax = _session_power_maxima(samples, laps, weight)
-        summary.update(whp_lb=weight,
-                       whp_max=None if wmax is None else round(wmax, 1),
-                       wtq_max=None if qmax is None else round(qmax, 1))
     except Exception as e:
         summary["error"] = str(e)[:200]
     cp = LAPCACHE_DIR / safe_name(user) / (p.name + ".json")
@@ -7168,17 +7209,31 @@ def get_session_power(request: Request, user: str, filename: str) -> JSONRespons
     out = {"set": w > 0, "weight_lb": w, "estimate": "wheel power, no drivetrain loss",
            "laps": [{"lap": lp["lap"]} for lp in laps]}
     if w > 0:
-        series = _power_series(samples, w)
+        rel, _basis = _relative_seconds(samples)
+        track = split_session_name(p.name)[1] or ""
+        grade, ginfo, elev = _power_grade(samples, rel, laps, track)
+        mph = [_num_or_none(s.get("speed_mph")) for s in samples]
+        rpm = [_num_or_none(s.get("rpm")) for s in samples]
+        series = pw.wheel_series(rel, mph, [None] * len(samples), rpm, w,
+                                 grade=grade, elev_m=elev)
+        d = pw.dyno(rel, mph, rpm, w, grade, laps, elev_m=elev,
+                    heading=[_num_or_none(s.get("heading_deg")) for s in samples])
         first_abs = next((_num_or_none(x.get("t")) for x in samples
                           if _num_or_none(x.get("t")) is not None), 0.0)
         out["t"] = [round(float(x) + first_abs, 2) for x in series["t"]]   # epoch s, as logged
         out["whp"] = [round(float(x), 1) for x in series["whp"]]
         out["wtq"] = [round(float(x), 1) for x in series["wtq"]]
-        smax, qmax = _session_power_maxima(samples, laps, w)
-        out["max"] = {"whp": pw.round_or_none(smax), "wtq": pw.round_or_none(qmax)}
+        pk = d["peak"]
+        out["max"] = {"whp": pw.round_or_none(pk["whp"]), "wtq": pw.round_or_none(pk["wtq"]),
+                      "whp_rpm": pk["whp_rpm"], "wtq_rpm": pk["wtq_rpm"]}
+        out["curve"] = [{"rpm": c["rpm"], "whp": round(c["whp"], 1), "wtq": round(c["wtq"], 1),
+                         "n": c["n"]} for c in d["curve"]]
         out["laps"] = [{"lap": r["lap"], "whp": pw.round_or_none(r["whp"]),
-                        "wtq": pw.round_or_none(r["wtq"])}
-                       for r in pw.lap_maxima(series, laps)]
+                        "wtq": pw.round_or_none(r["wtq"])} for r in d["laps"]]
+        out["method"] = {"pulls": d["pulls"], "gears": d["gears"],
+                         "straight_only": d.get("straight_only", False),
+                         "grade": {k: ginfo.get(k) for k in
+                                   ("source", "used", "spread_m", "relief_m", "laps", "why")}}
     return JSONResponse(out)
 
 
@@ -8244,14 +8299,6 @@ _ACCOUNT_HTML = (
             if (!c || c.dataset.done) return;
             var d = (j.laps || {})[k];
             if (!d) return;
-            var wc = Array.prototype.filter.call(document.querySelectorAll('[data-whp]'),
-                       function(x){ return x.dataset.whp === k; })[0];
-            if (wc) {                       // every cell resolves: a number, or an honest dash
-              if (d.whp_max != null) {
-                var h = Math.round(d.whp_max);
-                wc.textContent = h; wc.dataset.sort = h;
-              } else { wc.textContent = '\u2014'; wc.dataset.sort = ''; }
-            }
             var sec = d.best_s;
             c.textContent = (sec == null || !isFinite(sec) || sec <= 0) ? '\u2014'
               : (sec >= 60 ? (Math.floor(sec / 60) + ':' + ((sec - Math.floor(sec / 60) * 60) < 10 ? '0' : '')
@@ -8824,16 +8871,6 @@ async def index(request: Request) -> Response:
                           f'data-user="{user_h}" data-file="{file_h}">')
                 )
                 cached = _lap_summary_cached(user_dir.name, f)
-                # est WHP = the cached session peak, computed for THIS session's weight
-                whp_v = None
-                if cached and cached.get("whp_max") is not None:
-                    whp_v = round(cached["whp_max"])
-                if cached is None:
-                    whp_h, whp_sort = "\u2026", ""
-                elif whp_v is None:
-                    whp_h, whp_sort = "\u2014", ""
-                else:
-                    whp_h, whp_sort = str(whp_v), str(whp_v)
                 best_str = (f'<span title="{cached.get("laps", 0)} laps">'
                             f"{_fmt_lap_s(cached.get('best_s'))}</span>"
                             if cached else "\u2026")
@@ -8847,10 +8884,6 @@ async def index(request: Request) -> Response:
                     f'<td data-k="track">{track_h}</td>'
                     f'<td class="num best" data-k="best" data-best="{user_h}/{file_h}">'
                     f"{best_str}</td>"
-                    f'<td class="num" data-k="whp" data-whp="{user_h}/{file_h}" '
-                    f'data-sort="{whp_sort}" '
-                    f'title="estimated wheel hp at the set car weight (no drivetrain loss)">'
-                    f"{whp_h}</td>"
                     f'<td class="mono" data-k="filename">'
                     f'<a href="/review/{user_h}/{file_h}">{file_h}</a></td>'
                     f'<td class="num" data-k="size" data-sort="{st.st_size}">{size_str}</td>'
@@ -8873,7 +8906,6 @@ async def index(request: Request) -> Response:
             '<th class="sortable" data-key="started">started (UTC)<span class="ind"></span></th>'
             '<th class="sortable" data-key="track">track<span class="ind"></span></th>'
             '<th class="sortable" data-key="best">best lap<span class="ind"></span></th>'
-            '<th class="sortable num" data-key="whp">est WHP<span class="ind"></span></th>'
             '<th class="sortable" data-key="filename">filename<span class="ind"></span></th>'
             '<th class="sortable num" data-key="size">size<span class="ind"></span></th>'
             '<th>actions</th></tr></thead><tbody id="rows">'
@@ -16671,6 +16703,8 @@ _REVIEW_HTML = (
           <input id="car-wt" type="number" min="700" max="9000" step="1" placeholder="lb, with driver" style="width:9em">
           <button class="btn" id="car-save">save</button>
           <span class="t-label" id="car-note" style="opacity:.8"></span>
+          <canvas id="dyno-chart" width="330" height="170" style="display:none;margin-top:4px;background:#0f1218;border:1px solid #232a36;border-radius:6px"></canvas>
+          <span class="t-label" id="dyno-how" style="opacity:.65;max-width:330px;line-height:1.35;text-transform:none;letter-spacing:0"></span>
         </div>
         <div class="lap-table-wrap">
           <table class="laptable">
@@ -17840,12 +17874,44 @@ _REVIEW_HTML = (
     if (p.set) {
       if (p.max && p.max.whp != null) {
         el('lap-sub').textContent = el('lap-sub').textContent.replace(/ \u00b7 est .*$/, '') +
-          ' \u00b7 est ' + Math.round(p.max.whp) + ' whp / ' + Math.round(p.max.wtq) + ' lb-ft';
+          ' \u00b7 est ' + Math.round(p.max.whp) + ' whp @' + p.max.whp_rpm +
+          ' / ' + Math.round(p.max.wtq) + ' lb-ft @' + p.max.wtq_rpm;
       }
       el('car-note').textContent = 'est. wheel hp at ' + p.weight_lb + ' lb \u00b7 no drivetrain loss';
+      drawDyno(p.curve || []);
+      const m = p.method || {}, g = m.grade || {};
+      el('dyno-how').textContent = (p.curve && p.curve.length)
+        ? 'virtual dyno: ' + m.pulls + ' clean pulls (in gear' +
+          (m.straight_only ? ', straight-line' : ', all pulls: too few straights') +
+          '), 90th percentile per 250 rpm. Grade: ' +
+          (g.used ? g.source + ' (laps agree to ' + g.spread_m + ' m)' : 'flat \u2014 ' + (g.why || 'no elevation'))
+        : 'not enough clean full-throttle pulls for a dyno curve';
     } else {
       el('car-note').textContent = 'enter the car weight (with driver) for est. wheel hp';
     }
+  }
+
+  // HP (red) and TQ (blue) against rpm, dyno-sheet style, from /power's curve
+  function drawDyno(curve){
+    const cv = el('dyno-chart');
+    if (!curve.length){ cv.style.display = 'none'; return; }
+    cv.style.display = '';
+    const c = cv.getContext('2d'), W = cv.width, H = cv.height, L = 34, R = 8, T = 10, B = 22;
+    c.clearRect(0, 0, W, H);
+    const r0 = curve[0].rpm, r1 = curve[curve.length-1].rpm;
+    const top = Math.ceil(Math.max.apply(null, curve.map(x=>Math.max(x.whp, x.wtq))) / 20) * 20 || 20;
+    const X = r => L + (r1 > r0 ? (r - r0) / (r1 - r0) : 0.5) * (W - L - R);
+    const Y = v => T + (1 - v / top) * (H - T - B);
+    c.font = '10px monospace'; c.fillStyle = '#7d8799'; c.strokeStyle = '#232a36';
+    for (let v = 0; v <= top; v += 20){ c.beginPath(); c.moveTo(L, Y(v)); c.lineTo(W-R, Y(v)); c.stroke();
+      c.fillText(String(v), 4, Y(v) + 3); }
+    for (let r = Math.ceil(r0/1000)*1000; r <= r1; r += 1000) c.fillText(r/1000 + 'k', X(r) - 6, H - 6);
+    [['whp', '#FF4D4D'], ['wtq', '#4DA3FF']].forEach(function(k){
+      c.strokeStyle = k[1]; c.lineWidth = 2; c.beginPath();
+      curve.forEach(function(p, i){ i ? c.lineTo(X(p.rpm), Y(p[k[0]])) : c.moveTo(X(p.rpm), Y(p[k[0]])); });
+      c.stroke();
+    });
+    c.fillStyle = '#FF4D4D'; c.fillText('WHP', W - 64, T + 10); c.fillStyle = '#4DA3FF'; c.fillText('WTQ', W - 34, T + 10);
   }
 
   (async function loadLaps(){

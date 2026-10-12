@@ -469,41 +469,50 @@ curl -s https://racecar.api.blueuc.com/firmware/list      # {"firmware":[...]}  
 ```
 Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
 
-### Estimated WHEEL power & torque (est WHP / est WTQ) — per session, `track3d_v` 15
+### Estimated WHEEL power & torque — a VIRTUAL DYNO per session, `track3d_v` 15
 - **The car weight is a property of the DRIVE**, so it lives on the SESSION, not the account:
   sidecar `DATA_DIR/session_meta/<user>/<file>.json` = `{weight_lb, by, at}`. It follows renames
   (`_session_sidecar_paths`) and is deleted with the session. Lb, 700–9000; 0/blank clears it.
-- `GET /sessions/{u}/{f}/car` (view-gated; returns `can_edit`), `POST` (owner-or-admin, like
-  editing the session; a read-only grant cannot write it).
-- `GET /sessions/{u}/{f}/power` (view-gated): `set`, `weight_lb`, per-sample `t` (EPOCH seconds
-  as logged), `whp`, `wtq`, `max`, `laps[]`. **With no weight set it returns no numbers at all.**
-- **The model is `server/app/power.py`** (pure, tested in `tests/test_power.py`), a ROAD-LOAD model
-  at the wheels: `P = m·v·(a + g·grade + g·CRR) + ½·RHO·CDA·v³`. `a` = least-squares slope of GPS
-  speed against TIME over ±0.25 s (the RC3D.longG GPS path; NOT a sample-to-sample difference);
-  grade = altitude slope over ±4 s, clamped ±6 %, zero below 5 m/s. Constants (typical values for a
-  small roadster, NOT measured on the car): `CRR` 0.012, `CDA` 0.60 m², `RHO` 1.20 kg/m³.
-  WHP = P/745.7 (WHEEL, no drivetrain loss). WTQ = WHP·5252/rpm (rpm < 400 → none).
-- **Do NOT use the throttle/coast classifier's coast curve as the drag term.** It is a COASTING
-  deceleration envelope that includes engine braking. Used as road load it overstated aero at speed
-  about 2×, which put a 124-hp car at ~150 WHP. This was the cause of the first "way off" report.
-- **Spike filter, four layers, in order:** (1) speed and altitude are median-of-5 BEFORE they are
-  differenced; (2) a sample with more than 1 g of FORWARD acceleration is dropped; (3) median-of-5 on
-  the power; (4) a 2 s time-window average (an engine's peak is what it holds for seconds).
-- **Calibration record (one dyno point, owner's car):** dyno max **123.8 HP / 122.5 lb-ft**. At
-  2420 lb (the test value, NOT the owner's measured weight) the road-load model gives peak **119**
-  (Thompson, 114 lb-ft), **126** (Summit Point Main) and **123** (Watkins Glen GP) on the real
-  sessions. No constant was tuned to the dyno. The owner's entered weight is the largest unknown
-  (WHP scales ~linearly with it), and the CRR/CDA/RHO assumptions are the next largest.
-- **Cache:** the lap summary stores `whp_max`, `wtq_max` and `whp_lb` (the weight it was computed
-  for). `_lap_summary_cached` treats a different weight as a MISS, so the list recomputes lazily and
-  never shows a stale number. `_LAP_RULES_V` is 4.
-- Shown in three places: the review page (weight row above the laps, est WHP/WTQ per lap, session
-  peak in the card header), the 3D HUD (`est WHP`/`est WTQ` rows, now · max, and the ghost's speed in
-  red beside yours), and the sessions list (`est WHP` column, filled from `/laps/summary`).
-- **Uncalibrated beyond that one point.** Expect roughly ±10–15 % from the constants and the weight.
-  The local synthetic runs (`Watkins-Glen-Grand-Prix`, `Summit-Point`, `Nowhere-Test` under
-  `dev/`/`dev_example.com/`) hold a constant ~0.4 g pull that no car can do, so their numbers
-  (~430 hp) are the data, not the model. Do not use them to judge the model.
+  `GET /sessions/{u}/{f}/car` (view-gated, returns `can_edit`), `POST` (owner-or-admin).
+- `GET /sessions/{u}/{f}/power` (view-gated; **no numbers at all without a weight**): per-sample
+  `t` (EPOCH seconds), `whp`, `wtq` (the 3D HUD's "now"), `max {whp, wtq, whp_rpm, wtq_rpm}`,
+  `curve [{rpm, whp, wtq, n}]`, `laps [{lap, whp, wtq}]`, `method {pulls, gears, straight_only,
+  grade {source, used, spread_m, relief_m, laps, why}}`.
+- Shown on the **review page** (weight row, dyno chart, method line, est WHP/WTQ per lap, peaks @rpm
+  in the laps header) and the **3D HUD** (now · max, ghost speed in red). **NOT on the sessions list**
+  (the owner asked for it to be removed; the lap summary does no power work).
+- **Road load** (`server/app/power.py`, tests `tests/test_power.py`, 23):
+  `P = m·v·(a + g·grade + g·CRR) + ½·ρ·CDA·v³`, CRR 0.012, CDA 0.60 m², ρ = 1.20·e^(−h/8500).
+  `a` = least-squares slope of GPS speed against TIME over ±0.25 s (despiked input). Typical-value
+  constants, not measured on the car.
+- **Do NOT use the throttle/coast classifier's coast curve as drag.** It includes engine braking and
+  overstated aero ~2×.
+- **Peaks come from the virtual dyno, never "the best moment"** (a max over ~10 laps picks the noise
+  and the downhill):
+  1. **Pulls only:** in a gear (`gear_centres` = log(rpm/mph) histogram peaks; ±0.06), no shift or
+     clutch slip within 0.3 s (a gear CHANGE counts as a shift), accelerating, rpm rising.
+  2. **Straight-line only** (|lateral g| < 0.35 from speed × GPS-course rate): out of a corner the
+     tyres run a slip angle, and the scrub absorbs power the speed trace never shows. Measured: 3rd-gear
+     corner exits read 15–25 % under 4th-gear straights at the same rpm. If a twisty circuit gives fewer
+     than 4 curve bins of straight pulls, every pull is used and `straight_only` is false (Thompson).
+  3. **Curve:** per 250-rpm bin, each pull's 0.5 s mean power; the 90th percentile over ≥ 5 pulls (the
+     full-throttle level; partial throttle sits below, one wild pull cannot set it); 3-bin median.
+     Peak WHP = curve max; peak WTQ = max of curve·5252/rpm. Per lap: the same bins from that lap only
+     (median per bin).
+- **Grade = ONE elevation profile per lap position** (`grade_profile`): elevation at each fix (the
+  track's lidar DEM via `_dem_grid_for`, else logged GPS `alt_m`) moves 1–2 m with sideways wander
+  (Thompson read an 8.5 % "grade"), so the profile is the median across same-layout laps (±10 % length)
+  per 5 m, smoothed 50 m. **Rejected (grade 0) if the laps disagree by > 0.5 m** (bare-earth lidar
+  under a bridge, different layouts). Measured agreement: 0.06–0.11 m. Without grade, downhill pulls
+  read as extra horsepower (Summit dropped 10 hp when grade was added).
+- The HUD's per-sample series keeps the 2 s window, but its torque divides by rpm averaged over the
+  SAME window (instant rpm made a false torque spike after every upshift).
+- **Calibration record (owner's car):** dyno **123.8 HP / 122.5 lb-ft**. At 2420 lb (a test value,
+  not the owner's weight): Summit Point Main **112.5 / 106**, Watkins Glen GP **119 / 114.5**, Thompson
+  122 / 114 (all-pull fallback). No constant was tuned to the dyno. Remaining known biases: weight
+  (≈ linear), CRR/CDA, flywheel inertia in low gears (~5 %, not modelled), and low-rpm bins on tight
+  circuits are mostly part-throttle (read low). The local synthetic runs hold an impossible 0.4 g pull;
+  ignore their numbers.
 
 ### Session metadata: ONE edit popup (date & time / track / driver)
 A session's static metadata IS its filename: `<sid>_<track>[-combined].ndjson` inside
