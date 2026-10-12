@@ -870,7 +870,11 @@ legend explains green/grey/red, and the toggle reads **accel / brake**.
 The 3D bar has a **view** selector: `chase` (in the car) and **`plan`** — a north-up top-down camera that fits
 the whole circuit from the asset's DEM bounds (with a margin), showing the baked satellite ground at the real
 width, the accel/brake-coloured ribbon, corner boards and **an amber car arrow at your current position**.
-A **scale bar** (auto 100 m/500 m/1 km) makes the size literal. The wheel zooms. A prepared track **opens in
+A **scale bar** (auto 100 m/500 m/1 km) makes the size literal. **Left-drag pans** (the world follows the
+mouse, along the camera's own screen axes so it stays right however the view is oriented; the cursor says
+`grab`), the **wheel zooms at the POINTER** — the metres-per-pixel scales as 1/zoom, so holding the point
+under the cursor fixed is a pan of `(mpp0 − mpp1) × (screen offset)` — and a **double-click refits** the
+whole circuit (`planPan = {x,z}`, `PLAN.h`, `planMPerPx()`, `planAxis()`). A prepared track **opens in
 plan** (one click to `chase`) because that is the view that answers "how big is the track"; without imagery it
 stays in the car.
 
@@ -889,6 +893,11 @@ Real circuits mark a braking zone with numbered boards (5 4 3 2 1 = hundreds of 
 they are needed. `RC3D.corners()` measures the TOTAL heading change through each corner on the smoothed path
 (works on a driven line or an OSM trace):
 **≥80° → 5 4 3 2 1 · ≥62° → 3 2 1 · ≥45° → 2 1 · <45° → nothing** (a kink needs no brake reference).
+The ladder is in **HUNDREDS OF FEET** — the "5" board stands 500 ft (152 m) before turn-in and they are
+**100 ft (30.5 m) apart, not 100 m** (`RC3D.FT = 0.3048`; the tiers are stored in feet and converted at
+placement, so the label can never drift from the distance). The data-driven ladder asks whether the straight
+physically fits its furthest board (180/110/80/50 m, with ≥100 mph entry for the 5-board set): the old
+520/320/220/130 m metre thresholds would have left most corners with a single board 30 m out.
 Boards stand ~1.9 m outside the road edge on the OUTSIDE of the corner, on a post, facing back at the
 oncoming car (canvas-drawn digits — no font, no glyph server); the "1" board is red/white, the rest amber.
 A board is dropped if it would fall inside a corner or the previous corner's braking zone, or before the

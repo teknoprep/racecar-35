@@ -10660,9 +10660,14 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   //   >= 62 deg  ->  3 2 1
   //   >= 45 deg  ->  2 1
   //   <  45 deg  ->  nothing (a kink needs no braking reference)
+  // Brake boards are numbered in HUNDREDS OF FEET at US circuits: the "5" board
+  // stands 500 ft (152.4 m) before the corner and each one is 100 ft (30.48 m)
+  // apart, NOT 100 m. The ladder is stored in feet and converted where it is
+  // placed, so the label and the distance can never drift apart.
+  RC3D.FT = 0.3048;
   RC3D.MARKER_TIERS = [[80, [500, 400, 300, 200, 100]],
                        [62, [300, 200, 100]],
-                       [45, [200, 100]]];
+                       [45, [200, 100]]];   // [corner degrees, feet before turn-in]
 
   RC3D.corners = function (path, opt) {
     opt = opt || {};
@@ -10734,10 +10739,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       }
       if (dists) {
         for (k = 0; k < dists.length; k++) {
-          var s = C.s0 - dists[k];
+          var ft = dists[k], m = ft * RC3D.FT;
+          var s = C.s0 - m;
           if (s < 5) continue;                       // before the start of this lap
           if (s < prevExit + minGapM) continue;      // would sit inside the previous corner
-          out.push({ s: s, m: dists[k], label: String(Math.round(dists[k] / 100)),
+          out.push({ s: s, m: m, ft: ft, label: String(Math.round(ft / 100)),
                      side: -C.dir, deg: deg });
         }
       }
@@ -12023,17 +12029,22 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       else if (c === 0 && !closed) straight = C.s0;
       else straight = rel(C.s0, prev.s1);
       if (!(straight > 0)) straight = closed ? straight + total : 0;
+      // FEET again (see RC3D.MARKER_TIERS): a board stands where the straight is
+      // long enough to hold it with room to read. 500 ft is 152 m, so the old
+      // 520 m / 320 m / 220 m / 130 m metre thresholds would have left most
+      // corners with a single board 30 m out.
       var dists;
-      if (straight >= 520 && entry >= 100) dists = [500, 400, 300, 200, 100];
-      else if (straight >= 320) dists = [300, 200, 100];
-      else if (straight >= 220) dists = [200, 100];
-      else if (straight >= 130) dists = [100];
+      if (straight >= 180 && entry >= 100) dists = [500, 400, 300, 200, 100];
+      else if (straight >= 110) dists = [300, 200, 100];
+      else if (straight >= 80) dists = [200, 100];
+      else if (straight >= 50) dists = [100];
       else continue;
       for (k = 0; k < dists.length; k++) {
-        var s = C.s0 - dists[k];
+        var ft = dists[k], m = ft * RC3D.FT;
+        var s = C.s0 - m;
         if (closed) { while (s < 0) s += total; }
         else if (s < 5) continue;
-        out.push({ s: s, m: dists[k], label: String(Math.round(dists[k] / 100)),
+        out.push({ s: s, m: m, ft: ft, label: String(Math.round(ft / 100)),
                    side: -C.dir, deg: Math.abs(C.deg), corner: c, laps: nl, entry_mph: entry });
       }
     }
@@ -12061,6 +12072,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   var look = { yaw: 0, pitch: 0 };
   var view = "chase";                                     // "chase" | "plan"
   var planZoom = 1;                                       // wheel zoom in plan view
+  // How far the plan camera has been dragged away from the fitted centre
+  // (metres). Reset by the view switch's double-click / the fit button.
+  var planPan = { x: 0, z: 0 };
   var realWidth = null;                                   // metres, from the asset
   var CORNERS = [];                                       // detected corners
   var TRACK_SEED = "track";                               // stable per-track scatter
@@ -14654,6 +14668,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     span = Math.max(maxX - minX, maxZ - minZ, 60);
     var fov = camera.fov * Math.PI / 180;
     var h = (span / 2) / Math.tan(fov / 2) * 1.12 / planZoom;   // fit, with a margin
+    cx += planPan.x; cz += planPan.z;      // whatever the mouse has dragged it by
+    PLAN.h = h;                            // metres-per-pixel for the wheel/drag
+    PLAN.span = span;
     PLAN.up = null;
     // markers drawn from above grow with the view: a 7 m arrow is ~6 px when
     // the whole facility is on screen (yours and the ghost's both vanished)
@@ -14944,6 +14961,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     if (el("b-view")) el("b-view").addEventListener("change", function () {
       view = el("b-view").value === "plan" ? "plan" : "chase";
       if (view === "chase") { look.yaw = 0; look.pitch = 0; }
+      // plan view is draggable: say so with the cursor
+      canvas.style.cursor = view === "plan" ? "grab" : "";
       applyViewVisibility();
       render();
     });
@@ -14972,21 +14991,61 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var dragging = false, lx = 0, ly = 0;
     canvas.addEventListener("mousedown", function (e) {
       dragging = true; freeLook = true; lx = e.clientX; ly = e.clientY;
+      if (view === "plan") canvas.style.cursor = "grabbing";
     });
     window.addEventListener("mouseup", function () {
       // released -> the view eases back to following the car by itself
       dragging = false; freeLook = false;
+      canvas.style.cursor = view === "plan" ? "grab" : "";
     });
+    // Metres per CSS pixel on the ground: the plan camera is orthographic-ish
+    // from straight above, so this is the scale bar's own arithmetic.
+    function planMPerPx() {
+      var hpx = canvas.clientHeight || 1;
+      if (!PLAN.h) return 1;
+      return (2 * PLAN.h * Math.tan(camera.fov * Math.PI / 360)) / hpx;
+    }
+    function planAxis(index) {          // camera's world +x / +y (screen right / down)
+      return new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, index);
+    }
     window.addEventListener("mousemove", function (e) {
       if (!dragging) return;
+      if (view === "plan") {
+        // The world follows the mouse: move the camera the other way, along the
+        // camera's OWN screen axes so it stays correct however it is oriented.
+        var mpp = planMPerPx(), dx = e.clientX - lx, dy = e.clientY - ly;
+        var right = planAxis(0), down = planAxis(1);
+        planPan.x -= (right.x * dx + down.x * dy) * mpp;
+        planPan.z -= (right.z * dx + down.z * dy) * mpp;
+        lx = e.clientX; ly = e.clientY;
+        return;
+      }
       look.yaw -= (e.clientX - lx) * 0.004;
       look.pitch = Math.max(-0.5, Math.min(0.5, look.pitch + (e.clientY - ly) * 0.02));
       lx = e.clientX; ly = e.clientY;
     });
+    canvas.addEventListener("dblclick", function () {
+      if (view !== "plan") return;
+      planPan.x = 0; planPan.z = 0; planZoom = 1;    // back to the fitted view
+    });
     canvas.addEventListener("wheel", function (e) {
       e.preventDefault();
       if (view === "plan") {
-        planZoom = Math.max(0.35, Math.min(6, planZoom * (e.deltaY > 0 ? 0.88 : 1.14)));
+        // Zoom where the mouse IS: the metres-per-pixel scales as 1/zoom, so
+        // keeping the point under the cursor fixed is a pan of
+        // (mpp0 - mpp1) x (screen offset from the centre) along the camera axes.
+        var z0 = planZoom;
+        var z1 = Math.max(0.35, Math.min(6, z0 * (e.deltaY > 0 ? 0.88 : 1.14)));
+        if (z1 !== z0) {
+          var r = canvas.getBoundingClientRect();
+          var dx = e.clientX - (r.left + r.width / 2);
+          var dy = e.clientY - (r.top + r.height / 2);
+          var right = planAxis(0), down = planAxis(1);
+          var dmp = planMPerPx() * (1 - z0 / z1);
+          planPan.x += (right.x * dx + down.x * dy) * dmp;
+          planPan.z += (right.z * dx + down.z * dy) * dmp;
+          planZoom = z1;
+        }
         return;
       }
       opts.eye = Math.max(0.5, Math.min(6, opts.eye + (e.deltaY > 0 ? 0.15 : -0.15)));

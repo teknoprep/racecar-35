@@ -431,6 +431,7 @@ R.corners = {};
     radius: cs.length ? Math.round(cs[0].radius_m) : null,
     labels: mk.map(function (m) { return m.label; }).join(""),
     distances: mk.map(function (m) { return m.m; }),
+    feets: mk.map(function (m) { return m.ft; }),
     sides: mk.map(function (m) { return m.side; }).join(""),
     beforeEntry: mk.every(function (m) { return m.s <= cs[0].s0 + 0.001; }),
     apexInside: cs.length ? (cs[0].apex_s >= cs[0].s0 - 0.001 &&
@@ -1414,7 +1415,10 @@ class Track3DMathTests(unittest.TestCase):
         self.assertAlmostEqual(c95["deg"], 95, delta=8)
         self.assertEqual(c95["dir"], 1)                     # right-hander
         self.assertEqual(c95["labels"], "54321")
-        self.assertEqual(c95["distances"], [500, 400, 300, 200, 100])
+        # HUNDREDS OF FEET: the ladder is 100 ft (30.48 m) apart, not 100 m
+        self.assertEqual(c95["feets"], [500, 400, 300, 200, 100])
+        for got, ft in zip(c95["distances"], [500, 400, 300, 200, 100]):
+            self.assertAlmostEqual(got, ft * 0.3048, delta=0.5)
         self.assertEqual(c95["sides"], "-1-1-1-1-1")        # outside of a right turn = left
         self.assertTrue(c95["beforeEntry"], "a board landed inside the corner")
         self.assertTrue(c95["apexInside"])
@@ -1422,11 +1426,11 @@ class Track3DMathTests(unittest.TestCase):
 
         c70 = res["corners"]["70deg"]
         self.assertEqual(c70["labels"], "321")
-        self.assertEqual(c70["distances"], [300, 200, 100])
+        self.assertEqual(c70["feets"], [300, 200, 100])
 
         c50 = res["corners"]["50deg"]
         self.assertEqual(c50["labels"], "21")
-        self.assertEqual(c50["distances"], [200, 100])
+        self.assertEqual(c50["feets"], [200, 100])
 
         for gentle in ("38deg", "20deg"):
             g = res["corners"][gentle]
@@ -1437,10 +1441,14 @@ class Track3DMathTests(unittest.TestCase):
         pair = res["corners"]["pair"]
         self.assertEqual(pair["corners"], 2)
         self.assertEqual(pair["insideLink"], 0, "a board landed inside a corner")
-        # corner 1's entry is 490 m in, so its 500 m board has nowhere to stand
-        # (correctly dropped); corner 2 sits 200 m later, so its 500/400/300/200
-        # boards would fall at/inside corner 1 - only the 100 m board survives
-        self.assertEqual(pair["labels"], "43211", pair)
+        # Both corners are 90 deg, so both want the full 5..1 ladder. With the
+        # feet spacing (500 ft = 152 m, 100 ft apart) each ladder fits between
+        # the corners; with the old 100 m spacing the second corner's far boards
+        # fell inside the first and were dropped ("43211").
+        self.assertEqual(pair["labels"], "5432154321", pair)
+        self.assertEqual(pair["boards"], 10, "both ladders fit")
+        # ...and none of them sits inside a corner (the invariant above)
+        self.assertEqual(pair["insideLink"], 0)
 
         # 10e. road colour is the DRIVER'S INPUT: green accelerating, grey
         #      neither, red braking (deeper with g) — never the speed
