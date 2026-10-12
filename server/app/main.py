@@ -17355,16 +17355,21 @@ _REVIEW_HTML = (
       view.style.display = '';
       view.href = '/overlay/__USER__/__FILE__';
       save.textContent = 'update';
-      share.style.display = '';
     } else {
       view.style.display = 'none';
       save.textContent = 'link video';
     }
-    // the SHARE is of the session, not of the video: offer it either way
   }
   try { reflect(await (await fetch(base)).json()); } catch(e){}
-  // Share state is owner-or-admin; a 403 just means the button acts as create-on-click.
-  try { const r=await fetch(sbase); if (r.ok){ shareTok=(await r.json()).token; reflectShare(); } } catch(e){}
+  // The SHARE is of the SESSION, not of the video, and the button must be
+  // offered whenever this account may actually create one — a session with no
+  // video is every bit as shareable as one with. The share-state call is itself
+  // owner-or-admin (403 for a viewer), so it decides the button, not the video.
+  try {
+    const r = await fetch(sbase);
+    if (r.ok){ shareTok = (await r.json()).token; reflectShare(); share.style.display = ''; }
+    else { share.style.display = 'none'; }
+  } catch(e){}
   // ---- the share popup: link, copy, revoke -----------------------------
   const smodal = document.getElementById('share-modal');
   const surl = document.getElementById('share-url');
