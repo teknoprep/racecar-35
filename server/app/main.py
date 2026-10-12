@@ -864,6 +864,139 @@ def gate_view_dir(request: Request, dirname: str) -> None:
         raise HTTPException(status_code=403, detail="you don't have access to that user's sessions")
 
 
+# ---------------------------------------------------------------------------
+# Per-SESSION access grants: "share this session with that account"
+#
+# Three different things, deliberately:
+#   * a public /shared/<token> link — no account at all (see SHARE_DIR);
+#   * can_view on a user record  — every session of that whole account;
+#   * a grant here               — ONE session of someone else's, which then
+#     appears in the grantee's own sessions list.
+# A grant is READ-ONLY: it lets the account open, replay, compare and run the AI
+# over the session. Editing, renaming, reassigning and deleting stay
+# owner-or-admin (can_delete_dir), so a shared session can never be destroyed by
+# the person it was shared with.
+#
+# Stored one file per VIEWER (/data/session_shares/<viewer slug>.json): the hot
+# question is "what may this account see?" (the sessions list asks once per page
+# load), while "who may see THIS session?" (the review page) scans a handful of
+# small files.
+# ---------------------------------------------------------------------------
+SESSION_SHARE_DIR = DATA_DIR / "session_shares"
+
+
+def _session_share_read(p: pathlib.Path) -> list:
+    """Normalized rows from one viewer file; junk is dropped, never fatal."""
+    try:
+        rows = json.loads(p.read_text("utf-8"))
+    except Exception:
+        return []
+    out = []
+    for r in (rows if isinstance(rows, list) else []):
+        if not isinstance(r, dict):
+            continue
+        user = safe_name(str(r.get("user") or "").strip(), default="")
+        filename = str(r.get("filename") or "").strip()
+        if not user or not filename:
+            continue
+        out.append({"user": user, "filename": filename,
+                    "viewer": str(r.get("viewer") or p.stem),
+                    "by": str(r.get("by") or ""),
+                    "created": int(r.get("created") or 0)})
+    return out
+
+
+def session_share_rows(viewer: str) -> list:
+    p = SESSION_SHARE_DIR / (safe_name(viewer) + ".json")
+    return _session_share_read(p) if p.is_file() else []
+
+
+def session_shares_for(viewer: str) -> dict:
+    """{user slug: {filename, ...}} granted to this viewer."""
+    out: dict = {}
+    for r in session_share_rows(viewer):
+        out.setdefault(r["user"], set()).add(r["filename"])
+    return out
+
+
+def session_share_filenames(viewer: str, user: str) -> set:
+    return set(session_shares_for(viewer).get(safe_name(user), set()))
+
+
+def session_share_viewers(user: str, filename: str) -> list:
+    """Everyone this one session has been shared with (for the review page)."""
+    out = []
+    if SESSION_SHARE_DIR.is_dir():
+        for p in sorted(SESSION_SHARE_DIR.glob("*.json")):
+            for r in _session_share_read(p):
+                if r["user"] == safe_name(user) and r["filename"] == filename:
+                    out.append(r)
+    return sorted(out, key=lambda r: r["viewer"])
+
+
+def _session_share_write(viewer: str, rows: list) -> None:
+    """Atomic; an empty list removes the file (no empty husks)."""
+    SESSION_SHARE_DIR.mkdir(parents=True, exist_ok=True)
+    p = SESSION_SHARE_DIR / (safe_name(viewer) + ".json")
+    if not rows:
+        p.unlink(missing_ok=True)
+        return
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(rows, indent=1), "utf-8")
+    tmp.replace(p)
+
+
+def session_share_add(viewer: str, user: str, filename: str, by: str) -> bool:
+    """Grant one session to one account. False when it was already granted."""
+    viewer = (viewer or "").strip().lower()
+    if not viewer or "@" not in viewer or " " in viewer:
+        raise HTTPException(status_code=422, detail="a valid email is required")
+    u, f = safe_name(user), filename
+    rows = session_share_rows(viewer)
+    if any(r["user"] == u and r["filename"] == f for r in rows):
+        return False
+    rows.append({"user": u, "filename": f, "viewer": viewer,
+                 "by": by, "created": int(time.time())})
+    _session_share_write(viewer, rows)
+    log.info("session %s/%s shared with %s (by %s)", u, f, viewer, by)
+    return True
+
+
+def session_share_remove(viewer: str, user: str, filename: str) -> int:
+    viewer = (viewer or "").strip().lower()
+    rows = session_share_rows(viewer)
+    u, f = safe_name(user), filename
+    keep = [r for r in rows if not (r["user"] == u and r["filename"] == f)]
+    n = len(rows) - len(keep)
+    if n:
+        _session_share_write(viewer, keep)
+        log.info("session %s/%s no longer shared with %s", u, f, viewer)
+    return n
+
+
+def can_view_session(email: str, user: str, filename: str) -> bool:
+    """May this account open this one session? Whole-dir visibility, or a grant."""
+    if can_view_dir(email, user):
+        return True
+    email = (email or "").lower()
+    if not email:
+        return False
+    return filename in session_share_filenames(email, user)
+
+
+def gate_view_session(request: Request, user: str, filename: str) -> None:
+    """gate_view_dir's per-session twin: a session SHARED with this account
+    counts as visible. No-op in dev mode, like every other gate here."""
+    if not oauth_enabled():
+        return
+    viewer = current_user(request)
+    if not viewer:
+        raise HTTPException(status_code=401, detail="login required")
+    if not can_view_session(str(viewer.get("email", "")), user, filename):
+        raise HTTPException(status_code=403,
+                            detail="that session has not been shared with you")
+
+
 def can_delete_dir(email: str, dirname: str) -> bool:
     """Web-delete permission: your OWN sessions only, unless you're an admin.
 
@@ -1347,6 +1480,12 @@ def _admin_rows_html(self_email: str) -> str:
         return (f"<button class='btn' data-act='history' "
                 f"data-email='{html.escape(em)}'>history</button>")
 
+    def share_btn(em: str) -> str:
+        # One public read-only link listing EVERY session of this account.
+        return (f"<button class='btn' data-act='share' data-email='{html.escape(em)}' "
+                f"title='public read-only link to all of this account's sessions'>"
+                f"share</button>")
+
     def vis_badge(view_all: bool, n: int) -> str:
         if view_all:
             return " <span class='badge admin'>sees all</span>"
@@ -1363,7 +1502,7 @@ def _admin_rows_html(self_email: str) -> str:
         return (f"<tr><td class=mono>{em_h}{you_badge(em)}</td>"
                 f"<td>{role} <span class='badge env'>env</span>{sees}</td>"
                 f"<td class=mono>.env</td>"
-                f"<td><div class='row-actions'>{imp_btn(em)}{hist_btn(em)}"
+                f"<td><div class='row-actions'>{share_btn(em)}{imp_btn(em)}{hist_btn(em)}"
                 f"<span style='color:var(--muted)'>locked</span></div></td></tr>")
 
     def managed_row(em: str, u: dict) -> str:
@@ -1380,7 +1519,7 @@ def _admin_rows_html(self_email: str) -> str:
                 f"<td class=mono>{added_by}</td>"
                 f"<td><div class='row-actions'>"
                 f"<a class='btn' href='/admin/user/{em_h}'>manage</a>"
-                f"{imp_btn(em)}{hist_btn(em)}"
+                f"{share_btn(em)}{imp_btn(em)}{hist_btn(em)}"
                 f"<button class='btn' data-act='toggle' data-admin='{1 if is_admin else 0}' data-email='{em_h}'>{toggle_label}</button>"
                 f"<button class='btn danger' data-act='remove' data-email='{em_h}'>remove</button>"
                 f"</div></td></tr>")
@@ -2471,7 +2610,7 @@ async def session_coach_generate(request: Request, user: str, filename: str) -> 
     auto-review is off (or when an upload predates the feature). Idempotent:
     refuses if this session already produced items, unless ?force=1."""
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     if not ai_enabled():
         raise HTTPException(status_code=503,
                             detail="AI is not configured (set RACECAR_AI_API_KEY)")
@@ -3018,7 +3157,7 @@ async def session_track_asset(request: Request, user: str, filename: str) -> JSO
     """The prepared track asset for this session's track, or 404 with the slug it
     WOULD use (so the viewer can offer to prepare it)."""
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     slug = _track_slug(_track_key(p.name))
     # off the event loop: the first request for an older asset classifies its
@@ -3126,7 +3265,7 @@ def session_track_prep(request: Request, user: str, filename: str,
 @app.get("/sessions/{user}/{filename}/track-prep/status")
 async def session_track_prep_status(request: Request, user: str, filename: str) -> JSONResponse:
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     slug = _track_slug(_track_key(p.name))
     with _PREP_LOCK:
@@ -4265,11 +4404,15 @@ async def list_sessions(request: Request) -> dict:
         for user_dir in sorted(sessions_root.iterdir()):
             if not user_dir.is_dir():
                 continue
-            if oauth_enabled() and not can_view_dir(viewer_email, user_dir.name):
+            dir_visible = (not oauth_enabled()) or can_view_dir(viewer_email, user_dir.name)
+            granted = set() if dir_visible else session_share_filenames(viewer_email, user_dir.name)
+            if not dir_visible and not granted:
                 continue
             for f in sorted(user_dir.iterdir()):
                 if not f.is_file() or not f.name.endswith(".ndjson"):
                     continue
+                if not dir_visible and f.name not in granted:
+                    continue        # shared with someone else, not you
                 st = f.stat()
                 out.append(
                     {
@@ -5077,7 +5220,7 @@ def _ai_model_list() -> list:
 @app.get("/sessions/{user}/{filename}")
 async def download_session(request: Request, user: str, filename: str) -> FileResponse:
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     return FileResponse(
         p,
@@ -5323,7 +5466,7 @@ async def session_data(
           "bounds": [[minLat,minLon],[maxLat,maxLon]] | null }
     """
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
 
     if fixes:
@@ -5633,7 +5776,8 @@ async def laps_summary(request: Request, files: str = Query("")):
             continue
         u, _, fn = item.partition("/")
         u = safe_name(u)
-        if oauth_enabled() and not can_view_dir(str((current_user(request) or {}).get("email", "")), u):
+        if oauth_enabled() and not can_view_session(
+                str((current_user(request) or {}).get("email", "")), u, fn):
             continue
         try:
             p = _resolve_session(u, fn)
@@ -5680,7 +5824,7 @@ async def session_laps(request: Request, user: str, filename: str) -> JSONRespon
     own sample array regardless of stride.
     """
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     return JSONResponse(_apply_lap_meta(_laps_payload(p), safe_name(user), p.name))
 
@@ -5722,7 +5866,7 @@ async def session_gpsdiag(request: Request, user: str, filename: str) -> JSONRes
     Open this URL while logged in and paste the JSON. Reports fix distribution,
     frozen-position (stale) runs, inter-sample time gaps, and time-to-first-fix."""
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     ts = []; fixes = {}; lat = lon = None
     n = 0; first_fix_t = None; t0 = None
@@ -5832,7 +5976,7 @@ async def session_debug(request: Request, user: str, filename: str) -> JSONRespo
     (companion .dbg.ndjson uploaded alongside it). Open logged-in and read the
     'diagnosis'. 404 if the session predates the debug logger / wasn't a cloud rec."""
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _debug_path_for(user, filename)
     if not p.exists():
         raise HTTPException(status_code=404, detail="no debug log for this session")
@@ -5872,7 +6016,7 @@ async def session_debug(request: Request, user: str, filename: str) -> JSONRespo
 async def session_debug_raw(request: Request, user: str, filename: str) -> Response:
     """Raw text of the on-SD debug log (for eyeballing every health line)."""
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _debug_path_for(user, filename)
     if not p.exists():
         raise HTTPException(status_code=404, detail="no debug log for this session")
@@ -5912,7 +6056,7 @@ async def session_ai(request: Request, user: str, filename: str) -> JSONResponse
     to the session's persistent history (deleted when the session is deleted).
     """
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     if not ai_enabled():
         raise HTTPException(status_code=503,
                             detail="AI is not configured (set RACECAR_AI_API_KEY)")
@@ -6001,7 +6145,7 @@ async def session_lines(request: Request, user: str, filename: str) -> JSONRespo
     drove it), the current session's best, and up to 4 further fast references
     — each with a GPS trace + brake/apex/throttle markers + speeds."""
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     try:
         body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
@@ -6064,7 +6208,7 @@ async def session_lines_ai(request: Request, user: str, filename: str) -> JSONRe
     asked to interpret it (what the ideal does differently, concrete actions).
     Body {region:{points}, model?}. Appended to the session's AI history."""
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     if not ai_enabled():
         raise HTTPException(status_code=503,
                             detail="AI is not configured (set RACECAR_AI_API_KEY)")
@@ -6131,7 +6275,7 @@ async def lineview_page(request: Request, user: str, filename: str) -> Response:
     apex/throttle markers + speed labels vs your line). ?pts=lat,lon|lat,lon…"""
     if oauth_enabled() and not current_user(request):
         return login_redirect(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     _resolve_session(user, filename)
     html_out = (_LINEVIEW_HTML
                 .replace("__USER__", json.dumps(user))
@@ -6427,7 +6571,7 @@ _LINEVIEW_HTML = """<!doctype html>
 async def session_ai_history(request: Request, user: str, filename: str) -> JSONResponse:
     """Persistent AI Q&A history for this session (newest handling is client-side)."""
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     return JSONResponse({"history": _hist_public(_ai_history_load(user, p.name),
                                                  _req_is_admin(request))})
@@ -6459,7 +6603,7 @@ async def session_ai_delete(request: Request, user: str, filename: str) -> JSONR
 async def review(request: Request, user: str, filename: str) -> Response:
     if oauth_enabled() and not current_user(request):
         return login_redirect(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     epoch = int(display_epoch_for(p))
     when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(epoch))
@@ -6491,7 +6635,7 @@ async def map3d(request: Request, user: str, filename: str) -> Response:
     the same corner over real ground is occasionally what you want."""
     if oauth_enabled() and not current_user(request):
         return login_redirect(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     return _TRACK3DMAP_HTML.replace("__USER__", safe_name(user)) \
                         .replace("__FILE__", p.name) \
@@ -6515,7 +6659,7 @@ async def track3d(request: Request, user: str, filename: str) -> Response:
     polygon arrives as ?pts=)."""
     if oauth_enabled() and not current_user(request):
         return login_redirect(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     return _TRACK3D_HTML.replace("__USER__", safe_name(user)) \
                         .replace("__FILE__", p.name)
@@ -6544,7 +6688,7 @@ def _parse_youtube_id(s: str) -> Optional[str]:
 @app.get("/sessions/{user}/{filename}/video")
 async def get_video_link(request: Request, user: str, filename: str) -> JSONResponse:
     require_web_user(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     mp = _video_meta_path(user, p.name)
     meta = {}
@@ -6592,7 +6736,7 @@ async def overlay(request: Request, user: str, filename: str) -> Response:
     one-click 'launch' auto-sync); SAVE persists the offset."""
     if oauth_enabled() and not current_user(request):
         return login_redirect(request)
-    gate_view_dir(request, safe_name(user))
+    gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     u = safe_name(user)
     return HTMLResponse(_OVERLAY_HTML
@@ -6756,6 +6900,68 @@ async def revoke_share(request: Request, user: str, filename: str) -> JSONRespon
         tok = _share_token_for(u, p.name)
     log.info("share revoked %s/%s (%d token(s))", u, p.name, n)
     return JSONResponse({"ok": True, "revoked": n})
+
+
+# ---------------------------------------------------------------------------
+# "Share this session with <account>": not a link, a PERSON
+#
+# The grantee signs in as themselves and the session is simply there, in their
+# own list, marked as shared. Read-only for them: they can open, replay,
+# compare, download and run the AI over it, but every mutating route stays
+# owner-or-admin, so they cannot rename, reassign or delete it.
+# ---------------------------------------------------------------------------
+@app.get("/sessions/{user}/{filename}/access")
+async def session_access_list(request: Request, user: str, filename: str) -> JSONResponse:
+    """Which accounts this one session has been shared with (owner-or-admin)."""
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    return JSONResponse({"viewers": session_share_viewers(safe_name(user), p.name)})
+
+
+@app.post("/sessions/{user}/{filename}/access")
+async def session_share_with(request: Request, user: str, filename: str) -> JSONResponse:
+    """Share this ONE session with another account. Body JSON: {viewer: email}.
+
+    Idempotent. Owner-or-admin.
+    """
+    viewer = current_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    target = str(body.get("viewer") or body.get("email") or "").strip().lower()
+    if not target or "@" not in target or " " in target:
+        raise HTTPException(status_code=422, detail="a valid email is required")
+    if safe_name(target) == safe_name(user):
+        raise HTTPException(status_code=422, detail="that account already owns this session")
+    by = str((viewer or {}).get("email", ""))
+    added = session_share_add(target, safe_name(user), p.name, by)
+    return JSONResponse({"ok": True, "viewer": target, "added": added,
+                         "viewers": session_share_viewers(safe_name(user), p.name)})
+
+
+@app.post("/sessions/{user}/{filename}/access/revoke")
+async def session_unshare_with(request: Request, user: str, filename: str) -> JSONResponse:
+    """Take the session back. Body JSON: {viewer: email} (or {all: true}).
+    Owner-or-admin."""
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    u = safe_name(user)
+    if body.get("all"):
+        n = sum(session_share_remove(r["viewer"], u, p.name)
+                for r in session_share_viewers(u, p.name))
+    else:
+        target = str(body.get("viewer") or body.get("email") or "").strip().lower()
+        if not target:
+            raise HTTPException(status_code=422, detail="a viewer email is required")
+        n = session_share_remove(target, u, p.name)
+    return JSONResponse({"ok": True, "revoked": n, "viewers": session_share_viewers(u, p.name)})
 
 
 # ---------------------------------------------------------------------------
@@ -7975,13 +8181,20 @@ async def index(request: Request) -> Response:
         for user_dir in sorted(sessions_root.iterdir()):
             if not user_dir.is_dir():
                 continue
-            if oauth_enabled() and not can_view_dir(viewer_email, user_dir.name):
+            dir_visible = (not oauth_enabled()) or can_view_dir(viewer_email, user_dir.name)
+            # A directory you cannot see as a whole can still hold sessions that
+            # were shared with you by name; those, and only those, are listed.
+            granted = set() if dir_visible else session_share_filenames(viewer_email, user_dir.name)
+            if not dir_visible and not granted:
                 continue
             # Delete is owner-only (admins excepted) even when you can VIEW
-            # another user's sessions via a can_view / view_all grant.
+            # another user's sessions via can_view / view_all / a session share.
             dir_can_delete = (not oauth_enabled()) or can_delete_dir(viewer_email, user_dir.name)
             for f in sorted(user_dir.iterdir(), reverse=True):
                 if not f.is_file() or not f.name.endswith(".ndjson"):
+                    continue
+                shared_with_me = (not dir_visible) and f.name in granted
+                if not dir_visible and not shared_with_me:
                     continue
                 st = f.stat()
                 epoch = display_epoch_for(f)
@@ -7996,6 +8209,9 @@ async def index(request: Request) -> Response:
                     track = track[:-7]
                 track = re.sub(r"^\d+_", "", track) or "?"
                 user_h = html.escape(user_dir.name)
+                if shared_with_me:
+                    user_h += (' <span class="pill good" title="shared with you by the '
+                               'owner \u2014 read-only">shared</span>')
                 file_h = html.escape(f.name)
                 track_h = html.escape(track)
                 when_h = html.escape(when)
@@ -15415,6 +15631,11 @@ _REVIEW_HTML = (
     margin-top: 5px; min-height: 13px; }
   .cmp-status { color: var(--muted); font: 600 11px/1.35 var(--ff-mono);
     min-height: 15px; margin: 0 0 6px; }
+  .acc-chip { display:flex; align-items:center; justify-content:space-between;
+    gap:10px; padding:6px 0; border-bottom:1px solid var(--surface-3);
+    font: 13px var(--ff-mono); }
+  .acc-chip:last-child { border-bottom:none; }
+  .acc-chip .who { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .cmp-status.bad { color: var(--bad); }
   /* the comparison-session search: a WIDE dropdown with real columns
      (when / track / fastest lap / driver). A native <datalist> is as narrow as
@@ -15776,12 +15997,27 @@ _REVIEW_HTML = (
       <button class="btn" id="share-x" type="button" aria-label="close">&#10005;</button>
     </div>
     <div class="modal-body">
-      <p class="hint" style="margin:0 0 10px">Anyone with this link can <b>look</b> at this
-        session \u2014 the drive replay, the laps, and the video if one is linked. Nothing can be
-        changed from it, and no other driver or session is visible.</p>
+      <div class="t-label" style="margin-bottom:6px">share with someone in the system</div>
+      <p class="hint" style="margin:0 0 8px">They sign in as themselves and this session is simply
+        there, in their own list, marked <b>shared</b>. They can look, replay, compare, download
+        and run the AI over it — they cannot change or delete it, and it grants them nothing
+        else.</p>
+      <div class="inline">
+        <span class="combo" style="flex:1">
+          <input id="acc-pick" class="cmp-input" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="their account email…">
+          <div id="acc-list" class="combo-list" style="display:none"></div>
+        </span>
+        <button class="btn primary" id="acc-add" type="button">share</button>
+      </div>
+      <div id="acc-current" style="margin:8px 0 4px"></div>
+      <div class="t-label" style="margin:16px 0 6px">or a public link (no account)</div>
+      <p class="hint" style="margin:0 0 8px">Anyone who has the URL can open this one session,
+        signed in or not.</p>
       <div class="inline">
         <input id="share-url" class="cmp-input" type="text" readonly>
         <button class="btn" id="share-copy" type="button">copy</button>
+        <button class="btn" id="share-make" type="button">create</button>
       </div>
       <div class="cmp-status" id="share-msg"></div>
       <div class="modal-foot">
@@ -17343,6 +17579,9 @@ _REVIEW_HTML = (
   const share = document.getElementById('yt-share');
   const base  = '/sessions/'+enc('__USER__')+'/'+enc('__FILE__')+'/video';
   const sbase = '/sessions/'+enc('__USER__')+'/'+enc('__FILE__')+'/share';
+  // sharing with a PERSON is a different endpoint: /access grants the session to
+  // an account (it shows up in THEIR list), /share mints an account-free link
+  const abase = '/sessions/'+enc('__USER__')+'/'+enc('__FILE__')+'/access';
   let offset_ms = 0;
   let shareTok = null;
   function reflectShare(){
@@ -17376,9 +17615,10 @@ _REVIEW_HTML = (
   const smsg = document.getElementById('share-msg');
   function say(t, bad){ smsg.textContent = t||''; smsg.className = 'cmp-status' + (bad?' bad':''); }
   function openShare(url){
-    surl.value = url; say('');
+    surl.value = url || ''; say('');
     smodal.style.display = 'flex';
-    setTimeout(function(){ surl.focus(); surl.select(); }, 30);
+    loadViewers();
+    setTimeout(function(){ accPick.focus(); }, 30);
   }
   function closeShare(){ smodal.style.display = 'none'; }
   document.getElementById('share-x').addEventListener('click', closeShare);
@@ -17387,6 +17627,109 @@ _REVIEW_HTML = (
   document.addEventListener('keydown', function(ev){
     if (ev.key==='Escape' && smodal.style.display!=='none') closeShare();
   });
+  // ---- who this session is shared WITH (accounts, not links) ------------
+  // They see it in their own sessions list, marked "shared". Read-only for
+  // them: they cannot rename, move or delete it.
+  var accPick = document.getElementById('acc-pick');
+  var accList = document.getElementById('acc-list');
+  var accCur = document.getElementById('acc-current');
+  var accAdd = document.getElementById('acc-add');
+  var accounts = [], accShown = [], accAct = -1;
+  function accSay(t, bad){ say(t, bad); }
+  function renderViewers(rows){
+    accCur.innerHTML = '';
+    if (!rows || !rows.length){
+      accCur.innerHTML = '<div class="hint" style="margin:0">not shared with anyone yet</div>';
+      return;
+    }
+    rows.forEach(function(v){
+      var chip = document.createElement('div'); chip.className = 'acc-chip';
+      var who = document.createElement('span'); who.className = 'who'; who.textContent = v.viewer;
+      who.title = v.by ? ('shared by ' + v.by) : '';
+      var rm = document.createElement('button');
+      rm.className = 'btn danger'; rm.type = 'button'; rm.textContent = 'remove';
+      rm.addEventListener('click', async function(){
+        rm.disabled = true;
+        try {
+          var r = await fetch(abase + '/revoke', {method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({viewer: v.viewer})});
+          var j = await r.json().catch(function(){ return {}; });
+          if (!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
+          renderViewers(j.viewers); accSay('no longer shared with ' + v.viewer);
+        } catch(e){ accSay('could not remove: ' + e.message, true); rm.disabled = false; }
+      });
+      chip.appendChild(who); chip.appendChild(rm);
+      accCur.appendChild(chip);
+    });
+  }
+  async function loadViewers(){
+    try {
+      var r = await fetch(abase);
+      if (!r.ok) return;
+      var j = await r.json();
+      renderViewers(j.viewers);
+      // the same list feeds the picker: everyone this account could share with
+      try {
+        var t = await (await fetch('/admin/sessions/targets')).json();
+        accounts = (t.targets || []).slice().sort(function(a,b){
+          return a.toLowerCase().localeCompare(b.toLowerCase()); });
+      } catch(e){}
+    } catch(e){}
+  }
+  function renderAcc(){
+    var q = (accPick.value || '').trim().toLowerCase();
+    accShown = q ? accounts.filter(function(x){ return x.toLowerCase().indexOf(q) >= 0; })
+                 : accounts.slice();
+    accList.innerHTML = '';
+    if (!accShown.length){
+      var d = document.createElement('div'); d.className = 'combo-empty';
+      d.textContent = accounts.length ? 'no account matches \u2014 type a full email to share anyway'
+                                      : 'loading accounts\u2026';
+      accList.appendChild(d);
+    } else {
+      accShown.forEach(function(em, i){
+        var d = document.createElement('div');
+        d.className = 'combo-opt' + (i === accAct ? ' active' : '');
+        d.textContent = em;
+        d.addEventListener('mousedown', function(ev){
+          ev.preventDefault(); accPick.value = em; accHide(); });
+        accList.appendChild(d);
+      });
+    }
+    accList.style.display = '';
+  }
+  function accHide(){ accList.style.display = 'none'; accAct = -1; }
+  accPick.addEventListener('focus', function(){ accAct = -1; renderAcc(); });
+  accPick.addEventListener('input', function(){ accAct = -1; renderAcc(); });
+  accPick.addEventListener('keydown', function(ev){
+    if (ev.key === 'Enter'){ ev.preventDefault(); accAdd.click(); return; }
+    if (accList.style.display === 'none') return;
+    if (ev.key === 'ArrowDown'){ ev.preventDefault(); accAct = Math.min(accAct + 1, accShown.length - 1); renderAcc(); }
+    else if (ev.key === 'ArrowUp'){ ev.preventDefault(); accAct = Math.max(accAct - 1, 0); renderAcc(); }
+    else if (ev.key === 'Escape'){ accHide(); }
+  });
+  document.addEventListener('click', function(ev){
+    if (accList.parentNode && !accList.parentNode.contains(ev.target)) accHide();
+  });
+  accAdd.addEventListener('click', async function(){
+    var who = (accPick.value || '').trim().toLowerCase();
+    if (!who || who.indexOf('@') < 0){ accSay('enter the email of the account to share with', true); return; }
+    accAdd.disabled = true;
+    try {
+      var r = await fetch(abase, {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({viewer: who})});
+      var j = await r.json().catch(function(){ return {}; });
+      if (!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
+      renderViewers(j.viewers);
+      accPick.value = '';
+      accSay(j.added ? ('shared with ' + who + ' \u2014 it is in their sessions list now')
+                     : (who + ' already had it'));
+    } catch(e){ accSay('could not share: ' + e.message, true); }
+    accAdd.disabled = false;
+  });
+
   document.getElementById('share-copy').addEventListener('click', function(){
     surl.select(); surl.setSelectionRange(0, 9999);
     navigator.clipboard.writeText(surl.value).then(function(){ say('copied to the clipboard'); },
@@ -17401,17 +17744,24 @@ _REVIEW_HTML = (
       shareTok = null; reflectShare(); closeShare();
     } catch(e){ say('revoke failed: '+e.message, true); }
   });
-  share.addEventListener('click', async function(){
-    if (shareTok){ openShare(location.origin + '/shared/' + shareTok); return; }
-    share.disabled = true;
+  document.getElementById('share-make').addEventListener('click', async function(){
+    var mk = document.getElementById('share-make');
+    mk.disabled = true;
     try {
       const r = await fetch(sbase, {method:'POST'});
       const j = await r.json().catch(function(){ return {}; });
       if (!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
       shareTok = j.token; reflectShare();
-      openShare(location.origin + j.url);
-    } catch(e){ alert('share failed: '+e.message); }
-    share.disabled = false;
+      surl.value = location.origin + j.url;
+      surl.select();
+      say('link ready \u2014 copy it');
+    } catch(e){ say('could not create the link: '+e.message, true); }
+    mk.disabled = false;
+  });
+  // the header button opens the popup: sharing with a PERSON is the normal
+  // case, so nothing is minted until a public link is actually asked for
+  share.addEventListener('click', async function(){
+    openShare(shareTok ? (location.origin + '/shared/' + shareTok) : '');
   });
   save.addEventListener('click', async ()=>{
     save.disabled = true;

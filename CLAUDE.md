@@ -1019,6 +1019,27 @@ upload response is never delayed) that distils the session into **1-3 short acti
     launch) hide themselves; with a video linked the viewer is the original overlay (`__RO__=1`).
   - Tests: `tests/test_shares.py` (token back-compat, per-token isolation incl. traversal, admin-
     only user shares, idempotent create/revoke, the list page's escaping).
+- **Session-level access grants (share with a PERSON, not a link)**: three different things,
+  deliberately — a public `/shared/<token>` link (no account at all), `can_view` on a user record
+  (EVERY session of that account), and a grant here (**ONE** session, which then appears in the
+  grantee's own sessions list marked `shared`). `POST /sessions/{u}/{f}/access {viewer: email}`,
+  `GET .../access` (who has it), `POST .../access/revoke {viewer|all}` — all **owner-or-admin**
+  (`gate_delete_dir`), idempotent, and stored one file per VIEWER
+  (`/data/session_shares/<viewer slug>.json`) because the hot question is "what may this account
+  see?" (the list asks once per load); "who has THIS session?" scans the handful of files.
+  A grant is **READ-ONLY for the grantee**: `can_delete_dir` is unchanged, so they can open,
+  replay, compare, download and run the AI over it but cannot rename, move, re-share or delete.
+  Visibility is `can_view_dir(...) OR <explicit grant>` — `can_view_session()` — and
+  `gate_view_session()` is the per-session twin of `gate_view_dir()` (**every** per-session route
+  uses it now: data/laps/gpsdiag/debug/ai/lines/review/map3d/track3d/video/overlay/download).
+  ⚠️ Grants are deliberately NOT folded into `visible_dirnames_for()`: that function answers
+  "may this account see this whole DIRECTORY", so adding one granted file there would silently
+  open every other session in the same directory. The listings (`/sessions` and `/`) instead loop
+  per FILE: `dir_visible = can_view_dir(...)`, `granted = session_share_filenames(...)`, and a file
+  is listed only when the dir is visible or that file is granted. `/laps/summary` checks per file
+  for the same reason (else a shared session's best-lap cell stays blank).
+  Tests: `tests/test_shares.py` (one session to one account, the sibling under the same directory
+  stays closed, read-only, idempotent, revoke-all, owner-or-admin, junk-tolerant store).
 - **Delete is owner-only however you authenticate** (security fix): per-user API keys now
   pass `can_delete_dir(key_owner, dir)` — a viewer's own key can no longer delete other
   users' sessions. Firmware/master key stays exempt (dash deletes its own uploads).

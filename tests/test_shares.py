@@ -35,16 +35,22 @@ WANTED_FUNCS = (
     "_share_path", "_share_bad", "_share_meta", "_shared_session", "_share_token_for",
     "_share_user_token_for", "_share_create", "_shares_all",
     "_user_share_target", "_shared_list_html",
+    "_session_share_read", "_session_share_write", "session_share_rows",
+    "session_shares_for", "session_share_filenames", "session_share_viewers",
+    "session_share_add", "session_share_remove", "can_view_session",
+    "gate_view_session", "session_access_list", "session_share_with",
+    "session_unshare_with",
     "load_managed_users", "save_managed_users", "managed_upsert", "generate_api_key",
     "profile_of", "clean_profile_value",
     "oauth_enabled", "is_admin_email", "can_delete_dir", "gate_delete_dir",
+    "can_view_dir", "visible_dirnames_for", "user_sees_all",
     "require_admin", "require_web_user", "current_user",
     "get_share", "create_share", "revoke_share",
     "admin_user_share_get", "admin_user_share_create", "admin_shares",
     "admin_share_revoke",
 )
 WANTED_VARS = (
-    "DATA_DIR", "SESSION_COOKIE", "SHARE_DIR", "LAPCACHE_DIR", "USERS_FILE",
+    "DATA_DIR", "SESSION_COOKIE", "SHARE_DIR", "SESSION_SHARE_DIR", "LAPCACHE_DIR", "USERS_FILE",
     "LAP_META_DIR", "VIDEO_META_DIR", "AI_HISTORY_DIR", "COACH_DIR", "SESSION_EXT",
     "_safe_re", "API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
     "ALLOWED_EMAILS", "ADMIN_EMAILS", "SESSION_SECRET",
@@ -125,7 +131,8 @@ class ShareTokenTests(unittest.TestCase):
             (self.tmp / sub).mkdir(parents=True, exist_ok=True)
         self.me = self.ns["safe_name"]("dev@example.com")        # dev_example.com
         self.other = self.ns["safe_name"]("maria.rivera@example.com")
-        for slug in (self.me, self.other):
+        self.third = self.ns["safe_name"]("someone.else@example.com")
+        for slug in (self.me, self.other, self.third):
             d = self.tmp / "sessions" / slug
             d.mkdir(parents=True, exist_ok=True)
             (d / _OLD).write_text('{"t":1}\n')
@@ -158,11 +165,11 @@ class ShareTokenTests(unittest.TestCase):
         """Run a helper or a route handler; (status, payload) — status is None
         when it succeeded, exactly like the HTTP layer would report."""
         f = self.ns[fn]
+        args = list(a)
+        if "request" in inspect.signature(f).parameters:
+            args.insert(0, Request(kw.pop("body", None)))
         try:
-            if inspect.iscoroutinefunction(f):
-                out = asyncio.run(f(Request(kw.pop("body", None)), *a))
-            else:
-                out = f(*a)
+            out = asyncio.run(f(*args)) if inspect.iscoroutinefunction(f) else f(*args)
         except HTTPException as exc:
             return exc.status_code, {"detail": exc.detail}
         if isinstance(out, JSONResponse):
@@ -289,6 +296,111 @@ class ShareTokenTests(unittest.TestCase):
         html = self.ns["_shared_list_html"]({"kind": "user", "user": self.me}, "tok")
         self.assertNotIn("<img src=x", html)
         self.assertIn("&lt;img", html)
+
+    # -- "share this session with <account>" (a PERSON, not a link) --------
+    def grant(self, viewer="maria.rivera@example.com", filename=None):
+        return self.call("session_share_with", self.me,
+                         filename or _OLD, body={"viewer": viewer})
+
+    def test_a_grant_shows_one_session_to_one_account(self):
+        other_file = "1785588879_Thompson.ndjson"
+        (self.tmp / "sessions" / self.me / other_file).write_text("{}")
+        self.assertFalse(self.ns["can_view_session"]("maria.rivera@example.com", self.me, _OLD))
+        code, out = self.grant()
+        self.assertIsNone(code, out)
+        self.assertTrue(out["added"])
+        self.assertEqual([v["viewer"] for v in out["viewers"]], ["maria.rivera@example.com"])
+        # the grantee sees THAT session...
+        self.assertTrue(self.ns["can_view_session"]("maria.rivera@example.com", self.me, _OLD))
+        self.assertEqual(self.ns["session_share_filenames"]("maria.rivera@example.com", self.me), {_OLD})
+        # ...not the rest of the directory, and not another driver's copy
+        self.assertFalse(self.ns["can_view_session"]("maria.rivera@example.com", self.me, other_file))
+        self.assertFalse(self.ns["can_view_session"]("maria.rivera@example.com", self.third, _OLD),
+                         "the same filename under another driver is another session")
+        self.assertFalse(self.ns["can_view_session"]("someone@else.com", self.me, _OLD))
+
+    def test_a_grant_is_read_only(self):
+        """The whole point: look, do not touch. Delete/edit stay owner-only."""
+        self.grant()
+        self.assertTrue(self.ns["can_view_session"]("maria.rivera@example.com", self.me, _OLD))
+        self.assertFalse(self.ns["can_delete_dir"]("maria.rivera@example.com", self.me))
+        self.assertTrue(self.ns["can_delete_dir"]("dev@example.com", self.me))
+
+    def test_granting_is_idempotent_and_revocable(self):
+        code, out = self.grant()
+        self.assertTrue(out["added"])
+        code, out = self.grant()
+        self.assertFalse(out["added"], "sharing twice is not an error, just a no-op")
+        self.assertEqual(len(self.ns["session_share_viewers"](self.me, _OLD)), 1)
+        code, out = self.call("session_unshare_with", self.me, _OLD,
+                              body={"viewer": "maria.rivera@example.com"})
+        self.assertIsNone(code, out)
+        self.assertEqual(out["revoked"], 1)
+        self.assertEqual(out["viewers"], [])
+        self.assertFalse(self.ns["can_view_session"]("maria.rivera@example.com", self.me, _OLD))
+        self.assertFalse(list(self.ns["SESSION_SHARE_DIR"].glob("*.json")),
+                         "an empty grant list leaves no husk behind")
+
+    def test_revoke_all_takes_the_session_back(self):
+        self.grant("maria.rivera@example.com")
+        self.grant("someone@else.com")
+        self.assertEqual(len(self.ns["session_share_viewers"](self.me, _OLD)), 2)
+        code, out = self.call("session_unshare_with", self.me, _OLD, body={"all": True})
+        self.assertIsNone(code, out)
+        self.assertEqual(out["revoked"], 2)
+        self.assertEqual(self.ns["session_share_viewers"](self.me, _OLD), [])
+
+    def test_only_the_owner_or_an_admin_may_grant(self):
+        self.viewer = {"email": "maria.rivera@example.com"}
+        code, _ = self.grant("someone@else.com")
+        self.assertEqual(code, 403, "a grantee cannot pass the session on")
+        code, _ = self.call("session_access_list", self.me, _OLD)
+        self.assertEqual(code, 403)
+        self.viewer = {"email": "admin@example.com"}
+        code, out = self.grant("someone@else.com")
+        self.assertIsNone(code, out)
+        self.assertTrue(out["added"])
+
+    def test_a_grant_cannot_be_given_to_the_owner(self):
+        code, out = self.grant("dev@example.com")
+        self.assertEqual(code, 422)
+        code, _ = self.grant("not-an-email")
+        self.assertEqual(code, 422)
+
+    def test_the_gate_lets_a_grantee_through_and_nobody_else(self):
+        """gate_view_session is what every per-session route calls now."""
+        ns = self.ns
+        ns["oauth_enabled"] = lambda: True            # production: gates are live
+        self.assertEqual(self.call("gate_view_session", self.me, _OLD)[0], None,
+                         "the owner may always open it")
+        self.viewer = {"email": "maria.rivera@example.com"}
+        code, out = self.call("gate_view_session", self.me, _OLD)
+        self.assertEqual(code, 403)
+        self.viewer = {"email": "dev@example.com"}     # the owner hands it over
+        self.grant()
+        self.viewer = {"email": "maria.rivera@example.com"}
+        self.assertIsNone(self.call("gate_view_session", self.me, _OLD)[0])
+        # ...but only that file: a sibling in the same directory stays closed
+        (self.tmp / "sessions" / self.me / "sibling.ndjson").write_text("{}")
+        code, _ = self.call("gate_view_session", self.me, "sibling.ndjson")
+        self.assertEqual(code, 403)
+        self.viewer = None
+        self.assertEqual(self.call("gate_view_session", self.me, _OLD)[0], 401)
+
+    def test_the_store_survives_junk(self):
+        p = self.tmp / "session_shares" / (self.ns["safe_name"]("maria.rivera@example.com") + ".json")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps([{"user": self.me, "filename": _OLD},
+                                 {"nope": 1}, "junk", {"user": "", "filename": "x"},
+                                 {"user": "../../etc", "filename": "passwd"}]))
+        rows = self.ns["session_share_rows"]("maria.rivera@example.com")
+        self.assertEqual(len(rows), 2, rows)
+        self.assertTrue(self.ns["can_view_session"]("maria.rivera@example.com", self.me, _OLD))
+        # a crafted "user" is slugged like everything else, so it names a directory
+        # that cannot exist — and _resolve_session refuses it outright
+        self.assertEqual(sorted(r["user"] for r in rows), sorted([".._.._etc", self.me]))
+        code, _ = self.call("_resolve_session", "../../etc", "passwd")
+        self.assertEqual(code, 404)
 
 
 if __name__ == "__main__":
