@@ -330,6 +330,18 @@ from the last build were staged and published under the new version number. A de
    `[ "$v" = "$NEW" ] || { echo ABORT; exit 1; }`.
 3. After publishing, **re-download the served binaries** and check the version string inside them
    AND the sha — trusting the local staging dir is what hid this.
+4. **A commit that says "Release vX" publishes NOTHING.** Bumping the two `FIRMWARE_VERSION`
+   defines and committing them is only half the job; `publish_firmware.sh` is a separate,
+   explicit step. v0.1.171 sat in git for a week while the server served 0.1.170, so every dash
+   OTA'd 0.1.170, saw "already current" against the 0.1.171 Teensy it had just been pushed, and
+   stayed mismatched. **Check for drift before AND after any release** — the two numbers must be
+   equal:
+   ```bash
+   grep -h '#define FIRMWARE_VERSION' src/main.cpp crowpanel-arduino/RaceDash/RaceDash.ino   # source
+   curl -s https://racecar.api.blueuc.com/firmware/manifest.json | grep '"version"'           # served
+   ```
+   (The three served entries must all equal BOTH source defines. Never "fix" a mismatch by
+   reverting a source define — publish the newer build.)
 
 ## ⛳ STANDING ORDERS — do these EVERY update without being asked
 
@@ -2624,6 +2636,14 @@ tests/                                    pytest suite (peer-owned): can_sim gol
                                          fabrication guard, wifi-only, aem_afr
 tools/validate_dash.py                   Structural checks on RaceDash.ino (LastDrawn/invalidateAll coverage, NVS
                                          blob guards, SettingId↔ROWS sync, PAGE_MON_CFG wiring)
+tools/teensy_flash.py                    Flash a Teensy 4.1 from Linux, INCLUDING a factory-fresh one: the stock
+                                         teensy_loader_cli soft-reboot only knows the CDC PID 16c0:0483, so a
+                                         new board (RawHID 16c0:0486) needs the SEREMU feature report
+                                         A9 45 C2 6B over hidraw first. No reset-button press needed.
+tools/teensy_check.py                    Reboot a unit and report what the boot banner + live telemetry say:
+                                         IMU detected/calibrated/live, GPS link + baud + PVT freshness +
+                                         fix/sats, SD card. Exits non-zero on a fault. Reads the port RAW -
+                                         a tty with ECHO on echoes the Teensy's own telemetry back at it.
 crowpanel-arduino/RaceDash_v0139_orig/    Pre-touch-rework backup of RaceDash (swap/revert screens easily)
 crowpanel-arduino/PanelTest/PanelTest.ino Bare panel bring-up sketch — display only, NO touch (not a touch baseline)
 crowpanel-baseline/                       Dead PIO experiments — do not touch
