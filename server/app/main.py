@@ -14919,24 +14919,45 @@ _REVIEW_HTML = (
     padding: 7px 9px; font: 13px var(--ff-ui); min-width: 0; }
   .cmp-sub { color: var(--bad); font: 600 12px/1 var(--ff-mono);
     margin-top: 5px; min-height: 13px; }
-  /* the comparison-session search: a WIDE dropdown (a native <datalist> is
-     as narrow as its input, which truncated every session name). Fixed-
-     positioned on <body> so the card's overflow:hidden cannot clip it. */
+  .cmp-status { color: var(--muted); font: 600 11px/1.35 var(--ff-mono);
+    min-height: 15px; margin: 0 0 6px; }
+  .cmp-status.bad { color: var(--bad); }
+  /* the comparison-session search: a WIDE dropdown with real columns
+     (when / track / fastest lap / driver). A native <datalist> is as narrow as
+     its input and can only show one string per row, which is why picking the
+     session to compare against was guesswork. Fixed-positioned on <body> so
+     the card's overflow:hidden cannot clip it. */
   .cmp-drop { position: fixed; z-index: 2000; display: none; overflow: auto;
-    max-height: min(60vh, 480px); background: var(--surface);
+    max-height: min(70vh, 560px); background: var(--surface);
     border: 1px solid var(--line); border-radius: var(--r-md);
     box-shadow: 0 14px 36px rgba(0,0,0,0.55); padding: 4px 0; }
-  .cmp-drop .opt { display: grid; grid-template-columns: 132px minmax(0,1fr) auto;
-    gap: 14px; align-items: baseline; padding: 7px 14px; cursor: pointer;
+  .cmp-drop .hd, .cmp-drop .opt {
+    display: grid; gap: 16px; align-items: baseline;
+    grid-template-columns: 148px minmax(0,1fr) 104px minmax(0,230px); }
+  .cmp-drop .hd { padding: 6px 16px 7px; border-bottom: 1px solid var(--line);
+    color: var(--muted); font: 600 10px var(--ff-ui); letter-spacing: 0.08em;
+    text-transform: uppercase; position: sticky; top: 0;
+    background: var(--surface-2); }
+  .cmp-drop .opt { padding: 7px 16px; cursor: pointer;
     font: 13px var(--ff-ui); color: var(--text); }
-  .cmp-drop .opt .d { color: var(--muted); font: 12px var(--ff-mono); white-space: nowrap; }
-  .cmp-drop .opt .f { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cmp-drop .opt .u { color: var(--muted); font-size: 12px; white-space: nowrap; }
-  .cmp-drop .opt.same .f::after { content: "same track"; margin-left: 8px;
-    color: var(--good, #34D058); font: 600 10px var(--ff-ui); letter-spacing: 0.05em;
+  .cmp-drop .opt .when { color: var(--muted); font: 12px var(--ff-mono);
+    white-space: nowrap; }
+  .cmp-drop .opt .track { overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .cmp-drop .opt .lap { text-align: right; font: 600 13px var(--ff-mono);
+    color: var(--good, #6CD07A); white-space: nowrap; }
+  .cmp-drop .opt .lap.pending { color: var(--muted); font-weight: 400; }
+  .cmp-drop .opt .who { color: var(--muted); font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cmp-drop .opt.same .track::after { content: "same track"; margin-left: 8px;
+    color: var(--good, #6CD07A); font: 600 10px var(--ff-ui); letter-spacing: 0.05em;
     text-transform: uppercase; }
   .cmp-drop .opt.act, .cmp-drop .opt:hover { background: rgba(255,176,32,0.14); }
-  .cmp-drop .empty { padding: 10px 14px; color: var(--muted); font: 13px var(--ff-ui); }
+  .cmp-drop .empty { padding: 10px 16px; color: var(--muted); font: 13px var(--ff-ui); }
+  @media (max-width: 820px) {
+    .cmp-drop .hd, .cmp-drop .opt { grid-template-columns: 132px minmax(0,1fr) 92px; }
+    .cmp-drop .hd .who, .cmp-drop .opt .who { display: none; }
+  }
   /* ---- AI corner analysis ---------------------------------------- */
   /* Composer layout: section tools on one line, the model picker as a
      labelled field (it is a setting, not an action), the quick-ask chips on
@@ -15174,7 +15195,7 @@ _REVIEW_HTML = (
           <div class="cmp-row">
             <input id="cmp-session" class="cmp-input" autocomplete="off" spellcheck="false"
                    role="combobox" aria-expanded="false" aria-controls="cmp-drop"
-                   placeholder="compare vs another session (type to filter)">
+                   placeholder="compare vs another session \u2014 search by track, date, driver or fastest lap">
             <select id="cmp-lap" class="cmp-input"></select>
           </div>
           <div class="cmp-row2">
@@ -15187,6 +15208,7 @@ _REVIEW_HTML = (
             <span style="flex:1"></span>
             <button id="cmp-reset" class="btn">best lap</button>
           </div>
+          <div class="cmp-status" id="cmp-status"></div>
           <div class="t-label" style="margin:2px 0 6px">Delta
             <span id="delta-sel" style="color:var(--muted)"></span>
             <span id="delta-live" class="mono" style="float:right"></span></div>
@@ -15965,8 +15987,23 @@ _REVIEW_HTML = (
   }
   // the track part of a session file name, for "same track first"
   function trackKey(fn){
-    return String(fn||'').replace(/\\.ndjson$/,'').replace(/^\\d+_/,'')
-      .replace(/-combined$/,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    return String(fn||'').replace(/\\.ndjson$/,'').replace(/^\\d+_/,'').replace(/-combined$/,'')
+      .toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  }
+  // ...and the same thing the way a person reads it:
+  // 1788543989_Summit_Point_Main -> "Summit Point Main" (the raw filename is
+  // still there on hover, and is still what a pasted value may name).
+  function trackLabel(fn){
+    var t=String(fn||'').replace(/\\.ndjson$/,'').replace(/^\\d+_/,'');
+    var comb=/-combined$/.test(t);
+    if (comb) t=t.replace(/-combined$/,'');
+    t=t.replace(/_+/g,' ').replace(/\\s+/g,' ').trim();
+    return (t||'?')+(comb?' \u00b7 combined':'');
+  }
+  function fmtLapShort(s){
+    if (s==null || !isFinite(s) || s<=0) return '\u2014';
+    var m=Math.floor(s/60), r=s-m*60;
+    return m ? (m+':'+(r<10?'0':'')+r.toFixed(2)) : r.toFixed(2);
   }
   let compList=[];
   async function loadCompList(){
@@ -15979,51 +16016,114 @@ _REVIEW_HTML = (
       const ep=(s.display_epoch||s.mtime||0)*1000;
       const date=ep ? new Date(ep).toISOString().slice(0,16).replace('T',' ') : '';
       const name=s.filename.replace(/\\.ndjson$/,'');
-      const label=s.user+' \u00b7 '+date+' \u00b7 '+name;
+      const track=trackLabel(s.filename);
       const tk=trackKey(s.filename);
-      const e={ user:s.user, file:s.filename, date, name, label, ep,
+      const e={ user:s.user, file:s.filename, date, name, track, ep,
+                best:null, bestTried:0, label:'', hay:'',
                 // "summit point" is the same place as "summit point main"
-                same: !!mine && !!tk && (tk===mine || tk.startsWith(mine+' ') || mine.startsWith(tk+' ')),
-                hay: label.toLowerCase() };
-      compSessions[label]={ user:s.user, file:s.filename };
+                same: !!mine && !!tk && (tk===mine || tk.startsWith(mine+' ') || mine.startsWith(tk+' ')) };
       compList.push(e);
     }
     // same track first, then newest
     compList.sort((a,b)=> (b.same-a.same) || (b.ep-a.ep));
+    compList.forEach(e=>{
+      // what the input shows once this row is picked, and what an exact paste
+      // matches (the bare filename is accepted as well)
+      e.label=[e.track, e.date, e.user].filter(Boolean).join(' \u00b7 ');
+      e.hay=(e.label+' '+e.name).toLowerCase();
+      compSessions[e.label]={ user:e.user, file:e.file };
+      compSessions[e.name]={ user:e.user, file:e.file };
+    });
+    cmpBestStart();
+  }
+  function setCmpStatus(text, bad){
+    const x=el('cmp-status'); if (!x) return;
+    x.textContent=text||''; x.className='cmp-status'+(bad?' bad':'');
   }
   async function pickCompSession(sess){
     el('cmp-lap').innerHTML='';
     if (!sess) return;
+    // Fetching a session's samples takes a moment on a big file, and silently
+    // doing NOTHING (the old behaviour) is indistinguishable from a dead box.
+    setCmpStatus('loading ' + sess.user + ' / ' + sess.file + '…');
     try { cmpEntry=await loadCompSession(sess.user, sess.file); cmpSess=sess; }
-    catch(e){ return; }
+    catch(e){
+      cmpEntry=null; cmpSess=null;
+      setCmpStatus('could not load that session: ' + ((e && e.message) || e), true);
+      return;
+    }
     fillLapPicker(cmpEntry);
     applyCompLap();
+    // the input carries the label and the delta line the pairing; the status
+    // line exists for the in-between states, so clear it once we are there
+    setCmpStatus('');
   }
   // ---- the wide session search ----------------------------------------
   const cmpIn=el('cmp-session');
   const cmpDrop=document.createElement('div');
   cmpDrop.id='cmp-drop'; cmpDrop.className='cmp-drop'; cmpDrop.setAttribute('role','listbox');
   document.body.appendChild(cmpDrop);
-  let cmpShown=[], cmpAct=-1;
+  let cmpShown=[], cmpAct=-1, cmpBestRounds=0, cmpBestOpen=false;
+
+  // Fastest lap per session, filled in BEHIND the open list. Same endpoint the
+  // sessions list uses: cached summaries come back instantly, a few cold files
+  // are computed per call, and we simply ask again for the rest. It is never on
+  // the drop's critical path - a row shows "..." until its value lands, and a
+  // row the server cannot summarise shows a dash rather than spinning forever.
+  async function cmpBestFill(){
+    const want=compList.filter(e=>e.best===null && !e.bestTried);
+    if (!want.length || cmpBestRounds>12) return;
+    cmpBestRounds++;
+    let any=false;
+    for (let i=0;i<want.length;i+=25){
+      const batch=want.slice(i,i+25);
+      const keys=batch.map(e=>e.user+'/'+e.file);
+      try{
+        const r=await fetch('/laps/summary?files='+encodeURIComponent(keys.join(',')));
+        if (!r.ok) continue;
+        const j=await r.json();
+        for (const e of batch){
+          const d=(j.laps||{})[e.user+'/'+e.file];
+          if (!d) continue;                     // not computed yet: ask again
+          e.best=(typeof d.best_s==='number' && d.best_s>0) ? d.best_s : 0;
+          e.laps=d.laps||0;
+          any=true;
+        }
+      }catch(err){}
+    }
+    if (!any) compList.forEach(e=>{ if (e.best===null) e.bestTried=1; });
+    if (any && cmpBestOpen && cmpDrop.style.display==='block') renderDrop();
+    if (any) setTimeout(cmpBestFill, 400);
+  }
+  function cmpBestStart(){ if (cmpBestRounds===0) cmpBestFill(); }
   function placeDrop(){
     const r=cmpIn.getBoundingClientRect(), vw=window.innerWidth, vh=window.innerHeight;
-    const w=Math.min(vw-16, Math.max(r.width, 640));
+    // Four columns of real data do not fit in a form input, and being no wider
+    // than the anchor is what made the old list unreadable: ask for 1200 px and
+    // only fall back to the input's own width on a narrow screen.
+    const w=Math.min(vw-16, Math.max(r.width, 1200));
     cmpDrop.style.width=w+'px';
     cmpDrop.style.left=Math.max(8, Math.min(r.left, vw-w-8))+'px';
     const below=vh-r.bottom-12, above=r.top-12;
-    if (below>=220 || below>=above){
+    if (below>=240 || below>=above){
       cmpDrop.style.top=(r.bottom+4)+'px'; cmpDrop.style.bottom='';
-      cmpDrop.style.maxHeight=Math.max(160, Math.min(480, below))+'px';
+      cmpDrop.style.maxHeight=Math.max(180, Math.min(560, below))+'px';
     } else {
       cmpDrop.style.top=''; cmpDrop.style.bottom=(vh-r.top+4)+'px';
-      cmpDrop.style.maxHeight=Math.max(160, Math.min(480, above))+'px';
+      cmpDrop.style.maxHeight=Math.max(180, Math.min(560, above))+'px';
     }
   }
+  const CMP_COLS=[['when','date & time'],['track','track'],['lap','fastest lap'],['who','driver']];
   function renderDrop(){
     const words=cmpIn.value.toLowerCase().split(/\\s+/).filter(Boolean);
     cmpShown=compList.filter(e=>words.every(w=>e.hay.indexOf(w)>=0)).slice(0,300);
     cmpDrop.innerHTML='';
-    if (!cmpShown.length){
+    if (cmpShown.length){
+      const hd=document.createElement('div'); hd.className='hd';
+      CMP_COLS.forEach(function(c){ const s=document.createElement('span');
+        s.className=c[0]; s.textContent=c[1]; hd.appendChild(s); });
+      cmpDrop.appendChild(hd);
+    } else {
       const d=document.createElement('div'); d.className='empty';
       d.textContent=compList.length ? 'no session matches' : 'loading sessions\u2026';
       cmpDrop.appendChild(d);
@@ -16031,22 +16131,26 @@ _REVIEW_HTML = (
     cmpShown.forEach((e,i)=>{
       const o=document.createElement('div');
       o.className='opt'+(e.same?' same':'')+(i===cmpAct?' act':'');
-      o.setAttribute('role','option'); o.title=e.label;
-      const d=document.createElement('span'); d.className='d'; d.textContent=e.date;
-      const f=document.createElement('span'); f.className='f'; f.textContent=e.name;
-      const u=document.createElement('span'); u.className='u'; u.textContent=e.user;
-      o.append(d,f,u);
+      o.setAttribute('role','option');
+      o.title=e.track+'  \u00b7  '+e.date+'  \u00b7  '+e.user+'  \u00b7  '+e.name+'.ndjson';
+      function mk(cl,txt){ const s=document.createElement('span'); s.className=cl; s.textContent=txt; return s; }
+      const lap=mk('lap', e.best===null ? '\u2026' : fmtLapShort(e.best));
+      if (e.best===null) lap.className='lap pending';
+      else if (e.best>0) lap.title=(e.laps||0)+' laps';
+      o.append(mk('when', e.date || '\u2014'), mk('track', e.track), lap, mk('who', e.user));
       o.addEventListener('mousedown', ev=>{ ev.preventDefault(); chooseDrop(i); });
       cmpDrop.appendChild(o);
     });
   }
   function openDrop(){
     if (cmpDrop.style.display!=='block'){ cmpAct=-1; }
+    cmpBestOpen=true; cmpBestStart();
     renderDrop(); placeDrop();
     cmpDrop.style.display='block'; cmpIn.setAttribute('aria-expanded','true');
   }
   function closeDrop(){
     cmpDrop.style.display='none'; cmpIn.setAttribute('aria-expanded','false'); cmpAct=-1;
+    cmpBestOpen=false;
   }
   function chooseDrop(i){
     const e=cmpShown[i]; if (!e) return;

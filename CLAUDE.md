@@ -581,10 +581,17 @@ that driver is.
   shifted to the first-FIX time basis. If fewer than 70 % of its fixes are within 30 m of this track it is
   REFUSED ("driven somewhere else"), never drawn across the scenery. Ghost notices only ever hide a message
   the ghost itself put up. Debug: `window.__rc3dGhost()` (read-only).
-- **Comparison search:** the review page's native `<datalist>` (as narrow as its input; truncated every name)
-  became a **fixed-position dropdown at least 640 px wide** (clamped to the viewport, flips above when there
-  is no room): date · session · user columns, **every typed word must match**, same-track sessions first (then
-  newest) with a SAME TRACK tag, ↑↓/Enter/Esc. Pasting an exact label still works (`change` handler).
+- **Comparison search:** the review page's native `<datalist>` (as narrow as its input, one string per row)
+  is a **fixed-position dropdown 1200 px wide** (clamped to the viewport, flips above when there is no room,
+  driver column dropped under 820 px) with the four things that identify a session: **date & time · track ·
+  fastest lap · driver**. Track renders the filename the way a driver reads it
+  (`1788543989_Summit_Point_Main` → "Summit Point Main", `-combined` marked); the raw filename is the tooltip
+  and a pasted one still resolves. **Fastest lap is filled in behind the open list** in 25-file batches from
+  the SAME `/laps/summary` the sessions list uses (cached = instant, a few cold files per call, ask again),
+  so it never blocks a row rendering: "…" until it lands, "—" if it cannot be summarised. Filtering: **every
+  typed word must match** (label + filename), same track first then newest, SAME TRACK tag, ↑↓/Enter/Esc. A
+  `#cmp-status` line under the controls reports *loading…* and *could not load that session: <why>* — a pick
+  that silently did nothing used to be indistinguishable from a dead box.
 
 ### 3D view v13 — the REAL track surface: edges traced in 2-D (`track3d_v` 13, network v2, `ENRICH_VERSION` 3)
 The user: "the line goes through the grass… the track should be wider like the real tracks… straights should

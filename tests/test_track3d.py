@@ -1940,9 +1940,79 @@ class ReviewGhostLinkTests(unittest.TestCase):
         self.assertNotIn("<datalist id=\"cmp-sessions\"", html)
         self.assertNotIn("list=\"cmp-sessions\"", html)
         self.assertIn('id="cmp-session"', html)
-        self.assertIn("Math.max(r.width, 640)", html)
+        # the list is WIDER than the input it hangs off, not clamped to it: four
+        # columns of real data do not fit in a form field.
+        self.assertIn("Math.max(r.width, 1200)", html)
         self.assertIn("words.every(w=>e.hay.indexOf(w)>=0)", html)
         self.assertIn("position: fixed", html)
+
+    def test_the_picker_shows_what_you_need_to_choose(self):
+        """Date & time / track / fastest lap / driver — the four things that
+        identify the session to compare against."""
+        html = self._review()
+        self.assertIn("[['when','date & time'],['track','track'],"
+                      "['lap','fastest lap'],['who','driver']]", html)
+        for cls in (".cmp-drop .opt .when", ".cmp-drop .opt .track",
+                    ".cmp-drop .opt .lap", ".cmp-drop .opt .who"):
+            self.assertIn(cls, html)
+        # the fastest lap is filled in behind the open list, from the SAME
+        # endpoint the sessions list uses, and never blocks a row rendering
+        self.assertIn("/laps/summary?files=", html)
+        self.assertIn("e.best=(typeof d.best_s==='number' && d.best_s>0) ? d.best_s : 0;", html)
+        self.assertIn("e.best===null ? '\u2026' : fmtLapShort(e.best)", html)
+        # picking a session says what it is doing, and says so when it fails
+        self.assertIn("function setCmpStatus(", html)
+        self.assertIn("could not load that session: ", html)
+        # the raw filename is still the tooltip, and a pasted one still resolves
+        self.assertIn("+e.name+'.ndjson'", html)
+
+    @unittest.skipIf(NODE is None, "node not available")
+    def test_track_label_and_lap_format(self):
+        """The two formatters the picker leans on, run for real: a session file
+        name is `1788543989_Summit_Point_Main.ndjson` and must read as
+        "Summit Point Main" (the underscores and the id are ours, not the
+        driver's), and a lap is seconds until a minute, then m:ss.hh."""
+        import re
+        import subprocess
+        import tempfile
+        html = self._review()
+
+        def fn(name):
+            i = html.index("function %s(" % name)
+            j = html.index("{", i)
+            depth = 0
+            while True:
+                ch = html[j]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            return html[i:j + 1]
+
+        driver = """
+const out = {};
+["1788543989_Summit_Point_Main.ndjson", "1783200000_Nowhere-Test.ndjson",
+ "1785588879_Thompson-combined.ndjson", "1783100000_Summit-Point.ndjson", ""]
+  .forEach(f => out[f] = trackLabel(f));
+out.laps = [89.598, 60.0, 9.5, 3725.2, null, 0].map(fmtLapShort);
+console.log(JSON.stringify(out));
+"""
+        src = fn("trackLabel") + "\n" + fn("fmtLapShort") + "\n" + driver
+        with tempfile.TemporaryDirectory() as td:
+            f = pathlib.Path(td) / "labels.js"
+            f.write_text(src)
+            proc = subprocess.run([NODE, str(f)], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+            r = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(r["1788543989_Summit_Point_Main.ndjson"], "Summit Point Main")
+        self.assertEqual(r["1783200000_Nowhere-Test.ndjson"], "Nowhere-Test")
+        self.assertEqual(r["1785588879_Thompson-combined.ndjson"], "Thompson \u00b7 combined")
+        self.assertEqual(r["1783100000_Summit-Point.ndjson"], "Summit-Point")
+        self.assertEqual(r[""], "?")
+        self.assertEqual(r["laps"], ["1:29.60", "1:00.00", "9.50", "62:05.20", "\u2014", "\u2014"])
 
     @unittest.skipIf(NODE is None, "node not available")
     def test_review_scripts_parse(self):
