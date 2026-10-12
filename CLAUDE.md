@@ -1028,7 +1028,11 @@ upload response is never delayed) that distils the session into **1-3 short acti
   (`/data/session_shares/<viewer slug>.json`) because the hot question is "what may this account
   see?" (the list asks once per load); "who has THIS session?" scans the handful of files.
   A grant is **READ-ONLY for the grantee**: `can_delete_dir` is unchanged, so they can open,
-  replay, compare, download and run the AI over it but cannot rename, move, re-share or delete.
+  replay, compare and run the AI over it but cannot rename, move, re-share or delete — and
+  **`download_session` deliberately keeps `gate_view_dir`, not `gate_view_session`**, so a share
+  grantee gets no copy of the file (the review header's download button is hidden for them by
+  `__DLSTYLE__`, computed from the same rule, so the UI never offers what the route would 403).
+  The sessions list marks the row `shared`, drops its checkbox and leaves Actions EMPTY.
   Visibility is `can_view_dir(...) OR <explicit grant>` — `can_view_session()` — and
   `gate_view_session()` is the per-session twin of `gate_view_dir()` (**every** per-session route
   uses it now: data/laps/gpsdiag/debug/ai/lines/review/map3d/track3d/video/overlay/download).

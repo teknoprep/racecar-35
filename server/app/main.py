@@ -5220,7 +5220,11 @@ def _ai_model_list() -> list:
 @app.get("/sessions/{user}/{filename}")
 async def download_session(request: Request, user: str, filename: str) -> FileResponse:
     require_web_user(request)
-    gate_view_session(request, safe_name(user), filename)
+    # Deliberately the DIRECTORY gate, not gate_view_session: holding a session
+    # someone shared with you is read-only, and taking a copy of the file is not
+    # part of looking at it. (A can_view / view_all viewer was always able to
+    # download, and still is.)
+    gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
     return FileResponse(
         p,
@@ -6613,10 +6617,15 @@ async def review(request: Request, user: str, filename: str) -> Response:
     viewer_email = str((current_user(request) or {}).get("email", ""))
     can_edit = (not oauth_enabled()) or can_delete_dir(viewer_email, safe_name(user))
     is_admin = (not oauth_enabled()) or is_admin_email(viewer_email)
+    # Taking a copy of the file is not part of "someone shared this drive with
+    # me": a session-share grantee gets no download button (the route refuses it
+    # too — same rule, so the UI can never offer what the server would reject).
+    can_download = (not oauth_enabled()) or can_view_dir(viewer_email, safe_name(user))
     return _REVIEW_HTML.replace("__USER__", safe_name(user)) \
                        .replace("__FILE__", p.name) \
                        .replace("__WHEN__", when) \
                        .replace("__EPOCH__", str(epoch)) \
+                       .replace("__DLSTYLE__", "" if can_download else "display:none") \
                        .replace("__CAN_EDIT__", "true" if can_edit else "false") \
                        .replace("__IS_ADMIN__", "true" if is_admin else "false") \
                        .replace("__MAP_TILES__", json.dumps(MAP_TILES)) \
@@ -8208,17 +8217,33 @@ async def index(request: Request) -> Response:
                 if track.endswith(".ndjson"):
                     track = track[:-7]
                 track = re.sub(r"^\d+_", "", track) or "?"
+                # user_h goes into ATTRIBUTES (data-user / data-file / data-best
+                # and the review URL), so it stays the bare slug; anything shown
+                # goes in user_cell. Appending markup here put the badge inside
+                # data-user="..." and broke the row's HTML.
                 user_h = html.escape(user_dir.name)
+                user_cell = user_h
                 if shared_with_me:
-                    user_h += (' <span class="pill good" title="shared with you by the '
-                               'owner \u2014 read-only">shared</span>')
+                    user_cell += (' <span class="pill good" title="shared with you by '
+                                  'the owner \u2014 read-only">shared</span>')
                 file_h = html.escape(f.name)
                 track_h = html.escape(track)
                 when_h = html.escape(when)
                 delete_btn = (
                     f'<button class="btn danger" data-delete="1" '
                     f'data-user="{user_h}" data-file="{file_h}">delete</button>'
-                    if dir_can_delete else ""
+                    if dir_can_delete and not shared_with_me else ""
+                )
+                # A session someone shared with you is read-only all the way
+                # down: no download, no delete, nothing to select.
+                download_btn = (
+                    "" if shared_with_me
+                    else f'<a class="btn" href="/sessions/{user_h}/{file_h}">download</a>'
+                )
+                pick_cell = (
+                    "" if shared_with_me
+                    else (f'<input type="checkbox" class="cmb" '
+                          f'data-user="{user_h}" data-file="{file_h}">')
                 )
                 cached = _lap_summary_cached(user_dir.name, f)
                 best_str = (f'<span title="{cached.get("laps", 0)} laps">'
@@ -8228,9 +8253,8 @@ async def index(request: Request) -> Response:
                 # value where the RENDERED text would sort wrong (a formatted date,
                 # "1.5 MB"). The client sorter reads these, not the text.
                 rows.append((epoch,
-                    f'<tr><td><input type="checkbox" class="cmb" '
-                    f'data-user="{user_h}" data-file="{file_h}"></td>'
-                    f'<td data-k="user">{user_h}</td>'
+                    f'<tr><td>{pick_cell}</td>'
+                    f'<td data-k="user">{user_cell}</td>'
                     f'<td class="mono" data-k="started" data-sort="{epoch}">{when_h}</td>'
                     f'<td data-k="track">{track_h}</td>'
                     f'<td class="num best" data-k="best" data-best="{user_h}/{file_h}">'
@@ -8239,8 +8263,7 @@ async def index(request: Request) -> Response:
                     f'<a href="/review/{user_h}/{file_h}">{file_h}</a></td>'
                     f'<td class="num" data-k="size" data-sort="{st.st_size}">{size_str}</td>'
                     f'<td><div class="actions">'
-                    f'<a class="btn" href="/sessions/{user_h}/{file_h}">download</a>'
-                    f'{delete_btn}'
+                    f'{download_btn}{delete_btn}'
                     f'</div></td></tr>'
                 ))
                 total += 1
@@ -15799,7 +15822,7 @@ _REVIEW_HTML = (
   <span class="pill" id="count">\u2026</span>
   <button id="edit-btn" class="btn" style="display:none;white-space:nowrap"
           title="the start date &amp; time, the track, and the owning driver — the filename IS that metadata, so everything that belongs to this session is renamed and moved with it">edit session…</button>
-  <a class="btn" href="/sessions/__USER__/__FILE__">download</a>
+  <a class="btn" href="/sessions/__USER__/__FILE__" style="__DLSTYLE__">download</a>
   <input id="yt-url" class="cmp-input" type="text" placeholder="YouTube link…"
          autocomplete="off" style="width:190px">
   <button id="yt-save" class="btn">link video</button>
