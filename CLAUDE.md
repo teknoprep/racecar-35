@@ -477,26 +477,33 @@ Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
   editing the session; a read-only grant cannot write it).
 - `GET /sessions/{u}/{f}/power` (view-gated): `set`, `weight_lb`, per-sample `t` (EPOCH seconds
   as logged), `whp`, `wtq`, `max`, `laps[]`. **With no weight set it returns no numbers at all.**
-- **The model is `server/app/power.py`** (pure, tested in `tests/test_power.py`). Per sample:
-  `P/m = v·(a + C(v) + g·grade)`; `a` = least-squares slope of GPS speed against TIME over ±0.25 s
-  (the RC3D.longG GPS path; NOT a sample-to-sample difference); `C(v) = g·(0.045+0.095·(mph/100)²)`
-  is the coast curve the throttle/coast classifier uses; `grade` = altitude slope over ±4 s,
-  clamped ±6 %, zero below 5 m/s. WHP = P·(lb·0.4536)/745.7 (WHEEL, no drivetrain loss).
-  WTQ = WHP·5252/rpm (rpm < 400 → none).
+- **The model is `server/app/power.py`** (pure, tested in `tests/test_power.py`), a ROAD-LOAD model
+  at the wheels: `P = m·v·(a + g·grade + g·CRR) + ½·RHO·CDA·v³`. `a` = least-squares slope of GPS
+  speed against TIME over ±0.25 s (the RC3D.longG GPS path; NOT a sample-to-sample difference);
+  grade = altitude slope over ±4 s, clamped ±6 %, zero below 5 m/s. Constants (typical values for a
+  small roadster, NOT measured on the car): `CRR` 0.012, `CDA` 0.60 m², `RHO` 1.20 kg/m³.
+  WHP = P/745.7 (WHEEL, no drivetrain loss). WTQ = WHP·5252/rpm (rpm < 400 → none).
+- **Do NOT use the throttle/coast classifier's coast curve as the drag term.** It is a COASTING
+  deceleration envelope that includes engine braking. Used as road load it overstated aero at speed
+  about 2×, which put a 124-hp car at ~150 WHP. This was the cause of the first "way off" report.
 - **Spike filter, four layers, in order:** (1) speed and altitude are median-of-5 BEFORE they are
-  differenced (a single bad GPS fix otherwise spreads through the regression and lifts the peak
-  ~17 %); (2) a sample with more than 1 g of FORWARD acceleration is dropped; (3) median-of-5 on the
-  power; (4) a 2 s time-window average, because an engine's peak is what it holds for seconds.
-- **Weight is applied LAST.** Power is linear in mass, so the lap summary caches per-kg peaks
-  (`wkg_max`, `tqkg_max`, `_LAP_RULES_V` 3) and the sessions list multiplies by each session's own
-  weight. Changing a weight never needs a re-scan.
+  differenced; (2) a sample with more than 1 g of FORWARD acceleration is dropped; (3) median-of-5 on
+  the power; (4) a 2 s time-window average (an engine's peak is what it holds for seconds).
+- **Calibration record (one dyno point, owner's car):** dyno max **123.8 HP / 122.5 lb-ft**. At
+  2420 lb (the test value, NOT the owner's measured weight) the road-load model gives peak **119**
+  (Thompson, 114 lb-ft), **126** (Summit Point Main) and **123** (Watkins Glen GP) on the real
+  sessions. No constant was tuned to the dyno. The owner's entered weight is the largest unknown
+  (WHP scales ~linearly with it), and the CRR/CDA/RHO assumptions are the next largest.
+- **Cache:** the lap summary stores `whp_max`, `wtq_max` and `whp_lb` (the weight it was computed
+  for). `_lap_summary_cached` treats a different weight as a MISS, so the list recomputes lazily and
+  never shows a stale number. `_LAP_RULES_V` is 4.
 - Shown in three places: the review page (weight row above the laps, est WHP/WTQ per lap, session
   peak in the card header), the 3D HUD (`est WHP`/`est WTQ` rows, now · max, and the ghost's speed in
   red beside yours), and the sessions list (`est WHP` column, filled from `/laps/summary`).
-- **Uncalibrated.** Nothing here is checked against a dyno. Real sessions read ~150–165 WHP peak at
-  2420 lb (Thompson, Summit Point Main, Watkins Glen). The Watkins/Summit "Nowhere Test" synthetic runs
-  in the local harness hold a constant ~0.4 g pull and read ~495 hp; that is the data, not the model.
-  Do not trust the numbers on the synthetic runs. Expect ±15–20 % from the drag and grade model.
+- **Uncalibrated beyond that one point.** Expect roughly ±10–15 % from the constants and the weight.
+  The local synthetic runs (`Watkins-Glen-Grand-Prix`, `Summit-Point`, `Nowhere-Test` under
+  `dev/`/`dev_example.com/`) hold a constant ~0.4 g pull that no car can do, so their numbers
+  (~430 hp) are the data, not the model. Do not use them to judge the model.
 
 ### Session metadata: ONE edit popup (date & time / track / driver)
 A session's static metadata IS its filename: `<sid>_<track>[-combined].ndjson` inside

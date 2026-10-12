@@ -5974,13 +5974,23 @@ def _apply_lap_meta(payload: dict, user: str, session_name: str) -> dict:
 # /laps/summary, which computes a few at a time off the event loop.
 # ---------------------------------------------------------------------------
 LAPCACHE_DIR = DATA_DIR / "lapcache"
-_LAP_RULES_V = 3                     # bump when lap detection/exclusion rules change
+_LAP_RULES_V = 4                     # bump when lap detection/exclusion rules change
 _LAP_SUMMARY_MEM: dict = {}          # (name, mtime, size) -> summary
 _LAP_SUMMARY_LOCK = threading.Lock()
 _LAP_SUMMARY_MAX_PER_CALL = 4        # uncached files one /laps/summary may do
 
 
 def _lap_summary_cached(user: str, p: pathlib.Path) -> Optional[dict]:
+    """Cached summary, but ONLY while it was computed for this session's current car
+    weight. A changed weight is a cache miss, so the list recomputes it lazily and
+    never shows a stale number."""
+    hit = _lap_summary_cached_raw(user, p)
+    if hit is None or hit.get("whp_lb", 0) != _weight_lb_of(user, p.name):
+        return None
+    return hit
+
+
+def _lap_summary_cached_raw(user: str, p: pathlib.Path) -> Optional[dict]:
     """Cached summary if (mtime, size) still match, else None."""
     try:
         st = p.stat()
@@ -6046,22 +6056,23 @@ def _power_mod():
         return importlib.import_module("power")
 
 
-def _power_series(samples: list) -> dict:
-    """Est wheel power per kg for every sample (server/app/power.py)."""
+def _power_series(samples: list, weight_lb: float) -> dict:
+    """Est WHEEL power and torque for every sample at this car weight (server/app/power.py)."""
     rel, _basis = _relative_seconds(samples)
-    return _power_mod().per_kg_series(
+    return _power_mod().wheel_series(
         rel,
         [_num_or_none(s.get("speed_mph")) for s in samples],
         [_num_or_none(s.get("alt_m")) for s in samples],
-        [_num_or_none(s.get("rpm")) for s in samples])
+        [_num_or_none(s.get("rpm")) for s in samples],
+        weight_lb)
 
 
-def _session_power_maxima(samples: list, laps: list) -> tuple:
-    """Peak est WHP-per-kg and WTQ-per-kg over the INCLUDED laps. No laps = no answer
-    (a whole-file peak would count the out-lap and pit-lane junk)."""
-    if not laps:
+def _session_power_maxima(samples: list, laps: list, weight_lb: float) -> tuple:
+    """Peak est WHP and WTQ over the INCLUDED laps. No laps (or no weight) = no answer:
+    a whole-file peak would count the out-lap and pit-lane junk."""
+    if not laps or not weight_lb:
         return None, None
-    return _power_mod().session_maxima(_power_series(samples), laps)
+    return _power_mod().session_maxima(_power_series(samples, weight_lb), laps)
 
 
 def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
@@ -6087,11 +6098,13 @@ def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
         summary.update(best_s=secs, best_lap=best, laps=len(laps),
                        excluded=len(payload.get("excluded_laps") or []),
                        source=payload.get("source"))
-        # est wheel power per KG (weight-free: the session's car weight scales it
-        # at display time, so changing the weight never needs a re-scan)
-        wmax, qmax = _session_power_maxima(samples, laps)
-        summary.update(wkg_max=None if wmax is None else round(wmax, 4),
-                       tqkg_max=None if qmax is None else round(qmax, 5))
+        # est wheel power for THIS session's car weight. whp_lb records which weight
+        # it was computed for, so a changed weight is recomputed, never shown stale.
+        weight = _weight_lb_of(user, p.name)
+        wmax, qmax = _session_power_maxima(samples, laps, weight)
+        summary.update(whp_lb=weight,
+                       whp_max=None if wmax is None else round(wmax, 1),
+                       wtq_max=None if qmax is None else round(qmax, 1))
     except Exception as e:
         summary["error"] = str(e)[:200]
     cp = LAPCACHE_DIR / safe_name(user) / (p.name + ".json")
@@ -6150,10 +6163,6 @@ async def laps_summary(request: Request, files: str = Query("")):
             *[loop.run_in_executor(None, _lap_summary, u, p) for _, u, p in pending])
         for (key, _, _), res in zip(pending, results):
             out[key] = res
-    for key in list(out):
-        if isinstance(out[key], dict):
-            uu, _, ff = key.partition("/")
-            out[key] = dict(out[key], weight_lb=_weight_lb_of(uu, ff))
     return JSONResponse({"ok": True, "laps": out})
 
 
@@ -7155,26 +7164,21 @@ def get_session_power(request: Request, user: str, filename: str) -> JSONRespons
     samples = _load_samples(p)
     laps = (_apply_lap_meta(_detect_laps(samples), user, p.name).get("laps") or [])
     pw = _power_mod()
-    series = _power_series(samples)
     w = _weight_lb_of(user, p.name)
-    rows = pw.lap_maxima(series, laps)
     out = {"set": w > 0, "weight_lb": w, "estimate": "wheel power, no drivetrain loss",
-           "laps": [{"lap": r["lap"]} for r in rows]}
+           "laps": [{"lap": lp["lap"]} for lp in laps]}
     if w > 0:
-        ser = pw.apply_weight(series, w)
+        series = _power_series(samples, w)
         first_abs = next((_num_or_none(x.get("t")) for x in samples
                           if _num_or_none(x.get("t")) is not None), 0.0)
-        out["t"] = [round(float(x) + first_abs, 2) for x in ser["t"]]   # epoch s, as logged
-        out["whp"] = [round(float(x), 1) for x in ser["whp"]]
-        out["wtq"] = [round(float(x), 1) for x in ser["wtq"]]
-        smax, qmax = _session_power_maxima(samples, laps)
-        sw, sq = pw.scale(smax, qmax, w)
-        out["max"] = {"whp": pw.round_or_none(sw), "wtq": pw.round_or_none(sq)}
-        out["laps"] = []
-        for r in rows:
-            lw, lq = pw.scale(r["wkg"], r["tqkg"], w)
-            out["laps"].append({"lap": r["lap"], "whp": pw.round_or_none(lw),
-                                "wtq": pw.round_or_none(lq)})
+        out["t"] = [round(float(x) + first_abs, 2) for x in series["t"]]   # epoch s, as logged
+        out["whp"] = [round(float(x), 1) for x in series["whp"]]
+        out["wtq"] = [round(float(x), 1) for x in series["wtq"]]
+        smax, qmax = _session_power_maxima(samples, laps, w)
+        out["max"] = {"whp": pw.round_or_none(smax), "wtq": pw.round_or_none(qmax)}
+        out["laps"] = [{"lap": r["lap"], "whp": pw.round_or_none(r["whp"]),
+                        "wtq": pw.round_or_none(r["wtq"])}
+                       for r in pw.lap_maxima(series, laps)]
     return JSONResponse(out)
 
 
@@ -8243,8 +8247,8 @@ _ACCOUNT_HTML = (
             var wc = Array.prototype.filter.call(document.querySelectorAll('[data-whp]'),
                        function(x){ return x.dataset.whp === k; })[0];
             if (wc) {                       // every cell resolves: a number, or an honest dash
-              if (d.weight_lb && d.wkg_max != null) {
-                var kg = d.weight_lb * 0.45359237, h = Math.round(d.wkg_max * kg / 745.69987);
+              if (d.whp_max != null) {
+                var h = Math.round(d.whp_max);
                 wc.textContent = h; wc.dataset.sort = h;
               } else { wc.textContent = '\u2014'; wc.dataset.sort = ''; }
             }
@@ -8820,12 +8824,10 @@ async def index(request: Request) -> Response:
                           f'data-user="{user_h}" data-file="{file_h}">')
                 )
                 cached = _lap_summary_cached(user_dir.name, f)
-                # est WHP = cached per-kg peak x THIS session's weight (blank = unknown)
-                w_lb = _weight_lb_of(user_dir.name, f.name)
+                # est WHP = the cached session peak, computed for THIS session's weight
                 whp_v = None
-                if cached and cached.get("wkg_max") is not None and w_lb:
-                    whp_v = _power_mod().scale(cached["wkg_max"], None, w_lb)[0]
-                    whp_v = None if whp_v is None else round(whp_v)
+                if cached and cached.get("whp_max") is not None:
+                    whp_v = round(cached["whp_max"])
                 if cached is None:
                     whp_h, whp_sort = "\u2026", ""
                 elif whp_v is None:

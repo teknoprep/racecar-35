@@ -1,41 +1,45 @@
 """Estimated WHEEL power and torque for one session.
 
-These are wheel figures ("est WHP" / "est WTQ"). No drivetrain loss is taken off,
-because the car's engine and drivetrain are not measured here.
+These are wheel figures ("est WHP" / "est WTQ"). No drivetrain loss is taken off.
 
-Per sample, the power at the road per kilogram is
+Power at the wheels is what the car's ENGINE must deliver through the drivetrain
+to hold the logged motion. The road-load model is
 
-    P/m = v * (a + C(v) + g * grade)
+    P = m * v * (a + g * grade + g * CRR) + 0.5 * RHO * CDA * v^3
 
+  m      car weight with driver, in kg (from the session's car weight, lb)
   v      GPS speed in m/s (the logged speed_mph; null = 0)
-  a      longitudinal acceleration: a least-squares slope of speed against TIME
-         over +/-0.25 s. This is the same GPS-only path as RC3D.longG in the 3D
-         view. Differencing the raw speed sample to sample is what produced
-         565 hp on a 2420 lb car, so it is not used.
-  C(v)   the coast curve the throttle/coast classifier already uses,
-         g * (0.045 + 0.095 * (mph/100)^2): rolling, aero and engine braking.
-  grade  d(altitude)/d(distance). The altitude slope is taken over +/-4 s and
-         clamped to +/-6 %, and is zero below 5 m/s, where GPS altitude is noise.
+  a      longitudinal acceleration: a least-squares slope of speed against TIME over
+         +/-0.25 s, the same GPS-only path as RC3D.longG in the 3D view. Differencing
+         the raw speed sample to sample is what produced the wild early numbers.
+  grade  d(altitude)/d(distance). The altitude slope is taken over +/-4 s and clamped
+         to +/-6 %, and is zero below 5 m/s, where GPS altitude is noise.
+  CRR    rolling resistance coefficient (street tyres on asphalt)
+  CDA    drag area, Cd x frontal area, m^2
+  RHO    air density, kg/m^3
+
+The three constants are TYPICAL VALUES for a small roadster, not measured on the car.
+They are the largest source of error and are kept here so that they can be measured
+later. A previous version used the throttle/coast classifier's coasting-deceleration
+curve instead. That curve includes engine braking, so it overstated the aero load at
+speed by roughly 2x and gave about 150 WHP on a car that dynos at 124.
 
 Spike filter, four layers, in this order:
-  1. the INPUT is despiked: speed and altitude get a median of 5 before anything is
-     differenced. A single bad GPS fix is replaced by its neighbours' median, so it
-     cannot leak into the acceleration regression (which spreads one outlier over
-     about seven samples and would otherwise lift the peak by ~17 %).
-  2. a sample whose acceleration is still more than 1 g FORWARD is dropped (set to
-     0). Braking (negative power) is also 0.
-  3. a median of 5 on the power itself, so outliers are ignored, not averaged in.
-  4. a 2 s time-window average. An engine's peak is what it holds for seconds.
+  1. speed and altitude are median-of-5 BEFORE they are differenced. A single bad GPS
+     fix would otherwise spread through the acceleration regression and lift the peak.
+  2. a sample whose acceleration is more than 1 g FORWARD is dropped (set to 0).
+     Braking (negative power) is also 0.
+  3. a median of 5 on the power itself: outliers are ignored, not averaged in.
+  4. a 2 s time-window average, because an engine's peak is what it holds for seconds.
 
 Torque: lb-ft = HP * 5252 / rpm. Below 400 rpm there is no torque figure.
 
-Car weight is applied LAST. Power is linear in mass, so one per-kg series serves the
-review page, the 3D view and the sessions list. Nothing here is calibrated against
-a dyno; the numbers are estimates.
+The model is computed for the session's own weight (no weight, no numbers), so the
+per-lap and session peaks are all for one set of assumptions. Nothing here is checked
+against a dyno except the single point recorded in CLAUDE.md.
 """
 from __future__ import annotations
 
-import math
 from typing import Iterable, Optional
 
 import numpy as np
@@ -46,6 +50,11 @@ HP_W = 745.69987
 MPH_MS = 0.44704
 TQ_CONST = 5252.0
 RPM_MIN = 400.0
+
+CRR = 0.012          # rolling resistance (street tyres, asphalt)
+CDA = 0.60           # m^2: Cd ~0.36 x frontal ~1.65 m^2 for a Miata-class car
+RHO = 1.20           # kg/m^3, sea level, about 20 C
+
 ACCEL_HALF_S = 0.25          # longG's window
 GRADE_HALF_S = 4.0
 GRADE_MAX = 0.06
@@ -118,23 +127,32 @@ def _fill_nan(a: np.ndarray) -> np.ndarray:
     return np.interp(idx, idx[good], a[good])
 
 
-def per_kg_series(t: Iterable, mph: Iterable, alt: Iterable, rpm: Iterable) -> dict:
-    """Estimated power (W/kg, at the wheels) and torque (lb-ft per kg) per sample.
+def _as_float_array(values: Iterable, fill: float) -> np.ndarray:
+    arr = [float(x) if (x is not None and not isinstance(x, bool)
+                        and isinstance(x, (int, float))
+                        and np.isfinite(float(x))) else np.nan for x in values]
+    out = np.asarray(arr, dtype=float)
+    return np.where(np.isfinite(out), out, fill)
 
-    t    seconds from the session start (server _relative_seconds, monotonic)
-    mph  speed; None / NaN = 0 (no GPS)
-    alt  altitude in metres; None = unknown (grade 0)
-    rpm  engine speed; None / < 400 = no torque figure
+
+def wheel_series(t: Iterable, mph: Iterable, alt: Iterable, rpm: Iterable,
+                 weight_lb: float) -> dict:
+    """Estimated WHEEL power (hp) and torque (lb-ft) per sample for one car weight.
+
+    t          seconds (epoch or relative; only differences matter), monotonic
+    mph        speed; None / NaN = 0 (no GPS)
+    alt        altitude in metres; None = unknown (grade 0)
+    rpm        engine speed; None / < 400 = no torque figure
+    weight_lb  car weight with driver, lb
     """
     t = np.asarray(list(t), dtype=float)
     n = len(t)
-    if n == 0:
-        return {"t": t, "wkg": t.copy(), "tqkg": t.copy()}
-    mph_a = np.asarray([float(x) if x is not None else np.nan for x in mph], dtype=float)
-    mph_a = np.where(np.isfinite(mph_a), mph_a, 0.0)
-    alt_a = np.asarray([float(x) if x is not None else np.nan for x in alt], dtype=float)
-    rpm_a = np.asarray([float(x) if x is not None else np.nan for x in rpm], dtype=float)
-    rpm_a = np.where(np.isfinite(rpm_a), rpm_a, 0.0)
+    if n == 0 or weight_lb is None or float(weight_lb) <= 0:
+        nan = np.full(n, np.nan)              # no weight = no numbers, never a guess
+        return {"t": t, "whp": nan, "wtq": nan.copy()}
+    mph_a = _as_float_array(mph, 0.0)
+    alt_a = _as_float_array(alt, np.nan)
+    rpm_a = _as_float_array(rpm, 0.0)
 
     mph_a = _median5(mph_a)                                      # layer 1: despike input
     v = mph_a * MPH_MS
@@ -144,25 +162,17 @@ def per_kg_series(t: Iterable, mph: Iterable, alt: Iterable, rpm: Iterable) -> d
     with np.errstate(divide="ignore", invalid="ignore"):
         grade = np.where(v >= GRADE_MIN_MS, dh / np.maximum(v, 1e-9), 0.0)
     grade = np.clip(np.nan_to_num(grade), -GRADE_MAX, GRADE_MAX)
-    c = G * (0.045 + 0.095 * (mph_a / 100.0) ** 2)               # coast curve, m/s^2
 
-    x = (a + c + G * grade) * v                                  # W/kg
-    x = np.where(a > GLITCH_G * G, 0.0, x)                       # layer 2: glitch
-    x = np.maximum(x, 0.0)                                       # braking is not power
-    x = _median5(x)                                              # layer 3: median
-    wkg = _window_mean(t, x, PEAK_HALF_S)                        # layer 4: 2 s mean
+    m = float(weight_lb) * LB_KG
+    p = m * v * (a + G * grade + G * CRR) + 0.5 * RHO * CDA * v ** 3   # W at the wheels
+    p = np.where(a > GLITCH_G * G, 0.0, p)                       # layer 2: glitch
+    p = np.maximum(p, 0.0)                                       # braking is not power
+    p = _median5(p)                                              # layer 3: median
+    whp = _window_mean(t, p, PEAK_HALF_S) / HP_W                 # layer 4: 2 s mean
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        tqkg = np.where(rpm_a >= RPM_MIN, wkg / HP_W * TQ_CONST / rpm_a, 0.0)
-    return {"t": t, "wkg": wkg, "tqkg": np.nan_to_num(tqkg)}
-
-
-def apply_weight(series: dict, weight_lb: float) -> dict:
-    """Scale the per-kg series to a car: est WHP and est WTQ (lb-ft) per sample."""
-    kg = float(weight_lb) * LB_KG
-    return {"t": series["t"],
-            "whp": series["wkg"] * kg / HP_W,
-            "wtq": series["tqkg"] * kg}
+        wtq = np.where(rpm_a >= RPM_MIN, whp * TQ_CONST / rpm_a, 0.0)
+    return {"t": t, "whp": whp, "wtq": np.nan_to_num(wtq)}
 
 
 def _maxima(series: dict, lo: float, hi: float):
@@ -170,28 +180,27 @@ def _maxima(series: dict, lo: float, hi: float):
     m = (t >= lo) & (t <= hi)
     if not m.any():
         return None, None
-    return float(series["wkg"][m].max()), float(series["tqkg"][m].max())
+    return float(series["whp"][m].max()), float(series["wtq"][m].max())
 
 
 def lap_maxima(series: dict, laps: list) -> list:
-    """Peak per-kg power and torque inside each lap window.
+    """Peak WHP and WTQ inside each lap window.
 
     laps: [{"lap": n, "t_start": s, "t_end": s}] (the server's _detect_laps shape).
-    Returns [{"lap", "wkg", "tqkg"}] (None where a lap has no samples).
+    Returns [{"lap", "whp", "wtq"}] (None where a lap has no samples).
     """
     out = []
     for lp in laps:
         w, q = _maxima(series, float(lp["t_start"]), float(lp["t_end"]))
-        out.append({"lap": lp["lap"], "wkg": w, "tqkg": q})
+        out.append({"lap": lp["lap"], "whp": w, "wtq": q})
     return out
 
 
 def session_maxima(series: dict, laps: Optional[list]) -> tuple:
-    """Session peak per kg over the given lap windows (whole session if none)."""
+    """Session peak WHP and WTQ over the given lap windows. No laps = no answer
+    (a whole-file peak would count the out-lap and pit-lane junk)."""
     if not laps:
-        if len(series["t"]) == 0:
-            return None, None
-        return float(series["wkg"].max()), float(series["tqkg"].max())
+        return None, None
     ws = [_maxima(series, float(lp["t_start"]), float(lp["t_end"])) for lp in laps]
     ws = [w for w in ws if w[0] is not None]
     if not ws:
@@ -200,13 +209,6 @@ def session_maxima(series: dict, laps: Optional[list]) -> tuple:
 
 
 def round_or_none(x, nd: int = 0):
-    if x is None or not math.isfinite(x):
+    if x is None or not np.isfinite(x):
         return None
     return round(float(x), nd)
-
-
-def scale(wkg, tqkg, weight_lb: float):
-    """(est WHP, est WTQ) for one per-kg peak pair and a car weight in lb."""
-    kg = float(weight_lb) * LB_KG
-    return (None if wkg is None else wkg * kg / HP_W,
-            None if tqkg is None else tqkg * kg)
