@@ -17,7 +17,7 @@ Revision F · four-layer · 150.05 × 155.05 mm · 193 placements · 104 nets.
 | File | What it is |
 |---|---|
 | `Racecar-RevF-PCBWAY-GERBERS.zip` | **This is the file you upload for the bare board.** 16 files: 4 copper layers, both masks, both silkscreens, both pastes, `Edge.Cuts`, separate **PTH** and **NPTH** Excellon drills with maps, and the `.gbrjob`. |
-| `Racecar-RevF-BOM-pcbway-assembly.csv` | Turnkey-assembly BOM in PCBWay's column layout, with the "fit this, not that" instructions in the Comment column. |
+| `Racecar-RevF-BOM-pcbway-assembly.csv` | Turnkey-assembly BOM in PCBWay's column layout, with the "fit this, not that" instructions in the Comment column. **PCB features are not listed** (H1–H4 are NPTH mounting holes, TP1–TP7 are bare-copper test pads): nothing to buy, nothing to place, so the BOM designators match the CPL **1:1** and part matching cannot stall on a designator that has no placement (the 2026-10-08 JLCPCB query). |
 | `Racecar-RevF-CPL.csv` | Pick-and-place, origin at the board lower-left, Y positive up, 182 rows (mounting holes and test pads are deliberately absent — nothing to place). |
 | `REVF-CHANGES-AND-ORDER.md` | What changed since Rev D/E and why (the CAN fix, the 5 V rail, the input monitor). |
 | `make_package.py` | Regenerates the three files above from `components.json` + the routed PCB. |

@@ -99,7 +99,9 @@ D21, D22, C40 — all ordinary parts.
   with maps, and the job file. Board is **150.05 × 155.05 mm**, 4 layer, 1.6 mm, **1 oz outer**,
   ENIG, impedance control ON (50 Ω single-ended GNSS feed), green mask, white silk,
   **no panelisation** (connectors and a battery holder sit on the edges).
-* `Racecar-RevF-BOM-pcbway-assembly.csv` — grouped BOM with designators.
+* `Racecar-RevF-BOM-pcbway-assembly.csv` — grouped BOM with designators. PCB features
+  (H1–H4, TP1–TP7) are **not** listed — there is no part and no placement, so the BOM
+  designators correspond to the CPL **1:1** (182 each).
 * `Racecar-RevF-CPL.csv` — placement positions (Top layer, millimetres, Y already flipped to
   PCBWay's convention).
 * `PCBWAY-ORDER-GUIDE.md` — **read this before quoting**: board settings, the fit/no-fit

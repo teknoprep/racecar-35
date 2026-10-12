@@ -65,13 +65,16 @@ FIXUPS = {
     'SS56': ('SMB (DO-214AA) 5 A / 60 V Schottky ONLY - e.g. LCSC C2687867 (BORN SS56 SMB) or '
              'Diotec SK56. Do NOT fit the DO-214AC (SMA) SS56: it does not fit this land pattern.',
              None, None),
-    # PCB FEATURES, NOT PARTS - there is nothing to buy or place.
-    'M3 insulated hardware': ('NO PART - do not source and do not place. H1-H4 are 3.2mm non-plated '
-                              'mounting holes in the PCB; the M3 hardware is customer-fitted.',
-                              'N/A', 'N/A'),
-    'PCB test pad': ('NO PART - do not source and do not place. TP1-TP7 are 2.0mm plated through-hole '
-                     'pads (bare copper) in the PCB.', 'N/A', 'N/A'),
 }
+
+# PCB FEATURES, NOT PARTS - the M3 mounting holes (H1-H4, non-plated) and the test pads
+# (TP1-TP7, bare copper). There is nothing to buy or place, and they must not appear in
+# the assembly BOM at all: assemblers match BOM designators against the CPL, and a BOM
+# designator that has no placement STALLS their part matching (JLCPCB, 2026-10-08: the
+# H1-H4/TP1-TP7 rows were the only BOM-vs-CPL mismatch in Rev F). Drop the rows, leave
+# the CPL alone - the pads are in the Gerbers where they belong.
+NOT_PARTS = {'M3 insulated hardware', 'PCB test pad'}
+
 for r in rows:
     if r['mpn'] in FIXUPS:
         c, mpn, maker = FIXUPS[r['mpn']]
@@ -85,8 +88,14 @@ with bom.open('w', newline='') as f:
     w = csv.writer(f)
     w.writerow(['No.', 'Quantity', 'Comment', 'Designator', 'Footprint',
                 'Manufacturer Part Number', 'Manufacturer', 'Supplier Part Number'])
-    for i, r in enumerate(rows, 1):
-        w.writerow([i, len(r['refs']), r['comment'], ' '.join(r['refs']),
+    written = 0
+    bom_refs = []
+    for r in rows:
+        if r['mpn'] in NOT_PARTS:
+            continue
+        written += 1
+        bom_refs += r['refs']
+        w.writerow([written, len(r['refs']), r['comment'], ' '.join(r['refs']),
                     r['fp'], r['mpn'], r['maker'], ''])
 
 # --- pick-and-place; PCBWay wants origin at the board lower-left, Y positive up -
@@ -95,12 +104,24 @@ subprocess.run(['kicad-cli', 'pcb', 'export', 'pos', '--format', 'csv', '--units
                 '--side', 'both', '-o', str(tmp / 'pos.csv'), str(PCB)],
                check=True, stdout=subprocess.DEVNULL)
 cpl = OUT / f'Racecar-{REV}-CPL.csv'
+cpl_refs = []
 with (tmp / 'pos.csv').open() as src, cpl.open('w', newline='') as dst:
     w = csv.writer(dst)
     w.writerow(['Designator', 'Mid X', 'Mid Y', 'Layer', 'Rotation'])
     for row in csv.DictReader(src):
+        cpl_refs.append(row['Ref'])
         w.writerow([row['Ref'], f"{float(row['PosX']):.4f}", f"{-float(row['PosY']):.4f}",
                     row['Side'].capitalize(), str(float(row['Rot']))])
+
+# --- HARD GUARD: the BOM and the CPL must list the SAME designators. Assemblers run a
+#     BOM-vs-CPL correspondence check, and a BOM designator with no placement stalls their
+#     part matching (JLCPCB query, 2026-10-08: H1-H4/TP1-TP7 were in the BOM only). This
+#     check fails hard - printing and continuing is how the bad package shipped last time.
+if sorted(bom_refs) != sorted(cpl_refs):
+    raise SystemExit(
+        f"ABORT: BOM and CPL designators differ - "
+        f"BOM-only {sorted(set(bom_refs) - set(cpl_refs))}, "
+        f"CPL-only {sorted(set(cpl_refs) - set(bom_refs))}")
 
 # --- gerber-only ZIP (copper, mask, silk, paste, outline, PTH + NPTH drills) ---
 gz = tmp / 'gerbers'
@@ -121,4 +142,4 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
             z.write(p, p.name)
 
 print(f'Wrote {bom.name}, {cpl.name}, {zip_path.name} '
-      f'({len(rows)} BOM lines, {len(parts)} placements, {len(list(gz.iterdir()))} gerber/drill files)')
+      f'({written} BOM lines, {len(cpl_refs)} placements, {len(list(gz.iterdir()))} gerber/drill files)')
