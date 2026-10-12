@@ -994,14 +994,31 @@ upload response is never delayed) that distils the session into **1-3 short acti
   ±0.05/1/10 s, **SYNC @ LAUNCH** (scrub video to the car launching, click — offset pinned
   to the data's first sustained >15 mph), SAVE persists. HUD ticks 20 Hz off
   `player.getCurrentTime()` + binary-search sample lookup.
-- **Public share links** (`/shared/<token>`): review-page **share** button (visible once a
-  video is linked) mints an opaque token (`/data/shares/<token>.json` → {user, filename});
-  `GET /shared/<token>` serves the overlay **read-only** (`__RO__=1` hides all sync/save UI)
-  and `/shared/<token>/{data,laps,video}` feed it with **no auth**. Read-only is structural:
-  everything under /shared is GET-only and all mutating endpoints stay behind owner-or-admin
-  auth. Create/read/revoke of the token itself = owner-or-admin (`gate_delete_dir`); revoke
-  kills the link instantly (404). Data/laps logic shared with the authed routes via
-  `_session_data_payload()`/`_laps_payload()`.
+- **Public share links** (`/shared/<token>`): an opaque token in `/data/shares/<token>.json` opens
+  a session to someone with **no account**. `kind` is `session` (the default, and what every token
+  written before whole-user shares existed means — never break that) or `user`.
+  - **session**: the review page's **share** button (owner-or-admin) opens a popup with the link,
+    copy and revoke. It used to be hidden unless a video was linked; the share is of the SESSION,
+    so it is offered either way.
+  - **user** (admin only): the admin portal's per-account **share** button → a link that LISTS
+    every session that account has (`_shared_list_html`, best lap filled lazily from
+    `/shared/<token>/laps-summary`). The public list deliberately shows no email.
+  - `/shared/<token>` = the viewer/list; `/shared/<token>/s/<file>` = one file inside a user
+    share (whose API base becomes `/shared/<token>/s/<file>`, so the viewer's relative fetches
+    need no special casing). `{data,laps,video}` exist at both depths.
+  - **Isolation is the contract**: `_shared_session()` resolves every request through
+    `_resolve_session`, so a session token reaches exactly its own file, a user token reaches
+    only that driver's directory (another driver's file and any crafted `../` name 404), and
+    nothing under /shared is anything but a GET. Create/revoke a session link = owner-or-admin
+    (`gate_delete_dir`); user links and `POST /admin/shares/revoke {token}` = `require_admin`.
+    The admin portal's **shared links** panel lists every live token (kind / who / when / by) with
+    copy and revoke — an audit view, not just a create button.
+  - **No video is a normal case**: the overlay's HUD/map/laps/playback run on their own clock
+    (`noVideo`, `#seek` scrub, `#stage.novideo` puts the circuit where the video would be), so a
+    shared session is watchable without one. Video-specific controls (sync nudges, offset, SAVE,
+    launch) hide themselves; with a video linked the viewer is the original overlay (`__RO__=1`).
+  - Tests: `tests/test_shares.py` (token back-compat, per-token isolation incl. traversal, admin-
+    only user shares, idempotent create/revoke, the list page's escaping).
 - **Delete is owner-only however you authenticate** (security fix): per-user API keys now
   pass `can_delete_dir(key_owner, dir)` — a viewer's own key can no longer delete other
   users' sessions. Firmware/master key stays exempt (dash deletes its own uploads).

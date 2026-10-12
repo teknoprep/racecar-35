@@ -6613,28 +6613,111 @@ async def overlay(request: Request, user: str, filename: str) -> Response:
 # link can only ever LOOK at this one session. Revoking deletes the token and
 # kills the link immediately.
 # ---------------------------------------------------------------------------
-def _share_lookup(token: str) -> tuple[str, str]:
-    tp = SHARE_DIR / (safe_name(token, maxlen=64) + ".json")
+def _share_path(token: str) -> pathlib.Path:
+    return SHARE_DIR / (safe_name(token, maxlen=64) + ".json")
+
+
+def _share_bad() -> HTTPException:
+    return HTTPException(status_code=404, detail="unknown or revoked share link")
+
+
+def _share_meta(token: str) -> dict:
+    """A token's record, or 404. `kind` defaults to "session": tokens minted
+    before whole-user shares existed have no field and mean this one session."""
+    tp = _share_path(token)
     if not tp.exists():
-        raise HTTPException(status_code=404, detail="unknown or revoked share link")
+        raise _share_bad()
     try:
         meta = json.loads(tp.read_text("utf-8"))
-        return str(meta["user"]), str(meta["filename"])
+        user = str(meta.get("user") or "")
     except Exception:
-        raise HTTPException(status_code=404, detail="unknown or revoked share link")
+        raise _share_bad()
+    if not user:
+        raise _share_bad()
+    kind = str(meta.get("kind") or "session")
+    if kind not in ("session", "user"):
+        raise _share_bad()
+    if kind == "session" and not meta.get("filename"):
+        raise _share_bad()
+    meta["user"] = user
+    meta["kind"] = kind
+    return meta
+
+
+def _shared_session(meta: dict, filename: Optional[str] = None) -> tuple:
+    """(user slug, filename) a token may open. A session token opens exactly its
+    own file; a user token opens any of that user's sessions (and nothing else —
+    the filename still goes through _resolve_session, so no other account and no
+    path traversal)."""
+    user = safe_name(meta["user"])
+    if meta["kind"] == "session":
+        if filename and filename != meta["filename"]:
+            raise _share_bad()
+        return user, meta["filename"]
+    if not filename:
+        raise _share_bad()
+    p = _resolve_session(user, filename)
+    return user, p.name
 
 
 def _share_token_for(user: str, filename: str) -> Optional[str]:
-    if not SHARE_DIR.exists():
-        return None
-    for f in SHARE_DIR.glob("*.json"):
+    for f in (SHARE_DIR.glob("*.json") if SHARE_DIR.exists() else []):
         try:
             meta = json.loads(f.read_text("utf-8"))
         except Exception:
             continue
-        if meta.get("user") == user and meta.get("filename") == filename:
+        if (meta.get("user") == user and meta.get("filename") == filename
+                and str(meta.get("kind") or "session") == "session"):
             return f.stem
     return None
+
+
+def _share_user_token_for(user: str) -> Optional[str]:
+    for f in (SHARE_DIR.glob("*.json") if SHARE_DIR.exists() else []):
+        try:
+            meta = json.loads(f.read_text("utf-8"))
+        except Exception:
+            continue
+        if meta.get("kind") == "user" and meta.get("user") == user:
+            return f.stem
+    return None
+
+
+def _share_create(kind: str, user: str, by: str, filename: str = "",
+                  email: str = "") -> str:
+    """Mint (idempotently) a public view-only token for a session or a user."""
+    u = safe_name(user)
+    tok = (_share_token_for(u, filename) if kind == "session"
+           else _share_user_token_for(u))
+    if tok:
+        return tok
+    SHARE_DIR.mkdir(parents=True, exist_ok=True)
+    tok = secrets.token_urlsafe(16)
+    rec = {"kind": kind, "user": u, "created": int(time.time()), "by": by}
+    if kind == "session":
+        rec["filename"] = filename
+    if email:
+        rec["email"] = email
+    _share_path(tok).write_text(json.dumps(rec), "utf-8")
+    log.info("share created (%s) %s/%s -> %s", kind, u, filename or "*", tok)
+    return tok
+
+
+def _shares_all() -> list:
+    """Every live share token, newest first (the admin portal's audit list)."""
+    out = []
+    for f in (SHARE_DIR.glob("*.json") if SHARE_DIR.exists() else []):
+        try:
+            meta = json.loads(f.read_text("utf-8"))
+        except Exception:
+            continue
+        if not meta.get("user"):
+            continue
+        meta["kind"] = str(meta.get("kind") or "session")
+        meta["token"] = f.stem
+        meta["url"] = f"/shared/{f.stem}"
+        out.append(meta)
+    return sorted(out, key=lambda m: int(m.get("created") or 0), reverse=True)
 
 
 @app.get("/sessions/{user}/{filename}/share")
@@ -6649,20 +6732,13 @@ async def get_share(request: Request, user: str, filename: str) -> JSONResponse:
 
 @app.post("/sessions/{user}/{filename}/share")
 async def create_share(request: Request, user: str, filename: str) -> JSONResponse:
-    """Create (idempotent) a public view-only overlay link. Owner-or-admin."""
+    """Create (idempotent) a PUBLIC read-only link to this one session.
+    Works with or without a linked video. Owner-or-admin."""
     require_web_user(request)
     gate_delete_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
-    u = safe_name(user)
-    tok = _share_token_for(u, p.name)
-    if not tok:
-        tok = secrets.token_urlsafe(16)
-        SHARE_DIR.mkdir(parents=True, exist_ok=True)
-        (SHARE_DIR / (tok + ".json")).write_text(json.dumps({
-            "user": u, "filename": p.name, "created": int(time.time()),
-            "by": str((current_user(request) or {}).get("email", "")),
-        }), "utf-8")
-        log.info("share created %s/%s -> %s", u, p.name, tok)
+    tok = _share_create("session", safe_name(user),
+                        str((current_user(request) or {}).get("email", "")), p.name)
     return JSONResponse({"token": tok, "url": f"/shared/{tok}"})
 
 
@@ -6675,23 +6751,138 @@ async def revoke_share(request: Request, user: str, filename: str) -> JSONRespon
     n = 0
     tok = _share_token_for(u, p.name)
     while tok:   # defensive: clear duplicates too
-        (SHARE_DIR / (tok + ".json")).unlink(missing_ok=True)
+        _share_path(tok).unlink(missing_ok=True)
         n += 1
         tok = _share_token_for(u, p.name)
     log.info("share revoked %s/%s (%d token(s))", u, p.name, n)
     return JSONResponse({"ok": True, "revoked": n})
 
 
+# ---------------------------------------------------------------------------
+# Whole-USER shares (admin): one link that lists every session of a driver, so
+# a coach or a sponsor can be handed the lot without an account. Same token
+# mechanism and the same read-only promise; the public page shows no email.
+# ---------------------------------------------------------------------------
+def _user_share_target(email: str) -> tuple:
+    """(slug, email) for a share target: an account (email) or an existing
+    session directory. 404 when there is nothing to share."""
+    target = (email or "").strip()
+    if not target:
+        raise HTTPException(status_code=422, detail="a user is required")
+    slug = safe_name(target)
+    if not (DATA_DIR / "sessions" / slug).is_dir():
+        raise HTTPException(status_code=404,
+                            detail=f"{slug} has no sessions to share")
+    return slug, (target.lower() if "@" in target else "")
+
+
+@app.get("/admin/users/{email}/share")
+async def admin_user_share_get(request: Request, email: str) -> JSONResponse:
+    require_admin(request)
+    slug, _ = _user_share_target(email)
+    tok = _share_user_token_for(slug)
+    return JSONResponse({"token": tok, "url": (f"/shared/{tok}" if tok else None)})
+
+
+@app.post("/admin/users/{email}/share")
+async def admin_user_share_create(request: Request, email: str) -> JSONResponse:
+    """Create (idempotent) a PUBLIC link that lists ALL of this user's sessions."""
+    admin = require_admin(request)
+    slug, addr = _user_share_target(email)
+    tok = _share_create("user", slug, str(admin.get("email", "")), email=addr)
+    return JSONResponse({"token": tok, "url": f"/shared/{tok}"})
+
+
+@app.get("/admin/shares")
+async def admin_shares(request: Request) -> JSONResponse:
+    """Every live share link (admin): what is out there, and how to kill it."""
+    require_admin(request)
+    return JSONResponse({"shares": _shares_all()})
+
+
+@app.post("/admin/shares/revoke")
+async def admin_share_revoke(request: Request) -> JSONResponse:
+    """Revoke ANY share token by value (admin) — sessions and whole users."""
+    admin = require_admin(request)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    token = str(body.get("token", "")).strip()
+    tp = _share_path(token)
+    if not token or safe_name(token, maxlen=64) != token or not tp.exists():
+        raise HTTPException(status_code=404, detail="no such share link")
+    meta = _share_meta(token)
+    tp.unlink(missing_ok=True)
+    log.info("admin %s revoked share %s (%s %s)", admin.get("email"), token,
+             meta["kind"], meta["user"])
+    return JSONResponse({"ok": True, "revoked": 1, "kind": meta["kind"],
+                         "user": meta["user"]})
+
+
+def _shared_list_html(meta: dict, token: str) -> str:
+    """Render a whole-user share: their sessions, newest first."""
+    user = safe_name(meta["user"])
+    root = DATA_DIR / "sessions" / user
+    rows: list = []
+    for f in sorted(root.iterdir(), reverse=True):
+        if not f.is_file() or not f.name.endswith(".ndjson"):
+            continue
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        epoch = int(display_epoch_for(f))
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(epoch))
+        track = re.sub(r"^\d+_", "", f.name[: -len(".ndjson")]) or "?"
+        track = track[: -len("-combined")] if track.endswith("-combined") else track
+        name = html.escape(f.name)
+        url = f"/shared/{html.escape(token)}/s/{urllib.parse.quote(f.name)}"
+        rows.append(
+            f'<tr><td class="mono" data-sort="{epoch}">{html.escape(when)}</td>'
+            f'<td>{html.escape(track.replace("_", " "))}</td>'
+            f'<td class="num best" data-best="{name}">\u2026</td>'
+            f'<td class="num">{_human_bytes(st.st_size)}</td>'
+            f'<td><a class="btn" href="{url}">view</a></td></tr>')
+    body = ("\n".join(rows) if rows else
+            '<tr><td colspan="5" style="color:var(--muted);font-style:italic">'
+            'no sessions</td></tr>')
+    return (_SHARED_LIST_HTML
+            .replace("__ROWS__", body)
+            .replace("__COUNT__", str(len(rows)))
+            .replace("__TOKEN__", html.escape(token)))
+
+
 @app.get("/shared/{token}", response_class=HTMLResponse)
-async def shared_overlay(token: str) -> Response:
-    """PUBLIC read-only overlay viewer. No auth; sync/save UI hidden."""
-    user, filename = _share_lookup(token)
-    p = _resolve_session(user, filename)
-    return HTMLResponse(_OVERLAY_HTML
-                        .replace("__API__", f"/shared/{safe_name(token, maxlen=64)}")
-                        .replace("__BACK__", "#")
-                        .replace("__FILE__", p.name)
-                        .replace("__RO__", "1"))
+async def shared_root(token: str) -> Response:
+    """PUBLIC read-only entry point. A session token opens that session's
+    viewer (no auth, and no control that could change anything); a USER token
+    lists every session that driver has."""
+    meta = _share_meta(token)
+    tok = safe_name(token, maxlen=64)
+    if meta["kind"] == "user":
+        return HTMLResponse(_shared_list_html(meta, tok))
+    user, filename = _shared_session(meta)
+    return HTMLResponse(_overlay_html(f"/shared/{tok}", filename, "#"))
+
+
+@app.get("/shared/{token}/s/{filename}", response_class=HTMLResponse)
+async def shared_session(token: str, filename: str) -> Response:
+    """One session inside a share link (what the list page's rows link to)."""
+    meta = _share_meta(token)
+    _, name = _shared_session(meta, filename)
+    tok = safe_name(token, maxlen=64)
+    api = f"/shared/{tok}/s/{urllib.parse.quote(name)}"
+    return HTMLResponse(_overlay_html(api, name, f"/shared/{tok}"))
+
+
+def _overlay_html(api: str, filename: str, back: str) -> str:
+    """The overlay viewer wired to a PUBLIC api base: read-only, no sync/save."""
+    return (_OVERLAY_HTML
+            .replace("__API__", api)
+            .replace("__BACK__", back)
+            .replace("__FILE__", filename)
+            .replace("__RO__", "1"))
 
 
 @app.get("/shared/{token}/data")
@@ -6700,16 +6891,87 @@ async def shared_data(
     stride: int = Query(1, ge=1, le=100),
     target: int = Query(0, ge=0, le=200000),
 ) -> JSONResponse:
-    user, filename = _share_lookup(token)
-    p = _resolve_session(user, filename)
-    return JSONResponse(_session_data_payload(p, stride, target))
+    user, filename = _shared_session(_share_meta(token))
+    return JSONResponse(_session_data_payload(_resolve_session(user, filename), stride, target))
+
+
+@app.get("/shared/{token}/s/{filename}/data")
+async def shared_file_data(
+    token: str,
+    filename: str,
+    stride: int = Query(1, ge=1, le=100),
+    target: int = Query(0, ge=0, le=200000),
+) -> JSONResponse:
+    user, name = _shared_session(_share_meta(token), filename)
+    return JSONResponse(_session_data_payload(_resolve_session(user, name), stride, target))
 
 
 @app.get("/shared/{token}/laps")
 async def shared_laps(token: str) -> JSONResponse:
-    user, filename = _share_lookup(token)
+    user, filename = _shared_session(_share_meta(token))
     p = _resolve_session(user, filename)
-    return JSONResponse(_apply_lap_meta(_laps_payload(p), safe_name(user), p.name))
+    return JSONResponse(_apply_lap_meta(_laps_payload(p), safe_name(user), filename))
+
+
+@app.get("/shared/{token}/s/{filename}/laps")
+async def shared_file_laps(token: str, filename: str) -> JSONResponse:
+    user, name = _shared_session(_share_meta(token), filename)
+    p = _resolve_session(user, name)
+    return JSONResponse(_apply_lap_meta(_laps_payload(p), safe_name(user), name))
+
+
+async def _shared_video_payload(user: str, filename: str) -> JSONResponse:
+    mp = _video_meta_path(user, filename)
+    meta = {}
+    if mp.exists():
+        try:
+            meta = json.loads(mp.read_text("utf-8"))
+        except Exception:
+            meta = {}
+    return JSONResponse({"id": meta.get("id"), "url": "",   # url withheld: id is enough to play
+                         "offset_ms": int(meta.get("offset_ms", 0) or 0)})
+
+
+@app.get("/shared/{token}/video")
+async def shared_video(token: str) -> JSONResponse:
+    user, filename = _shared_session(_share_meta(token))
+    return await _shared_video_payload(user, filename)
+
+
+@app.get("/shared/{token}/s/{filename}/video")
+async def shared_file_video(token: str, filename: str) -> JSONResponse:
+    user, name = _shared_session(_share_meta(token), filename)
+    return await _shared_video_payload(user, name)
+
+
+@app.get("/shared/{token}/laps-summary")
+async def shared_laps_summary(token: str, files: str = Query("")):
+    """Best lap per session for a USER share's list page. Filenames only, and
+    only that user's own sessions (the token never reaches another account)."""
+    meta = _share_meta(token)
+    if meta["kind"] != "user":
+        raise _share_bad()
+    out: dict = {}
+    pending: list = []
+    budget = _LAP_SUMMARY_MAX_PER_CALL
+    for fn in [x for x in (files or "").split(",") if x.strip()][:400]:
+        try:
+            p = _resolve_session(meta["user"], fn)
+        except HTTPException:
+            continue
+        hit = _lap_summary_cached(meta["user"], p)
+        if hit is not None:
+            out[p.name] = hit
+        elif budget > 0:
+            budget -= 1
+            pending.append(p)
+    if pending:
+        loop = asyncio.get_running_loop()
+        results = await asyncio.gather(
+            *[loop.run_in_executor(None, _lap_summary, meta["user"], p) for p in pending])
+        for p, res in zip(pending, results):
+            out[p.name] = res
+    return JSONResponse({"ok": True, "laps": out})
 
 
 @app.get("/shared/{token}/video")
@@ -6914,6 +7176,11 @@ _ADMIN_EXTRA_CSS = """
     border-radius:var(--r-sm); font-size:13px; }
   .msg.bad { display:block; background:rgba(255,93,93,0.1); color:var(--bad);
     border:1px solid rgba(255,93,93,0.3); }
+  .share-row { display:flex; align-items:center; gap:10px; padding:9px 0;
+    border-bottom:1px solid var(--surface-3); font-size:13px; }
+  .share-row:last-child { border-bottom:none; }
+  .share-row .mono { overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    max-width:34ch; }
 """
 
 _ADMIN_HTML = (
@@ -7067,6 +7334,16 @@ _ADMIN_HTML = (
   </section>
   <table><thead><tr><th>email</th><th>role</th><th>added by</th><th>actions</th></tr></thead>
   <tbody id="rows">__ROWS__</tbody></table>
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:var(--sp-md)">Shared links</div>
+    <div id="shares"></div>
+    <p class="summary" style="color:var(--muted);margin:var(--sp-md) 0 0;font-size:12px">
+      A <b>session</b> link opens that one drive; a <b>user</b> link lists every session that
+      account has. Both are public and read-only: anyone with the URL can look, nothing can be
+      changed, and revoking kills the link instantly. <b>share</b> on a row creates (or shows)
+      that account's user link.</p>
+  </section>
+
   <p class="summary" style="color:var(--muted);margin-top:var(--sp-md);font-size:12px">
     Bootstrap admins come from <span class="mono">RACECAR_ADMIN_EMAILS</span> in
     <span class="mono">.env</span> and can't be edited from here. Everyone else
@@ -7108,10 +7385,60 @@ _ADMIN_HTML = (
         location.href='/'; return;
       } else if(act==='history'){
         location.href='/admin/user/'+encodeURIComponent(email)+'/history'; return;
+      } else if(act==='share'){
+        await post('/admin/users/'+encodeURIComponent(email)+'/share', {});
+        location.reload(); return;
       }
       location.reload();
     }catch(e){ show('Action failed: '+e.message); }
   });
+  // ---- live share links: what is out there, and how to kill it ----------
+  function esc(t){ return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+  async function loadShares(){
+    var box = document.getElementById('shares');
+    if (!box) return;
+    try{
+      var j = await (await fetch('/admin/shares')).json();
+      var rows = j.shares || [];
+      box.innerHTML = '';
+      if (!rows.length){
+        box.innerHTML = '<div style="color:var(--muted);font-size:13px">' +
+          'none yet \u2014 press <b>share</b> on an account above.</div>';
+        return;
+      }
+      rows.forEach(function(s){
+        var what = (s.kind === 'user')
+          ? ('ALL sessions of ' + s.user)
+          : (s.user + ' / ' + (s.filename || ''));
+        var when = s.created ? new Date(s.created*1000).toISOString().slice(0,16).replace('T',' ') : '';
+        var row = document.createElement('div'); row.className = 'share-row';
+        var kind = document.createElement('span');
+        kind.className = 'badge' + (s.kind === 'user' ? ' admin' : '');
+        kind.textContent = s.kind;
+        var who = document.createElement('span'); who.className = 'mono'; who.textContent = what;
+        var meta = document.createElement('span');
+        meta.style.color = 'var(--muted)';
+        meta.textContent = when + (s.by ? ' \u00b7 ' + s.by : '');
+        var grow = document.createElement('span'); grow.style.flex = '1';
+        var copy = document.createElement('button'); copy.className = 'btn'; copy.textContent = 'copy link';
+        copy.addEventListener('click', function(){
+          navigator.clipboard.writeText(location.origin + s.url).then(function(){
+            copy.textContent = 'copied'; setTimeout(function(){ copy.textContent = 'copy link'; }, 1500);
+          }, function(){ window.prompt('Copy this link:', location.origin + s.url); });
+        });
+        var rev = document.createElement('button'); rev.className = 'btn danger'; rev.textContent = 'revoke';
+        rev.addEventListener('click', async function(){
+          if (!confirm('Revoke this link?\\n\\nIt stops working immediately.')) return;
+          try { await post('/admin/shares/revoke', {token: s.token}); loadShares(); }
+          catch(e){ show('Revoke failed: ' + e.message); }
+        });
+        row.appendChild(kind); row.appendChild(who); row.appendChild(meta); row.appendChild(grow);
+        row.appendChild(copy); row.appendChild(rev);
+        box.appendChild(row);
+      });
+    }catch(e){ box.textContent = 'could not load the share list'; }
+  }
+  loadShares();
 })();
 </script>
 </body></html>"""
@@ -15440,6 +15767,31 @@ _REVIEW_HTML = (
   <div id="err" class="err" style="display:none"></div>
 </main>
 
+<div id="share-modal" class="modal" role="dialog" aria-modal="true"
+     aria-labelledby="share-title" style="display:none">
+  <div class="modal-card" style="width:min(560px, calc(100vw - 32px))">
+    <div class="modal-head">
+      <span class="t-label" id="share-title">share this session</span>
+      <span style="flex:1"></span>
+      <button class="btn" id="share-x" type="button" aria-label="close">&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <p class="hint" style="margin:0 0 10px">Anyone with this link can <b>look</b> at this
+        session \u2014 the drive replay, the laps, and the video if one is linked. Nothing can be
+        changed from it, and no other driver or session is visible.</p>
+      <div class="inline">
+        <input id="share-url" class="cmp-input" type="text" readonly>
+        <button class="btn" id="share-copy" type="button">copy</button>
+      </div>
+      <div class="cmp-status" id="share-msg"></div>
+      <div class="modal-foot">
+        <button class="btn danger" id="share-revoke" type="button">revoke link</button>
+        <button class="btn primary" id="share-close" type="button">done</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="meta-modal" class="modal" role="dialog" aria-modal="true"
      aria-labelledby="meta-title" style="display:none">
   <div class="modal-card">
@@ -17006,32 +17358,55 @@ _REVIEW_HTML = (
       share.style.display = '';
     } else {
       view.style.display = 'none';
-      share.style.display = 'none';
       save.textContent = 'link video';
     }
+    // the SHARE is of the session, not of the video: offer it either way
   }
   try { reflect(await (await fetch(base)).json()); } catch(e){}
   // Share state is owner-or-admin; a 403 just means the button acts as create-on-click.
   try { const r=await fetch(sbase); if (r.ok){ shareTok=(await r.json()).token; reflectShare(); } } catch(e){}
-  share.addEventListener('click', async ()=>{
-    if (shareTok){
-      const full = location.origin + '/shared/' + shareTok;
-      const revoke = !prompt('PUBLIC view-only overlay link (anyone with it can watch \u2014 nothing can be changed):\\n\\nCopy it, or clear this box and press OK to REVOKE the link.', full);
-      if (revoke && confirm('Revoke the public link? It stops working immediately.')){
-        try {
-          const r=await fetch(sbase+'/revoke',{method:'POST'});
-          if (r.ok){ shareTok=null; reflectShare(); }
-        } catch(e){}
-      }
-      return;
-    }
+  // ---- the share popup: link, copy, revoke -----------------------------
+  const smodal = document.getElementById('share-modal');
+  const surl = document.getElementById('share-url');
+  const smsg = document.getElementById('share-msg');
+  function say(t, bad){ smsg.textContent = t||''; smsg.className = 'cmp-status' + (bad?' bad':''); }
+  function openShare(url){
+    surl.value = url; say('');
+    smodal.style.display = 'flex';
+    setTimeout(function(){ surl.focus(); surl.select(); }, 30);
+  }
+  function closeShare(){ smodal.style.display = 'none'; }
+  document.getElementById('share-x').addEventListener('click', closeShare);
+  document.getElementById('share-close').addEventListener('click', closeShare);
+  smodal.addEventListener('mousedown', function(ev){ if (ev.target===smodal) closeShare(); });
+  document.addEventListener('keydown', function(ev){
+    if (ev.key==='Escape' && smodal.style.display!=='none') closeShare();
+  });
+  document.getElementById('share-copy').addEventListener('click', function(){
+    surl.select(); surl.setSelectionRange(0, 9999);
+    navigator.clipboard.writeText(surl.value).then(function(){ say('copied to the clipboard'); },
+      function(){ try{ document.execCommand('copy'); say('copied to the clipboard'); }
+                  catch(e){ say('copy failed - select the box and copy', true); } });
+  });
+  document.getElementById('share-revoke').addEventListener('click', async function(){
+    if (!confirm('Revoke this link?\\n\\nIt stops working immediately.')) return;
     try {
-      const r=await fetch(sbase,{method:'POST'});
-      const j=await r.json().catch(()=>({}));
+      const r = await fetch(sbase+'/revoke', {method:'POST'});
+      if (!r.ok) throw new Error('HTTP '+r.status);
+      shareTok = null; reflectShare(); closeShare();
+    } catch(e){ say('revoke failed: '+e.message, true); }
+  });
+  share.addEventListener('click', async function(){
+    if (shareTok){ openShare(location.origin + '/shared/' + shareTok); return; }
+    share.disabled = true;
+    try {
+      const r = await fetch(sbase, {method:'POST'});
+      const j = await r.json().catch(function(){ return {}; });
       if (!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
-      shareTok=j.token; reflectShare();
-      prompt('PUBLIC view-only overlay link created \u2014 copy it:', location.origin+j.url);
+      shareTok = j.token; reflectShare();
+      openShare(location.origin + j.url);
     } catch(e){ alert('share failed: '+e.message); }
+    share.disabled = false;
   });
   save.addEventListener('click', async ()=>{
     save.disabled = true;
@@ -17049,6 +17424,98 @@ _REVIEW_HTML = (
 </script>
 </body></html>
 """
+)
+
+
+# ---------------------------------------------------------------------------
+# A whole-USER share's landing page: every session the driver has, newest
+# first, read-only and account-free. Server-rendered rows (the links work
+# without JS); the best-lap column fills in lazily from /shared/<token>/
+# laps-summary, exactly like the sessions list does.
+# ---------------------------------------------------------------------------
+_SHARED_LIST_HTML = (
+    """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>shared sessions \u00b7 racecar-35</title>
+""" + _FONTS_LINK + "<style>" + _BASE_CSS + """
+  main { max-width: 1100px; }
+  table { width:100%; border-collapse:separate; border-spacing:0;
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); overflow:hidden; }
+  th,td { padding:11px 14px; font-size:13px; text-align:left;
+    border-bottom:1px solid var(--line); }
+  th { background:var(--surface-2); color:var(--muted); font-weight:600;
+    text-transform:uppercase; letter-spacing:0.08em; font-size:11px; }
+  tbody tr:last-child td { border-bottom:none; }
+  tbody tr:hover { background: rgba(255,176,32,0.05); }
+  td.num { text-align:right; font-variant-numeric: tabular-nums; }
+  .panel { background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-md); padding:var(--sp-md); margin-bottom:var(--sp-lg); }
+</style></head><body>
+<header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 shared</h1>
+  <span class="crumbs">read-only link</span>
+  <span style="flex:1"></span>
+  <span class="pill" id="count">__COUNT__ sessions</span>
+</header>
+<main>
+  <div class="panel">
+    <div class="t-label" style="margin-bottom:6px">Shared driving history</div>
+    <p class="summary" style="color:var(--muted);margin:0;font-size:13px">
+      Anyone with this link can look at these sessions. Nothing here can be
+      changed or uploaded, and no other driver is visible from it.</p>
+  </div>
+  <table>
+    <thead><tr><th>started</th><th>track</th><th class="num">best lap</th>
+      <th class="num">size</th><th></th></tr></thead>
+    <tbody>__ROWS__</tbody>
+  </table>
+</main>
+<script>
+// Best lap per session, filled behind the page (same contract as the sessions
+// list: cached summaries are instant, a few cold files per call, ask again).
+// AWAITED per batch: with promise chains the "did anything land?" decision runs
+// before the first response and paints every cell as empty.
+(async function(){
+  const cells = Array.from(document.querySelectorAll('td.best'));
+  if (!cells.length) return;
+  const byKey = new Map(cells.map(c => [c.dataset.best, c]));
+  function fmt(s){
+    if (s == null || !isFinite(s) || s <= 0) return '\u2014';
+    s = Number(s); const m = Math.floor(s / 60), r = s - m * 60;
+    return m ? (m + ':' + (r < 10 ? '0' : '') + r.toFixed(2)) : r.toFixed(2);
+  }
+  let rounds = 0;
+  async function fill(){
+    const want = cells.filter(c => !c.dataset.done).map(c => c.dataset.best);
+    if (!want.length || rounds > 12) return;
+    rounds++;
+    let any = false;
+    for (let i = 0; i < want.length; i += 25){
+      const batch = want.slice(i, i + 25);
+      try {
+        const r = await fetch('/shared/__TOKEN__/laps-summary?files=' +
+                              encodeURIComponent(batch.join(',')));
+        if (!r.ok) continue;
+        const j = await r.json();
+        for (const k of batch){
+          const c = byKey.get(k); if (!c || c.dataset.done) continue;
+          const d = (j.laps || {})[k]; if (!d) continue;   // not computed yet: ask again
+          c.textContent = fmt(d.best_s);
+          c.title = (d.laps || 0) + ' laps' + (d.excluded ? ' (' + d.excluded + ' excluded)' : '');
+          c.dataset.done = '1';
+          any = true;
+        }
+      } catch(e){}
+    }
+    if (any){ setTimeout(fill, 400); }
+    else {
+      cells.forEach(c => { if (!c.dataset.done){ c.dataset.done = '1';
+        if (!c.textContent.trim() || c.textContent.trim() === '\u2026') c.textContent = '\u2014'; } });
+    }
+  }
+  fill();
+})();
+</script>
+</body></html>"""
 )
 
 
@@ -17094,6 +17561,13 @@ _OVERLAY_HTML = (
     padding:10px 14px; background:rgba(10,10,12,0.85);
     transition:opacity .25s; }
   #bar.hidden { opacity:0; pointer-events:none; }
+  /* no video: the hole where the video would be is filled by the CIRCUIT, at
+     a size worth looking at (the canvas is re-backed to 700 px so it is crisp) */
+  #stage.novideo #tmap { left:50%; top:50%; transform:translate(-50%,-50%);
+    width:min(74vmin, 76vh); height:auto; background:rgba(255,255,255,0.02); }
+  #stage.novideo #lapbox { top:10px; }
+  #stage.novideo #lapbox .n { line-height:1.3; }
+  #stage.novideo #speedbox { bottom:96px; }
   #bar button, #bar a { background:#222; color:#eee; border:1px solid #444;
     border-radius:6px; padding:7px 11px; font:600 13px system-ui; cursor:pointer;
     text-decoration:none; }
@@ -17135,6 +17609,7 @@ _OVERLAY_HTML = (
     <button data-n="0.05">+.05</button>
     <button data-n="1">+1s</button>
     <button data-n="10">+10s</button>
+    <input type="range" id="seek" min="0" max="1" step="0.02" value="0" style="display:none">
     <input type="range" id="coarse" min="-300" max="300" step="0.1" value="0">
     <button id="launch" class="acc" title="Scrub the video to the moment the car starts moving, then click">SYNC @ LAUNCH</button>
     <button id="save" class="acc">SAVE</button>
@@ -17155,6 +17630,10 @@ _OVERLAY_HTML = (
   }
   let S=[], T=[], laps=[], bestLapS=null, meta={}, offset=0, player=null, ready=false;
   let rpmMax=8000, bounds=null;
+  // A session with no video is a normal case: the HUD, the map, the laps and
+  // the playback then run on their OWN clock (noVideo), so a shared session is
+  // watchable without one. Only the video/sync controls disappear.
+  let noVideo=false, playing=false, lt=0, llast=0;
 
   function fmtLap(sec){
     if (!(sec>0)) return '--:--.-';
@@ -17179,13 +17658,20 @@ _OVERLAY_HTML = (
       return;
     }
     meta = v||{};
-    if (!meta.id){
-      el('msg').style.display='block';
-      el('msg').innerHTML='No video linked to this session yet.<br>' +
-        'Go back to the review page and paste a YouTube link.';
-      return;
+    noVideo = !meta.id;
+    if (noVideo){
+      el('stage').classList.add('novideo');
+      // re-back the canvas BEFORE the samples arrive: drawTrack() runs later in
+      // boot (drawing here would find no points and hide the canvas for good)
+      const tm = el('tmap');
+      tm.width = tm.height = 700;      // crisp at the size the CSS gives it
+      el('ytwrap').style.display='none';
+      ['launch','save','coarse','off','backlink'].forEach(id=>{ const x=el(id); if(x) x.style.display='none'; });
+      document.querySelectorAll('#bar [data-n], #bar .synclbl').forEach(x=>{ x.style.display='none'; });
+      el('seek').style.display='';
+      el('msg').style.display='none';
     }
-    offset = (meta.offset_ms||0)/1000;
+    offset = noVideo ? 0 : (meta.offset_ms||0)/1000;
     el('off').textContent = fmtOff();
     el('coarse').value = Math.max(-300, Math.min(300, offset));
     S = d.samples||[]; bounds = d.bounds;
@@ -17205,6 +17691,13 @@ _OVERLAY_HTML = (
     let mr=0; for (const s of S) if (s.rpm>mr) mr=s.rpm;
     rpmMax = Math.max(1000, Math.ceil(mr/1000)*1000);
     drawTrack();
+    if (noVideo){
+      ready = true;
+      lt = T.length ? T[0] : 0;
+      el('seek').max = String(Math.max(1, (T.length ? T[T.length-1] : 1)));
+      toast('replaying the data (no video linked)');
+      return;
+    }
     // YouTube IFrame API
     const tag=document.createElement('script');
     tag.src='https://www.youtube.com/iframe_api';
@@ -17257,9 +17750,21 @@ _OVERLAY_HTML = (
 
   // ---- HUD tick ----------------------------------------------------------
   setInterval(function(){
-    if (!ready || !S.length || !player || !player.getCurrentTime) return;
-    const vt = player.getCurrentTime()||0;
-    const dt = vt + offset;
+    if (!ready || !S.length) return;
+    let dt;
+    if (noVideo){
+      const end = T.length ? T[T.length-1] : 0;
+      if (playing){
+        const n=performance.now();
+        lt += (n-llast)/1000; llast=n;
+        if (lt>=end){ lt=end; playing=false; el('pp').textContent='play'; }
+        el('seek').value = String(lt);
+      }
+      dt = Math.min(lt, end);
+    } else {
+      if (!player || !player.getCurrentTime) return;
+      dt = (player.getCurrentTime()||0) + offset;
+    }
     const i = idxAt(dt);
     const s = S[i];
     const inRange = dt>=T[0]-2 && dt<=T[T.length-1]+2;
@@ -17299,8 +17804,20 @@ _OVERLAY_HTML = (
   });
   el('coarse').addEventListener('input',()=>setOffset(parseFloat(el('coarse').value)));
   el('pp').addEventListener('click',()=>{
+    if (noVideo){
+      const end = T.length ? T[T.length-1] : 0;
+      if (!playing && lt>=end-0.05) lt = T.length ? T[0] : 0;   // replay from the start
+      playing = !playing; llast = performance.now();
+      el('pp').textContent = playing ? 'pause' : 'play';
+      return;
+    }
     if (!player) return;
     (player.getPlayerState()===1)?player.pauseVideo():player.playVideo();
+  });
+  el('seek').addEventListener('input',()=>{
+    if (!noVideo) return;
+    lt = parseFloat(el('seek').value)||0;
+    if (playing){ playing=false; el('pp').textContent='play'; }
   });
   el('fs').addEventListener('click',()=>{
     const st=el('stage');
