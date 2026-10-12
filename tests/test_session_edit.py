@@ -35,7 +35,7 @@ WANTED_FUNCS = (
     "safe_name", "reasonable_epoch",
     "split_session_name", "session_filename", "session_dir_for", "_resolve_session",
     # the mover
-    "_ai_history_path", "_lap_meta_path", "_video_meta_path", "_debug_path_for",
+    "_ai_history_path", "_lap_meta_path", "_video_meta_path", "_session_meta_path", "_debug_path_for",
     "_coach_path", "_coach_load", "_coach_save",
     "_session_sidecar_paths", "session_sidecars_follow",
     # auth
@@ -46,7 +46,7 @@ WANTED_FUNCS = (
     FUNC,
 )
 WANTED_VARS = (
-    "DATA_DIR", "AI_HISTORY_DIR", "VIDEO_META_DIR", "SHARE_DIR", "LAP_META_DIR",
+    "DATA_DIR", "AI_HISTORY_DIR", "VIDEO_META_DIR", "SESSION_META_DIR", "SHARE_DIR", "LAP_META_DIR",
     "LAPCACHE_DIR", "COACH_DIR", "USERS_FILE", "SESSION_EXT", "PROFILE_FIELDS",
     "PROFILE_MAX", "_safe_re", "API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
     "ALLOWED_EMAILS", "ADMIN_EMAILS",
@@ -160,6 +160,7 @@ class SessionEditTests(unittest.TestCase):
         put(ns["_ai_history_path"](user, name), '[{"a":1}]')
         put(ns["_lap_meta_path"](user, name), '{"excluded":[3]}')
         put(ns["_video_meta_path"](user, name), '{"id":"abc"}')
+        put(ns["_session_meta_path"](user, name), '{"weight_lb": 2420}')
         put(self.tmp / "lapcache" / ns["safe_name"](user) / (name + ".json"), '{"best":1}')
         put(ns["_debug_path_for"](user, name), '{"dbg":1}')
         (self.tmp / "shares" / "tok.json").write_text(json.dumps(

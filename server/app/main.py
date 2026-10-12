@@ -417,6 +417,7 @@ def _ai_feature_model(feature: Optional[str]) -> str:
 # alongside the session data and is trivially deleted with its session.
 AI_HISTORY_DIR = DATA_DIR / "ai_history"
 VIDEO_META_DIR = DATA_DIR / "video_meta"   # per-session YouTube link + sync offset
+SESSION_META_DIR = DATA_DIR / "session_meta"   # per-session car weight (est WHP)
 SHARE_DIR = DATA_DIR / "shares"            # public view-only overlay tokens
 LAP_META_DIR = DATA_DIR / "lap_meta"       # per-session excluded-lap lists
 
@@ -3588,6 +3589,7 @@ def _session_sidecar_paths(user: str, name: str) -> list:
         ("ai_history", _ai_history_path(user, name)),
         ("lap_meta", _lap_meta_path(user, name)),
         ("video", _video_meta_path(user, name)),
+        ("car", _session_meta_path(user, name)),
         ("lap_cache", LAPCACHE_DIR / safe_name(user) / (name + ".json")),
         ("debug", _debug_path_for(user, name)),
     ]
@@ -3880,7 +3882,7 @@ load();
 # Bumps whenever the 3D drive view changes materially (documented at length in
 # the /caps docstring below). Kept as a constant because /caps and /version both
 # report it — two literals would drift.
-TRACK3D_V = 14
+TRACK3D_V = 15
 
 
 @app.get("/caps")
@@ -5539,6 +5541,7 @@ async def delete_session(
         pass
     # Cascade: a deleted session takes its entire AI Q&A history with it.
     _ai_history_delete_file(user, session_name)
+    _session_meta_path(user, p.name).unlink(missing_ok=True)
     log.info("deleted session %s bytes=%d (+ai history)", rel, size)
     return JSONResponse({"ok": True, "deleted": rel, "bytes": size})
 
@@ -5971,7 +5974,7 @@ def _apply_lap_meta(payload: dict, user: str, session_name: str) -> dict:
 # /laps/summary, which computes a few at a time off the event loop.
 # ---------------------------------------------------------------------------
 LAPCACHE_DIR = DATA_DIR / "lapcache"
-_LAP_RULES_V = 2                     # bump when lap detection/exclusion rules change
+_LAP_RULES_V = 3                     # bump when lap detection/exclusion rules change
 _LAP_SUMMARY_MEM: dict = {}          # (name, mtime, size) -> summary
 _LAP_SUMMARY_LOCK = threading.Lock()
 _LAP_SUMMARY_MAX_PER_CALL = 4        # uncached files one /laps/summary may do
@@ -6014,6 +6017,53 @@ def _lap_summary_invalidate(user: str, p: pathlib.Path) -> None:
         pass
 
 
+def _load_samples(p: pathlib.Path) -> list:
+    """Every parseable NDJSON row of one session file (junk lines skipped)."""
+    samples: list = []
+    with open(p, "rb") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                samples.append(json.loads(raw))
+            except Exception:
+                continue
+    return samples
+
+
+def _num_or_none(x):
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    return float(x) if math.isfinite(x) else None
+
+
+def _power_mod():
+    import importlib
+    try:
+        return importlib.import_module(".power", __package__)
+    except Exception:
+        return importlib.import_module("power")
+
+
+def _power_series(samples: list) -> dict:
+    """Est wheel power per kg for every sample (server/app/power.py)."""
+    rel, _basis = _relative_seconds(samples)
+    return _power_mod().per_kg_series(
+        rel,
+        [_num_or_none(s.get("speed_mph")) for s in samples],
+        [_num_or_none(s.get("alt_m")) for s in samples],
+        [_num_or_none(s.get("rpm")) for s in samples])
+
+
+def _session_power_maxima(samples: list, laps: list) -> tuple:
+    """Peak est WHP-per-kg and WTQ-per-kg over the INCLUDED laps. No laps = no answer
+    (a whole-file peak would count the out-lap and pit-lane junk)."""
+    if not laps:
+        return None, None
+    return _power_mod().session_maxima(_power_series(samples), laps)
+
+
 def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
     """Compute (+ cache) the best lap of one session. Blocking: call it from a
     worker thread, never from the event loop."""
@@ -6026,7 +6076,8 @@ def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
                "computed": int(time.time()), "best_s": None, "best_lap": None,
                "laps": 0, "excluded": 0, "source": None, "error": None}
     try:
-        payload = _apply_lap_meta(_laps_payload(p), user, p.name)
+        samples = _load_samples(p)
+        payload = _apply_lap_meta(_detect_laps(samples), user, p.name)
         best = payload.get("best_lap")
         laps = payload.get("laps") or []
         secs = None
@@ -6036,6 +6087,11 @@ def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
         summary.update(best_s=secs, best_lap=best, laps=len(laps),
                        excluded=len(payload.get("excluded_laps") or []),
                        source=payload.get("source"))
+        # est wheel power per KG (weight-free: the session's car weight scales it
+        # at display time, so changing the weight never needs a re-scan)
+        wmax, qmax = _session_power_maxima(samples, laps)
+        summary.update(wkg_max=None if wmax is None else round(wmax, 4),
+                       tqkg_max=None if qmax is None else round(qmax, 5))
     except Exception as e:
         summary["error"] = str(e)[:200]
     cp = LAPCACHE_DIR / safe_name(user) / (p.name + ".json")
@@ -6094,6 +6150,10 @@ async def laps_summary(request: Request, files: str = Query("")):
             *[loop.run_in_executor(None, _lap_summary, u, p) for _, u, p in pending])
         for (key, _, _), res in zip(pending, results):
             out[key] = res
+    for key in list(out):
+        if isinstance(out[key], dict):
+            uu, _, ff = key.partition("/")
+            out[key] = dict(out[key], weight_lb=_weight_lb_of(uu, ff))
     return JSONResponse({"ok": True, "laps": out})
 
 
@@ -7003,6 +7063,119 @@ async def get_video_link(request: Request, user: str, filename: str) -> JSONResp
             meta = {}
     return JSONResponse({"id": meta.get("id"), "url": meta.get("url", ""),
                          "offset_ms": int(meta.get("offset_ms", 0) or 0)})
+
+
+# ---- Estimated WHEEL power (est WHP / est WTQ) -----------------------------
+# The car weight is a property of the DRIVE (a driver can run two cars, or the
+# same car at two events), so it is stored on the SESSION, not the account.
+# Power is weight-free (server/app/power.py); the weight only scales it.
+CAR_WEIGHT_MIN, CAR_WEIGHT_MAX = 700, 9000          # lb; anything else is refused
+
+
+def _session_meta_path(user: str, session_name: str) -> pathlib.Path:
+    return SESSION_META_DIR / safe_name(user) / (safe_name(session_name) + ".json")
+
+
+def _car_meta_read(user: str, session_name: str) -> dict:
+    try:
+        d = json.loads(_session_meta_path(user, session_name).read_text("utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _weight_lb_of(user: str, session_name: str) -> int:
+    """The session's car weight in lb, or 0 when not set / out of range."""
+    try:
+        w = int(_car_meta_read(user, session_name).get("weight_lb") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return w if CAR_WEIGHT_MIN <= w <= CAR_WEIGHT_MAX else 0
+
+
+def _can_edit_session(request: Request, user: str) -> bool:
+    try:
+        gate_delete_dir(request, safe_name(user))
+        return True
+    except HTTPException:
+        return False
+
+
+@app.get("/sessions/{user}/{filename}/car")
+def get_session_car(request: Request, user: str, filename: str) -> JSONResponse:
+    gate_view_session(request, user, filename)
+    p = _resolve_session(user, filename)
+    rec = _car_meta_read(user, p.name)
+    return JSONResponse({"set": _weight_lb_of(user, p.name) > 0,
+                         "weight_lb": _weight_lb_of(user, p.name),
+                         "by": rec.get("by"), "at": rec.get("at"),
+                         "can_edit": _can_edit_session(request, user)})
+
+
+@app.post("/sessions/{user}/{filename}/car")
+async def set_session_car(request: Request, user: str, filename: str) -> JSONResponse:
+    """Set the car weight for this session. 0 or blank clears it. Owner-or-admin,
+    the same rule as editing the session; a read-only grant cannot change it."""
+    require_web_user(request)
+    gate_delete_dir(request, safe_name(user))
+    p = _resolve_session(user, filename)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="json body required")
+    raw = body.get("weight_lb") if isinstance(body, dict) else None
+    mp = _session_meta_path(user, p.name)
+    if raw in (None, "", 0, "0"):
+        mp.unlink(missing_ok=True)
+        return JSONResponse({"ok": True, "set": False, "weight_lb": 0})
+    try:
+        w = int(round(float(raw)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="weight_lb must be a number")
+    if not CAR_WEIGHT_MIN <= w <= CAR_WEIGHT_MAX:
+        raise HTTPException(status_code=422, detail=f"weight_lb must be {CAR_WEIGHT_MIN}-{CAR_WEIGHT_MAX} lb")
+    who = str((current_user(request) or {}).get("email", "") or "")
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = mp.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"weight_lb": w, "by": who, "at": int(time.time())}), "utf-8")
+    tmp.replace(mp)
+    return JSONResponse({"ok": True, "set": True, "weight_lb": w})
+
+
+@app.get("/sessions/{user}/{filename}/power")
+def get_session_power(request: Request, user: str, filename: str) -> JSONResponse:
+    """Est WHEEL power and torque for one session (view-gated).
+
+    Per-sample arrays (t = epoch seconds as logged, whp = hp, wtq = lb-ft) and the
+    peak per included lap. Without a car weight on the session it returns
+    set=false and NO numbers: nothing is assumed about the car.
+    """
+    gate_view_session(request, user, filename)
+    p = _resolve_session(user, filename)
+    samples = _load_samples(p)
+    laps = (_apply_lap_meta(_detect_laps(samples), user, p.name).get("laps") or [])
+    pw = _power_mod()
+    series = _power_series(samples)
+    w = _weight_lb_of(user, p.name)
+    rows = pw.lap_maxima(series, laps)
+    out = {"set": w > 0, "weight_lb": w, "estimate": "wheel power, no drivetrain loss",
+           "laps": [{"lap": r["lap"]} for r in rows]}
+    if w > 0:
+        ser = pw.apply_weight(series, w)
+        first_abs = next((_num_or_none(x.get("t")) for x in samples
+                          if _num_or_none(x.get("t")) is not None), 0.0)
+        out["t"] = [round(float(x) + first_abs, 2) for x in ser["t"]]   # epoch s, as logged
+        out["whp"] = [round(float(x), 1) for x in ser["whp"]]
+        out["wtq"] = [round(float(x), 1) for x in ser["wtq"]]
+        smax, qmax = _session_power_maxima(samples, laps)
+        sw, sq = pw.scale(smax, qmax, w)
+        out["max"] = {"whp": pw.round_or_none(sw), "wtq": pw.round_or_none(sq)}
+        out["laps"] = []
+        for r in rows:
+            lw, lq = pw.scale(r["wkg"], r["tqkg"], w)
+            out["laps"].append({"lap": r["lap"], "whp": pw.round_or_none(lw),
+                                "wtq": pw.round_or_none(lq)})
+    return JSONResponse(out)
 
 
 @app.post("/sessions/{user}/{filename}/video")
@@ -8067,6 +8240,14 @@ _ACCOUNT_HTML = (
             if (!c || c.dataset.done) return;
             var d = (j.laps || {})[k];
             if (!d) return;
+            var wc = Array.prototype.filter.call(document.querySelectorAll('[data-whp]'),
+                       function(x){ return x.dataset.whp === k; })[0];
+            if (wc) {                       // every cell resolves: a number, or an honest dash
+              if (d.weight_lb && d.wkg_max != null) {
+                var kg = d.weight_lb * 0.45359237, h = Math.round(d.wkg_max * kg / 745.69987);
+                wc.textContent = h; wc.dataset.sort = h;
+              } else { wc.textContent = '\u2014'; wc.dataset.sort = ''; }
+            }
             var sec = d.best_s;
             c.textContent = (sec == null || !isFinite(sec) || sec <= 0) ? '\u2014'
               : (sec >= 60 ? (Math.floor(sec / 60) + ':' + ((sec - Math.floor(sec / 60) * 60) < 10 ? '0' : '')
@@ -8639,6 +8820,18 @@ async def index(request: Request) -> Response:
                           f'data-user="{user_h}" data-file="{file_h}">')
                 )
                 cached = _lap_summary_cached(user_dir.name, f)
+                # est WHP = cached per-kg peak x THIS session's weight (blank = unknown)
+                w_lb = _weight_lb_of(user_dir.name, f.name)
+                whp_v = None
+                if cached and cached.get("wkg_max") is not None and w_lb:
+                    whp_v = _power_mod().scale(cached["wkg_max"], None, w_lb)[0]
+                    whp_v = None if whp_v is None else round(whp_v)
+                if cached is None:
+                    whp_h, whp_sort = "\u2026", ""
+                elif whp_v is None:
+                    whp_h, whp_sort = "\u2014", ""
+                else:
+                    whp_h, whp_sort = str(whp_v), str(whp_v)
                 best_str = (f'<span title="{cached.get("laps", 0)} laps">'
                             f"{_fmt_lap_s(cached.get('best_s'))}</span>"
                             if cached else "\u2026")
@@ -8652,6 +8845,10 @@ async def index(request: Request) -> Response:
                     f'<td data-k="track">{track_h}</td>'
                     f'<td class="num best" data-k="best" data-best="{user_h}/{file_h}">'
                     f"{best_str}</td>"
+                    f'<td class="num" data-k="whp" data-whp="{user_h}/{file_h}" '
+                    f'data-sort="{whp_sort}" '
+                    f'title="estimated wheel hp at the set car weight (no drivetrain loss)">'
+                    f"{whp_h}</td>"
                     f'<td class="mono" data-k="filename">'
                     f'<a href="/review/{user_h}/{file_h}">{file_h}</a></td>'
                     f'<td class="num" data-k="size" data-sort="{st.st_size}">{size_str}</td>'
@@ -8674,6 +8871,7 @@ async def index(request: Request) -> Response:
             '<th class="sortable" data-key="started">started (UTC)<span class="ind"></span></th>'
             '<th class="sortable" data-key="track">track<span class="ind"></span></th>'
             '<th class="sortable" data-key="best">best lap<span class="ind"></span></th>'
+            '<th class="sortable num" data-key="whp">est WHP<span class="ind"></span></th>'
             '<th class="sortable" data-key="filename">filename<span class="ind"></span></th>'
             '<th class="sortable num" data-key="size">size<span class="ind"></span></th>'
             '<th>actions</th></tr></thead><tbody id="rows">'
@@ -9428,7 +9626,7 @@ _TRACK3D_HTML = (
 <canvas id="view"></canvas>
 <div id="notice">loading session…</div>
 <div id="hud" style="display:none">
-  <div class="spd"><span class="v" id="h-mph">0</span><span class="u">mph</span></div>
+  <div class="spd"><span class="v" id="h-mph">0</span><span class="u">mph</span><span id="h-gmph" style="display:none;color:#FF4D4D;font-size:26px;margin-left:12px"></span></div>
   <div class="bar"><i id="h-bar"></i></div>
   <div class="row"><span class="k">rpm</span><span id="h-rpm">—</span></div>
   <div class="row"><span class="k">lap</span><span id="h-lap">—</span></div>
@@ -9436,6 +9634,8 @@ _TRACK3D_HTML = (
   <div class="row"><span class="k">best</span><span id="h-best">—</span></div>
   <div class="row"><span class="k">altitude</span><span id="h-alt">—</span></div>
   <div class="row"><span class="k">long g</span><span id="h-g">—</span></div>
+  <div class="row" title="estimated wheel power at the car weight set on the review page (no drivetrain loss)"><span class="k">est WHP</span><span id="h-whp">—</span></div>
+  <div class="row"><span class="k">est WTQ</span><span id="h-wtq">—</span></div>
   <div class="row" id="h-ghost-row" style="display:none"><span class="k" style="color:#C084FC">ghost</span><span id="h-ghost">—</span></div>
 </div>
 <div id="legend">
@@ -14751,6 +14951,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     renderer.render(scene, camera);
 
     el("h-mph").textContent = Math.round(st.mph);
+    if (GHOST && GHOST.lastMph != null && el("h-ghost-row").style.display !== "none") {
+      el("h-gmph").style.display = ""; el("h-gmph").textContent = Math.round(GHOST.lastMph);
+    } else { el("h-gmph").style.display = "none"; }
+    showPower3();
     el("h-rpm").textContent = (cur && typeof cur.rpm === "number") ? cur.rpm : "—";
     el("h-lap").textContent = LAPNO ? LAPNO : "whole session";
     el("h-lapt").textContent = L ? fmtLap(NOW - L.t_start) : fmtLap(NOW);
@@ -15383,6 +15587,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var gT = Math.min(GHOST.t1, GHOST.t0 + Math.max(0, tInto));
     var p = RC3D.pointAtS(GHOST.path, RC3D.sAtTime(GHOST.path, gT));
     GHOST.last = p;
+    GHOST.lastMph = RC3D.mphAtS(GHOST.path, RC3D.sAtTime(GHOST.path, gT));
     GHOST_GRP.position.set(p.x, p.y + (plan ? 0.6 : 0), p.z);
     GHOST_GRP.rotation.y = Math.atan2(p.tan[0], p.tan[1]);
     // shaded by the GHOST's input: green on the gas, grey coasting, red on the
@@ -15746,7 +15951,44 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       .catch(function (e) { notice("could not load session: " + e.message, true); });
   }
 
+  // ---- est wheel power (server /power, power.py) ---------------------------
+  // The server's per-sample series is on the session's own relative clock, the
+  // same basis as PATH.t / NOW, so this is a lookup, never a second model here.
+  var POW3 = null;
+  function pwIndex(ts, x) {
+    if (!ts || !ts.length) return -1;
+    var lo = 0, hi = ts.length - 1;
+    while (lo < hi) { var m = (lo + hi + 1) >> 1; if (ts[m] <= x) lo = m; else hi = m - 1; }
+    return lo;
+  }
+  function firstAbsT() {
+    for (var k = 0; k < S.length; k++) {
+      if (S[k] && typeof S[k].t === "number" && isFinite(S[k].t)) return S[k].t;
+    }
+    return null;
+  }
+  function showPower3() {
+    if (!POW3) return;
+    try {
+      if (!POW3.set) { el("h-whp").textContent = "set car weight on review"; return; }
+      var t0 = firstAbsT();
+      if (t0 == null) return;
+      var i = pwIndex(POW3.t, t0 + NOW), mx = POW3.max || {};
+      el("h-whp").textContent = (i >= 0 ? Math.round(POW3.whp[i]) : "\u2014") +
+        (mx.whp != null ? " \u00b7 max " + Math.round(mx.whp) : "");
+      el("h-wtq").textContent = (i >= 0 ? Math.round(POW3.wtq[i]) : "\u2014") +
+        (mx.wtq != null ? " \u00b7 max " + Math.round(mx.wtq) : "");
+    } catch (e) { /* a HUD readout must never stop the render loop */ }
+  }
+  function loadPower3() {
+    fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) + "/power")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) { if (j) { POW3 = j; showPower3(); } })
+      .catch(function () {});
+  }
+
   start();
+  loadPower3();
 })();
 </script>
 <script>
@@ -16422,9 +16664,15 @@ _REVIEW_HTML = (
       <div class="card-head"><span class="t-label">Laps</span>
         <span class="t-label" id="lap-sub">—</span></div>
       <div class="card-body lap-body">
+        <div class="car-row" id="car-row" style="display:none;margin:0 0 10px;flex-direction:column;align-items:flex-start;gap:6px">
+          <span class="t-label">car weight</span>
+          <input id="car-wt" type="number" min="700" max="9000" step="1" placeholder="lb, with driver" style="width:9em">
+          <button class="btn" id="car-save">save</button>
+          <span class="t-label" id="car-note" style="opacity:.8"></span>
+        </div>
         <div class="lap-table-wrap">
           <table class="laptable">
-            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th>Max</th><th></th></tr></thead>
+            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th>Max</th><th title="estimated wheel horsepower (no drivetrain loss)">est WHP</th><th title="estimated wheel torque, lb-ft">est WTQ</th><th></th></tr></thead>
             <tbody id="lap-rows"></tbody>
           </table>
         </div>
@@ -17543,6 +17791,61 @@ _REVIEW_HTML = (
   });
 
   // ---- load this session's laps + wire the table ---------------------
+  // ---- est wheel power (server: /sessions/<u>/<f>/power, power.py) ----------
+  // The car weight is per SESSION. Without one nothing is shown and nothing is
+  // assumed. Peaks come from the server, so this page never re-derives power.
+  var POWER = null;
+  function carInit(){
+    fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/car').then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(c){
+        if (!c) return;
+        el('car-row').style.display = 'flex';
+        el('car-wt').value = c.set ? c.weight_lb : '';
+        el('car-wt').disabled = !c.can_edit;
+        el('car-save').style.display = c.can_edit ? '' : 'none';
+        if (!c.can_edit && !c.set) el('car-note').textContent = 'no car weight set for this session';
+      }).catch(function(){});
+  }
+  el('car-save').addEventListener('click', async function(){
+    const raw = el('car-wt').value.trim();
+    try {
+      const r = await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/car', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({weight_lb: raw === '' ? 0 : raw})});
+      if (!r.ok){ const j = await r.json().catch(()=>({}));
+        alert('car weight not saved: '+((j&&j.detail)||('HTTP '+r.status))); return; }
+    } catch(e){ alert('car weight not saved: '+e.message); return; }
+    location.reload();
+  });
+  async function loadPower(){
+    try {
+      const r = await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/power');
+      if (!r.ok) return;
+      POWER = await r.json();
+    } catch(e){ return; }
+    paintPower();
+  }
+  function paintPower(){
+    const p = POWER; if (!p) return;
+    const byLap = {};
+    (p.laps||[]).forEach(function(x){ byLap[x.lap] = x; });
+    document.querySelectorAll('#lap-rows tr[data-lap]').forEach(function(tr){
+      const x = byLap[parseInt(tr.dataset.lap, 10)] || {};
+      const h = tr.querySelector('.pw-hp'), q = tr.querySelector('.pw-tq');
+      if (h) h.textContent = (x.whp != null) ? Math.round(x.whp) : '\u2014';
+      if (q) q.textContent = (x.wtq != null) ? Math.round(x.wtq) : '\u2014';
+    });
+    if (p.set) {
+      if (p.max && p.max.whp != null) {
+        el('lap-sub').textContent = el('lap-sub').textContent.replace(/ \u00b7 est .*$/, '') +
+          ' \u00b7 est ' + Math.round(p.max.whp) + ' whp / ' + Math.round(p.max.wtq) + ' lb-ft';
+      }
+      el('car-note').textContent = 'est. wheel hp at ' + p.weight_lb + ' lb \u00b7 no drivetrain loss';
+    } else {
+      el('car-note').textContent = 'enter the car weight (with driver) for est. wheel hp';
+    }
+  }
+
   (async function loadLaps(){
     let lr;
     try {
@@ -17557,6 +17860,7 @@ _REVIEW_HTML = (
     defaultRef=makeRef(selfCtx, bestLap, 'best lap (lap '+bestLap.lap+')');
     currentRef=defaultRef;
     el('lapcard').style.display='';
+    carInit();
     el('lap-sub').textContent=laps.length+' laps \u00b7 best '+lapFmt(bestLap.seconds);
     const rows=el('lap-rows'); rows.innerHTML='';
     for (const lap of laps){
@@ -17567,6 +17871,7 @@ _REVIEW_HTML = (
       tr.innerHTML='<td>'+lap.lap+'</td><td>'+lapFmt(lap.seconds)+
         '</td><td class="gap">'+gapTxt+'</td><td>'+
         (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>'+
+        '<td class="num pw-hp">\u2026</td><td class="num pw-tq">\u2026</td>'+
         '<td><button class="btn" data-xlap="'+lap.lap+'" '+
         'title="exclude this lap from best/deltas" '+
         'style="padding:1px 7px;line-height:1.1">\u2715</button></td>';
@@ -17581,6 +17886,7 @@ _REVIEW_HTML = (
       tr.innerHTML='<td>'+lap.lap+'</td><td>'+lapFmt(lap.seconds)+
         '</td><td class="gap">excluded ('+(lap.excluded_reason||'')+')</td><td>'+
         (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>'+
+        '<td>\u2014</td><td>\u2014</td>'+
         '<td><button class="btn" data-rlap="'+lap.lap+'" title="restore this lap" '+
         'style="padding:1px 7px;line-height:1.1">\u21a9</button></td>';
       rows.appendChild(tr);
@@ -17602,6 +17908,7 @@ _REVIEW_HTML = (
     if ((lr.excluded_laps||[]).length)
       el('lap-sub').textContent += ' \u00b7 '+lr.excluded_laps.length+' excluded';
     selectPrimary(bestLap, rows);
+    loadPower();
     loadCompList();
   })();
 

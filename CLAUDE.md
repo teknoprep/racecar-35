@@ -469,6 +469,35 @@ curl -s https://racecar.api.blueuc.com/firmware/list      # {"firmware":[...]}  
 ```
 Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
 
+### Estimated WHEEL power & torque (est WHP / est WTQ) — per session, `track3d_v` 15
+- **The car weight is a property of the DRIVE**, so it lives on the SESSION, not the account:
+  sidecar `DATA_DIR/session_meta/<user>/<file>.json` = `{weight_lb, by, at}`. It follows renames
+  (`_session_sidecar_paths`) and is deleted with the session. Lb, 700–9000; 0/blank clears it.
+- `GET /sessions/{u}/{f}/car` (view-gated; returns `can_edit`), `POST` (owner-or-admin, like
+  editing the session; a read-only grant cannot write it).
+- `GET /sessions/{u}/{f}/power` (view-gated): `set`, `weight_lb`, per-sample `t` (EPOCH seconds
+  as logged), `whp`, `wtq`, `max`, `laps[]`. **With no weight set it returns no numbers at all.**
+- **The model is `server/app/power.py`** (pure, tested in `tests/test_power.py`). Per sample:
+  `P/m = v·(a + C(v) + g·grade)`; `a` = least-squares slope of GPS speed against TIME over ±0.25 s
+  (the RC3D.longG GPS path; NOT a sample-to-sample difference); `C(v) = g·(0.045+0.095·(mph/100)²)`
+  is the coast curve the throttle/coast classifier uses; `grade` = altitude slope over ±4 s,
+  clamped ±6 %, zero below 5 m/s. WHP = P·(lb·0.4536)/745.7 (WHEEL, no drivetrain loss).
+  WTQ = WHP·5252/rpm (rpm < 400 → none).
+- **Spike filter, four layers, in order:** (1) speed and altitude are median-of-5 BEFORE they are
+  differenced (a single bad GPS fix otherwise spreads through the regression and lifts the peak
+  ~17 %); (2) a sample with more than 1 g of FORWARD acceleration is dropped; (3) median-of-5 on the
+  power; (4) a 2 s time-window average, because an engine's peak is what it holds for seconds.
+- **Weight is applied LAST.** Power is linear in mass, so the lap summary caches per-kg peaks
+  (`wkg_max`, `tqkg_max`, `_LAP_RULES_V` 3) and the sessions list multiplies by each session's own
+  weight. Changing a weight never needs a re-scan.
+- Shown in three places: the review page (weight row above the laps, est WHP/WTQ per lap, session
+  peak in the card header), the 3D HUD (`est WHP`/`est WTQ` rows, now · max, and the ghost's speed in
+  red beside yours), and the sessions list (`est WHP` column, filled from `/laps/summary`).
+- **Uncalibrated.** Nothing here is checked against a dyno. Real sessions read ~150–165 WHP peak at
+  2420 lb (Thompson, Summit Point Main, Watkins Glen). The Watkins/Summit "Nowhere Test" synthetic runs
+  in the local harness hold a constant ~0.4 g pull and read ~495 hp; that is the data, not the model.
+  Do not trust the numbers on the synthetic runs. Expect ±15–20 % from the drag and grade model.
+
 ### Session metadata: ONE edit popup (date & time / track / driver)
 A session's static metadata IS its filename: `<sid>_<track>[-combined].ndjson` inside
 `/data/sessions/<safe_name(user)>/` — `<sid>` is the start epoch, so "change the start date &

@@ -26,7 +26,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 MAIN = ROOT / "server/app/main.py"
 SRC = MAIN.read_text()
 
-COLUMNS = ("user", "started", "track", "best", "filename", "size")
+COLUMNS = ("user", "started", "track", "best", "whp", "filename", "size")
 
 
 def _evaluated(name):
