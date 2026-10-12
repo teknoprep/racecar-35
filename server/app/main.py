@@ -5617,7 +5617,8 @@ async def combine_sessions(request: Request) -> JSONResponse:
 
 @app.get("/admin/sessions/targets")
 async def admin_session_targets(request: Request) -> JSONResponse:
-    """Users to offer as reassignment targets, alphabetical.
+    """The people picker's data: who a session can be reassigned to, or shared
+    with, with the NAMES needed to search for them.
 
     - **Admin / view-all**: EVERYONE — all known accounts (admins + allowlist +
       managed) as emails, unioned with every user dir that holds sessions
@@ -5625,9 +5626,10 @@ async def admin_session_targets(request: Request) -> JSONResponse:
     - **Regular user**: only the users they're allowed to view (their own dir +
       any can_view grants).
 
-    (The reassign UI itself is admin-only, but the list honors view scope so it
-    can be reused elsewhere without leaking who exists — the session editor
-    asks for it too, and a non-admin only ever gets the dirs they can see.)
+    `targets` stays a plain list of what gets SUBMITTED (email, or a directory
+    slug for an owner with no account); `people` is the same set with the name
+    from the account's contact details so a picker can match "Maria" as well as
+    "maria.rivera@…". Only the name travels here — never the phone or address.
     """
     web_user = require_web_user(request)
     viewer = str((web_user or {}).get("email", ""))
@@ -5636,23 +5638,46 @@ async def admin_session_targets(request: Request) -> JSONResponse:
     # Non-admin: restrict to the dirs this account may view.
     if oauth_enabled() and not user_sees_all(viewer):
         allowed = visible_dirnames_for(viewer)   # set of slugs, or None (=all)
+        by_slug = {safe_name(e): e for e in allowed_emails()}
         out = set()
         if viewer:
             out.add(viewer)
         if root.exists():
             for d in sorted(root.iterdir()):
                 if d.is_dir() and any(d.iterdir()) and (allowed is None or d.name in allowed):
-                    out.add(d.name)
-        return JSONResponse({"targets": sorted(out, key=str.lower)})
+                    # the account's EMAIL when the directory maps to one (the
+                    # picker can then show and search a name); the bare slug for
+                    # an owner with no account.
+                    out.add(by_slug.get(d.name, d.name))
+    else:
+        # Admin / view-all / dev-mode: everyone.
+        emails = set(allowed_emails())
+        known_slugs = {safe_name(e) for e in emails}
+        if root.exists():
+            for d in sorted(root.iterdir()):
+                if d.is_dir() and d.name not in known_slugs and any(d.iterdir()):
+                    emails.add(d.name)   # orphan owner: a valid move target by slug
+        out = emails
 
-    # Admin / view-all / dev-mode: everyone.
-    emails = set(allowed_emails())
-    known_slugs = {safe_name(e) for e in emails}
-    if root.exists():
-        for d in sorted(root.iterdir()):
-            if d.is_dir() and d.name not in known_slugs and any(d.iterdir()):
-                emails.add(d.name)   # orphan owner: a valid move target by slug
-    return JSONResponse({"targets": sorted(emails, key=str.lower)})
+    targets = sorted(out, key=str.lower)
+    return JSONResponse({"targets": targets, "people": people_for_picker(targets)})
+
+
+def people_for_picker(tokens) -> list:
+    """[{value, name, email, slug}] for a search box: `value` is what gets
+    submitted, `name`/`email` are what it is searched by."""
+    managed = load_managed_users()
+    rows = []
+    for t in tokens:
+        key = str(t).strip()
+        if not key:
+            continue
+        rec = managed.get(key.lower()) or {}
+        prof = profile_of(rec)
+        rows.append({"value": key, "slug": safe_name(key),
+                     "email": key if "@" in key else "",
+                     "name": prof["name"]})
+    return rows
 
 
 @app.post("/admin/sessions/move")
@@ -16150,6 +16175,9 @@ _REVIEW_HTML = (
   .combo-opt { padding: 8px 12px; cursor: pointer; color: var(--text);
     font: 13px var(--ff-mono); white-space: nowrap; }
   .combo-opt:hover, .combo-opt.active { background: var(--surface-3); color: var(--primary); }
+  .combo-opt .nm { font: 600 13px var(--ff-ui); }
+  .combo-opt .em { color: var(--muted); margin-left: 8px; font-size: 12px; }
+  .combo-opt .em.only { margin-left: 0; }
   .combo-empty { padding: 8px 12px; color: var(--muted); font-size: 12px; }
   /* ---- the "edit session" popup: every static field in one place ----- */
   .modal { position: fixed; inset: 0; z-index: 3000; display: flex;
@@ -16286,7 +16314,7 @@ _REVIEW_HTML = (
         <div class="tile full">
           <div class="label">All channels logged <span class="t-label" id="ch-note"></span></div>
           <table class="chtab">
-            <thead><tr><th>channel</th><th>unit</th><th>n</th><th>min</th><th>avg</th><th>max</th></tr></thead>
+            <thead><tr><th>channel</th><th>unit</th><th>cur</th><th>min</th><th>avg</th><th>max</th></tr></thead>
             <tbody id="chtab"></tbody>
           </table>
         </div>
@@ -16501,6 +16529,27 @@ _REVIEW_HTML = (
       ? (data.count + ' of ' + data.total + ' samples')
       : (data.count + ' samples');
 
+  // ---- live values for the channel table --------------------------------
+  // n / min / avg / max are facts about the WHOLE session; CUR is where the car
+  // is at this instant, so the table doubles as a live readout once you hit
+  // play (and follows the slider when you scrub).
+  const chCur = {};
+  const DISCRETE = {lap: 1, afr_status: 1};   // counters: never interpolate
+  function updateChannelCur(i0, i1, f) {
+    for (const k in chCur) {
+      const c = chCur[k];
+      let v;
+      if (i1 == null || i1 === i0 || c.discrete) {
+        // an exact sample (scrubbing) or a counter: never interpolate
+        v = S[(i1 != null && f >= 0.5) ? i1 : i0][k];
+      } else {
+        v = lerpN(S[i0][k], S[i1][k], f);
+      }
+      const txt = (typeof v === 'number' && isFinite(v)) ? fmt(v, c.dc) : '\u2014';
+      if (c.td.textContent !== txt) c.td.textContent = txt;
+    }
+  }
+
   // ---- every channel the session actually carries ------------------------
   // The firmware logs all of its live sources (speed, rpm, coolant, oil,
   // altitude, MAP, IAT, battery, CAN AFR, bench oil, IMU, throttle, timing
@@ -16559,11 +16608,14 @@ _REVIEW_HTML = (
       const tr = document.createElement('tr');
       tr.innerHTML = '<td class="ch-name">' + (NAMES[k] || k) + '</td>' +
         '<td class="ch-unit">' + (UNITS[k] || '') + '</td>' +
-        '<td>' + n + '</td><td>' + fmt(mn, dc) + '</td><td>' +
+        '<td class="ch-cur">\u2014</td>' +
+        '<td>' + fmt(mn, dc) + '</td><td>' +
         fmt(sum / n, Math.max(dc, 2)) + '</td><td>' + fmt(mx, dc) + '</td>';
       tb.appendChild(tr);
+      // remember the cell so the live value can be written on every frame
+      chCur[k] = {td: tr.querySelector('.ch-cur'), dc: dc, discrete: DISCRETE[k]};
     }
-    el('ch-note').textContent = shown + ' channels \u00b7 n / min / avg / max';
+    el('ch-note').textContent = shown + ' channels \u00b7 cur / min / avg / max';
   })();
 
   // ---- Leaflet map (basemap from the server config; default = keyless Esri
@@ -16774,6 +16826,7 @@ _REVIEW_HTML = (
     placeGDot(idx);
     placeDeltaCursor(idx);
     updateCompReadouts(idx);
+    updateChannelCur(idx, null, 0);
   }
   slider.addEventListener('input', () => render(Number(slider.value)));
   render(0);
@@ -16828,6 +16881,7 @@ _REVIEW_HTML = (
     placeGDotVal(gl, gL);
     placeDeltaCursor(i0, i0 + f);
     updateCompReadouts(i0, i0 + f);
+    updateChannelCur(i0, i1, f);
   }
 
   // ---- play / pause ---------------------------------------------------
@@ -18025,8 +18079,72 @@ _REVIEW_HTML = (
   var accList = document.getElementById('acc-list');
   var accCur = document.getElementById('acc-current');
   var accAdd = document.getElementById('acc-add');
-  var accounts = [], accShown = [], accAct = -1;
+  var people = [], accShown = [], accAct = -1;
   function accSay(t, bad){ say(t, bad); }
+
+  // ONE search box over first name, last name and email. The list stays EMPTY
+  // until something is typed: opening a picker on 40 accounts and making the
+  // reader scan it is worse than typing three letters.
+  function accMatch(v, q){ return String(v || '').toLowerCase().indexOf(q) >= 0; }
+  function accLabel(p){
+    var nm = document.createElement('span'); nm.className = 'nm';
+    var em = document.createElement('span'); em.className = 'em';
+    if (p.name){ nm.textContent = p.name;
+                 em.textContent = p.email || p.value; }
+    else { nm.className = 'nm em only'; nm.textContent = p.email || p.value; }
+    return [nm, em];
+  }
+  function renderAcc(){
+    var q = (accPick.value || '').trim().toLowerCase();
+    accList.innerHTML = '';
+    if (!q){ accList.style.display = 'none'; accAct = -1; return; }
+    accShown = people.filter(function(p){
+      return accMatch(p.name, q) || accMatch(p.email, q) || accMatch(p.value, q);
+    }).slice(0, 12);
+    accShown.forEach(function(p, i){
+      var d = document.createElement('div');
+      d.className = 'combo-opt' + (i === accAct ? ' active' : '');
+      accLabel(p).forEach(function(x){ d.appendChild(x); });
+      d.addEventListener('mousedown', function(ev){
+        ev.preventDefault(); accPick.value = p.value; accHide(); });
+      accList.appendChild(d);
+    });
+    if (!accShown.length){
+      var d = document.createElement('div');
+      if (q.indexOf('@') > 0){
+        // an email we do not know yet: still shareable (they may not have
+        // signed in for the first time)
+        d.className = 'combo-opt'; d.textContent = 'share with ' + q;
+        d.addEventListener('mousedown', function(ev){
+          ev.preventDefault(); accPick.value = q; accHide(); });
+      } else {
+        d.className = 'combo-empty'; d.textContent = 'no account matches';
+      }
+      accList.appendChild(d);
+    }
+    accList.style.display = '';
+  }
+  function accHide(){ accList.style.display = 'none'; accAct = -1; }
+  accPick.addEventListener('input', function(){ accAct = -1; renderAcc(); });
+  accPick.addEventListener('keydown', function(ev){
+    if (ev.key === 'Enter'){
+      ev.preventDefault();
+      // Enter on a highlighted row shares with THAT account; with nothing
+      // highlighted it submits what was typed (a full email works without
+      // touching the arrows).
+      if (accAct >= 0 && accShown[accAct]){
+        accPick.value = accShown[accAct].value; accHide(); accAdd.click(); return;
+      }
+      accAdd.click(); return;
+    }
+    if (accList.style.display === 'none') return;
+    if (ev.key === 'ArrowDown'){ ev.preventDefault(); accAct = Math.min(accAct + 1, accShown.length - 1); renderAcc(); }
+    else if (ev.key === 'ArrowUp'){ ev.preventDefault(); accAct = Math.max(accAct - 1, 0); renderAcc(); }
+    else if (ev.key === 'Escape'){ accHide(); }
+  });
+  document.addEventListener('click', function(ev){
+    if (accList.parentNode && !accList.parentNode.contains(ev.target)) accHide();
+  });
   function renderViewers(rows){
     accCur.innerHTML = '';
     if (!rows || !rows.length){
@@ -18035,7 +18153,9 @@ _REVIEW_HTML = (
     }
     rows.forEach(function(v){
       var chip = document.createElement('div'); chip.className = 'acc-chip';
-      var who = document.createElement('span'); who.className = 'who'; who.textContent = v.viewer;
+      var who = document.createElement('span'); who.className = 'who';
+      var known = people.filter(function(p){ return p.value === v.viewer; })[0];
+      who.textContent = (known && known.name) ? (known.name + ' \u00b7 ' + v.viewer) : v.viewer;
       who.title = v.by ? ('shared by ' + v.by) : '';
       var rm = document.createElement('button');
       rm.className = 'btn danger'; rm.type = 'button'; rm.textContent = 'remove';
@@ -18047,8 +18167,8 @@ _REVIEW_HTML = (
             body: JSON.stringify({viewer: v.viewer})});
           var j = await r.json().catch(function(){ return {}; });
           if (!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
-          renderViewers(j.viewers); accSay('no longer shared with ' + v.viewer);
-        } catch(e){ accSay('could not remove: ' + e.message, true); rm.disabled = false; }
+          renderViewers(j.viewers); say('no longer shared with ' + v.viewer);
+        } catch(e){ say('could not remove: ' + e.message, true); rm.disabled = false; }
       });
       chip.appendChild(who); chip.appendChild(rm);
       accCur.appendChild(chip);
@@ -18057,55 +18177,19 @@ _REVIEW_HTML = (
   async function loadViewers(){
     try {
       var r = await fetch(abase);
-      if (!r.ok) return;
-      var j = await r.json();
-      renderViewers(j.viewers);
-      // the same list feeds the picker: everyone this account could share with
-      try {
-        var t = await (await fetch('/admin/sessions/targets')).json();
-        accounts = (t.targets || []).slice().sort(function(a,b){
-          return a.toLowerCase().localeCompare(b.toLowerCase()); });
-      } catch(e){}
+      if (r.ok) renderViewers((await r.json()).viewers);
+    } catch(e){}
+    try {   // everyone this account could share with, names included
+      var t = await (await fetch('/admin/sessions/targets')).json();
+      people = (t.people || []).slice();
+      if (!people.length){
+        people = (t.targets || []).map(function(x){ return {value: x, email: x, name: ''}; });
+      }
     } catch(e){}
   }
-  function renderAcc(){
-    var q = (accPick.value || '').trim().toLowerCase();
-    accShown = q ? accounts.filter(function(x){ return x.toLowerCase().indexOf(q) >= 0; })
-                 : accounts.slice();
-    accList.innerHTML = '';
-    if (!accShown.length){
-      var d = document.createElement('div'); d.className = 'combo-empty';
-      d.textContent = accounts.length ? 'no account matches \u2014 type a full email to share anyway'
-                                      : 'loading accounts\u2026';
-      accList.appendChild(d);
-    } else {
-      accShown.forEach(function(em, i){
-        var d = document.createElement('div');
-        d.className = 'combo-opt' + (i === accAct ? ' active' : '');
-        d.textContent = em;
-        d.addEventListener('mousedown', function(ev){
-          ev.preventDefault(); accPick.value = em; accHide(); });
-        accList.appendChild(d);
-      });
-    }
-    accList.style.display = '';
-  }
-  function accHide(){ accList.style.display = 'none'; accAct = -1; }
-  accPick.addEventListener('focus', function(){ accAct = -1; renderAcc(); });
-  accPick.addEventListener('input', function(){ accAct = -1; renderAcc(); });
-  accPick.addEventListener('keydown', function(ev){
-    if (ev.key === 'Enter'){ ev.preventDefault(); accAdd.click(); return; }
-    if (accList.style.display === 'none') return;
-    if (ev.key === 'ArrowDown'){ ev.preventDefault(); accAct = Math.min(accAct + 1, accShown.length - 1); renderAcc(); }
-    else if (ev.key === 'ArrowUp'){ ev.preventDefault(); accAct = Math.max(accAct - 1, 0); renderAcc(); }
-    else if (ev.key === 'Escape'){ accHide(); }
-  });
-  document.addEventListener('click', function(ev){
-    if (accList.parentNode && !accList.parentNode.contains(ev.target)) accHide();
-  });
   accAdd.addEventListener('click', async function(){
     var who = (accPick.value || '').trim().toLowerCase();
-    if (!who || who.indexOf('@') < 0){ accSay('enter the email of the account to share with', true); return; }
+    if (!who || who.indexOf('@') < 0){ accSay('type a name or email, then pick the account', true); return; }
     accAdd.disabled = true;
     try {
       var r = await fetch(abase, {method:'POST',
