@@ -3136,6 +3136,196 @@ async def session_track_prep_status(request: Request, user: str, filename: str) 
     return JSONResponse({"ok": True, "slug": slug, "prep": st})
 
 
+# ---------------------------------------------------------------------------
+# A session's STATIC metadata IS its filename
+#
+#   <sid>_<track>[-combined].ndjson   in   /data/sessions/<safe_name(user)>/
+#
+# <sid> is the start epoch, so "the start date & time", "the track" and "who
+# owns it" are the filename and the directory it sits in. Editing any of them
+# is therefore a rename and/or a move — and everything keyed by
+# (user, filename) has to follow it, or the session quietly loses its AI
+# history, lap exclusions, video link, lap cache, debug log, share tokens and
+# coach items. One mover does all of it so no caller can forget a sidecar.
+# ---------------------------------------------------------------------------
+SESSION_EXT = ".ndjson"
+
+
+def split_session_name(name: str) -> tuple:
+    """(<sid epoch or 0>, <track>, <combined>) out of a session filename."""
+    base = name[: -len(SESSION_EXT)] if name.endswith(SESSION_EXT) else name
+    m = re.match(r"^(\d+)_(.*)$", base)
+    sid = int(m.group(1)) if m else 0
+    track = (m.group(2) if m else base) or "UNKNOWN"
+    combined = track.endswith("-combined")
+    if combined:
+        track = track[: -len("-combined")]
+    return sid, track, combined
+
+
+def session_filename(sid: int, track: str, combined: bool = False) -> str:
+    """Build <sid>_<track>[-combined].ndjson (the track is slugged for disk)."""
+    return (f"{int(sid)}_{safe_name(track, default='UNKNOWN')}"
+            f"{'-combined' if combined else ''}{SESSION_EXT}")
+
+
+def _session_sidecar_paths(user: str, name: str) -> list:
+    """(label, path) for everything stored per (user, session filename).
+
+    Built at CALL time on purpose: these path helpers are defined further down
+    the file than the routes that use this.
+    """
+    return [
+        ("ai_history", _ai_history_path(user, name)),
+        ("lap_meta", _lap_meta_path(user, name)),
+        ("video", _video_meta_path(user, name)),
+        ("lap_cache", LAPCACHE_DIR / safe_name(user) / (name + ".json")),
+        ("debug", _debug_path_for(user, name)),
+    ]
+
+
+def session_sidecars_follow(old_user: str, old_name: str,
+                            new_user: str, new_name: str) -> None:
+    """Move every sidecar after a session is renamed and/or reassigned.
+
+    Best-effort per file and never fatal: the session itself has already moved,
+    so a sidecar that fails to follow is a stale cache or an orphan, not a
+    reason to fail a request that already succeeded.
+    """
+    for (label, src), (_, dst) in zip(_session_sidecar_paths(old_user, old_name),
+                                      _session_sidecar_paths(new_user, new_name)):
+        try:
+            if src == dst or not src.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+        except Exception as exc:
+            log.warning("session sidecar %s did not follow %s: %s", label, old_name, exc)
+    # A share token names the session INSIDE its json, so without this a rename
+    # 404s every public link already handed out.
+    try:
+        if SHARE_DIR.exists():
+            for tf in SHARE_DIR.glob("*.json"):
+                try:
+                    td = json.loads(tf.read_text("utf-8"))
+                    if td.get("user") == safe_name(old_user) and td.get("filename") == old_name:
+                        td["user"] = safe_name(new_user)
+                        td["filename"] = new_name
+                        tf.write_text(json.dumps(td), "utf-8")
+                except Exception:
+                    pass
+    except Exception as exc:
+        log.warning("session share tokens did not follow %s: %s", old_name, exc)
+    # Coach checklist items name the session they came from and they belong to
+    # the DRIVER, so a real account change moves them to that driver's list.
+    # (The "rest" list is built BEFORE the items are renamed — renaming first
+    # made every item stop matching the filter and left a stale copy behind on
+    # the old driver.)
+    try:
+        items = _coach_load(old_user)
+        mine = [i for i in items if i.get("session") == old_name]
+        if mine:
+            rest = [i for i in items if i.get("session") != old_name]
+            for i in mine:
+                i["session"] = new_name
+            if safe_name(new_user) == safe_name(old_user):
+                _coach_save(old_user, items)
+            else:
+                _coach_save(old_user, rest)
+                _coach_save(new_user, _coach_load(new_user) + mine)
+    except Exception as exc:
+        log.warning("session coach items did not follow %s: %s", old_name, exc)
+
+
+def _may_reassign(request: Request) -> bool:
+    """May this request move a session to ANOTHER account? Admin-only.
+
+    In dev mode (OAuth off) every gate in this app is a no-op and this one
+    follows that rule, so the reassign path stays exercisable on a bench.
+    """
+    if not oauth_enabled():
+        return True
+    return is_admin_email(str((current_user(request) or {}).get("email", "")))
+
+
+@app.post("/sessions/{user}/{filename}/update")
+async def session_update(request: Request, user: str, filename: str) -> JSONResponse:
+    """Edit a session's STATIC metadata in one place: what the review page's
+    "edit session" popup saves.
+
+    Body JSON, every field optional (absent = leave it alone):
+        track   new track name                  owner-or-admin
+        epoch   new start epoch (seconds)       owner-or-admin (it is the <sid>)
+        target  new owning account (email)      ADMIN only — this is the reassign
+
+    Refuses to overwrite an existing session (409) and answers with the new
+    /review URL, because a rename changes it.
+    """
+    gate_delete_dir(request, safe_name(user))
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="a JSON object body is required")
+
+    p = _resolve_session(user, filename)
+    old_user = safe_name(user)
+    sid, track, combined = split_session_name(p.name)
+
+    if "track" in body:
+        track = safe_name(str(body.get("track") or "").strip(), default="")
+        if not track:
+            raise HTTPException(status_code=400, detail="track cannot be empty")
+    if "epoch" in body:
+        try:
+            sid = int(body.get("epoch"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422,
+                                detail="date & time must be a unix timestamp")
+        if not reasonable_epoch(sid):
+            raise HTTPException(status_code=422,
+                                detail="date & time is outside the allowed range (2000-2100)")
+    new_name = session_filename(sid, track, combined)
+
+    target = str(body.get("target") or "").strip().lower()
+    new_user = old_user
+    if target and target != old_user:
+        if not _may_reassign(request):
+            raise HTTPException(status_code=403,
+                                detail="only an admin can move a session to another account")
+        # Either an email address (a new or existing account) or the slug of a
+        # directory that already holds sessions: the picker offers both, and an
+        # "orphan owner" (a directory with no matching account) is a legitimate
+        # target — the old reassign accepted slugs the same way.
+        if " " in target or ("@" not in target
+                             and not (DATA_DIR / "sessions" / safe_name(target)).is_dir()):
+            raise HTTPException(status_code=422,
+                                detail="that is neither an email address nor an existing user")
+        new_user = safe_name(target)
+
+    if new_name == p.name and new_user == old_user:
+        return JSONResponse({"ok": True, "unchanged": True, "user": new_user,
+                             "filename": p.name,
+                             "review": f"/review/{new_user}/{p.name}"})
+
+    dst_dir = session_dir_for(target) if new_user != old_user else p.parent
+    dst = dst_dir / new_name
+    if dst.exists():
+        raise HTTPException(status_code=409,
+                            detail=f"{new_user} already has a session named {new_name}")
+    shutil.move(str(p), str(dst))
+    session_sidecars_follow(old_user, p.name, new_user, new_name)
+    if new_user != old_user:
+        try:
+            p.parent.rmdir()          # tidy the source dir if the move emptied it
+        except OSError:
+            pass
+    log.info("session %s/%s -> %s/%s", old_user, p.name, new_user, new_name)
+    return JSONResponse({"ok": True, "user": new_user, "filename": new_name,
+                         "review": f"/review/{new_user}/{new_name}"})
+
+
 @app.post("/sessions/{user}/{filename}/rename")
 async def session_rename(request: Request, user: str, filename: str) -> JSONResponse:
     """Change a session's TRACK (renames the file to <sid>_<track>.ndjson and
@@ -3161,39 +3351,7 @@ async def session_rename(request: Request, user: str, filename: str) -> JSONResp
     if dst.exists():
         raise HTTPException(status_code=409, detail=f"{new_name} already exists")
     shutil.move(str(p), str(dst))
-    # sidecars — every one keyed by (user, filename)
-    for fn in (_ai_history_path, _lap_meta_path, _video_meta_path):
-        try:
-            src = fn(d, p.name)
-            if src.exists():
-                dstm = fn(d, new_name)
-                dstm.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(dstm))
-        except Exception as e:
-            log.warning("rename sidecar %s failed: %s", fn.__name__, e)
-    try:   # share tokens reference the filename inside their json
-        if SHARE_DIR.exists():
-            for tf in SHARE_DIR.glob("*.json"):
-                try:
-                    td = json.loads(tf.read_text("utf-8"))
-                    if td.get("user") == d and td.get("filename") == p.name:
-                        td["filename"] = new_name
-                        tf.write_text(json.dumps(td), "utf-8")
-                except Exception:
-                    pass
-    except Exception as e:
-        log.warning("rename shares failed: %s", e)
-    try:   # coach items carry the session filename
-        items = _coach_load(d)
-        ch = False
-        for i in items:
-            if i.get("session") == p.name:
-                i["session"] = new_name
-                ch = True
-        if ch:
-            _coach_save(d, items)
-    except Exception:
-        pass
+    session_sidecars_follow(d, p.name, d, new_name)
     log.info("renamed %s/%s -> %s", d, p.name, new_name)
     return JSONResponse({"ok": True, "file": new_name})
 
@@ -5051,7 +5209,8 @@ async def admin_session_targets(request: Request) -> JSONResponse:
       any can_view grants).
 
     (The reassign UI itself is admin-only, but the list honors view scope so it
-    can be reused elsewhere without leaking who exists.)
+    can be reused elsewhere without leaking who exists — the session editor
+    asks for it too, and a non-admin only ever gets the dirs they can see.)
     """
     web_user = require_web_user(request)
     viewer = str((web_user or {}).get("email", ""))
@@ -6302,12 +6461,20 @@ async def review(request: Request, user: str, filename: str) -> Response:
         return login_redirect(request)
     gate_view_dir(request, safe_name(user))
     p = _resolve_session(user, filename)
-    when = time.strftime(
-        "%Y-%m-%d %H:%M:%S UTC", time.gmtime(display_epoch_for(p))
-    )
+    epoch = int(display_epoch_for(p))
+    when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(epoch))
+    # Who may open the "edit session" popup, and may they change the owner too?
+    # Owner-or-admin renames the track/date (same rule as delete); moving a
+    # session to ANOTHER account is the admin-only half.
+    viewer_email = str((current_user(request) or {}).get("email", ""))
+    can_edit = (not oauth_enabled()) or can_delete_dir(viewer_email, safe_name(user))
+    is_admin = (not oauth_enabled()) or is_admin_email(viewer_email)
     return _REVIEW_HTML.replace("__USER__", safe_name(user)) \
                        .replace("__FILE__", p.name) \
                        .replace("__WHEN__", when) \
+                       .replace("__EPOCH__", str(epoch)) \
+                       .replace("__CAN_EDIT__", "true" if can_edit else "false") \
+                       .replace("__IS_ADMIN__", "true" if is_admin else "false") \
                        .replace("__MAP_TILES__", json.dumps(MAP_TILES)) \
                        .replace("__MAP_ATTRIB__", json.dumps(MAP_ATTRIB)) \
                        .replace("__MAP_MAXZOOM__", str(MAP_MAXZOOM))
@@ -15045,6 +15212,27 @@ _REVIEW_HTML = (
     font: 13px var(--ff-mono); white-space: nowrap; }
   .combo-opt:hover, .combo-opt.active { background: var(--surface-3); color: var(--primary); }
   .combo-empty { padding: 8px 12px; color: var(--muted); font-size: 12px; }
+  /* ---- the "edit session" popup: every static field in one place ----- */
+  .modal { position: fixed; inset: 0; z-index: 3000; display: flex;
+    align-items: center; justify-content: center; padding: 24px;
+    background: rgba(6,8,12,0.72); }
+  .modal-card { width: min(560px, calc(100vw - 32px));
+    max-height: calc(100vh - 48px); overflow: auto; background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--r-md);
+    box-shadow: 0 24px 60px rgba(0,0,0,0.6); }
+  .modal-head { display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .modal-body { padding: 16px; }
+  .modal-foot { display: flex; justify-content: flex-end; gap: 8px;
+    margin-top: 18px; }
+  .modal .field { margin-bottom: 15px; }
+  .modal .field > .t-label { display: block; margin-bottom: 6px; }
+  .modal .inline { display: flex; gap: 8px; align-items: center; }
+  .modal .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .modal .combo { display: block; position: relative; }
+  .modal .combo-list { width: 100%; }
+  .modal .saved-as { font-family: var(--ff-mono); font-size: 13px;
+    color: var(--primary); word-break: break-all; }
   .leaflet-crosshair, .leaflet-crosshair .leaflet-interactive { cursor: crosshair !important; }
 
   .delta-wrap { position: relative; }
@@ -15061,15 +15249,8 @@ _REVIEW_HTML = (
   <span style="flex:1"></span>
   <span class="pill" id="started">__WHEN__</span>
   <span class="pill" id="count">\u2026</span>
-  <span id="admin-move" style="display:none;align-items:center;gap:6px">
-    <span class="combo">
-      <input id="move-target" class="cmp-input" type="text"
-             placeholder="reassign to user…" autocomplete="off"
-             style="width:auto;min-width:210px">
-      <div id="move-list" class="combo-list" style="display:none"></div>
-    </span>
-    <button id="move-btn" class="btn">reassign</button>
-  </span>
+  <button id="edit-btn" class="btn" style="display:none;white-space:nowrap"
+          title="the start date &amp; time, the track, and the owning driver — the filename IS that metadata, so everything that belongs to this session is renamed and moved with it">edit session…</button>
   <a class="btn" href="/sessions/__USER__/__FILE__">download</a>
   <input id="yt-url" class="cmp-input" type="text" placeholder="YouTube link…"
          autocomplete="off" style="width:190px">
@@ -15258,6 +15439,53 @@ _REVIEW_HTML = (
   </div>
   <div id="err" class="err" style="display:none"></div>
 </main>
+
+<div id="meta-modal" class="modal" role="dialog" aria-modal="true"
+     aria-labelledby="meta-title" style="display:none">
+  <div class="modal-card">
+    <div class="modal-head">
+      <span class="t-label" id="meta-title">edit session</span>
+      <span style="flex:1"></span>
+      <button class="btn" id="meta-x" type="button" aria-label="close">&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label class="t-label" for="meta-when">date &amp; time (start of race)</label>
+        <div class="inline">
+          <input id="meta-when" class="cmp-input" type="datetime-local" step="1">
+          <button class="btn" id="meta-now" type="button"
+                  title="this session started just now">now</button>
+        </div>
+        <div class="hint">UTC — the same clock as the pill in the header and the
+          sessions list.</div>
+      </div>
+      <div class="field" id="meta-user-field">
+        <label class="t-label" for="meta-user">driver (owning account)</label>
+        <span class="combo">
+          <input id="meta-user" class="cmp-input" type="text" autocomplete="off"
+                 spellcheck="false" placeholder="driver@example.com">
+          <div id="meta-user-list" class="combo-list" style="display:none"></div>
+        </span>
+        <div class="hint" id="meta-user-hint"></div>
+      </div>
+      <div class="field">
+        <label class="t-label" for="meta-track">track</label>
+        <select id="meta-track" class="cmp-input"></select>
+        <input id="meta-track-custom" class="cmp-input" style="display:none;margin-top:6px"
+               placeholder="custom track name" spellcheck="false">
+      </div>
+      <div class="field">
+        <span class="t-label">saved as</span>
+        <div class="saved-as" id="meta-preview">—</div>
+      </div>
+      <div class="cmp-status" id="meta-msg"></div>
+      <div class="modal-foot">
+        <button class="btn" id="meta-cancel" type="button">cancel</button>
+        <button class="btn primary" id="meta-save" type="button">save</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
 (async function(){
@@ -16560,46 +16788,14 @@ _REVIEW_HTML = (
     });
     loadModels();
 
-    // ---- session tools: change TRACK + this session's coach checklist ----
+    // ---- this session's coach checklist --------------------------------
+    // (track / date & time / owning driver all live in the one "edit session"
+    // popup now, so there is no track box here any more.)
     (function(){
-      // Sits as its own toolbar row directly under the AI toolbar (the AI card's
-      // structure is tool rows on top, quick asks + composer + history below).
-      var row=document.createElement('div'); row.className='ai-tool';
-      row.innerHTML='<label class="ai-field">track '+
-        '<select id="trk-sel" class="cmp-input" style="width:auto;min-width:170px"></select></label>'+
-        '<input id="trk-custom" class="cmp-input" style="display:none;width:170px" placeholder="custom track name">'+
-        '<button id="trk-save" class="btn" type="button">rename session</button>'+
-        '<span class="t-label" id="trk-msg"></span>';
       var tool=el('ai-draw').closest('.ai-tool');
       var anchor = tool && tool.parentNode ? tool : el('ai-draw').parentNode;
-      anchor.parentNode.insertBefore(row, anchor.nextSibling);
       var chd=document.createElement('div'); chd.id='sess-coach';
-      anchor.parentNode.insertBefore(chd, row.nextSibling);
-      var sel=document.getElementById('trk-sel'), cus=document.getElementById('trk-custom'),
-          msg=document.getElementById('trk-msg');
-      fetch('/tracks').then(function(r){return r.json();}).then(function(j){
-        (j.tracks||[]).forEach(function(t){ var o=document.createElement('option');
-          o.value=t; o.textContent=t; sel.appendChild(o); });
-        var o=document.createElement('option'); o.value='__custom__'; o.textContent='(custom...)';
-        sel.appendChild(o);
-        var curTrack=FILE.replace(/^[0-9]+_/,'').replace(/(-combined)?[.]ndjson$/,'').replace(/_/g,' ');
-        for(var i=0;i<sel.options.length;i++)
-          if(sel.options[i].value.toLowerCase().replace(/_/g,' ')===curTrack.toLowerCase()){sel.selectedIndex=i;break;}
-      });
-      sel.addEventListener('change', function(){ cus.style.display = sel.value==='__custom__' ? '' : 'none'; });
-      document.getElementById('trk-save').addEventListener('click', function(){
-        var t = sel.value==='__custom__' ? cus.value.trim() : sel.value;
-        if(!t){ msg.textContent='pick a track'; return; }
-        msg.textContent='renaming...';
-        fetch('/sessions/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+'/rename',
-              {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({track:t})})
-        .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
-        .then(function(x){
-          if(!x.ok){ msg.textContent='error: '+(x.j.detail||'failed'); return; }
-          if(x.j.unchanged){ msg.textContent='already that track'; return; }
-          location.href='/review/'+encodeURIComponent(USER)+'/'+encodeURIComponent(x.j.file);
-        }).catch(function(e){ msg.textContent='failed: '+e.message; });
-      });
+      anchor.parentNode.insertBefore(chd, anchor.nextSibling);
       function loadSessCoach(){
         fetch('/coach/'+encodeURIComponent(USER)).then(function(r){return r.json();}).then(function(j){
           var items=(j.items||[]).filter(function(i){return i.session===FILE;});
@@ -16628,76 +16824,161 @@ _REVIEW_HTML = (
 })();
 </script>
 <script>
-// Admin-only: reassign this session (and its AI history) to another user.
+// ---- session metadata editor (date & time / track / owning driver) -------
+// ONE popup for every piece of static data this page shows about the session.
+// The filename IS that metadata (<sid>_<track>.ndjson inside the owner's
+// directory), so saving is a rename and/or a move - and the server carries the
+// AI history, lap exclusions, video link, lap cache, debug log, share tokens
+// and coach items with it.
 (async function(){
+  const $ = (id)=>document.getElementById(id);
   const U='__USER__', F='__FILE__';
-  let me;
-  try { me = await (await fetch('/me')).json(); } catch(e){ return; }
-  if (!me || !me.is_admin) return;
-  const wrap=document.getElementById('admin-move');
-  const sel=document.getElementById('move-target');
-  const list=document.getElementById('move-list');
-  const btn=document.getElementById('move-btn');
-  if (!wrap||!sel||!list||!btn) return;
-  let targets=[];
-  try {
-    const t = await (await fetch('/admin/sessions/targets')).json();
-    targets = (t.targets||[]).slice().sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
-  } catch(e){}
-  wrap.style.display='inline-flex';
+  const CAN_EDIT=__CAN_EDIT__, IS_ADMIN=__IS_ADMIN__, EPOCH=__EPOCH__;
+  const btn=$('edit-btn'), modal=$('meta-modal');
+  if(!btn||!modal||!CAN_EDIT) return;
+  const when=$('meta-when'), who=$('meta-user'), wlist=$('meta-user-list'),
+        trk=$('meta-track'), trkc=$('meta-track-custom'), prev=$('meta-preview'),
+        msg=$('meta-msg'), save=$('meta-save');
+  const CUR_TRACK = F.replace(/^[0-9]+_/,'').replace(/(-combined)?[.]ndjson$/,'');
+  const COMBINED  = /-combined[.]ndjson$/.test(F);
+  const pad = n => String(n).padStart(2,'0');
 
-  // Custom filterable dropdown: click shows the full alphabetical list; typing
-  // filters (substring, case-insensitive); click a row or Enter to pick.
-  let active=-1, shown=[];
-  function renderList(){
-    const q=(sel.value||'').trim().toLowerCase();
-    shown = q ? targets.filter(x=>x.toLowerCase().includes(q)) : targets.slice();
-    list.innerHTML='';
-    if (!shown.length){
-      const d=document.createElement('div'); d.className='combo-empty';
-      d.textContent = targets.length ? 'no match — type a full email to add' : 'no users found';
-      list.appendChild(d);
-    } else {
-      shown.forEach((em,i)=>{
-        const d=document.createElement('div'); d.className='combo-opt'+(i===active?' active':'');
-        d.textContent=em;
-        d.addEventListener('mousedown', ev=>{ ev.preventDefault(); sel.value=em; hide(); });
-        list.appendChild(d);
-      });
-    }
-    list.style.display='';
+  // what the server's safe_name() will do to a track name: it becomes the
+  // middle bit of the filename, so the preview shows the real result
+  function slug(s){
+    return String(s||'').replace(/[^A-Za-z0-9._+-]+/g,'_').replace(/^_+|_+$/g,'').slice(0,96);
   }
-  function hide(){ list.style.display='none'; active=-1; }
-  sel.addEventListener('focus', ()=>{ active=-1; renderList(); });
-  sel.addEventListener('input', ()=>{ active=-1; renderList(); });
-  sel.addEventListener('keydown', ev=>{
-    if (list.style.display==='none') return;
-    if (ev.key==='ArrowDown'){ ev.preventDefault(); active=Math.min(active+1, shown.length-1); renderList(); }
-    else if (ev.key==='ArrowUp'){ ev.preventDefault(); active=Math.max(active-1, 0); renderList(); }
-    else if (ev.key==='Enter'){ if (active>=0 && shown[active]){ ev.preventDefault(); sel.value=shown[active]; hide(); } }
-    else if (ev.key==='Escape'){ hide(); }
-  });
-  document.addEventListener('click', ev=>{ if (!wrap.contains(ev.target)) hide(); });
-
-  btn.addEventListener('click', async ()=>{
-    const target=(sel.value||'').trim().toLowerCase();
-    if (!target){ sel.focus(); return; }
-    // Allow either a known target (email or slug) or a fresh, valid email.
-    const known = targets.some(x=>x.toLowerCase()===target);
-    if (!known && (target.indexOf('@')<0 || target.indexOf('.')<0)){
-      alert('Pick a user from the list, or type a valid email address.'); sel.focus(); return;
+  function toInput(ep){
+    const d=new Date(ep*1000);
+    return d.getUTCFullYear()+'-'+pad(d.getUTCMonth()+1)+'-'+pad(d.getUTCDate())+'T'+
+           pad(d.getUTCHours())+':'+pad(d.getUTCMinutes())+':'+pad(d.getUTCSeconds());
+  }
+  // the field is UTC by contract, so pin the zone rather than let the browser
+  // read a bare datetime-local as local time
+  function fromInput(v){
+    if(!v) return null;
+    const ms=Date.parse(v.length===16 ? v+':00Z' : v+'Z');
+    return isFinite(ms) ? Math.floor(ms/1000) : null;
+  }
+  function say(t,bad){ msg.textContent=t||''; msg.className='cmp-status'+(bad?' bad':''); }
+  function trackValue(){ return trk.value==='__custom__' ? trkc.value.trim() : trk.value; }
+  function draw(){
+    const ep=fromInput(when.value);
+    prev.textContent=(ep==null?'?':ep)+'_'+(slug(trackValue())||'UNKNOWN')+
+      (COMBINED?'-combined':'')+'.ndjson';
+  }
+  function pickTrack(name){
+    const want=String(name||'').toLowerCase().replace(/_/g,' ');
+    for(let i=0;i<trk.options.length;i++){
+      if(trk.options[i].value.toLowerCase().replace(/_/g,' ')===want){
+        trk.selectedIndex=i; trkc.style.display='none'; return;
+      }
     }
-    if (!confirm('Move this session (and its AI history) to '+target+'?\\nThe URL will change to that user.')) return;
-    btn.disabled=true; btn.textContent='moving\u2026';
-    try {
-      const r=await fetch('/admin/sessions/move', {method:'POST',headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({user:U, filename:F, target})});
-      const j=await r.json();
-      if (r.ok && j.review){ location.href=j.review; return; }
-      alert('move failed: '+((j&&j.detail)||('HTTP '+r.status)));
-    } catch(e){ alert('move failed: '+e.message); }
-    btn.disabled=false; btn.textContent='reassign';
+    trk.value='__custom__'; trkc.style.display=''; trkc.value=String(name||'').replace(/_/g,' ');
+  }
+  trk.addEventListener('change', function(){
+    trkc.style.display = trk.value==='__custom__' ? '' : 'none'; draw();
   });
+  trkc.addEventListener('input', draw);
+  when.addEventListener('input', draw);
+
+  function fillTracks(){
+    fetch('/tracks').then(r=>r.json()).then(j=>{
+      (j.tracks||[]).forEach(function(t){ var o=document.createElement('option');
+        o.value=t; o.textContent=t; trk.appendChild(o); });
+      var o=document.createElement('option'); o.value='__custom__'; o.textContent='(custom\u2026)';
+      trk.appendChild(o); pickTrack(CUR_TRACK);
+    }).catch(function(){
+      var o=document.createElement('option'); o.value='__custom__'; o.textContent='(custom\u2026)';
+      trk.appendChild(o); pickTrack(CUR_TRACK);
+    });
+  }
+
+  // driver picker: every account a session can belong to. Admin only - a
+  // non-admin never sees the field, because they cannot reassign.
+  let targets=[], active=-1, shown=[];
+  function userField(){
+    fetch('/admin/sessions/targets').then(r=>r.json()).then(j=>{
+      targets=(j.targets||[]).slice().sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
+    }).catch(function(){});
+    function hide(){ wlist.style.display='none'; active=-1; }
+    function show(){
+      const q=(who.value||'').trim().toLowerCase();
+      shown = q ? targets.filter(x=>x.toLowerCase().includes(q)) : targets.slice();
+      wlist.innerHTML='';
+      if(!shown.length){
+        const d=document.createElement('div'); d.className='combo-empty';
+        d.textContent = targets.length ? 'no match \u2014 type a full email' : 'loading\u2026';
+        wlist.appendChild(d);
+      } else {
+        shown.forEach(function(em,i){
+          const d=document.createElement('div');
+          d.className='combo-opt'+(i===active?' active':''); d.textContent=em;
+          d.addEventListener('mousedown', function(ev){ ev.preventDefault(); who.value=em; hide(); });
+          wlist.appendChild(d);
+        });
+      }
+      wlist.style.display='';
+    }
+    who.addEventListener('focus', function(){ active=-1; show(); });
+    who.addEventListener('input', function(){ active=-1; show(); });
+    who.addEventListener('keydown', function(ev){
+      if(wlist.style.display==='none') return;
+      if(ev.key==='ArrowDown'){ ev.preventDefault(); active=Math.min(active+1, shown.length-1); show(); }
+      else if(ev.key==='ArrowUp'){ ev.preventDefault(); active=Math.max(active-1, 0); show(); }
+      else if(ev.key==='Enter'){ if(active>=0 && shown[active]){ ev.preventDefault(); who.value=shown[active]; hide(); } }
+      else if(ev.key==='Escape'){ hide(); }
+    });
+    document.addEventListener('click', function(ev){ if(!wlist.parentNode.contains(ev.target)) hide(); });
+    const hint=$('meta-user-hint');
+    if(hint) hint.textContent='Moving the session to another account takes its AI history, '+
+      'video link, share links, coach items and lap cache with it.';
+  }
+
+  function open(){
+    when.value=toInput(EPOCH);
+    who.value=U;
+    pickTrack(CUR_TRACK);
+    say(''); draw();
+    modal.style.display='flex';
+    setTimeout(function(){ when.focus(); }, 30);
+  }
+  function close(){ modal.style.display='none'; }
+  btn.style.display='';
+  btn.addEventListener('click', open);
+  $('meta-x').addEventListener('click', close);
+  $('meta-cancel').addEventListener('click', close);
+  $('meta-now').addEventListener('click', function(){
+    when.value=toInput(Math.floor(Date.now()/1000)); draw();
+  });
+  modal.addEventListener('mousedown', function(ev){ if(ev.target===modal) close(); });
+  document.addEventListener('keydown', function(ev){
+    if(ev.key==='Escape' && modal.style.display!=='none') close();
+  });
+
+  save.addEventListener('click', async function(){
+    const ep=fromInput(when.value);
+    if(ep==null){ say('date & time is not valid', true); return; }
+    const t=trackValue();
+    if(!t){ say('pick a track or type one', true); return; }
+    const body={track:t, epoch:ep};
+    const target=(who.value||'').trim().toLowerCase();
+    if(IS_ADMIN && target && target!==U) body.target=target;
+    save.disabled=true; say('saving\u2026');
+    try{
+      const r=await fetch('/sessions/'+encodeURIComponent(U)+'/'+encodeURIComponent(F)+'/update',
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j=await r.json().catch(function(){ return {}; });
+      if(!r.ok){ say('save failed: '+((j&&j.detail)||('HTTP '+r.status)), true); save.disabled=false; return; }
+      if(j.unchanged){ say('nothing changed'); save.disabled=false; return; }
+      if(j.review){ location.href=j.review; return; }
+      say('saved'); save.disabled=false;
+    }catch(e){ say('save failed: '+e.message, true); save.disabled=false; }
+  });
+
+  fillTracks();
+  if(!IS_ADMIN){ const f=$('meta-user-field'); if(f) f.style.display='none'; }
+  else userField();
 })();
 </script>
 <script>

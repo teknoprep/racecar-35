@@ -453,23 +453,43 @@ curl -s https://racecar.api.blueuc.com/firmware/list      # {"firmware":[...]}  
 ```
 Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
 
-### Admin: reassign a session to another user
-
-Sessions live at `/data/sessions/<safe_name(email)>/<file>.ndjson`. An **admin** can move a
-session to a different account (e.g. “someone drove my car — give them the data”) from the
-**review page header**: a `reassign` control (target dropdown, admin-only, shown after `/me`
-reports `is_admin`) POSTs `/admin/sessions/move {user, filename, target}`. The handler
-`shutil.move`s the `.ndjson` into `session_dir_for(target)` **and moves the matching
-`ai_history/<user>/<file>.json` alongside it**, tidies empty source dirs, and refuses (409) if
-the target already has a same-named session (never silently overwrites). Targets come from
-`GET /admin/sessions/targets`: for an **admin/view-all** viewer = `allowed_emails()` (known
-accounts) ∪ every session-owning dir (orphan owners by slug), deduped + alphabetical; for a
-**regular** viewer = only the dirs they may view. The review-page combobox is a custom
-filterable dropdown (click = full list, type = substring filter, ↑↓/Enter/Esc). On success the
-browser redirects to the new `/review/<new_slug>/<file>` URL. `admin_move_session` is
-`require_admin`-gated; the targets list is `require_web_user` + view-scoped.
-(NOTE: there is no `all_known_users()` — the helper is `allowed_emails()`; using the wrong name
-500s the endpoint → empty combobox → “no users found”.)
+### Session metadata: ONE edit popup (date & time / track / driver)
+A session's static metadata IS its filename: `<sid>_<track>[-combined].ndjson` inside
+`/data/sessions/<safe_name(user)>/` — `<sid>` is the start epoch, so "change the start date &
+time", "change the track" and "reassign to another driver" are one rename and/or move. The
+review page header therefore carries **one button** (`edit session…`, shown to the session's
+owner or an admin via the `__CAN_EDIT__` / `__IS_ADMIN__` / `__EPOCH__` values the route
+injects) which opens a modal with **date & time (UTC) · driver · track**, a live
+`saved as <filename>` preview, and save/cancel. The old standalone controls are GONE: the
+header's reassign combobox (`#move-target`) and the AI card's track select + "rename session"
+button (`#trk-sel`/`#trk-save`). The per-session coach checklist row (`#sess-coach`) stays.
+- **`POST /sessions/{user}/{filename}/update`** body `{track?, epoch?, target?}` — absent = leave
+  alone. **Owner-or-admin** for track/epoch (same rule as delete: `gate_delete_dir`); **target is
+  admin-only** (`_may_reassign`), and dev mode (OAuth off) is open so a bench can exercise it.
+  `target` may be an **email** (a new/existing account → its dir is created) or the **slug of a
+  directory that already holds sessions** (an "orphan owner"). 409 refuses to overwrite an
+  existing session, 422 rejects an out-of-range epoch (2000–2100) / an unknown target, and the
+  response carries the new `/review/<user>/<file>` URL because a rename changes it.
+- **Every sidecar follows** (`session_sidecars_follow`): AI history, lap exclusions, video link,
+  lap cache, debug log, **share tokens** (they name the session inside their JSON, so without
+  this every public link already handed out would 404) and **coach items** (they belong to the
+  DRIVER, so a real account change moves them to that driver's list — build the "rest" list
+  BEFORE renaming the items or they stop matching the filter and a stale copy stays behind).
+  Best-effort per file and never fatal: the session has already moved.
+- `POST /sessions/{user}/{filename}/rename` (track only) is kept and now shares that mover.
+- **Slugs**: `safe_name(email)` keeps dots and turns "@" into "_" — `maria.rivera@example.com`
+  lives in `sessions/maria.rivera_example.com/` (NOT `maria_rivera_example_com`).
+- Targets for the driver field come from `GET /admin/sessions/targets` (require_web_user +
+  view scope): for an **admin/view-all** viewer = `allowed_emails()` (known accounts) ∪ every
+  session-owning dir (orphan owners by slug), deduped + alphabetical; for a **regular** viewer =
+  only the dirs they may view. The field is a custom filterable combobox (click = full list,
+  type = substring, ↑↓/Enter/Esc). (NOTE: there is no `all_known_users()` — the helper is
+  `allowed_emails()`; using the wrong name 500s → empty combobox → "no users found".)
+- Tests: `tests/test_session_edit.py` extracts the real handler with `ast` and runs it against a
+  temp data dir (rename / re-date / reassign, every sidecar following, 409, validation,
+  owner-vs-admin), plus the review page's one-button/no-boxes markup and a check that **every
+  `__TOKEN__` in `_REVIEW_HTML` is replaced by the route** (a forgotten one is a silent JS
+  syntax error that kills the editor).
 
 ### Admin: impersonate a user + login audit + activity report
 
