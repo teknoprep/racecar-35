@@ -34,9 +34,11 @@ Run locally with docker compose (see ../docker-compose.yml) or directly:
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import hmac
 import html
+import io
 import asyncio
 import json
 import logging
@@ -678,6 +680,62 @@ def oauth_enabled() -> bool:
 # populated) and its email is in the union of all three sources. If nothing is
 # configured, the server stays in open dev mode (any verified Google account).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Contact details (name / phone / address) — the roster
+#
+# Stored ON the managed account record in users.json, next to the API key, so
+# the allowlist, the roster and the per-user credentials survive a rebuild
+# together. A PERSON here IS an ACCOUNT: adding someone adds them to the
+# sign-in allowlist (users.json is that allowlist).
+#
+# This is PII, so the read rule is NOT the session rule: you see your OWN
+# details, admins see everyone's. A non-admin account with ALL USERS (which
+# sees every session) does NOT get the phone book.
+# ---------------------------------------------------------------------------
+PROFILE_FIELDS = ("name", "phone", "address")
+PROFILE_MAX = {"name": 120, "phone": 40, "address": 500}
+
+
+def clean_profile_value(field: str, value) -> str:
+    """Trim + collapse whitespace and cap ONE contact field.
+
+    Never raises and never rejects: a bad paste in one field must not lose the
+    other two, and a phone number is whatever the owner types ("+44 7700
+    900123", "(555) 010-0100 x12"). `address` keeps its line breaks — a mailing
+    label has to survive a round trip; the other fields are single-line.
+    """
+    if value is None:
+        return ""
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    if field == "address":
+        # keep the MEANINGFUL lines of a mailing label; blank ones are noise
+        text = "\n".join(ln for ln in (" ".join(l.split()) for l in text.split("\n")) if ln)
+    else:
+        text = " ".join(text.split())
+    return text[: PROFILE_MAX.get(field, 120)]
+
+
+def profile_of(rec: Optional[dict]) -> dict:
+    """The contact fields, always all present ("" when unset)."""
+    rec = rec or {}
+    return {f: clean_profile_value(f, rec.get(f)) for f in PROFILE_FIELDS}
+
+
+def profile_missing(rec: Optional[dict]) -> list:
+    """Which contact fields are still blank — the roster's "collect this" list."""
+    p = profile_of(rec)
+    return [f for f in PROFILE_FIELDS if not p[f]]
+
+
+def profile_from_body(body: dict) -> dict:
+    """The profile fields PRESENT in a JSON body, cleaned.
+
+    Absent fields are left alone (a form that edits only the phone number
+    cannot blank the rest by omission); an explicitly empty string clears one.
+    """
+    return {f: clean_profile_value(f, body.get(f)) for f in PROFILE_FIELDS if f in body}
+
+
 def load_managed_users() -> dict:
     """Return {email: {email, is_admin, added_by, added_at}} from USERS_FILE."""
     try:
@@ -702,6 +760,8 @@ def load_managed_users() -> dict:
             "added_by": str(u.get("added_by") or ""),
             "added_at": int(u.get("added_at") or 0),
             "api_key": str(u.get("api_key") or ""),
+            # Contact details: name / phone / address (see PROFILE_FIELDS).
+            **profile_of(u),
             # Session-visibility scope:
             #   view_all  -> this account sees EVERY user's sessions.
             #   can_view  -> extra emails whose sessions this account may see
@@ -743,42 +803,44 @@ def ensure_user_record(email: str) -> dict:
     email = (email or "").strip().lower()
     if not email:
         return {}
-    users = load_managed_users()
-    u = users.get(email)
-    changed = False
-    if u is None:
-        u = {
-            "email": email,
-            "is_admin": False,
-            "added_by": "auto (first login)",
-            "added_at": int(time.time()),
-            "api_key": generate_api_key(),
-        }
-        users[email] = u
-        changed = True
-    elif not u.get("api_key"):
-        u["api_key"] = generate_api_key()
-        users[email] = u
-        changed = True
-    if changed:
-        save_managed_users(users)
-    return u
+    rec = load_managed_users().get(email)
+    if rec is not None and rec.get("api_key"):
+        return rec
+    return managed_upsert(email)
 
 
 def refresh_user_api_key(email: str) -> str:
     """Regenerate (or create) the API key for an account and persist it."""
+    return managed_upsert(email, api_key=generate_api_key())["api_key"]
+
+
+def managed_upsert(email: str, **fields) -> dict:
+    """Read-modify-write ONE managed account, PRESERVING every field we did not
+    touch.
+
+    Callers used to rebuild the record dict from scratch, so an unrelated admin
+    click ("make admin", "ALL USERS", adding somebody to a grant list) silently
+    erased everything that particular code path did not know about: it destroyed
+    API keys before profiles existed, and would have destroyed contact details
+    too. Always go through here instead.
+    """
     email = (email or "").strip().lower()
+    if not email or "@" not in email or " " in email:
+        raise HTTPException(status_code=422, detail="a valid email is required")
     users = load_managed_users()
-    u = users.get(email) or {
-        "email": email,
-        "is_admin": False,
-        "added_by": "auto (first login)",
-        "added_at": int(time.time()),
-    }
-    u["api_key"] = generate_api_key()
-    users[email] = u
+    rec = dict(users.get(email) or {})
+    rec.setdefault("email", email)
+    rec.setdefault("is_admin", False)
+    rec.setdefault("added_by", "auto (first login)")
+    rec.setdefault("added_at", int(time.time()))
+    rec.setdefault("api_key", generate_api_key())
+    rec.setdefault("view_all", False)
+    rec.setdefault("can_view", [])
+    for key, value in fields.items():
+        rec[key] = value
+    users[email] = rec
     save_managed_users(users)
-    return u["api_key"]
+    return rec
 
 
 def save_managed_users(users: dict) -> None:
@@ -1429,6 +1491,44 @@ def _require_account_user(request: Request) -> dict:
     return user
 
 
+def _shared_with_you_html(viewer_email: str) -> tuple:
+    """(rows html, count) for the account page: sessions OTHER people shared
+    with this account. A row whose file has since been deleted or renamed is
+    skipped — a stale grant is not an error, it is just gone."""
+    rows, n = [], 0
+    for r in session_share_rows(viewer_email):
+        p = DATA_DIR / "sessions" / r["user"] / r["filename"]
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        n += 1
+        epoch = int(display_epoch_for(p))
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(epoch))
+        track = r["filename"][: -len(".ndjson")] if r["filename"].endswith(".ndjson") else r["filename"]
+        track = re.sub(r"^\d+_", "", track) or "?"
+        if track.endswith("-combined"):
+            track = track[: -len("-combined")]
+        owner = html.escape(r["user"])
+        name = html.escape(r["filename"])
+        who = html.escape(r["by"] or r["user"])
+        rows.append(
+            f'<div class="share-row">'
+            f'<span class="badge">session</span>'
+            f'<span class="who">{html.escape(track.replace("_", " "))}</span>'
+            f'<span class="when">{html.escape(when)}</span>'
+            f'<span class="when">from {who}</span>'
+            f'<span class="num best" data-best="{owner}/{name}" '
+            f'style="margin-left:auto;font-family:var(--mono,monospace)">\u2026</span>'
+            f'<a class="btn" href="/review/{owner}/{name}">open</a>'
+            f"</div>")
+    if not rows:
+        return ('<div style="color:var(--muted);font-size:13px">'
+                'nothing yet \u2014 when someone shares a session with you it appears here, '
+                'and in your sessions list.</div>', 0)
+    return ("\n".join(rows), n)
+
+
 @app.get("/account", response_class=HTMLResponse)
 async def account_page(request: Request) -> Response:
     if not oauth_enabled():
@@ -1438,10 +1538,16 @@ async def account_page(request: Request) -> Response:
         return login_redirect(request)
     email = str(user.get("email", ""))
     rec = ensure_user_record(email)
+    prof = profile_of(rec)
+    shared_html, _shared_n = _shared_with_you_html(email)
     page = (_ACCOUNT_HTML
             .replace("__USER_CHIP__", _user_chip_html(user))
             .replace("__EMAIL__", html.escape(email))
-            .replace("__APIKEY__", html.escape(str(rec.get("api_key") or ""))))
+            .replace("__APIKEY__", html.escape(str(rec.get("api_key") or "")))
+            .replace("__NAME__", html.escape(prof["name"]))
+            .replace("__PHONE__", html.escape(prof["phone"]))
+            .replace("__ADDRESS__", html.escape(prof["address"]))
+            .replace("__SHARED__", shared_html))
     return HTMLResponse(page)
 
 
@@ -1459,6 +1565,57 @@ async def account_apikey_refresh(request: Request) -> JSONResponse:
     new_key = refresh_user_api_key(email)
     log.info("user %s refreshed their API key", email)
     return JSONResponse({"ok": True, "email": email, "api_key": new_key})
+
+
+# ---------------------------------------------------------------------------
+# Contact details — the account holder's own (name / phone / address)
+#
+# Collected so the team can actually reach its drivers. YOUR OWN details are
+# yours to edit here; admins can edit anyone's (the roster, below). Nobody else
+# may read them, whatever session visibility they have.
+# ---------------------------------------------------------------------------
+async def _json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="a JSON object body is required")
+    return body
+
+
+def profile_payload(email: str, rec: Optional[dict]) -> dict:
+    p = profile_of(rec)
+    return {"email": email, "profile": p, "missing": profile_missing(rec),
+            "complete": not profile_missing(rec)}
+
+
+@app.get("/account/profile")
+async def account_profile_get(request: Request) -> dict:
+    """The signed-in account's own contact details."""
+    user = _require_account_user(request)
+    email = str(user.get("email", "")).strip().lower()
+    return profile_payload(email, ensure_user_record(email))
+
+
+@app.post("/account/profile")
+async def account_profile_set(request: Request) -> JSONResponse:
+    """Save the signed-in account's own contact details.
+
+    The email is taken from the SESSION, never from the body: this endpoint can
+    only ever write your own record. Fields absent from the body are left as
+    they are, so the "save" button on a page that edits one field is safe.
+    """
+    user = _require_account_user(request)
+    email = str(user.get("email", "")).strip().lower()
+    fields = profile_from_body(await _json_body(request))
+    if not fields:
+        raise HTTPException(status_code=422, detail="no contact fields in the body")
+    rec = managed_upsert(email, **fields)
+    log.info("user %s updated their contact details (%s)", email, ",".join(sorted(fields)))
+    out = profile_payload(email, rec)
+    out["ok"] = True
+    return JSONResponse(out)
 
 
 # ---------------------------------------------------------------------------
@@ -1543,6 +1700,137 @@ def _admin_rows_html(self_email: str) -> str:
                 'style="color:var(--muted);font-style:italic;text-align:center">'
                 'no authorized accounts yet</td></tr>')
     return "\n".join(rows)
+
+
+# ---------------------------------------------------------------------------
+# The roster: who is who, and how to reach them (admin).
+#
+# A person here IS an account: adding somebody to the roster puts them on the
+# sign-in allowlist (users.json is that allowlist), so this page also carries a
+# plain warning about that. Contact details live on the account record and are
+# visible to the owner (account page) and to admins (here) — never to another
+# driver, whatever session visibility they have.
+# ---------------------------------------------------------------------------
+def roster_rows() -> list:
+    """Every account with its contact details, alphabetical by email."""
+    managed = load_managed_users()
+    out = []
+    for em in sorted(allowed_emails() | set(managed)):
+        rec = managed.get(em) or {"email": em, "is_admin": False}
+        prof = profile_of(rec)
+        out.append({
+            "email": em,
+            "name": prof["name"],
+            "phone": prof["phone"],
+            "address": prof["address"],
+            "is_admin": bool(rec.get("is_admin")) or em in ADMIN_EMAILS,
+            "source": "managed" if em in managed else "env",
+            "added_by": str(rec.get("added_by") or ""),
+            "missing": profile_missing(rec),
+        })
+    return out
+
+
+def csv_cell(value) -> str:
+    """One exported cell, hardened against spreadsheet FORMULA INJECTION.
+
+    A name or address is text any account holder types, and Excel/Sheets EXECUTE
+    a cell that starts with =, @, tab or CR — an export is a code path into the
+    machine that opens it. Cells that merely LOOK like a phone number
+    ("+1 555 0100", "(555) 010-0100") are left exactly as typed: mangling real
+    data to defeat a formula in it is the other half of this bug.
+    """
+    text = "" if value is None else str(value)
+    if not text:
+        return ""
+    head = text[0]
+    danger = head in ("=", "@", "\t", "\r", "\n")
+    if not danger and head in ("+", "-"):
+        # A leading + or - makes the cell an EXPRESSION, so "+cmd|..." and
+        # "-2+3+cmd|..." both run. Keep the + when the WHOLE cell is number or
+        # phone shaped ("+1 555 010 0100"), escape it otherwise ("+cmd|...").
+        danger = not (re.fullmatch(r"[+\-()0-9 .,]+", text) and any(c.isdigit() for c in text))
+    return "'" + text if danger else text
+
+
+@app.get("/admin/roster", response_class=HTMLResponse)
+async def admin_roster(request: Request) -> Response:
+    admin = require_admin(request)
+    rows = roster_rows()
+    missing = sum(1 for r in rows if r["missing"])
+    page = (_ROSTER_HTML
+            .replace("__USER_CHIP__", _user_chip_html(admin))
+            .replace("__ROWS__", _roster_rows_html(rows))
+            .replace("__COUNT__", f"{len(rows)} people")
+            .replace("__MISSING__", (f"{missing} with details missing" if missing
+                                     else "everyone has details on file"))
+            .replace("__DATA__", json.dumps(rows).replace("<", "\\u003c")))
+    return HTMLResponse(page)
+
+
+@app.get("/admin/roster.json")
+async def admin_roster_json(request: Request) -> JSONResponse:
+    require_admin(request)
+    return JSONResponse({"people": roster_rows()})
+
+
+@app.get("/admin/roster.csv")
+async def admin_roster_csv(request: Request) -> Response:
+    require_admin(request)
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["name", "email", "phone", "address", "role", "added_by"])
+    for r in roster_rows():
+        w.writerow([csv_cell(r["name"]), csv_cell(r["email"]), csv_cell(r["phone"]),
+                    csv_cell(r["address"]), "admin" if r["is_admin"] else "user",
+                    csv_cell(r["added_by"])])
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="racecar-roster.csv"',
+                             "Cache-Control": "no-store"})
+
+
+@app.post("/admin/profile")
+async def admin_set_profile(request: Request) -> JSONResponse:
+    """Set anyone's contact details. Body: {email, name?, phone?, address?} —
+    an absent field is left alone, an empty string clears it."""
+    admin = require_admin(request)
+    body = await _json_body(request)
+    target = str(body.get("email", "")).strip().lower()
+    if not target or "@" not in target or " " in target:
+        raise HTTPException(status_code=422, detail="a valid email is required")
+    fields = profile_from_body(body)
+    if not fields:
+        raise HTTPException(status_code=422, detail="no contact fields in the body")
+    rec = managed_upsert(target, **fields)
+    log.info("admin %s updated contact details for %s", admin.get("email"), target)
+    return JSONResponse({"ok": True, "email": target, "profile": profile_of(rec),
+                         "missing": profile_missing(rec)})
+
+
+def _roster_rows_html(rows: list) -> str:
+    if not rows:
+        return ('<tr><td colspan="6" style="color:var(--muted);font-style:italic;'
+                'text-align:center">nobody yet</td></tr>')
+    out = []
+    for r in rows:
+        em = html.escape(r["email"])
+        name = html.escape(r["name"]) if r["name"] else '<span style="color:var(--muted)">\u2014</span>'
+        phone = (f'<a class="mono" href="tel:{html.escape(re.sub("[^0-9+]", "", r["phone"]))}">'
+                 f'{html.escape(r["phone"])}</a>' if r["phone"]
+                 else '<span style="color:var(--muted)">\u2014</span>')
+        addr = (html.escape(r["address"]).replace("\n", "<br>") if r["address"]
+                else '<span style="color:var(--muted)">\u2014</span>')
+        role = ('<span class="badge admin">admin</span>' if r["is_admin"]
+                else '<span class="badge">user</span>')
+        if r["source"] == "env":
+            role += ' <span class="badge env">env</span>'
+        warn = (' <span class="badge" title="no phone or address on file" '
+                'style="color:var(--bad)">missing</span>' if r["missing"] else "")
+        out.append(
+            f'<tr><td>{name}{warn}</td><td class="mono">{em}</td><td>{phone}</td>'
+            f'<td style="max-width:34ch">{addr}</td><td>{role}</td>'
+            f'<td><button class="btn" data-edit="{em}">edit</button></td></tr>')
+    return "\n".join(out)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -1767,18 +2055,12 @@ async def admin_upsert_user(request: Request) -> JSONResponse:
         raise HTTPException(status_code=422, detail="a valid email is required")
     if email in ADMIN_EMAILS:
         raise HTTPException(status_code=409, detail="that account is a bootstrap admin (set in .env) and can't be edited here")
-    users = load_managed_users()
-    existing = users.get(email)
-    users[email] = {
-        "email": email,
-        "is_admin": is_admin,
-        "added_by": (existing or {}).get("added_by") or str(admin.get("email", "")).lower(),
-        "added_at": (existing or {}).get("added_at") or int(time.time()),
-        # Preserve any existing per-user key; mint one for brand-new accounts
-        # so a driver added here has a usable key before their first login.
-        "api_key": (existing or {}).get("api_key") or generate_api_key(),
-    }
-    save_managed_users(users)
+    existing = load_managed_users().get(email)
+    # managed_upsert keeps the API key, view_all / can_view and the contact
+    # details; only the admin flag changes, and `added_by`/`added_at` are
+    # stamped the first time this account is added.
+    managed_upsert(email, is_admin=is_admin,
+                   added_by=(existing or {}).get("added_by") or str(admin.get("email", "")).lower())
     log.info("admin %s %s user %s (admin=%s)", admin.get("email"),
              "updated" if existing else "added", email, is_admin)
     return JSONResponse({"ok": True, "email": email, "is_admin": is_admin})
@@ -1809,22 +2091,20 @@ async def admin_delete_user(request: Request) -> JSONResponse:
 #   - can_view: explicit list of other accounts whose sessions it may see.
 # ---------------------------------------------------------------------------
 def _upsert_managed_for_visibility(email: str, admin_email: str) -> dict:
-    """Fetch (or create) a managed record so visibility can be stored on it."""
+    """Fetch (or create) a managed record so visibility can be stored on it.
+
+    The write itself goes through managed_upsert (which preserves every other
+    field); this only validates the target and hands back the current record.
+    """
     email = (email or "").strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=422, detail="a valid email is required")
     if email in ADMIN_EMAILS:
         raise HTTPException(status_code=409, detail="that account is a bootstrap admin and already sees every user")
-    users = load_managed_users()
-    u = users.get(email)
-    if u is None:
-        u = {
-            "email": email, "is_admin": False,
-            "added_by": (admin_email or "").lower(), "added_at": int(time.time()),
-            "api_key": generate_api_key(), "view_all": False, "can_view": [],
-        }
-        users[email] = u
-    return u
+    rec = load_managed_users().get(email)
+    if rec is None:
+        rec = managed_upsert(email, added_by=(admin_email or "").lower())
+    return rec
 
 
 @app.post("/admin/users/visibility")
@@ -1837,11 +2117,8 @@ async def admin_set_visibility(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="invalid JSON body")
     email = str(body.get("email", "")).strip().lower()
     view_all = bool(body.get("view_all"))
-    users = load_managed_users()
-    u = _upsert_managed_for_visibility(email, str(admin.get("email", "")))
-    users[email] = u
-    u["view_all"] = view_all
-    save_managed_users(users)
+    _upsert_managed_for_visibility(email, str(admin.get("email", "")))
+    managed_upsert(email, view_all=view_all)
     log.info("admin %s set view_all=%s for %s", admin.get("email"), view_all, email)
     return JSONResponse({"ok": True, "email": email, "view_all": view_all})
 
@@ -1860,15 +2137,11 @@ async def admin_grant_view(request: Request) -> JSONResponse:
         raise HTTPException(status_code=422, detail="a valid target email is required")
     if target == email:
         raise HTTPException(status_code=422, detail="an account already sees its own sessions")
-    users = load_managed_users()
     u = _upsert_managed_for_visibility(email, str(admin.get("email", "")))
-    users[email] = u
-    cv = set(u.get("can_view") or [])
-    cv.add(target)
-    u["can_view"] = sorted(cv)
-    save_managed_users(users)
+    cv = sorted(set(u.get("can_view") or []) | {target})
+    managed_upsert(email, can_view=cv)
     log.info("admin %s granted %s view of %s", admin.get("email"), email, target)
-    return JSONResponse({"ok": True, "email": email, "can_view": u["can_view"]})
+    return JSONResponse({"ok": True, "email": email, "can_view": cv})
 
 
 @app.post("/admin/users/revoke")
@@ -1881,14 +2154,11 @@ async def admin_revoke_view(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="invalid JSON body")
     email = str(body.get("email", "")).strip().lower()
     target = str(body.get("target", "")).strip().lower()
-    users = load_managed_users()
-    u = users.get(email)
+    u = load_managed_users().get(email)
     if u is None:
         raise HTTPException(status_code=404, detail="no such managed account")
     cv = [e for e in (u.get("can_view") or []) if e != target]
-    u["can_view"] = cv
-    users[email] = u
-    save_managed_users(users)
+    managed_upsert(email, can_view=cv)
     log.info("admin %s revoked %s view of %s", admin.get("email"), email, target)
     return JSONResponse({"ok": True, "email": email, "can_view": cv})
 
@@ -7407,6 +7677,7 @@ _ADMIN_HTML = (
   <span style="flex:1"></span>
   <a class="btn" href="/coach">checklist</a>
   <a class="btn" href="/tools/sfpicker">S/F picker</a>
+  <a class="btn" href="/admin/roster">roster</a>
   <button class="btn" id="srvupd" title="git pull + docker compose up -d --build (executed by the host watcher)">update server</button>
   <span class="t-label" id="srvupdmsg" style="margin-right:var(--sp-md)" title="">&#8230;</span>
   <script>
@@ -7678,12 +7949,53 @@ _ACCOUNT_HTML = (
 """ + _FONTS_LINK + "<style>" + _BASE_CSS + _ADMIN_EXTRA_CSS + """
 .key-row{display:flex;gap:var(--sp-sm);align-items:center;flex-wrap:wrap}
 .key-row input{flex:1;min-width:220px;font-family:var(--mono,monospace);letter-spacing:1px}
+.prof-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-md)}
+.prof-grid .wide{grid-column:1 / -1}
+.prof-grid label{display:block}
+.prof-grid .t-label{display:block;margin-bottom:6px}
+.prof-grid textarea{width:100%;background:var(--surface-2);color:var(--text);
+  border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 12px;
+  font:14px var(--ff-ui);resize:vertical}
+@media (max-width:640px){ .prof-grid{grid-template-columns:1fr} }
+.share-row{display:flex;align-items:center;gap:10px;padding:9px 0;
+  border-bottom:1px solid var(--surface-3);font-size:13px}
+.share-row:last-child{border-bottom:none}
+.share-row .who{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:30ch}
+.share-row .when{color:var(--muted);font-family:var(--mono,monospace)}
 </style></head><body>
 <header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
   <span class="crumbs"><a href="/">sessions</a> &rsaquo; account</span>
   <span style="flex:1"></span>__USER_CHIP__</header>
 <main>
   <div id="msg" class="msg"></div>
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:6px">Your details</div>
+    <p class="summary" style="color:var(--muted);margin:0 0 var(--sp-md);font-size:13px">
+      Name, phone and address, kept with your account so the team can reach you.
+      Only you and the pit wall admins can see them.</p>
+    <div class="prof-grid">
+      <label><span class="t-label">name</span>
+        <input id="pName" type="text" value="__NAME__" autocomplete="name"></label>
+      <label><span class="t-label">phone</span>
+        <input id="pPhone" type="text" value="__PHONE__" autocomplete="tel"></label>
+      <label class="wide"><span class="t-label">address</span>
+        <textarea id="pAddr" rows="3" autocomplete="street-address">__ADDRESS__</textarea></label>
+    </div>
+    <div class="key-row" style="margin-top:var(--sp-md)">
+      <button class="btn primary" id="pSave">save details</button>
+      <span class="summary" id="pMsg" style="color:var(--muted);font-size:12px"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:6px">Shared with you</div>
+    <p class="summary" style="color:var(--muted);margin:0 0 var(--sp-md);font-size:13px">
+      Sessions other people have shared with your account. You can open, replay,
+      compare and analyse them — you cannot change or delete them, and only their
+      owner (or an admin) can take them back.</p>
+    __SHARED__
+  </section>
+
   <section class="panel">
     <div class="t-label" style="margin-bottom:var(--sp-md)">Signed in as</div>
     <p class="mono" style="margin:0 0 var(--sp-lg)">__EMAIL__</p>
@@ -7704,6 +8016,62 @@ _ACCOUNT_HTML = (
 (function(){
   var msg=document.getElementById('msg');
   var input=document.getElementById('apiKey');
+  var pMsg=document.getElementById('pMsg');
+  // Best lap for the "shared with you" rows: the same lazy contract the
+  // sessions list uses (cached summaries are instant, a few cold files per
+  // call, ask again) — and /laps/summary is grant-aware, so these fill for a
+  // session someone shared without exposing anybody else's.
+  (function(){
+    var cells = Array.prototype.slice.call(document.querySelectorAll('[data-best]'));
+    if (!cells.length) return;
+    var rounds = 0;
+    async function fill(){
+      var want = cells.filter(function(c){ return !c.dataset.done; })
+                      .map(function(c){ return c.dataset.best; });
+      if (!want.length || rounds > 12) return;
+      rounds++;
+      var any = false;
+      for (var i = 0; i < want.length; i += 25){
+        var batch = want.slice(i, i + 25);
+        try {
+          var r = await fetch('/laps/summary?files=' + encodeURIComponent(batch.join(',')));
+          if (!r.ok) continue;
+          var j = await r.json();
+          batch.forEach(function(k){
+            var c = cells.filter(function(x){ return x.dataset.best === k; })[0];
+            if (!c || c.dataset.done) return;
+            var d = (j.laps || {})[k];
+            if (!d) return;
+            var sec = d.best_s;
+            c.textContent = (sec == null || !isFinite(sec) || sec <= 0) ? '\u2014'
+              : (sec >= 60 ? (Math.floor(sec / 60) + ':' + ((sec - Math.floor(sec / 60) * 60) < 10 ? '0' : '')
+                 + (sec - Math.floor(sec / 60) * 60).toFixed(2)) : sec.toFixed(2));
+            c.title = (d.laps || 0) + ' laps' + (d.excluded ? ' (' + d.excluded + ' excluded)' : '');
+            c.dataset.done = '1'; any = true;
+          });
+        } catch(e){}
+      }
+      if (any) setTimeout(fill, 400);
+      else cells.forEach(function(c){ if (!c.dataset.done){ c.dataset.done = '1';
+        if (!c.textContent.trim() || c.textContent.trim() === '\u2026') c.textContent = '\u2014'; } });
+    }
+    fill();
+  })();
+
+  document.getElementById('pSave').addEventListener('click', async function(){
+    var body={name:document.getElementById('pName').value,
+              phone:document.getElementById('pPhone').value,
+              address:document.getElementById('pAddr').value};
+    pMsg.textContent='saving\u2026';
+    try{
+      var r=await fetch('/account/profile',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      var j=await r.json().catch(function(){return {};});
+      if(!r.ok) throw new Error((j&&j.detail)||('HTTP '+r.status));
+      pMsg.textContent = (j.missing&&j.missing.length)
+        ? ('saved \u2014 still blank: '+j.missing.join(', ')) : 'saved';
+    }catch(e){ pMsg.textContent='could not save: '+e.message; }
+  });
   function show(t,ok){ msg.className='msg '+(ok?'good':'bad'); msg.textContent=t; }
   async function post(url){
     var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
@@ -17802,6 +18170,111 @@ _REVIEW_HTML = (
 </script>
 </body></html>
 """
+)
+
+
+# ---------------------------------------------------------------------------
+# The roster page (admin): who is who, how to reach them, and a CSV for the
+# race file. Contact details are per-account; a person here IS an account.
+# ---------------------------------------------------------------------------
+_ROSTER_HTML = (
+    """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>roster \u00b7 racecar-35</title>
+""" + _FONTS_LINK + "<style>" + _BASE_CSS + _ADMIN_EXTRA_CSS + """
+  table td { vertical-align: top; }
+  .modal { position:fixed; inset:0; z-index:3000; display:flex; align-items:center;
+    justify-content:center; padding:24px; background:rgba(6,8,12,0.72); }
+  .modal-card { width:min(520px, calc(100vw - 32px)); background:var(--surface);
+    border:1px solid var(--line); border-radius:var(--r-md); padding:var(--sp-md);
+    box-shadow:0 24px 60px rgba(0,0,0,0.6); }
+  .modal-card .field { margin-bottom:12px; }
+  .modal-card label { display:block; margin-bottom:6px; }
+  .modal-card textarea { width:100%; background:var(--surface-2); color:var(--text);
+    border:1px solid var(--line); border-radius:var(--r-sm); padding:8px 12px;
+    font:14px var(--ff-ui); resize:vertical; }
+</style></head><body>
+<header class="app"><span class="dot"></span><h1>racecar-35 \u00b7 pit wall</h1>
+  <span class="crumbs"><a href="/">sessions</a> &rsaquo; <a href="/admin">admin</a> &rsaquo; roster</span>
+  <span style="flex:1"></span>
+  <a class="btn" href="/admin/roster.csv">download CSV</a>
+  <a class="btn" href="/admin">back to admin</a>
+  __USER_CHIP__</header>
+<main>
+  <div id="msg" class="msg"></div>
+  <section class="panel">
+    <div class="t-label" style="margin-bottom:6px">People</div>
+    <p class="summary" style="color:var(--muted);margin:0;font-size:13px">
+      __COUNT__ \u00b7 __MISSING__. Name, phone and address are what each driver fills in on
+      their own <b>account</b> page; you can correct them here. <b>Everyone listed can sign
+      in</b> \u2014 add or remove accounts on the <a href="/admin">admin page</a>.</p>
+  </section>
+  <table><thead><tr><th>name</th><th>email</th><th>phone</th><th>address</th>
+    <th>role</th><th></th></tr></thead><tbody>__ROWS__</tbody></table>
+</main>
+
+<div id="edit" class="modal" role="dialog" aria-modal="true" style="display:none">
+  <div class="modal-card">
+    <div class="t-label" style="margin-bottom:4px">Contact details</div>
+    <p class="mono" id="eWho" style="margin:0 0 14px;color:var(--muted)"></p>
+    <div class="field"><label class="t-label" for="eName">name</label>
+      <input id="eName" type="text" style="width:100%"></div>
+    <div class="field"><label class="t-label" for="ePhone">phone</label>
+      <input id="ePhone" type="text" style="width:100%"></div>
+    <div class="field"><label class="t-label" for="eAddr">address</label>
+      <textarea id="eAddr" rows="3"></textarea></div>
+    <div class="row-actions" style="justify-content:flex-end">
+      <button class="btn" id="eCancel">cancel</button>
+      <button class="btn primary" id="eSave">save</button>
+    </div>
+  </div>
+</div>
+<script>
+// The rows carry their details as JSON (not re-escaped into attributes) so a
+// name with quotes or a multi-line address survives the round trip.
+var PEOPLE = __DATA__;
+(function(){
+  var byEmail = {};
+  PEOPLE.forEach(function(p){ byEmail[p.email] = p; });
+  var modal = document.getElementById('edit');
+  var cur = null, msg = document.getElementById('msg');
+  function show(t, bad){ msg.className = 'msg ' + (bad ? 'bad' : 'bad'); msg.textContent = t;
+    msg.style.display = 'block'; }
+  async function post(url, payload){
+    var r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)});
+    var d = await r.json().catch(function(){ return {}; });
+    if (!r.ok) throw new Error((d && d.detail) || ('HTTP ' + r.status));
+    return d;
+  }
+  document.addEventListener('click', function(ev){
+    var t = ev.target.closest('[data-edit]');
+    if (!t) return;
+    cur = byEmail[t.dataset.edit];
+    if (!cur) return;
+    document.getElementById('eWho').textContent = cur.email;
+    document.getElementById('eName').value = cur.name || '';
+    document.getElementById('ePhone').value = cur.phone || '';
+    document.getElementById('eAddr').value = cur.address || '';
+    modal.style.display = 'flex';
+  });
+  function close(){ modal.style.display = 'none'; cur = null; }
+  document.getElementById('eCancel').addEventListener('click', close);
+  modal.addEventListener('mousedown', function(ev){ if (ev.target === modal) close(); });
+  document.addEventListener('keydown', function(ev){
+    if (ev.key === 'Escape' && modal.style.display !== 'none') close(); });
+  document.getElementById('eSave').addEventListener('click', async function(){
+    if (!cur) return;
+    try {
+      await post('/admin/profile', {email: cur.email,
+        name: document.getElementById('eName').value,
+        phone: document.getElementById('ePhone').value,
+        address: document.getElementById('eAddr').value});
+      location.reload();
+    } catch(e){ show('Save failed: ' + e.message); }
+  });
+})();
+</script>
+</body></html>"""
 )
 
 

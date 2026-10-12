@@ -82,7 +82,11 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   on `F.Fab`), so `U21` has a printed pin-1 dot and polarity is visible on the board.
   Order day: `pcbway/Racecar-RevF-PCBWAY-GERBERS.zip` +
   `Racecar-RevF-BOM-pcbway-assembly.csv` + `Racecar-RevF-CPL.csv` (regenerate all three
-  with `pcbway/make_package.py`); order settings in `pcbway/REVF-CHANGES-AND-ORDER.md`.
+  with `pcbway/make_package.py` — it now HARD-FAILS if the BOM and CPL designator sets
+  differ; the assembly BOM lists ONLY placed parts, so the PCB features H1-H4/TP1-TP7
+  are NOT rows, which is exactly the mismatch JLCPCB queried on 2026-10-08); order
+  settings in `pcbway/REVF-CHANGES-AND-ORDER.md`; JLCPCB reply in
+  `pcbway/JLCPCB-REPLY-2026-10-11.md`.
   Re-export with `fabrication/export.py --engineering-prototype`. **No automotive
   transient qualification, and no built, measured or independently reviewed board.**
 - Revision **E** (DELETED — superseded by Rev F; its only content not carried into Rev F
@@ -1019,6 +1023,30 @@ upload response is never delayed) that distils the session into **1-3 short acti
     launch) hide themselves; with a video linked the viewer is the original overlay (`__RO__=1`).
   - Tests: `tests/test_shares.py` (token back-compat, per-token isolation incl. traversal, admin-
     only user shares, idempotent create/revoke, the list page's escaping).
+- **Contact details + the roster (name / phone / address)**: held ON the account record in
+  `users.json` (`PROFILE_FIELDS`, cleaned by `clean_profile_value`: single-line fields collapse
+  whitespace, an address keeps its meaningful line breaks, everything is length-capped).
+  `GET/POST /account/profile` = your OWN (the email comes from the SESSION, never the body);
+  `GET /admin/roster` (page), `/admin/roster.json`, `/admin/roster.csv` (download) and
+  `POST /admin/profile {email, ...}` = admin. **A field is only written when it is PRESENT in the
+  body** — an absent field is left alone, an empty string clears it — so a form that edits one
+  field cannot blank the others. `managed_upsert()` is the single read-modify-write path for a
+  managed record; before it, every admin action rebuilt the dict from scratch and silently erased
+  whatever that code path did not know about (it destroyed API keys, and would have destroyed
+  contact details).
+  - **Visible to the owner and to admins only** — not to a `view_all` / `can_view` viewer, and not
+    to anyone holding a session share. The account page shows the form; the admin **roster** page
+    (`/admin` → roster) lists everyone with a phone/address and a *missing* marker, an inline edit
+    popup, and the CSV for the race file. **A roster entry IS an account**: everyone listed can
+    sign in (users.json is the allowlist), which the page says out loud.
+  - **The account page also lists every session shared WITH you** (`_shared_with_you_html`: track,
+    owner, when, best lap filled from the grant-aware `/laps/summary`, and an `open` link); a row
+    whose file has since been deleted or renamed is skipped rather than shown broken.
+  - **CSV escaping is a security boundary, not cosmetics** (`csv_cell`): a name or address is text
+    any account holder types, and Excel/Sheets EXECUTE a cell starting with `=`, `@`, tab or CR.
+    A leading `+`/`-` is only left alone when the WHOLE cell is number/phone shaped, so
+    `+1 555 010 0100` survives exactly as typed while `+cmd|'…'` and `-2+3+cmd|…` are defused with
+    a leading apostrophe. Tests: `tests/test_roster.py`.
 - **Session-level access grants (share with a PERSON, not a link)**: three different things,
   deliberately — a public `/shared/<token>` link (no account at all), `can_view` on a user record
   (EVERY session of that account), and a grant here (**ONE** session, which then appears in the
