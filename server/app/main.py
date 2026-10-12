@@ -15013,8 +15013,12 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       if (!PLAN.h) return 1;
       return (2 * PLAN.h * Math.tan(camera.fov * Math.PI / 360)) / hpx;
     }
-    function planAxis(index) {          // camera's world +x / +y (screen right / down)
-      return new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, index);
+    // The camera's own screen axes in world space. +x is RIGHT on screen and +y
+    // is UP (three.js convention) — so screen-DOWN is the NEGATIVE of column 1.
+    // Taking column 1 as "down" is what made a vertical drag run backwards.
+    function planRight() { return new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0); }
+    function planDown() {
+      return new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1).multiplyScalar(-1);
     }
     window.addEventListener("mousemove", function (e) {
       if (!dragging) return;
@@ -15022,7 +15026,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         // The world follows the mouse: move the camera the other way, along the
         // camera's OWN screen axes so it stays correct however it is oriented.
         var mpp = planMPerPx(), dx = e.clientX - lx, dy = e.clientY - ly;
-        var right = planAxis(0), down = planAxis(1);
+        var right = planRight(), down = planDown();
         planPan.x -= (right.x * dx + down.x * dy) * mpp;
         planPan.z -= (right.z * dx + down.z * dy) * mpp;
         lx = e.clientX; ly = e.clientY;
@@ -15048,7 +15052,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
           var r = canvas.getBoundingClientRect();
           var dx = e.clientX - (r.left + r.width / 2);
           var dy = e.clientY - (r.top + r.height / 2);
-          var right = planAxis(0), down = planAxis(1);
+          var right = planRight(), down = planDown();
           var dmp = planMPerPx() * (1 - z0 / z1);
           planPan.x += (right.x * dx + down.x * dy) * dmp;
           planPan.z += (right.z * dx + down.z * dy) * dmp;
