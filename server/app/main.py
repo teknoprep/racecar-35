@@ -16379,9 +16379,17 @@ _REVIEW_HTML = (
 
   /* ---- laps + delta ---------------------------------------------- */
   .lapcard { margin-top: var(--sp-md); }
-  .lap-body { display: grid; grid-template-columns: 340px 1fr; gap: var(--sp-md); }
-  @media (max-width: 820px) { .lap-body { grid-template-columns: 1fr; } }
-  .lap-table-wrap { max-height: 300px; overflow-y: auto;
+  .lap-body { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: var(--sp-md); }
+  .lap-body > .lap-table-wrap { grid-column: 1; grid-row: 1; }
+  .lap-body > #car-row { grid-column: 2; grid-row: 1; }
+  .lap-body > .lap-delta { grid-column: 1 / -1; grid-row: 2;
+    border-top: 1px solid var(--line); padding-top: var(--sp-md); }
+  @media (max-width: 820px) {
+    .lap-body { grid-template-columns: 1fr; }
+    .lap-body > .lap-table-wrap, .lap-body > #car-row, .lap-body > .lap-delta {
+      grid-column: 1; grid-row: auto; }
+  }
+  .lap-table-wrap { max-height: 430px; overflow-y: auto;
     border: 1px solid var(--line); border-radius: var(--r-sm); }
   table.laptable { width: 100%; border-collapse: collapse; font: 13px var(--ff-mono); }
   table.laptable th { position: sticky; top: 0; background: var(--surface-2);
@@ -16398,7 +16406,7 @@ _REVIEW_HTML = (
   .lap-delta { display: flex; flex-direction: column; }
   .lap-delta canvas { width: 100%; height: auto; background: var(--bg);
     border: 1px solid var(--line); border-radius: var(--r-sm); display: block; }
-  .cmp-row { display: grid; grid-template-columns: 1fr 170px; gap: 8px;
+  .cmp-row { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 8px;
     margin-bottom: 8px; }
   .cmp-row2 { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .cmp-syncl { color: var(--muted); font: 600 11px/1 var(--ff-ui);
@@ -16703,7 +16711,13 @@ _REVIEW_HTML = (
           <input id="car-wt" type="number" min="700" max="9000" step="1" placeholder="lb, with driver" style="width:9em">
           <button class="btn" id="car-save">save</button>
           <span class="t-label" id="car-note" style="opacity:.8"></span>
-          <canvas id="dyno-chart" width="330" height="170" style="display:none;margin-top:4px;background:#0f1218;border:1px solid #232a36;border-radius:6px"></canvas>
+          <div id="dyno-wrap" style="display:none;width:100%;max-width:340px">
+            <canvas id="dyno-chart" data-aspect="0.62" style="display:block;width:100%;margin-top:4px;background:#0f1218;border:1px solid #232a36;border-radius:6px;cursor:crosshair;touch-action:pan-y"></canvas>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
+              <span class="t-label" style="opacity:.6;text-transform:none;letter-spacing:0">hover for numbers \u00b7 click to pin</span>
+              <button class="btn" id="dyno-big-btn" style="padding:2px 8px">enlarge \u2922</button>
+            </div>
+          </div>
           <span class="t-label" id="dyno-how" style="opacity:.65;max-width:330px;line-height:1.35;text-transform:none;letter-spacing:0"></span>
         </div>
         <div class="lap-table-wrap">
@@ -17459,7 +17473,18 @@ _REVIEW_HTML = (
   }
 
   // ---- delta chart + follow-cursor -----------------------------------
+  function fitDeltaCanvas(){
+    const w=Math.max(300, Math.round(dcanv.getBoundingClientRect().width || 760));
+    const h=Math.max(200, Math.min(320, Math.round(w*0.22)));
+    if (dcanv.width!==w || dcanv.height!==h){ dcanv.width=w; dcanv.height=h; }
+  }
+  let deltaResizeT=0;
+  window.addEventListener('resize', function(){
+    clearTimeout(deltaResizeT);
+    deltaResizeT=setTimeout(function(){ if (primLap) drawDelta(primLap, currentRef); }, 120);
+  });
   function drawDelta(primLapArg, ref){
+    fitDeltaCanvas();
     const ctx=dcanv.getContext('2d'), W=dcanv.width, H=dcanv.height;
     ctx.clearRect(0,0,W,H);
     ctx.fillStyle='#0E1014'; ctx.fillRect(0,0,W,H);
@@ -17891,27 +17916,178 @@ _REVIEW_HTML = (
     }
   }
 
-  // HP (red) and TQ (blue) against rpm, dyno-sheet style, from /power's curve
-  function drawDyno(curve){
-    const cv = el('dyno-chart');
-    if (!curve.length){ cv.style.display = 'none'; return; }
-    cv.style.display = '';
-    const c = cv.getContext('2d'), W = cv.width, H = cv.height, L = 34, R = 8, T = 10, B = 22;
-    c.clearRect(0, 0, W, H);
-    const r0 = curve[0].rpm, r1 = curve[curve.length-1].rpm;
-    const top = Math.ceil(Math.max.apply(null, curve.map(x=>Math.max(x.whp, x.wtq))) / 20) * 20 || 20;
-    const X = r => L + (r1 > r0 ? (r - r0) / (r1 - r0) : 0.5) * (W - L - R);
-    const Y = v => T + (1 - v / top) * (H - T - B);
-    c.font = '10px monospace'; c.fillStyle = '#7d8799'; c.strokeStyle = '#232a36';
-    for (let v = 0; v <= top; v += 20){ c.beginPath(); c.moveTo(L, Y(v)); c.lineTo(W-R, Y(v)); c.stroke();
-      c.fillText(String(v), 4, Y(v) + 3); }
-    for (let r = Math.ceil(r0/1000)*1000; r <= r1; r += 1000) c.fillText(r/1000 + 'k', X(r) - 6, H - 6);
-    [['whp', '#FF4D4D'], ['wtq', '#4DA3FF']].forEach(function(k){
-      c.strokeStyle = k[1]; c.lineWidth = 2; c.beginPath();
-      curve.forEach(function(p, i){ i ? c.lineTo(X(p.rpm), Y(p[k[0]])) : c.moveTo(X(p.rpm), Y(p[k[0]])); });
-      c.stroke();
+  // ---- interactive dyno chart (WHP red / WTQ blue against rpm) --------------
+  // Hover (or touch-drag) shows rpm / WHP / WTQ under the cursor, a click pins the
+  // readout (click again to release), and the PEAK WHP and WTQ are always marked.
+  // "enlarge" opens the same chart in an overlay ON this page: no new window, no
+  // navigation, nothing reloads. Esc, the close button or the backdrop dismisses it.
+  var DYNO_CURVE = [], DYNO_CHARTS = [];
+  function dynoAt(curve, rpm){                      // linear interpolation along the curve
+    if (!curve.length) return null;
+    if (rpm <= curve[0].rpm) return {rpm: rpm, whp: curve[0].whp, wtq: curve[0].wtq};
+    for (var i = 1; i < curve.length; i++){
+      var a = curve[i-1], b = curve[i];
+      if (rpm <= b.rpm){
+        var f = (rpm - a.rpm) / Math.max(1, b.rpm - a.rpm);
+        return {rpm: rpm, whp: a.whp + f * (b.whp - a.whp), wtq: a.wtq + f * (b.wtq - a.wtq)};
+      }
+    }
+    var z = curve[curve.length-1];
+    return {rpm: rpm, whp: z.whp, wtq: z.wtq};
+  }
+  function dynoPeaks(curve){
+    var h = curve[0], q = curve[0];
+    curve.forEach(function(c){ if (c.whp > h.whp) h = c; if (c.wtq > q.wtq) q = c; });
+    return {h: h, q: q};
+  }
+  function makeDynoChart(cv){
+    var st = {cv: cv, rpm: null, pinned: false, g: null};
+    function fit(){
+      var w = Math.max(220, Math.round(cv.getBoundingClientRect().width || 330));
+      var h = Math.round(w * parseFloat(cv.dataset.aspect || '0.62')), d = window.devicePixelRatio || 1;
+      if (cv.width !== Math.round(w * d) || cv.height !== Math.round(h * d)){
+        cv.width = Math.round(w * d); cv.height = Math.round(h * d); cv.style.height = h + 'px';
+      }
+      return {w: w, h: h, d: d};
+    }
+    function label(c, txt, x, y, col, W, H, below, fs){
+      c.font = 'bold ' + fs + 'px monospace';
+      var tw = c.measureText(txt).width + 8, th = fs + 6;
+      var bx = Math.min(Math.max(x - tw / 2, 2), W - tw - 2);
+      var by = below ? y + 8 : y - 8 - th;
+      by = Math.min(Math.max(by, 2), H - th - 2);
+      c.fillStyle = 'rgba(15,18,24,0.92)'; c.fillRect(bx, by, tw, th);
+      c.strokeStyle = col; c.lineWidth = 1; c.strokeRect(bx + 0.5, by + 0.5, tw - 1, th - 1);
+      c.fillStyle = col; c.fillText(txt, bx + 4, by + fs + 1);
+    }
+    st.draw = function(){
+      var curve = DYNO_CURVE; if (!curve.length) return;
+      var z = fit(), c = cv.getContext('2d');
+      c.setTransform(z.d, 0, 0, z.d, 0, 0);
+      var W = z.w, H = z.h, big = W > 560, fs = big ? 13 : 10;
+      var L = big ? 46 : 32, R = big ? 18 : 8, T = big ? 34 : 24, B = big ? 30 : 20;
+      c.clearRect(0, 0, W, H);
+      var r0 = curve[0].rpm, r1 = curve[curve.length-1].rpm;
+      var mx = Math.max.apply(null, curve.map(function(x){ return Math.max(x.whp, x.wtq); }));
+      var top = Math.ceil(mx * 1.12 / 20) * 20 || 20;
+      var X = function(r){ return L + (r1 > r0 ? (r - r0) / (r1 - r0) : 0.5) * (W - L - R); };
+      var Y = function(v){ return T + (1 - v / top) * (H - T - B); };
+      st.g = {L: L, R: R, W: W, r0: r0, r1: r1};
+      c.font = fs + 'px monospace'; c.lineWidth = 1;
+      for (var v = 0; v <= top; v += 20){
+        c.strokeStyle = '#232a36'; c.beginPath(); c.moveTo(L, Y(v)); c.lineTo(W - R, Y(v)); c.stroke();
+        c.fillStyle = '#7d8799'; c.fillText(String(v), 4, Y(v) + 3);
+      }
+      for (var r = Math.ceil(r0 / 500) * 500; r <= r1; r += 500){
+        if (r % 1000 && !big) continue;
+        c.strokeStyle = '#1b212b'; c.beginPath(); c.moveTo(X(r), T); c.lineTo(X(r), H - B); c.stroke();
+        c.fillStyle = '#7d8799'; c.fillText((r / 1000).toFixed(r % 1000 ? 1 : 0) + 'k', X(r) - 8, H - 6);
+      }
+      [['whp', '#FF4D4D'], ['wtq', '#4DA3FF']].forEach(function(k){
+        c.strokeStyle = k[1]; c.lineWidth = big ? 3 : 2; c.beginPath();
+        curve.forEach(function(p, i){ var px = X(p.rpm), py = Y(p[k[0]]); i ? c.lineTo(px, py) : c.moveTo(px, py); });
+        c.stroke();
+      });
+      // PEAKS: always marked on the curves and listed across the top
+      var pk = dynoPeaks(curve);
+      [[pk.h, 'whp', '#FF4D4D'], [pk.q, 'wtq', '#4DA3FF']].forEach(function(m){
+        c.fillStyle = m[2]; c.beginPath(); c.arc(X(m[0].rpm), Y(m[0][m[1]]), big ? 5 : 3.5, 0, 6.3); c.fill();
+        c.strokeStyle = '#0f1218'; c.lineWidth = 1.5; c.stroke();
+      });
+      label(c, Math.round(pk.h.whp) + ' WHP', X(pk.h.rpm), Y(pk.h.whp), '#FF4D4D', W, H, false, fs);
+      label(c, Math.round(pk.q.wtq) + ' lb-ft', X(pk.q.rpm), Y(pk.q.wtq), '#4DA3FF', W, H, true, fs);
+      c.font = 'bold ' + fs + 'px monospace';
+      c.fillStyle = '#FF4D4D';
+      var t1 = 'PEAK ' + Math.round(pk.h.whp) + ' WHP @' + pk.h.rpm;
+      c.fillText(t1, L, fs + 4);
+      c.fillStyle = '#4DA3FF';
+      c.fillText(Math.round(pk.q.wtq) + ' lb-ft @' + pk.q.rpm, L + c.measureText(t1 + '   ').width, fs + 4);
+      // CROSSHAIR + readout under the cursor (or the pinned rpm)
+      if (st.rpm != null){
+        var p = dynoAt(curve, st.rpm), x = X(p.rpm);
+        c.setLineDash([4, 3]); c.strokeStyle = st.pinned ? '#e6e9ef' : '#9aa3b2'; c.lineWidth = 1;
+        c.beginPath(); c.moveTo(x, T); c.lineTo(x, H - B); c.stroke(); c.setLineDash([]);
+        [['whp', '#FF4D4D'], ['wtq', '#4DA3FF']].forEach(function(k){
+          c.fillStyle = '#0f1218'; c.beginPath(); c.arc(x, Y(p[k[0]]), big ? 6 : 4.5, 0, 6.3); c.fill();
+          c.strokeStyle = k[1]; c.lineWidth = 2; c.stroke();
+        });
+        var lines = [[Math.round(p.rpm / 10) * 10 + ' rpm' + (st.pinned ? '  (pinned)' : ''), '#e6e9ef'],
+                     [p.whp.toFixed(1) + ' WHP', '#FF4D4D'], [p.wtq.toFixed(1) + ' lb-ft', '#4DA3FF']];
+        c.font = 'bold ' + fs + 'px monospace';
+        var bw = Math.max.apply(null, lines.map(function(l){ return c.measureText(l[0]).width; })) + 14;
+        var lh = fs + 5, bh = lines.length * lh + 8;
+        // keep the readout clear of the curves (and the peak labels near the top):
+        // curves high at this rpm -> box at the bottom of the plot, else at the top
+        var yCurve = Math.min(Y(p.whp), Y(p.wtq));
+        var bx = x + 12 + bw > W - R ? x - 12 - bw : x + 12;
+        var by = yCurve < (T + H - B) / 2 ? H - B - bh - 4 : T + 4;
+        c.fillStyle = 'rgba(15,18,24,0.94)'; c.fillRect(bx, by, bw, bh);
+        c.strokeStyle = '#3a4352'; c.lineWidth = 1; c.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+        lines.forEach(function(l, i){ c.fillStyle = l[1]; c.fillText(l[0], bx + 7, by + 4 + (i + 1) * lh - 4); });
+      }
+    };
+    function rpmAt(clientX){
+      var g = st.g; if (!g) return null;
+      var x = clientX - cv.getBoundingClientRect().left;
+      var f = Math.min(1, Math.max(0, (x - g.L) / Math.max(1, g.W - g.L - g.R)));
+      return g.r0 + f * (g.r1 - g.r0);
+    }
+    cv.addEventListener('mousemove', function(e){ if (!st.pinned){ st.rpm = rpmAt(e.clientX); st.draw(); } });
+    cv.addEventListener('mouseleave', function(){ if (!st.pinned){ st.rpm = null; st.draw(); } });
+    cv.addEventListener('click', function(e){
+      if (st.pinned){ st.pinned = false; st.rpm = rpmAt(e.clientX); }
+      else { st.pinned = true; st.rpm = rpmAt(e.clientX); }
+      st.draw();
     });
-    c.fillStyle = '#FF4D4D'; c.fillText('WHP', W - 64, T + 10); c.fillStyle = '#4DA3FF'; c.fillText('WTQ', W - 34, T + 10);
+    function touch(e){ if (!e.touches.length) return; st.pinned = true; st.rpm = rpmAt(e.touches[0].clientX); st.draw(); }
+    cv.addEventListener('touchstart', touch, {passive: true});
+    cv.addEventListener('touchmove', touch, {passive: true});
+    DYNO_CHARTS.push(st);
+    return st;
+  }
+  var DYNO_SMALL = null, DYNO_BIG = null, DYNO_OVERLAY = null;
+  function openDynoOverlay(){
+    if (!DYNO_CURVE.length) return;
+    if (!DYNO_OVERLAY){                        // built once, then shown/hidden in place
+      var ov = document.createElement('div');
+      ov.id = 'dyno-overlay';
+      ov.style.cssText = 'position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,0.72);' +
+        'display:none;align-items:center;justify-content:center;padding:24px';
+      ov.innerHTML = '<div style="background:#12161d;border:1px solid #2a3240;border-radius:10px;' +
+        'width:min(1100px,96vw);padding:14px 16px 12px;box-shadow:0 12px 40px rgba(0,0,0,.6)">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+        '<span class="t-label" id="dyno-ov-title">virtual dyno</span>' +
+        '<button class="btn" id="dyno-ov-close" style="padding:2px 10px">close \u2715</button></div>' +
+        '<canvas id="dyno-big" data-aspect="0.5" style="display:block;width:100%;background:#0f1218;' +
+        'border:1px solid #232a36;border-radius:6px;cursor:crosshair;touch-action:pan-y"></canvas>' +
+        '<div class="t-label" style="opacity:.6;margin-top:6px;text-transform:none;letter-spacing:0">' +
+        'hover for numbers \u00b7 click to pin / release \u00b7 Esc to close</div></div>';
+      document.body.appendChild(ov);
+      ov.addEventListener('click', function(e){ if (e.target === ov) closeDynoOverlay(); });
+      ov.querySelector('#dyno-ov-close').addEventListener('click', closeDynoOverlay);
+      DYNO_OVERLAY = ov;
+      DYNO_BIG = makeDynoChart(ov.querySelector('#dyno-big'));
+    }
+    DYNO_OVERLAY.style.display = 'flex';
+    el('dyno-ov-title').textContent = 'virtual dyno \u00b7 ' + (POWER && POWER.weight_lb ? POWER.weight_lb + ' lb \u00b7 ' : '') +
+      'est. wheel hp, no drivetrain loss';
+    DYNO_BIG.rpm = null; DYNO_BIG.pinned = false;
+    requestAnimationFrame(function(){ DYNO_BIG.draw(); });
+  }
+  function closeDynoOverlay(){ if (DYNO_OVERLAY) DYNO_OVERLAY.style.display = 'none'; }
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'Escape' && DYNO_OVERLAY && DYNO_OVERLAY.style.display !== 'none') closeDynoOverlay();
+  });
+  window.addEventListener('resize', function(){ DYNO_CHARTS.forEach(function(ch){ ch.draw(); }); });
+  function drawDyno(curve){
+    DYNO_CURVE = curve || [];
+    el('dyno-wrap').style.display = DYNO_CURVE.length ? '' : 'none';
+    if (!DYNO_CURVE.length) return;
+    if (!DYNO_SMALL){
+      DYNO_SMALL = makeDynoChart(el('dyno-chart'));
+      el('dyno-big-btn').addEventListener('click', openDynoOverlay);
+    }
+    DYNO_SMALL.draw();
   }
 
   (async function loadLaps(){

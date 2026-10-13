@@ -478,6 +478,16 @@ Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
   `t` (EPOCH seconds), `whp`, `wtq` (the 3D HUD's "now"), `max {whp, wtq, whp_rpm, wtq_rpm}`,
   `curve [{rpm, whp, wtq, n}]`, `laps [{lap, whp, wtq}]`, `method {pulls, gears, straight_only,
   grade {source, used, spread_m, relief_m, laps, why}}`.
+- **Dyno chart is interactive** (review page): hover / touch-drag = crosshair + readout (rpm, WHP,
+  lb-ft, interpolated along the curve); click pins it, click again releases; peak WHP and WTQ are
+  ALWAYS marked on the curves and listed across the top. The readout box sits on whichever half of the
+  plot is clear of the curves, so it never covers the peak labels. **enlarge = an overlay ON the page**
+  (`#dyno-overlay`, built once in JS and appended to body): no new window, no navigation, no reload;
+  ✕ / Esc / backdrop click closes it.
+- **Laps card layout is placed explicitly** (`.lap-body > .lap-table-wrap` col 1, `> #car-row` col 2,
+  `> .lap-delta` full width, row 2). It used to rely on auto-placement, so inserting the car/dyno box as
+  the first child silently pushed the compare section into the 340 px slot. The delta canvas is now
+  sized to its on-screen width before every draw (it was a fixed 760×200 stretched) and redraws on resize.
 - Shown on the **review page** (weight row, dyno chart, method line, est WHP/WTQ per lap, peaks @rpm
   in the laps header) and the **3D HUD** (now · max, ghost speed in red). **NOT on the sessions list**
   (the owner asked for it to be removed; the lap summary does no power work).
