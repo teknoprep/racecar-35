@@ -507,8 +507,17 @@ Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
      than 4 curve bins of straight pulls, every pull is used and `straight_only` is false (Thompson).
   3. **Curve:** per 250-rpm bin, each pull's 0.5 s mean power; the 90th percentile over ≥ 5 pulls (the
      full-throttle level; partial throttle sits below, one wild pull cannot set it); 3-bin median.
-     Peak WHP = curve max; peak WTQ = max of curve·5252/rpm. Per lap: the same bins from that lap only
-     (median per bin).
+     Peak WHP = curve max; peak WTQ = max of curve·5252/rpm (solid tier only).
+  4. **Per lap = that lap's MAXIMUM** (the owner: "we don't care about averages"): its best pull in
+     each rpm bin, then the 3-bin median spike guard (a max must hold across neighbouring rpm). Laps
+     scatter around the curve peak (Summit: middle lap 112.3 vs curve 112.5, 4 of 10 above). The laps
+     table columns are `top mph` (top SPEED — it was labelled "Max" and read as power), `max WHP`,
+     `max WTQ`; the laps header shows `dyno peak … · best lap max … (lap n)`.
+  5. **Dashed low-confidence tier** (`tier: "low"`): straight pulls rarely reach below ~4.5–5k rpm on a
+     track (low rpm = corner exits), so bins outside the solid range are filled from EVERY clean pull
+     (corner exits included, ≥ 3 per bin), drawn dashed/faded, never used for peaks, and the readout
+     says "corner exits, reads low" with the pull count. Measured at Summit: 4.0–5.0k rpm has 100–125 s
+     of clean pulls but only 21–36 s straight; below 4k almost nothing is straight.
 - **Grade = ONE elevation profile per lap position** (`grade_profile`): elevation at each fix (the
   track's lidar DEM via `_dem_grid_for`, else logged GPS `alt_m`) moves 1–2 m with sideways wander
   (Thompson read an 8.5 % "grade"), so the profile is the median across same-layout laps (±10 % length)

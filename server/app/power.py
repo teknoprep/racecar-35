@@ -288,6 +288,7 @@ PULL_MIN_S = 1.0         # a pull shorter than this is not a pull
 CURVE_BIN_RPM = 250
 CURVE_PCT = 90           # the full-throttle level at each rpm (partial throttle sits below)
 CURVE_MIN_PULLS = 5
+EXT_MIN_PULLS = 3        # the dashed low-confidence extension (corner exits allowed)
 LAT_MAX_G = 0.35         # near-straight only: scrub ~ lateral g squared (~3 hp here, ~20 at 0.8 g)
 
 
@@ -405,7 +406,8 @@ def dyno(t, mph, rpm, weight_lb, grade, lap_windows, elev_m=None, heading=None) 
     Session: at each 250-rpm bin, the 90th percentile over every clean pull's mean power
     in that bin (>= 5 pulls), then a 3-bin median. That is the full-throttle level at that
     rpm: partial-throttle pulls sit below it, and a single noisy pull cannot set it.
-    Lap: the same bins from that lap's pulls only (median per bin, 3-bin median).
+    Lap: that lap's MAXIMUM - its best pull in each bin, then the 3-bin median spike
+    guard (a maximum must hold across neighbouring rpm).
     lap_windows: [{"lap", "t_start", "t_end"}] of the INCLUDED laps.
     """
     t = np.asarray(list(t), dtype=float)
@@ -430,6 +432,7 @@ def dyno(t, mph, rpm, weight_lb, grade, lap_windows, elev_m=None, heading=None) 
         return pw, rs, k, _curve_from_bins(bins, lambda x: np.percentile(x, CURVE_PCT),
                                            CURVE_MIN_PULLS)
 
+    pull_all = pull.copy()
     straight = False
     if heading is not None:
         sp = pull & (lateral_g(t, v, heading) < LAT_MAX_G)
@@ -440,13 +443,33 @@ def dyno(t, mph, rpm, weight_lb, grade, lap_windows, elev_m=None, heading=None) 
         if not pull.any():
             return dict(empty, gears=len(gears))
         pw_s, rpm_s, npulls, curve = build(pull)
+    # The solid curve covers only rpm with >= 5 STRAIGHT pulls; on a track the low rpm
+    # happens out of corners, so it rarely reaches below ~4.5-5k. Extend it from EVERY
+    # clean pull (corner exits included, >= 3 per bin) as a separate low-confidence tier:
+    # drawn dashed, never used for the peaks, and it reads low (tyre scrub, part throttle).
+    for c in curve:
+        c["tier"] = "main"
+    if curve:
+        lo_r, hi_r = curve[0]["rpm"], curve[-1]["rpm"]
+        pw_a = _masked_mean(t, p, pull_all, ACCEL_HALF_S) / HP_W
+        rs_a = _masked_mean(t, rpm5, pull_all, ACCEL_HALF_S)
+        bins_a, _ = _pull_bins(t, rs_a, pw_a, pull_all, in_laps)
+        ext = [c for c in _curve_from_bins(bins_a, lambda x: np.percentile(x, CURVE_PCT), EXT_MIN_PULLS)
+               if c["rpm"] < lo_r or c["rpm"] > hi_r]
+        for c in ext:
+            c["tier"] = "low"
+        curve = sorted(curve + ext, key=lambda c: c["rpm"])
     laps = []
     for lp in lap_windows:
         sel = (t >= float(lp["t_start"])) & (t <= float(lp["t_end"]))
         lb, _ = _pull_bins(t, rpm_s, pw_s, pull, sel)
-        pk = _peaks(_curve_from_bins(lb, np.median, 1))
+        # the lap's MAXIMUM: its best pull at each rpm. The 3-bin median in
+        # _curve_from_bins is the only guard: a max must hold across neighbouring rpm,
+        # so one GPS hiccup cannot become the lap's number. It is not an average.
+        pk = _peaks(_curve_from_bins(lb, np.max, 1))
         laps.append({"lap": lp["lap"], "whp": pk["whp"], "wtq": pk["wtq"]})
-    return {"curve": curve, "peak": _peaks(curve), "laps": laps, "pulls": npulls,
+    return {"curve": curve, "peak": _peaks([c for c in curve if c.get("tier") == "main"]),
+            "laps": laps, "pulls": npulls,
             "gears": len(gears), "straight_only": straight}
 
 

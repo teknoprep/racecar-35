@@ -185,6 +185,31 @@ class VirtualDynoTests(unittest.TestCase):
         self.assertFalse(d["straight_only"])
         self.assertAlmostEqual(d["peak"]["whp"], 100.0, delta=3.0)
 
+    def test_corner_exit_rpm_becomes_a_dashed_tier_not_the_peak(self):
+        t, mph, rpm, hd = simulate_pulls()
+        # below 4000 rpm the car is turning hard (a corner exit); above it, straight
+        hd = list(hd); ang = 0.0
+        for i in range(1, len(t)):
+            if rpm[i] < 4000:
+                ang += 40.0 * DT
+            hd[i] = ang % 360
+        d = P.dyno(t, mph, rpm, LB, np.zeros(len(t)), self.lap(t), heading=hd)
+        main = [c for c in d["curve"] if c["tier"] == "main"]
+        low = [c for c in d["curve"] if c["tier"] == "low"]
+        self.assertTrue(main and low)
+        self.assertLess(max(c["rpm"] for c in low), min(c["rpm"] for c in main))
+        self.assertGreaterEqual(min(c["rpm"] for c in main), 3900)
+        best = max(main, key=lambda c: c["wtq"])
+        self.assertEqual(d["peak"]["wtq_rpm"], best["rpm"])      # never from the dashed tier
+
+    def test_each_lap_reports_its_maximum(self):
+        t, mph, rpm, hd = simulate_pulls()
+        half = float(t[len(t) // 2])
+        laps = [{"lap": 1, "t_start": 0.0, "t_end": half}, {"lap": 2, "t_start": half, "t_end": float(t[-1])}]
+        d = P.dyno(t, mph, rpm, LB, np.zeros(len(t)), laps, heading=hd)
+        for lp in d["laps"]:
+            self.assertAlmostEqual(lp["whp"], 100.0, delta=3.0, msg=lp)
+
     def test_no_weight_no_curve(self):
         t, mph, rpm, hd = simulate_pulls(n_pulls=6)
         self.assertEqual(P.dyno(t, mph, rpm, 0, None, self.lap(t))["curve"], [])

@@ -7227,7 +7227,7 @@ def get_session_power(request: Request, user: str, filename: str) -> JSONRespons
         out["max"] = {"whp": pw.round_or_none(pk["whp"]), "wtq": pw.round_or_none(pk["wtq"]),
                       "whp_rpm": pk["whp_rpm"], "wtq_rpm": pk["wtq_rpm"]}
         out["curve"] = [{"rpm": c["rpm"], "whp": round(c["whp"], 1), "wtq": round(c["wtq"], 1),
-                         "n": c["n"]} for c in d["curve"]]
+                         "n": c["n"], "tier": c.get("tier", "main")} for c in d["curve"]]
         out["laps"] = [{"lap": r["lap"], "whp": pw.round_or_none(r["whp"]),
                         "wtq": pw.round_or_none(r["wtq"])} for r in d["laps"]]
         out["method"] = {"pulls": d["pulls"], "gears": d["gears"],
@@ -16722,7 +16722,7 @@ _REVIEW_HTML = (
         </div>
         <div class="lap-table-wrap">
           <table class="laptable">
-            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th>Max</th><th title="estimated wheel horsepower (no drivetrain loss)">est WHP</th><th title="estimated wheel torque, lb-ft">est WTQ</th><th></th></tr></thead>
+            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th title="top speed on this lap">top mph</th><th title="this lap's maximum estimated wheel horsepower (no drivetrain loss)">max WHP</th><th title="this lap's maximum estimated wheel torque, lb-ft">max WTQ</th><th></th></tr></thead>
             <tbody id="lap-rows"></tbody>
           </table>
         </div>
@@ -17899,8 +17899,16 @@ _REVIEW_HTML = (
     if (p.set) {
       if (p.max && p.max.whp != null) {
         el('lap-sub').textContent = el('lap-sub').textContent.replace(/ \u00b7 est .*$/, '') +
-          ' \u00b7 est ' + Math.round(p.max.whp) + ' whp @' + p.max.whp_rpm +
+          ' \u00b7 dyno peak ' + Math.round(p.max.whp) + ' whp @' + p.max.whp_rpm +
           ' / ' + Math.round(p.max.wtq) + ' lb-ft @' + p.max.wtq_rpm;
+        // the single best lap, so a lap above the curve is never a mystery
+        var bh = null, bq = null;
+        (p.laps || []).forEach(function(x){
+          if (x.whp != null && (bh == null || x.whp > bh.whp)) bh = x;
+          if (x.wtq != null && (bq == null || x.wtq > bq.wtq)) bq = x;
+        });
+        if (bh && bq) el('lap-sub').textContent += ' \u00b7 best lap max ' + Math.round(bh.whp) +
+          ' whp (lap ' + bh.lap + ') / ' + Math.round(bq.wtq) + ' lb-ft (lap ' + bq.lap + ')';
       }
       el('car-note').textContent = 'est. wheel hp at ' + p.weight_lb + ' lb \u00b7 no drivetrain loss';
       drawDyno(p.curve || []);
@@ -17908,7 +17916,10 @@ _REVIEW_HTML = (
       el('dyno-how').textContent = (p.curve && p.curve.length)
         ? 'virtual dyno: ' + m.pulls + ' clean pulls (in gear' +
           (m.straight_only ? ', straight-line' : ', all pulls: too few straights') +
-          '), 90th percentile per 250 rpm. Grade: ' +
+          '), 90th percentile per 250 rpm' +
+          ((p.curve || []).some(function(c){ return c.tier === 'low'; })
+            ? '; dashed = corner exits / few pulls (reads low, not used for peaks)' : '') +
+          '. Lap columns = the maximum of each lap. Grade: ' +
           (g.used ? g.source + ' (laps agree to ' + g.spread_m + ' m)' : 'flat \u2014 ' + (g.why || 'no elevation'))
         : 'not enough clean full-throttle pulls for a dyno curve';
     } else {
@@ -17936,8 +17947,10 @@ _REVIEW_HTML = (
     return {rpm: rpm, whp: z.whp, wtq: z.wtq};
   }
   function dynoPeaks(curve){
-    var h = curve[0], q = curve[0];
-    curve.forEach(function(c){ if (c.whp > h.whp) h = c; if (c.wtq > q.wtq) q = c; });
+    var main = curve.filter(function(c){ return c.tier !== 'low'; });
+    if (!main.length) main = curve;
+    var h = main[0], q = main[0];
+    main.forEach(function(c){ if (c.whp > h.whp) h = c; if (c.wtq > q.wtq) q = c; });
     return {h: h, q: q};
   }
   function makeDynoChart(cv){
@@ -17984,9 +17997,13 @@ _REVIEW_HTML = (
         c.fillStyle = '#7d8799'; c.fillText((r / 1000).toFixed(r % 1000 ? 1 : 0) + 'k', X(r) - 8, H - 6);
       }
       [['whp', '#FF4D4D'], ['wtq', '#4DA3FF']].forEach(function(k){
-        c.strokeStyle = k[1]; c.lineWidth = big ? 3 : 2; c.beginPath();
-        curve.forEach(function(p, i){ var px = X(p.rpm), py = Y(p[k[0]]); i ? c.lineTo(px, py) : c.moveTo(px, py); });
-        c.stroke();
+        c.strokeStyle = k[1]; c.lineWidth = big ? 3 : 2;
+        for (var i = 1; i < curve.length; i++){      // segment by segment: dashed if either end is low-confidence
+          var a = curve[i-1], b = curve[i], low = a.tier === 'low' || b.tier === 'low';
+          c.setLineDash(low ? [5, 4] : []); c.globalAlpha = low ? 0.55 : 1;
+          c.beginPath(); c.moveTo(X(a.rpm), Y(a[k[0]])); c.lineTo(X(b.rpm), Y(b[k[0]])); c.stroke();
+        }
+        c.setLineDash([]); c.globalAlpha = 1;
       });
       // PEAKS: always marked on the curves and listed across the top
       var pk = dynoPeaks(curve);
@@ -18011,8 +18028,11 @@ _REVIEW_HTML = (
           c.fillStyle = '#0f1218'; c.beginPath(); c.arc(x, Y(p[k[0]]), big ? 6 : 4.5, 0, 6.3); c.fill();
           c.strokeStyle = k[1]; c.lineWidth = 2; c.stroke();
         });
+        var near = curve.reduce(function(m, cc){ return Math.abs(cc.rpm - p.rpm) < Math.abs(m.rpm - p.rpm) ? cc : m; }, curve[0]);
         var lines = [[Math.round(p.rpm / 10) * 10 + ' rpm' + (st.pinned ? '  (pinned)' : ''), '#e6e9ef'],
-                     [p.whp.toFixed(1) + ' WHP', '#FF4D4D'], [p.wtq.toFixed(1) + ' lb-ft', '#4DA3FF']];
+                     [p.whp.toFixed(1) + ' WHP', '#FF4D4D'], [p.wtq.toFixed(1) + ' lb-ft', '#4DA3FF'],
+                     [(near.n || '?') + ' pulls' + (near.tier === 'low' ? ' \u00b7 corner exits, reads low' : ' \u00b7 straight-line'),
+                      near.tier === 'low' ? '#c9a24d' : '#7d8799']];
         c.font = 'bold ' + fs + 'px monospace';
         var bw = Math.max.apply(null, lines.map(function(l){ return c.measureText(l[0]).width; })) + 14;
         var lh = fs + 5, bh = lines.length * lh + 8;
