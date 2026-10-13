@@ -417,7 +417,6 @@ def _ai_feature_model(feature: Optional[str]) -> str:
 # alongside the session data and is trivially deleted with its session.
 AI_HISTORY_DIR = DATA_DIR / "ai_history"
 VIDEO_META_DIR = DATA_DIR / "video_meta"   # per-session YouTube link + sync offset
-SESSION_META_DIR = DATA_DIR / "session_meta"   # per-session car weight (est WHP)
 SHARE_DIR = DATA_DIR / "shares"            # public view-only overlay tokens
 LAP_META_DIR = DATA_DIR / "lap_meta"       # per-session excluded-lap lists
 
@@ -3589,7 +3588,6 @@ def _session_sidecar_paths(user: str, name: str) -> list:
         ("ai_history", _ai_history_path(user, name)),
         ("lap_meta", _lap_meta_path(user, name)),
         ("video", _video_meta_path(user, name)),
-        ("car", _session_meta_path(user, name)),
         ("lap_cache", LAPCACHE_DIR / safe_name(user) / (name + ".json")),
         ("debug", _debug_path_for(user, name)),
     ]
@@ -3882,7 +3880,7 @@ load();
 # Bumps whenever the 3D drive view changes materially (documented at length in
 # the /caps docstring below). Kept as a constant because /caps and /version both
 # report it — two literals would drift.
-TRACK3D_V = 15
+TRACK3D_V = 16
 
 
 @app.get("/caps")
@@ -5541,7 +5539,6 @@ async def delete_session(
         pass
     # Cascade: a deleted session takes its entire AI Q&A history with it.
     _ai_history_delete_file(user, session_name)
-    _session_meta_path(user, p.name).unlink(missing_ok=True)
     log.info("deleted session %s bytes=%d (+ai history)", rel, size)
     return JSONResponse({"ok": True, "deleted": rel, "bytes": size})
 
@@ -6032,95 +6029,6 @@ def _load_samples(p: pathlib.Path) -> list:
             except Exception:
                 continue
     return samples
-
-
-def _num_or_none(x):
-    if isinstance(x, bool) or not isinstance(x, (int, float)):
-        return None
-    return float(x) if math.isfinite(x) else None
-
-
-def _power_mod():
-    import importlib
-    try:
-        return importlib.import_module(".power", __package__)
-    except Exception:
-        return importlib.import_module("power")
-
-
-def _power_series(samples: list, weight_lb: float) -> dict:
-    """Est WHEEL power and torque for every sample at this car weight (server/app/power.py)."""
-    rel, _basis = _relative_seconds(samples)
-    return _power_mod().wheel_series(
-        rel,
-        [_num_or_none(s.get("speed_mph")) for s in samples],
-        [_num_or_none(s.get("alt_m")) for s in samples],
-        [_num_or_none(s.get("rpm")) for s in samples],
-        weight_lb)
-
-
-_DEM_GRID_CACHE: dict = {}
-
-
-def _dem_grid_for(track: str) -> Optional[dict]:
-    """The prepared track's lidar/terrain grid (dem_hr), cached per slug+file."""
-    try:
-        asset = _track_asset_for(track)
-    except Exception:
-        asset = None
-    meta = (asset or {}).get("dem_hr")
-    if not asset or not meta or not meta.get("file"):
-        return None
-    path = _track_asset_path(asset["slug"]).parent / meta["file"]
-    try:
-        key = (asset["slug"], str(path), path.stat().st_mtime)
-    except OSError:
-        return None
-    hit = _DEM_GRID_CACHE.get(key)
-    if hit is None:
-        try:
-            tp = _trackprep()
-            hit = dict(meta, values=tp.read_dem_bin(meta, path))
-        except Exception:
-            return None
-        _DEM_GRID_CACHE.clear()                  # one track at a time is plenty
-        _DEM_GRID_CACHE[key] = hit
-    return hit
-
-
-def _power_grade(samples: list, rel: list, laps: list, track: str) -> tuple:
-    """Grade per sample from the best elevation source that passes the lap-consensus
-    quality gate: the track's lidar DEM, then logged GPS altitude, else flat (0).
-    Returns (grade, info, median elevation or None)."""
-    pw = _power_mod()
-    wins = [(float(lp["t_start"]), float(lp["t_end"])) for lp in laps]
-    mph = [_num_or_none(s.get("speed_mph")) for s in samples]
-    tried = []
-    grid = _dem_grid_for(track)
-    if grid is not None:
-        try:
-            tp = _trackprep()
-            el = tp.dem_sample(grid, [_num_or_none(s.get("lat")) or float("nan") for s in samples],
-                               [_num_or_none(s.get("lon")) or float("nan") for s in samples])
-            g, info = pw.grade_profile(rel, mph, el, wins)
-            info["source"] = "track lidar / terrain model"
-            if info.get("used"):
-                import numpy as _np
-                return g, info, float(_np.nanmedian(el))
-            tried.append(info)
-        except Exception as e:
-            tried.append({"source": "track lidar / terrain model", "why": str(e)[:80]})
-    alt = [_num_or_none(s.get("alt_m")) for s in samples]
-    if sum(a is not None for a in alt) >= len(alt) * 0.5:
-        g, info = pw.grade_profile(rel, mph, alt, wins)
-        info["source"] = "GPS altitude"
-        if info.get("used"):
-            vals = sorted(a for a in alt if a is not None)
-            return g, info, vals[len(vals) // 2]
-        tried.append(info)
-    info = {"used": False, "source": "none (flat)",
-            "why": "; ".join(f"{x.get('source')}: {x.get('why')}" for x in tried) or "no elevation data"}
-    return [0.0] * len(samples), info, None
 
 
 def _lap_summary(user: str, p: pathlib.Path, force: bool = False) -> dict:
@@ -7113,128 +7021,6 @@ async def get_video_link(request: Request, user: str, filename: str) -> JSONResp
             meta = {}
     return JSONResponse({"id": meta.get("id"), "url": meta.get("url", ""),
                          "offset_ms": int(meta.get("offset_ms", 0) or 0)})
-
-
-# ---- Estimated WHEEL power (est WHP / est WTQ) -----------------------------
-# The car weight is a property of the DRIVE (a driver can run two cars, or the
-# same car at two events), so it is stored on the SESSION, not the account.
-# Power is weight-free (server/app/power.py); the weight only scales it.
-CAR_WEIGHT_MIN, CAR_WEIGHT_MAX = 700, 9000          # lb; anything else is refused
-
-
-def _session_meta_path(user: str, session_name: str) -> pathlib.Path:
-    return SESSION_META_DIR / safe_name(user) / (safe_name(session_name) + ".json")
-
-
-def _car_meta_read(user: str, session_name: str) -> dict:
-    try:
-        d = json.loads(_session_meta_path(user, session_name).read_text("utf-8"))
-        return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _weight_lb_of(user: str, session_name: str) -> int:
-    """The session's car weight in lb, or 0 when not set / out of range."""
-    try:
-        w = int(_car_meta_read(user, session_name).get("weight_lb") or 0)
-    except (TypeError, ValueError):
-        return 0
-    return w if CAR_WEIGHT_MIN <= w <= CAR_WEIGHT_MAX else 0
-
-
-def _can_edit_session(request: Request, user: str) -> bool:
-    try:
-        gate_delete_dir(request, safe_name(user))
-        return True
-    except HTTPException:
-        return False
-
-
-@app.get("/sessions/{user}/{filename}/car")
-def get_session_car(request: Request, user: str, filename: str) -> JSONResponse:
-    gate_view_session(request, user, filename)
-    p = _resolve_session(user, filename)
-    rec = _car_meta_read(user, p.name)
-    return JSONResponse({"set": _weight_lb_of(user, p.name) > 0,
-                         "weight_lb": _weight_lb_of(user, p.name),
-                         "by": rec.get("by"), "at": rec.get("at"),
-                         "can_edit": _can_edit_session(request, user)})
-
-
-@app.post("/sessions/{user}/{filename}/car")
-async def set_session_car(request: Request, user: str, filename: str) -> JSONResponse:
-    """Set the car weight for this session. 0 or blank clears it. Owner-or-admin,
-    the same rule as editing the session; a read-only grant cannot change it."""
-    require_web_user(request)
-    gate_delete_dir(request, safe_name(user))
-    p = _resolve_session(user, filename)
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="json body required")
-    raw = body.get("weight_lb") if isinstance(body, dict) else None
-    mp = _session_meta_path(user, p.name)
-    if raw in (None, "", 0, "0"):
-        mp.unlink(missing_ok=True)
-        return JSONResponse({"ok": True, "set": False, "weight_lb": 0})
-    try:
-        w = int(round(float(raw)))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=422, detail="weight_lb must be a number")
-    if not CAR_WEIGHT_MIN <= w <= CAR_WEIGHT_MAX:
-        raise HTTPException(status_code=422, detail=f"weight_lb must be {CAR_WEIGHT_MIN}-{CAR_WEIGHT_MAX} lb")
-    who = str((current_user(request) or {}).get("email", "") or "")
-    mp.parent.mkdir(parents=True, exist_ok=True)
-    tmp = mp.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"weight_lb": w, "by": who, "at": int(time.time())}), "utf-8")
-    tmp.replace(mp)
-    return JSONResponse({"ok": True, "set": True, "weight_lb": w})
-
-
-@app.get("/sessions/{user}/{filename}/power")
-def get_session_power(request: Request, user: str, filename: str) -> JSONResponse:
-    """Est WHEEL power and torque for one session (view-gated).
-
-    Per-sample arrays (t = epoch seconds as logged, whp = hp, wtq = lb-ft) and the
-    peak per included lap. Without a car weight on the session it returns
-    set=false and NO numbers: nothing is assumed about the car.
-    """
-    gate_view_session(request, user, filename)
-    p = _resolve_session(user, filename)
-    samples = _load_samples(p)
-    laps = (_apply_lap_meta(_detect_laps(samples), user, p.name).get("laps") or [])
-    pw = _power_mod()
-    w = _weight_lb_of(user, p.name)
-    out = {"set": w > 0, "weight_lb": w, "estimate": "wheel power, no drivetrain loss",
-           "laps": [{"lap": lp["lap"]} for lp in laps]}
-    if w > 0:
-        rel, _basis = _relative_seconds(samples)
-        track = split_session_name(p.name)[1] or ""
-        grade, ginfo, elev = _power_grade(samples, rel, laps, track)
-        mph = [_num_or_none(s.get("speed_mph")) for s in samples]
-        rpm = [_num_or_none(s.get("rpm")) for s in samples]
-        series = pw.wheel_series(rel, mph, [None] * len(samples), rpm, w,
-                                 grade=grade, elev_m=elev)
-        d = pw.dyno(rel, mph, rpm, w, grade, laps, elev_m=elev,
-                    heading=[_num_or_none(s.get("heading_deg")) for s in samples])
-        first_abs = next((_num_or_none(x.get("t")) for x in samples
-                          if _num_or_none(x.get("t")) is not None), 0.0)
-        out["t"] = [round(float(x) + first_abs, 2) for x in series["t"]]   # epoch s, as logged
-        out["whp"] = [round(float(x), 1) for x in series["whp"]]
-        out["wtq"] = [round(float(x), 1) for x in series["wtq"]]
-        pk = d["peak"]
-        out["max"] = {"whp": pw.round_or_none(pk["whp"]), "wtq": pw.round_or_none(pk["wtq"]),
-                      "whp_rpm": pk["whp_rpm"], "wtq_rpm": pk["wtq_rpm"]}
-        out["curve"] = [{"rpm": c["rpm"], "whp": round(c["whp"], 1), "wtq": round(c["wtq"], 1),
-                         "n": c["n"], "tier": c.get("tier", "main")} for c in d["curve"]]
-        out["laps"] = [{"lap": r["lap"], "whp": pw.round_or_none(r["whp"]),
-                        "wtq": pw.round_or_none(r["wtq"])} for r in d["laps"]]
-        out["method"] = {"pulls": d["pulls"], "gears": d["gears"],
-                         "straight_only": d.get("straight_only", False),
-                         "grade": {k: ginfo.get(k) for k in
-                                   ("source", "used", "spread_m", "relief_m", "laps", "why")}}
-    return JSONResponse(out)
 
 
 @app.post("/sessions/{user}/{filename}/video")
@@ -9668,8 +9454,6 @@ _TRACK3D_HTML = (
   <div class="row"><span class="k">best</span><span id="h-best">—</span></div>
   <div class="row"><span class="k">altitude</span><span id="h-alt">—</span></div>
   <div class="row"><span class="k">long g</span><span id="h-g">—</span></div>
-  <div class="row" title="estimated wheel power at the car weight set on the review page (no drivetrain loss)"><span class="k">est WHP</span><span id="h-whp">—</span></div>
-  <div class="row"><span class="k">est WTQ</span><span id="h-wtq">—</span></div>
   <div class="row" id="h-ghost-row" style="display:none"><span class="k" style="color:#C084FC">ghost</span><span id="h-ghost">—</span></div>
 </div>
 <div id="legend">
@@ -14988,7 +14772,6 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     if (GHOST && GHOST.lastMph != null && el("h-ghost-row").style.display !== "none") {
       el("h-gmph").style.display = ""; el("h-gmph").textContent = Math.round(GHOST.lastMph);
     } else { el("h-gmph").style.display = "none"; }
-    showPower3();
     el("h-rpm").textContent = (cur && typeof cur.rpm === "number") ? cur.rpm : "—";
     el("h-lap").textContent = LAPNO ? LAPNO : "whole session";
     el("h-lapt").textContent = L ? fmtLap(NOW - L.t_start) : fmtLap(NOW);
@@ -15985,44 +15768,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       .catch(function (e) { notice("could not load session: " + e.message, true); });
   }
 
-  // ---- est wheel power (server /power, power.py) ---------------------------
-  // The server's per-sample series is on the session's own relative clock, the
-  // same basis as PATH.t / NOW, so this is a lookup, never a second model here.
-  var POW3 = null;
-  function pwIndex(ts, x) {
-    if (!ts || !ts.length) return -1;
-    var lo = 0, hi = ts.length - 1;
-    while (lo < hi) { var m = (lo + hi + 1) >> 1; if (ts[m] <= x) lo = m; else hi = m - 1; }
-    return lo;
-  }
-  function firstAbsT() {
-    for (var k = 0; k < S.length; k++) {
-      if (S[k] && typeof S[k].t === "number" && isFinite(S[k].t)) return S[k].t;
-    }
-    return null;
-  }
-  function showPower3() {
-    if (!POW3) return;
-    try {
-      if (!POW3.set) { el("h-whp").textContent = "set car weight on review"; return; }
-      var t0 = firstAbsT();
-      if (t0 == null) return;
-      var i = pwIndex(POW3.t, t0 + NOW), mx = POW3.max || {};
-      el("h-whp").textContent = (i >= 0 ? Math.round(POW3.whp[i]) : "\u2014") +
-        (mx.whp != null ? " \u00b7 max " + Math.round(mx.whp) : "");
-      el("h-wtq").textContent = (i >= 0 ? Math.round(POW3.wtq[i]) : "\u2014") +
-        (mx.wtq != null ? " \u00b7 max " + Math.round(mx.wtq) : "");
-    } catch (e) { /* a HUD readout must never stop the render loop */ }
-  }
-  function loadPower3() {
-    fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) + "/power")
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (j) { if (j) { POW3 = j; showPower3(); } })
-      .catch(function () {});
-  }
-
   start();
-  loadPower3();
 })();
 </script>
 <script>
@@ -16379,16 +16125,10 @@ _REVIEW_HTML = (
 
   /* ---- laps + delta ---------------------------------------------- */
   .lapcard { margin-top: var(--sp-md); }
-  .lap-body { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: var(--sp-md); }
+  .lap-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-md); }
   .lap-body > .lap-table-wrap { grid-column: 1; grid-row: 1; }
-  .lap-body > #car-row { grid-column: 2; grid-row: 1; }
-  .lap-body > .lap-delta { grid-column: 1 / -1; grid-row: 2;
+  .lap-body > .lap-delta { grid-column: 1; grid-row: 2;
     border-top: 1px solid var(--line); padding-top: var(--sp-md); }
-  @media (max-width: 820px) {
-    .lap-body { grid-template-columns: 1fr; }
-    .lap-body > .lap-table-wrap, .lap-body > #car-row, .lap-body > .lap-delta {
-      grid-column: 1; grid-row: auto; }
-  }
   .lap-table-wrap { max-height: 430px; overflow-y: auto;
     border: 1px solid var(--line); border-radius: var(--r-sm); }
   table.laptable { width: 100%; border-collapse: collapse; font: 13px var(--ff-mono); }
@@ -16706,23 +16446,9 @@ _REVIEW_HTML = (
       <div class="card-head"><span class="t-label">Laps</span>
         <span class="t-label" id="lap-sub">—</span></div>
       <div class="card-body lap-body">
-        <div class="car-row" id="car-row" style="display:none;margin:0 0 10px;flex-direction:column;align-items:flex-start;gap:6px">
-          <span class="t-label">car weight</span>
-          <input id="car-wt" type="number" min="700" max="9000" step="1" placeholder="lb, with driver" style="width:9em">
-          <button class="btn" id="car-save">save</button>
-          <span class="t-label" id="car-note" style="opacity:.8"></span>
-          <div id="dyno-wrap" style="display:none;width:100%;max-width:340px">
-            <canvas id="dyno-chart" data-aspect="0.62" style="display:block;width:100%;margin-top:4px;background:#0f1218;border:1px solid #232a36;border-radius:6px;cursor:crosshair;touch-action:pan-y"></canvas>
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
-              <span class="t-label" style="opacity:.6;text-transform:none;letter-spacing:0">hover for numbers \u00b7 click to pin</span>
-              <button class="btn" id="dyno-big-btn" style="padding:2px 8px">enlarge \u2922</button>
-            </div>
-          </div>
-          <span class="t-label" id="dyno-how" style="opacity:.65;max-width:330px;line-height:1.35;text-transform:none;letter-spacing:0"></span>
-        </div>
         <div class="lap-table-wrap">
           <table class="laptable">
-            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th title="top speed on this lap">top mph</th><th title="this lap's maximum estimated wheel horsepower (no drivetrain loss)">max WHP</th><th title="this lap's maximum estimated wheel torque, lb-ft">max WTQ</th><th></th></tr></thead>
+            <thead><tr><th>Lap</th><th>Time</th><th>+/−</th><th title="top speed on this lap">top mph</th><th></th></tr></thead>
             <tbody id="lap-rows"></tbody>
           </table>
         </div>
@@ -17852,264 +17578,6 @@ _REVIEW_HTML = (
   });
 
   // ---- load this session's laps + wire the table ---------------------
-  // ---- est wheel power (server: /sessions/<u>/<f>/power, power.py) ----------
-  // The car weight is per SESSION. Without one nothing is shown and nothing is
-  // assumed. Peaks come from the server, so this page never re-derives power.
-  var POWER = null;
-  function carInit(){
-    fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/car').then(function(r){ return r.ok ? r.json() : null; })
-      .then(function(c){
-        if (!c) return;
-        el('car-row').style.display = 'flex';
-        el('car-wt').value = c.set ? c.weight_lb : '';
-        el('car-wt').disabled = !c.can_edit;
-        el('car-save').style.display = c.can_edit ? '' : 'none';
-        if (!c.can_edit && !c.set) el('car-note').textContent = 'no car weight set for this session';
-      }).catch(function(){});
-  }
-  el('car-save').addEventListener('click', async function(){
-    const raw = el('car-wt').value.trim();
-    try {
-      const r = await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/car', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({weight_lb: raw === '' ? 0 : raw})});
-      if (!r.ok){ const j = await r.json().catch(()=>({}));
-        alert('car weight not saved: '+((j&&j.detail)||('HTTP '+r.status))); return; }
-    } catch(e){ alert('car weight not saved: '+e.message); return; }
-    location.reload();
-  });
-  async function loadPower(){
-    try {
-      const r = await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/power');
-      if (!r.ok) return;
-      POWER = await r.json();
-    } catch(e){ return; }
-    paintPower();
-  }
-  function paintPower(){
-    const p = POWER; if (!p) return;
-    const byLap = {};
-    (p.laps||[]).forEach(function(x){ byLap[x.lap] = x; });
-    document.querySelectorAll('#lap-rows tr[data-lap]').forEach(function(tr){
-      const x = byLap[parseInt(tr.dataset.lap, 10)] || {};
-      const h = tr.querySelector('.pw-hp'), q = tr.querySelector('.pw-tq');
-      if (h) h.textContent = (x.whp != null) ? Math.round(x.whp) : '\u2014';
-      if (q) q.textContent = (x.wtq != null) ? Math.round(x.wtq) : '\u2014';
-    });
-    if (p.set) {
-      if (p.max && p.max.whp != null) {
-        el('lap-sub').textContent = el('lap-sub').textContent.replace(/ \u00b7 est .*$/, '') +
-          ' \u00b7 dyno peak ' + Math.round(p.max.whp) + ' whp @' + p.max.whp_rpm +
-          ' / ' + Math.round(p.max.wtq) + ' lb-ft @' + p.max.wtq_rpm;
-        // the single best lap, so a lap above the curve is never a mystery
-        var bh = null, bq = null;
-        (p.laps || []).forEach(function(x){
-          if (x.whp != null && (bh == null || x.whp > bh.whp)) bh = x;
-          if (x.wtq != null && (bq == null || x.wtq > bq.wtq)) bq = x;
-        });
-        if (bh && bq) el('lap-sub').textContent += ' \u00b7 best lap max ' + Math.round(bh.whp) +
-          ' whp (lap ' + bh.lap + ') / ' + Math.round(bq.wtq) + ' lb-ft (lap ' + bq.lap + ')';
-      }
-      el('car-note').textContent = 'est. wheel hp at ' + p.weight_lb + ' lb \u00b7 no drivetrain loss';
-      drawDyno(p.curve || []);
-      const m = p.method || {}, g = m.grade || {};
-      el('dyno-how').textContent = (p.curve && p.curve.length)
-        ? 'virtual dyno: ' + m.pulls + ' clean pulls (in gear' +
-          (m.straight_only ? ', straight-line' : ', all pulls: too few straights') +
-          '), 90th percentile per 250 rpm' +
-          ((p.curve || []).some(function(c){ return c.tier === 'low'; })
-            ? '; dashed = corner exits / few pulls (reads low, not used for peaks)' : '') +
-          '. Lap columns = the maximum of each lap. Grade: ' +
-          (g.used ? g.source + ' (laps agree to ' + g.spread_m + ' m)' : 'flat \u2014 ' + (g.why || 'no elevation'))
-        : 'not enough clean full-throttle pulls for a dyno curve';
-    } else {
-      el('car-note').textContent = 'enter the car weight (with driver) for est. wheel hp';
-    }
-  }
-
-  // ---- interactive dyno chart (WHP red / WTQ blue against rpm) --------------
-  // Hover (or touch-drag) shows rpm / WHP / WTQ under the cursor, a click pins the
-  // readout (click again to release), and the PEAK WHP and WTQ are always marked.
-  // "enlarge" opens the same chart in an overlay ON this page: no new window, no
-  // navigation, nothing reloads. Esc, the close button or the backdrop dismisses it.
-  var DYNO_CURVE = [], DYNO_CHARTS = [];
-  function dynoAt(curve, rpm){                      // linear interpolation along the curve
-    if (!curve.length) return null;
-    if (rpm <= curve[0].rpm) return {rpm: rpm, whp: curve[0].whp, wtq: curve[0].wtq};
-    for (var i = 1; i < curve.length; i++){
-      var a = curve[i-1], b = curve[i];
-      if (rpm <= b.rpm){
-        var f = (rpm - a.rpm) / Math.max(1, b.rpm - a.rpm);
-        return {rpm: rpm, whp: a.whp + f * (b.whp - a.whp), wtq: a.wtq + f * (b.wtq - a.wtq)};
-      }
-    }
-    var z = curve[curve.length-1];
-    return {rpm: rpm, whp: z.whp, wtq: z.wtq};
-  }
-  function dynoPeaks(curve){
-    var main = curve.filter(function(c){ return c.tier !== 'low'; });
-    if (!main.length) main = curve;
-    var h = main[0], q = main[0];
-    main.forEach(function(c){ if (c.whp > h.whp) h = c; if (c.wtq > q.wtq) q = c; });
-    return {h: h, q: q};
-  }
-  function makeDynoChart(cv){
-    var st = {cv: cv, rpm: null, pinned: false, g: null};
-    function fit(){
-      var w = Math.max(220, Math.round(cv.getBoundingClientRect().width || 330));
-      var h = Math.round(w * parseFloat(cv.dataset.aspect || '0.62')), d = window.devicePixelRatio || 1;
-      if (cv.width !== Math.round(w * d) || cv.height !== Math.round(h * d)){
-        cv.width = Math.round(w * d); cv.height = Math.round(h * d); cv.style.height = h + 'px';
-      }
-      return {w: w, h: h, d: d};
-    }
-    function label(c, txt, x, y, col, W, H, below, fs){
-      c.font = 'bold ' + fs + 'px monospace';
-      var tw = c.measureText(txt).width + 8, th = fs + 6;
-      var bx = Math.min(Math.max(x - tw / 2, 2), W - tw - 2);
-      var by = below ? y + 8 : y - 8 - th;
-      by = Math.min(Math.max(by, 2), H - th - 2);
-      c.fillStyle = 'rgba(15,18,24,0.92)'; c.fillRect(bx, by, tw, th);
-      c.strokeStyle = col; c.lineWidth = 1; c.strokeRect(bx + 0.5, by + 0.5, tw - 1, th - 1);
-      c.fillStyle = col; c.fillText(txt, bx + 4, by + fs + 1);
-    }
-    st.draw = function(){
-      var curve = DYNO_CURVE; if (!curve.length) return;
-      var z = fit(), c = cv.getContext('2d');
-      c.setTransform(z.d, 0, 0, z.d, 0, 0);
-      var W = z.w, H = z.h, big = W > 560, fs = big ? 13 : 10;
-      var L = big ? 46 : 32, R = big ? 18 : 8, T = big ? 34 : 24, B = big ? 30 : 20;
-      c.clearRect(0, 0, W, H);
-      var r0 = curve[0].rpm, r1 = curve[curve.length-1].rpm;
-      var mx = Math.max.apply(null, curve.map(function(x){ return Math.max(x.whp, x.wtq); }));
-      var top = Math.ceil(mx * 1.12 / 20) * 20 || 20;
-      var X = function(r){ return L + (r1 > r0 ? (r - r0) / (r1 - r0) : 0.5) * (W - L - R); };
-      var Y = function(v){ return T + (1 - v / top) * (H - T - B); };
-      st.g = {L: L, R: R, W: W, r0: r0, r1: r1};
-      c.font = fs + 'px monospace'; c.lineWidth = 1;
-      for (var v = 0; v <= top; v += 20){
-        c.strokeStyle = '#232a36'; c.beginPath(); c.moveTo(L, Y(v)); c.lineTo(W - R, Y(v)); c.stroke();
-        c.fillStyle = '#7d8799'; c.fillText(String(v), 4, Y(v) + 3);
-      }
-      for (var r = Math.ceil(r0 / 500) * 500; r <= r1; r += 500){
-        if (r % 1000 && !big) continue;
-        c.strokeStyle = '#1b212b'; c.beginPath(); c.moveTo(X(r), T); c.lineTo(X(r), H - B); c.stroke();
-        c.fillStyle = '#7d8799'; c.fillText((r / 1000).toFixed(r % 1000 ? 1 : 0) + 'k', X(r) - 8, H - 6);
-      }
-      [['whp', '#FF4D4D'], ['wtq', '#4DA3FF']].forEach(function(k){
-        c.strokeStyle = k[1]; c.lineWidth = big ? 3 : 2;
-        for (var i = 1; i < curve.length; i++){      // segment by segment: dashed if either end is low-confidence
-          var a = curve[i-1], b = curve[i], low = a.tier === 'low' || b.tier === 'low';
-          c.setLineDash(low ? [5, 4] : []); c.globalAlpha = low ? 0.55 : 1;
-          c.beginPath(); c.moveTo(X(a.rpm), Y(a[k[0]])); c.lineTo(X(b.rpm), Y(b[k[0]])); c.stroke();
-        }
-        c.setLineDash([]); c.globalAlpha = 1;
-      });
-      // PEAKS: always marked on the curves and listed across the top
-      var pk = dynoPeaks(curve);
-      [[pk.h, 'whp', '#FF4D4D'], [pk.q, 'wtq', '#4DA3FF']].forEach(function(m){
-        c.fillStyle = m[2]; c.beginPath(); c.arc(X(m[0].rpm), Y(m[0][m[1]]), big ? 5 : 3.5, 0, 6.3); c.fill();
-        c.strokeStyle = '#0f1218'; c.lineWidth = 1.5; c.stroke();
-      });
-      label(c, Math.round(pk.h.whp) + ' WHP', X(pk.h.rpm), Y(pk.h.whp), '#FF4D4D', W, H, false, fs);
-      label(c, Math.round(pk.q.wtq) + ' lb-ft', X(pk.q.rpm), Y(pk.q.wtq), '#4DA3FF', W, H, true, fs);
-      c.font = 'bold ' + fs + 'px monospace';
-      c.fillStyle = '#FF4D4D';
-      var t1 = 'PEAK ' + Math.round(pk.h.whp) + ' WHP @' + pk.h.rpm;
-      c.fillText(t1, L, fs + 4);
-      c.fillStyle = '#4DA3FF';
-      c.fillText(Math.round(pk.q.wtq) + ' lb-ft @' + pk.q.rpm, L + c.measureText(t1 + '   ').width, fs + 4);
-      // CROSSHAIR + readout under the cursor (or the pinned rpm)
-      if (st.rpm != null){
-        var p = dynoAt(curve, st.rpm), x = X(p.rpm);
-        c.setLineDash([4, 3]); c.strokeStyle = st.pinned ? '#e6e9ef' : '#9aa3b2'; c.lineWidth = 1;
-        c.beginPath(); c.moveTo(x, T); c.lineTo(x, H - B); c.stroke(); c.setLineDash([]);
-        [['whp', '#FF4D4D'], ['wtq', '#4DA3FF']].forEach(function(k){
-          c.fillStyle = '#0f1218'; c.beginPath(); c.arc(x, Y(p[k[0]]), big ? 6 : 4.5, 0, 6.3); c.fill();
-          c.strokeStyle = k[1]; c.lineWidth = 2; c.stroke();
-        });
-        var near = curve.reduce(function(m, cc){ return Math.abs(cc.rpm - p.rpm) < Math.abs(m.rpm - p.rpm) ? cc : m; }, curve[0]);
-        var lines = [[Math.round(p.rpm / 10) * 10 + ' rpm' + (st.pinned ? '  (pinned)' : ''), '#e6e9ef'],
-                     [p.whp.toFixed(1) + ' WHP', '#FF4D4D'], [p.wtq.toFixed(1) + ' lb-ft', '#4DA3FF'],
-                     [(near.n || '?') + ' pulls' + (near.tier === 'low' ? ' \u00b7 corner exits, reads low' : ' \u00b7 straight-line'),
-                      near.tier === 'low' ? '#c9a24d' : '#7d8799']];
-        c.font = 'bold ' + fs + 'px monospace';
-        var bw = Math.max.apply(null, lines.map(function(l){ return c.measureText(l[0]).width; })) + 14;
-        var lh = fs + 5, bh = lines.length * lh + 8;
-        // keep the readout clear of the curves (and the peak labels near the top):
-        // curves high at this rpm -> box at the bottom of the plot, else at the top
-        var yCurve = Math.min(Y(p.whp), Y(p.wtq));
-        var bx = x + 12 + bw > W - R ? x - 12 - bw : x + 12;
-        var by = yCurve < (T + H - B) / 2 ? H - B - bh - 4 : T + 4;
-        c.fillStyle = 'rgba(15,18,24,0.94)'; c.fillRect(bx, by, bw, bh);
-        c.strokeStyle = '#3a4352'; c.lineWidth = 1; c.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
-        lines.forEach(function(l, i){ c.fillStyle = l[1]; c.fillText(l[0], bx + 7, by + 4 + (i + 1) * lh - 4); });
-      }
-    };
-    function rpmAt(clientX){
-      var g = st.g; if (!g) return null;
-      var x = clientX - cv.getBoundingClientRect().left;
-      var f = Math.min(1, Math.max(0, (x - g.L) / Math.max(1, g.W - g.L - g.R)));
-      return g.r0 + f * (g.r1 - g.r0);
-    }
-    cv.addEventListener('mousemove', function(e){ if (!st.pinned){ st.rpm = rpmAt(e.clientX); st.draw(); } });
-    cv.addEventListener('mouseleave', function(){ if (!st.pinned){ st.rpm = null; st.draw(); } });
-    cv.addEventListener('click', function(e){
-      if (st.pinned){ st.pinned = false; st.rpm = rpmAt(e.clientX); }
-      else { st.pinned = true; st.rpm = rpmAt(e.clientX); }
-      st.draw();
-    });
-    function touch(e){ if (!e.touches.length) return; st.pinned = true; st.rpm = rpmAt(e.touches[0].clientX); st.draw(); }
-    cv.addEventListener('touchstart', touch, {passive: true});
-    cv.addEventListener('touchmove', touch, {passive: true});
-    DYNO_CHARTS.push(st);
-    return st;
-  }
-  var DYNO_SMALL = null, DYNO_BIG = null, DYNO_OVERLAY = null;
-  function openDynoOverlay(){
-    if (!DYNO_CURVE.length) return;
-    if (!DYNO_OVERLAY){                        // built once, then shown/hidden in place
-      var ov = document.createElement('div');
-      ov.id = 'dyno-overlay';
-      ov.style.cssText = 'position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,0.72);' +
-        'display:none;align-items:center;justify-content:center;padding:24px';
-      ov.innerHTML = '<div style="background:#12161d;border:1px solid #2a3240;border-radius:10px;' +
-        'width:min(1100px,96vw);padding:14px 16px 12px;box-shadow:0 12px 40px rgba(0,0,0,.6)">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
-        '<span class="t-label" id="dyno-ov-title">virtual dyno</span>' +
-        '<button class="btn" id="dyno-ov-close" style="padding:2px 10px">close \u2715</button></div>' +
-        '<canvas id="dyno-big" data-aspect="0.5" style="display:block;width:100%;background:#0f1218;' +
-        'border:1px solid #232a36;border-radius:6px;cursor:crosshair;touch-action:pan-y"></canvas>' +
-        '<div class="t-label" style="opacity:.6;margin-top:6px;text-transform:none;letter-spacing:0">' +
-        'hover for numbers \u00b7 click to pin / release \u00b7 Esc to close</div></div>';
-      document.body.appendChild(ov);
-      ov.addEventListener('click', function(e){ if (e.target === ov) closeDynoOverlay(); });
-      ov.querySelector('#dyno-ov-close').addEventListener('click', closeDynoOverlay);
-      DYNO_OVERLAY = ov;
-      DYNO_BIG = makeDynoChart(ov.querySelector('#dyno-big'));
-    }
-    DYNO_OVERLAY.style.display = 'flex';
-    el('dyno-ov-title').textContent = 'virtual dyno \u00b7 ' + (POWER && POWER.weight_lb ? POWER.weight_lb + ' lb \u00b7 ' : '') +
-      'est. wheel hp, no drivetrain loss';
-    DYNO_BIG.rpm = null; DYNO_BIG.pinned = false;
-    requestAnimationFrame(function(){ DYNO_BIG.draw(); });
-  }
-  function closeDynoOverlay(){ if (DYNO_OVERLAY) DYNO_OVERLAY.style.display = 'none'; }
-  document.addEventListener('keydown', function(e){
-    if (e.key === 'Escape' && DYNO_OVERLAY && DYNO_OVERLAY.style.display !== 'none') closeDynoOverlay();
-  });
-  window.addEventListener('resize', function(){ DYNO_CHARTS.forEach(function(ch){ ch.draw(); }); });
-  function drawDyno(curve){
-    DYNO_CURVE = curve || [];
-    el('dyno-wrap').style.display = DYNO_CURVE.length ? '' : 'none';
-    if (!DYNO_CURVE.length) return;
-    if (!DYNO_SMALL){
-      DYNO_SMALL = makeDynoChart(el('dyno-chart'));
-      el('dyno-big-btn').addEventListener('click', openDynoOverlay);
-    }
-    DYNO_SMALL.draw();
-  }
-
   (async function loadLaps(){
     let lr;
     try {
@@ -18124,7 +17592,6 @@ _REVIEW_HTML = (
     defaultRef=makeRef(selfCtx, bestLap, 'best lap (lap '+bestLap.lap+')');
     currentRef=defaultRef;
     el('lapcard').style.display='';
-    carInit();
     el('lap-sub').textContent=laps.length+' laps \u00b7 best '+lapFmt(bestLap.seconds);
     const rows=el('lap-rows'); rows.innerHTML='';
     for (const lap of laps){
@@ -18135,7 +17602,6 @@ _REVIEW_HTML = (
       tr.innerHTML='<td>'+lap.lap+'</td><td>'+lapFmt(lap.seconds)+
         '</td><td class="gap">'+gapTxt+'</td><td>'+
         (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>'+
-        '<td class="num pw-hp">\u2026</td><td class="num pw-tq">\u2026</td>'+
         '<td><button class="btn" data-xlap="'+lap.lap+'" '+
         'title="exclude this lap from best/deltas" '+
         'style="padding:1px 7px;line-height:1.1">\u2715</button></td>';
@@ -18150,7 +17616,6 @@ _REVIEW_HTML = (
       tr.innerHTML='<td>'+lap.lap+'</td><td>'+lapFmt(lap.seconds)+
         '</td><td class="gap">excluded ('+(lap.excluded_reason||'')+')</td><td>'+
         (lap.max_mph!=null?Math.round(lap.max_mph):'\u2014')+'</td>'+
-        '<td>\u2014</td><td>\u2014</td>'+
         '<td><button class="btn" data-rlap="'+lap.lap+'" title="restore this lap" '+
         'style="padding:1px 7px;line-height:1.1">\u21a9</button></td>';
       rows.appendChild(tr);
@@ -18172,7 +17637,6 @@ _REVIEW_HTML = (
     if ((lr.excluded_laps||[]).length)
       el('lap-sub').textContent += ' \u00b7 '+lr.excluded_laps.length+' excluded';
     selectPrimary(bestLap, rows);
-    loadPower();
     loadCompList();
   })();
 

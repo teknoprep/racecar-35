@@ -469,69 +469,24 @@ curl -s https://racecar.api.blueuc.com/firmware/list      # {"firmware":[...]}  
 ```
 Data (incl. `firmware/`) persists in the `./data` volume across rebuilds.
 
-### Estimated WHEEL power & torque — a VIRTUAL DYNO per session, `track3d_v` 15
-- **The car weight is a property of the DRIVE**, so it lives on the SESSION, not the account:
-  sidecar `DATA_DIR/session_meta/<user>/<file>.json` = `{weight_lb, by, at}`. It follows renames
-  (`_session_sidecar_paths`) and is deleted with the session. Lb, 700–9000; 0/blank clears it.
-  `GET /sessions/{u}/{f}/car` (view-gated, returns `can_edit`), `POST` (owner-or-admin).
-- `GET /sessions/{u}/{f}/power` (view-gated; **no numbers at all without a weight**): per-sample
-  `t` (EPOCH seconds), `whp`, `wtq` (the 3D HUD's "now"), `max {whp, wtq, whp_rpm, wtq_rpm}`,
-  `curve [{rpm, whp, wtq, n}]`, `laps [{lap, whp, wtq}]`, `method {pulls, gears, straight_only,
-  grade {source, used, spread_m, relief_m, laps, why}}`.
-- **Dyno chart is interactive** (review page): hover / touch-drag = crosshair + readout (rpm, WHP,
-  lb-ft, interpolated along the curve); click pins it, click again releases; peak WHP and WTQ are
-  ALWAYS marked on the curves and listed across the top. The readout box sits on whichever half of the
-  plot is clear of the curves, so it never covers the peak labels. **enlarge = an overlay ON the page**
-  (`#dyno-overlay`, built once in JS and appended to body): no new window, no navigation, no reload;
-  ✕ / Esc / backdrop click closes it.
-- **Laps card layout is placed explicitly** (`.lap-body > .lap-table-wrap` col 1, `> #car-row` col 2,
-  `> .lap-delta` full width, row 2). It used to rely on auto-placement, so inserting the car/dyno box as
-  the first child silently pushed the compare section into the 340 px slot. The delta canvas is now
-  sized to its on-screen width before every draw (it was a fixed 760×200 stretched) and redraws on resize.
-- Shown on the **review page** (weight row, dyno chart, method line, est WHP/WTQ per lap, peaks @rpm
-  in the laps header) and the **3D HUD** (now · max, ghost speed in red). **NOT on the sessions list**
-  (the owner asked for it to be removed; the lap summary does no power work).
-- **Road load** (`server/app/power.py`, tests `tests/test_power.py`, 23):
-  `P = m·v·(a + g·grade + g·CRR) + ½·ρ·CDA·v³`, CRR 0.012, CDA 0.60 m², ρ = 1.20·e^(−h/8500).
-  `a` = least-squares slope of GPS speed against TIME over ±0.25 s (despiked input). Typical-value
-  constants, not measured on the car.
-- **Do NOT use the throttle/coast classifier's coast curve as drag.** It includes engine braking and
-  overstated aero ~2×.
-- **Peaks come from the virtual dyno, never "the best moment"** (a max over ~10 laps picks the noise
-  and the downhill):
-  1. **Pulls only:** in a gear (`gear_centres` = log(rpm/mph) histogram peaks; ±0.06), no shift or
-     clutch slip within 0.3 s (a gear CHANGE counts as a shift), accelerating, rpm rising.
-  2. **Straight-line only** (|lateral g| < 0.35 from speed × GPS-course rate): out of a corner the
-     tyres run a slip angle, and the scrub absorbs power the speed trace never shows. Measured: 3rd-gear
-     corner exits read 15–25 % under 4th-gear straights at the same rpm. If a twisty circuit gives fewer
-     than 4 curve bins of straight pulls, every pull is used and `straight_only` is false (Thompson).
-  3. **Curve:** per 250-rpm bin, each pull's 0.5 s mean power; the 90th percentile over ≥ 5 pulls (the
-     full-throttle level; partial throttle sits below, one wild pull cannot set it); 3-bin median.
-     Peak WHP = curve max; peak WTQ = max of curve·5252/rpm (solid tier only).
-  4. **Per lap = that lap's MAXIMUM** (the owner: "we don't care about averages"): its best pull in
-     each rpm bin, then the 3-bin median spike guard (a max must hold across neighbouring rpm). Laps
-     scatter around the curve peak (Summit: middle lap 112.3 vs curve 112.5, 4 of 10 above). The laps
-     table columns are `top mph` (top SPEED — it was labelled "Max" and read as power), `max WHP`,
-     `max WTQ`; the laps header shows `dyno peak … · best lap max … (lap n)`.
-  5. **Dashed low-confidence tier** (`tier: "low"`): straight pulls rarely reach below ~4.5–5k rpm on a
-     track (low rpm = corner exits), so bins outside the solid range are filled from EVERY clean pull
-     (corner exits included, ≥ 3 per bin), drawn dashed/faded, never used for peaks, and the readout
-     says "corner exits, reads low" with the pull count. Measured at Summit: 4.0–5.0k rpm has 100–125 s
-     of clean pulls but only 21–36 s straight; below 4k almost nothing is straight.
-- **Grade = ONE elevation profile per lap position** (`grade_profile`): elevation at each fix (the
-  track's lidar DEM via `_dem_grid_for`, else logged GPS `alt_m`) moves 1–2 m with sideways wander
-  (Thompson read an 8.5 % "grade"), so the profile is the median across same-layout laps (±10 % length)
-  per 5 m, smoothed 50 m. **Rejected (grade 0) if the laps disagree by > 0.5 m** (bare-earth lidar
-  under a bridge, different layouts). Measured agreement: 0.06–0.11 m. Without grade, downhill pulls
-  read as extra horsepower (Summit dropped 10 hp when grade was added).
-- The HUD's per-sample series keeps the 2 s window, but its torque divides by rpm averaged over the
-  SAME window (instant rpm made a false torque spike after every upshift).
-- **Calibration record (owner's car):** dyno **123.8 HP / 122.5 lb-ft**. At 2420 lb (a test value,
-  not the owner's weight): Summit Point Main **112.5 / 106**, Watkins Glen GP **119 / 114.5**, Thompson
-  122 / 114 (all-pull fallback). No constant was tuned to the dyno. Remaining known biases: weight
-  (≈ linear), CRR/CDA, flywheel inertia in low gears (~5 %, not modelled), and low-rpm bins on tight
-  circuits are mostly part-throttle (read low). The local synthetic runs hold an impossible 0.4 g pull;
-  ignore their numbers.
+### Estimated HP / torque — BUILT, THEN REMOVED at the owner's request (`track3d_v` 16)
+The owner compared it with his dyno sheet (123.8 hp / 122.5 lb-ft) and decided: **show only numbers the
+car actually logs, never an estimated HP or torque.** Everything was removed — the `/power` and `/car`
+endpoints, `server/app/power.py` + `tests/test_power.py`, the per-session car-weight sidecar
+(`data/session_meta/`, harmless orphans may remain on the server), the review page's car-weight box,
+virtual-dyno chart + overlay and per-lap WHP/WTQ columns, and the 3D HUD's est WHP/WTQ rows. **Do not
+re-add an estimate without being asked.** The full history is in git (`6f93de9` … `f97fd65`).
+What it taught, in case it is ever revisited:
+- The throttle/coast classifier's coast curve is NOT road load (it includes engine braking; ~2× aero).
+- A "best moment" peak over many laps measures noise and downhill; grade from GPS-sampled lidar is noise
+  unless it is a lap-consensus profile; corner exits read 15–25 % low (tyre scrub); torque from a 2 s
+  power average over instant rpm spikes after every upshift. Even with all of that handled, the result
+  depends on an entered weight and typical drag constants, which is why it was dropped.
+What was KEPT from that work: the 3D HUD shows the **ghost's speed in red beside yours** (measured),
+the laps table's top-speed column is labelled **top mph** (it read "Max" and looked like power), and:
+- **Laps card layout is placed explicitly** (`.lap-body > .lap-table-wrap` row 1, `> .lap-delta` row 2,
+  both full width). Auto-placement once pushed the compare section into a 340 px slot when a block was
+  inserted. The delta canvas is sized to its on-screen width before every draw and redraws on resize.
 
 ### Session metadata: ONE edit popup (date & time / track / driver)
 A session's static metadata IS its filename: `<sid>_<track>[-combined].ndjson` inside
