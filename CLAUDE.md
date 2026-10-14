@@ -984,6 +984,10 @@ byte-identical line and an absent key IS the diagnostic):
   **never written to the log**.
 - **`oil_can_psi`** — RC35 bench CAN oil (0x701), separate from the direct-transducer
   `oil_psi`. Bench oil expires on its own clock, so it disappears when the bench source stops.
+- **`vin_v`** (v0.1.172) — car voltage from the logger's OWN 180k/20k divider on
+  Teensy A16/pin 40, only while `CFG,vdir,1` (VOLT item Source = DIRECT). Separate from
+  `batt_v` (the ECU's / dongle's measurement). Also the last-resort fallback for HLTH /
+  `.dbg` `batt`.
 Together with the existing `speed_mph/rpm/heading_deg/ax..gz/tps_pct/spark_deg/oil_psi/
 coolant_f/afr/lambda/lap`, the sample carries every channel the car can produce. Server side:
 `_OPTIONAL_NUMERIC_FIELDS` validates the new keys (numeric **or null**), and the review page
@@ -1340,6 +1344,12 @@ lockstep** — keep all four (+ the legacy alias) equal.
     NOT active in v0.1.150. Current pin **13** heartbeat must be disabled for SPI.
     No Ethernet driver returns. RTC backup needs **VBAT**, not a spare GPIO.
   - **A6/pin 20**: opt-in AEM 30-0300 gauge-output ADC (v0.1.149); protected 0.500 gain input required.
+  - **A16/pin 40**: car input voltage, **180 k / 20 k = 1:10** divider (Rev F's monitor and the
+    breadboard's J8 VBATT — same ratio, same firmware; `VIN_DIVIDER_RATIO = 10.0`). Opt-in
+    `CFG,vdir` (VOLT Source = DIRECT), pin is `INPUT` with no pull. Breadboard circuit + clamps:
+    `hardware/breadboard/PINOUT.md` §6b (Schottky-to-rail, NOT a 3.3 V Zener — it leaks); wiring
+    sheet `hardware/Prototype/05-Car-voltage-sensor.{svg,png}` (from `generate.py`). Released in
+    v0.1.172.
   - **SDIO (built-in)**: SD card (pins are dedicated, not on the header)
 - **FlasherX OTA staging vs Teensy 4.1 EEPROM emulation (v0.1.99).** PJRC's EEPROM emulation
   lives in flash `0x607C0000..0x607FF000` (63 sectors) and we write it nearly every boot (IMU
@@ -1362,7 +1372,9 @@ Note: the live baud is **921600** (not 115200) for telemetry + file uploads — 
 Up to 25 Hz when GPS PVT is fresh; 1 Hz heartbeat fallback when not.
 ```
 GPS,<fix>,<sats>,<lat_deg>,<lon_deg>,<speed_mph>,<heading_deg>,<gps_status>
-ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>[,<direct_rpm>,<direct_coolant_f_x10>]
+ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>[,<direct_rpm>,<direct_coolant_f_x10>[,<direct_vin_x10>]]
+                   # v0.1.172: field 6 = DIRECT car volts x10 from the A16 divider,
+                   # -1 unless CFG,vdir,1. An older Teensy omits it -> the dash shows no data.
                    # v0.1.170: fields 4-5 are the PURE direct sensors (opto-tach RPM, NTC
                    # coolant) — never substituted by CAN or Bluetooth. The dash's per-item
                    # Source = DIRECT reads ONLY these, so choosing Direct can no longer show
@@ -1601,6 +1613,9 @@ CFG,<key>,<value>  # push settings (incl. srctyp, cloud, inet, and sf = active
                    #   NOTE: cl_strm REMOVED in v0.1.66 (live "stream to cloud"
                    #   deleted). Teensy ignores cl_strm if an old dash sends it.
 CFG,viden,<0|1>    # (v0.1.150) Pi 5 video interconnect. Teensy Serial1 pins 0/1.
+CFG,vdir,<0|1>     # (v0.1.172) read + log the A16 car-voltage divider. Derived from
+                   #   mon_cfg.src[MON_VOLT]==DIRECT (no separate NVS key); sent in the CFG
+                   #   burst, on the item-page Source tap, on RESET and on CANCEL.
 HUDLAP,<lap>,<last_ms>,<pred_ms>,<best_ms>  # dash -> Teensy, merged into HUD for overlay
 CFG,dbg_on,<0|1>   # (part of CFG) debug logging master switch. 0 = Teensy writes
                    #   NO .dbg health log for a session. NVS key dbg2 on the dash
@@ -1744,7 +1759,7 @@ now the **Bluetooth OBD-II** pairing page reached from Settings.
 | --- | --- | --- | --- |
 | TEMP | `eng.direct_coolant_f_x10` (NTC ADC) | `obd::coolantF_x10()` | `ecu.coolant_f_x10` |
 | OIL  | `eng.oil_psi_x10` (A2) | — | `ecu.oil_x10` — RC35 bench frames ONLY |
-| VOLT | — (this board has no battery ADC) | `obd::voltX10()` (ATRV) | `ecu.bat_x10` |
+| VOLT | `eng.direct_vin_x10` — A16 1:10 divider, ENG field 6 (v0.1.172; opt-in, **never seeded** — `monDefaults()` maps a DIRECT seed to CANBUS because an unwired pin floats) | `obd::voltX10()` (ATRV) | `ecu.bat_x10` |
 | AFR  | the AEM analogue input (Source shows **AEM**) | — | `ecu.afr_x10` |
 | IAT  | — | `obd::iatF_x10()` | `ecu.iat_f_x10` |
 | MAP  | — | — (no MAP PID is polled) | `ecu.map_x10` |
@@ -2038,6 +2053,8 @@ live bench backtraces; confirmed by test (WiFi off → BT works). Fix: a radio
 **time-share arbiter** in RaceDash.ino (`net_owner`: `NET_WIFI` /
 `NET_TO_WIFI` / `NET_BT`; `btAcquireRadio()` / `btReleaseRadio()` /
 `netOwnerTick()`; `wifiTick()` holds WiFi hard-off unless `NET_WIFI`).
+**v0.1.172: the arbiter is LEVEL-triggered — read "Bluetooth reliability" below
+first; the edge-triggered description in this paragraph is history.**
 **Policy: BT owns the radio ONLY while `recording`** (that's when coolant matters), **while the
 user is on PAGE_SENSOR/PAGE_BT_SCAN/PAGE_PID_SCAN pairing**, **or (v0.1.157) while the sensor
 monitor menu is open and an item's source is Bluetooth** — `monBtMenuTick()`, so the OBD
@@ -2062,6 +2079,49 @@ is a CONTINUOUS active scan, ~+90 mA; passive may list some dongles as
 visible reason via `obd::lastErr()` instead of crashing). **NimBLE adds ~180 KB
 of flash → the dash binary was ~94 % of the old 1.31 MB OTA slot; since v0.1.152 the A/B
 slots are 6 MB so this is no longer a release constraint.**
+
+### Bluetooth reliability + Tools → "Bluetooth test mode" (v0.1.172 — released; not yet bench-tested)
+Symptom: "it doesn't connect once I hit START and am recording on track", and pairing / picking
+a BLUETOOTH source was flaky. Root causes found in the code (no bench capture yet):
+1. **One-shot, edge-triggered arbiter.** BT was brought up ONCE on the `recording` rising edge.
+   Anything that made that attempt miss left BT dead for the whole session: a handover still
+   draining (leave the sensor menu / pairing page, hit START within the drain — `btAcquireRadio`
+   flipped to NET_BT, `begin()` no-op'd on the dying task, the connect request died with it),
+   `upload_active` at that instant, or the low-heap bail-out below.
+2. **The low-heap guard parked the obd task FOREVER** with `g_inited` still set, so it never
+   processed a shutdown and every later `begin()` was a no-op → no BT until reboot.
+3. **A brownout while connected blocked BLE for the next boot** (crash forensics treated
+   phase 4 + BROWNOUT as a BLE crash). Cranking the car with the dash on = no BT next session.
+4. **The disconnect callback nulled `g_tx` on the NimBLE host task** while the obd task was
+   mid-`writeValue()` through it → null-deref panic → (3) blocked BT next boot.
+5. **`openSensorPage()` / `monBtMenuTick()` never connected**: `obd::begin()` then
+   `if (obd::isDown()) connectTo(...)` — `begin()` had just made `isDown()` false.
+Fixes:
+- `netOwnerTick()` now evaluates **`btWanted()` every loop** and reconciles: NET_WIFI + wanted →
+  WiFi hard-off, `btStartClient()`; NET_BT + not wanted → release; NET_BT + obd task gone →
+  **self-heal restart** (5 s rate limit, `DBG,bt client restart #n`); NET_BT + idle with a paired
+  dongle and nobody connecting → connect; NET_TO_WIFI + task down + wanted again → **straight
+  back to NET_BT** (no WiFi bounce). `monBtMenuTick()` and closeUploadModal's hand-back are gone.
+  `btWanted()` = false while `upload_active`/`net_pending_upload`, false while a WiFi job is
+  in flight (`wifiJobBusy()`: speed test, coach fetch, OTA — BT waits, never yanks the radio),
+  false when `obd::blocked()`; true for BT test mode and the pairing pages; with a paired dongle,
+  true while recording with a BT source or in the monitor menu with a BT item.
+- obd task: `g_link_up` (`connected()` never dereferences `g_client` from core 1), the callback
+  only flags, `elmCmd()` uses a local `tx` and **every wait aborts on shutdown/stop/link loss**
+  (`abortReq()`, `waitMs()`), so a handover lands in < 1 s instead of tripping the 12 s
+  failsafe with BLE still alive; low heap / failed spawn = task EXITS (`isDown()` true, retried);
+  shutdown sets OFF + clears all pending requests before `deinit`; `begin()` clears stale
+  shutdown/stop flags; picking a different dongle disconnects the old one first.
+- Crash forensics: BROWNOUT in phase 4 = supply dip, never blocks. Other crash-attributed resets
+  need **two consecutive strikes** (`blediag`/`strk`, cleared by any non-BLE reset) to block.
+- `startWifiScan()` refuses while BT owns the radio (WiFi scan + BLE = the coex crash).
+- **Tools page button 6 "Bluetooth test mode"** (Tools is now SIX 56 px buttons; the CAN + UART
+  readout sits under button 6). `bt_test_mode` (RAM only — a reboot is always WiFi): BT-only,
+  WiFi off, paired dongle connected, and it STAYS on when you leave Tools, so the dash monitor /
+  STATUS BT row / Sensor monitoring can be checked live without recording. The button shows
+  CONNECTED + coolant/volts/IAT/TPS, or state + `try n, ok n, heap nK`, or the obd error. No
+  dongle paired → turning it on opens the pairing page. An UPLOAD still borrows WiFi and BT
+  returns afterwards. Tap again to hand the radio back to WiFi.
 
 ### Track picker
 Pre-seeded with 15 common US road courses (`TRACKS[]` near the top of `RaceDash.ino`). To add tracks, extend that array (TODO: editable from settings).
@@ -2384,8 +2444,8 @@ seconds/kbps/RSSI/fw) — review later via `GET /admin/upload/log` (firmware-key
 Interpretation: hundreds of KB/s here but session uploads fail → transfer code's fault;
 tens of KB/s (or STALLED) while a phone on the same AP is fast → the dash's RF path is
 starved (RGB-panel EMI / weak AP — check the RSSI number, move the hotspot). Runs on a
-core-0 task (`netTestTask`); blocked while an upload is active. Tools page is now FIVE
-64 px buttons; the CAN health readout moved below button 5.
+core-0 task (`netTestTask`); blocked while an upload is active. Tools page is now SIX
+56 px buttons (v0.1.172 added Bluetooth test mode); the CAN health readout sits below button 6.
 
 ## CAN sniffer (Tools page → "Start CAN capture")
 

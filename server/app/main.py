@@ -1236,6 +1236,7 @@ _OPTIONAL_NUMERIC_FIELDS = {
     # writer). Null is still accepted (sensor absent/faulted); present = finite.
     "map_kpa", "iat_f", "batt_v", "afr_can", "oil_can_psi",
     "tps_pct", "spark_deg", "lap",
+    "vin_v",   # v0.1.172: car voltage from the logger's own A16 divider (DIRECT)
 }
 
 
@@ -16673,7 +16674,7 @@ _REVIEW_HTML = (
     const UNITS = { speed_mph: 'mph', rpm: 'rpm', heading_deg: 'deg', alt_m: 'm',
       coolant_f: 'F', oil_psi: 'psi', oil_can_psi: 'psi', afr: 'AFR', afr_can: 'AFR',
       lambda: 'lambda', afr_v: 'mV', afr_status: '0-3', iat_f: 'F', map_kpa: 'kPa',
-      tps_pct: '%', spark_deg: 'deg BTDC', batt_v: 'V', ax: 'g', ay: 'g', az: 'g',
+      tps_pct: '%', spark_deg: 'deg BTDC', batt_v: 'V', vin_v: 'V', ax: 'g', ay: 'g', az: 'g',
       gx: 'deg/s', gy: 'deg/s', gz: 'deg/s', lap: '#' };
     const NAMES = { speed_mph: 'speed', rpm: 'rpm', heading_deg: 'heading',
       alt_m: 'altitude (GPS, MSL)', coolant_f: 'coolant',
@@ -16681,18 +16682,18 @@ _REVIEW_HTML = (
       afr: 'AFR (AEM gauge)', afr_can: 'AFR (MS3 CAN)', lambda: 'lambda (AEM)',
       afr_v: 'AFR gauge voltage', afr_status: 'AFR status',
       iat_f: 'intake air temp', map_kpa: 'manifold pressure', tps_pct: 'throttle',
-      spark_deg: 'timing advance', batt_v: 'battery', lap: 'lap counter',
+      spark_deg: 'timing advance', batt_v: 'battery', vin_v: 'car voltage (direct)', lap: 'lap counter',
       ax: 'accel x', ay: 'accel y', az: 'accel z',
       gx: 'gyro x', gy: 'gyro y', gz: 'gyro z' };
     // lat/lon/fix/sats have their own tiles; t is the clock.
     const SKIP = { t: 1, t_ms: 1, lat: 1, lon: 1, fix: 1, sats: 1 };
     const ORDER = ['speed_mph', 'rpm', 'heading_deg', 'alt_m', 'coolant_f', 'oil_psi',
       'oil_can_psi', 'afr', 'afr_can', 'lambda', 'afr_v', 'afr_status', 'iat_f',
-      'map_kpa', 'tps_pct', 'spark_deg', 'batt_v', 'lap', 'ax', 'ay', 'az',
+      'map_kpa', 'tps_pct', 'spark_deg', 'batt_v', 'vin_v', 'lap', 'ax', 'ay', 'az',
       'gx', 'gy', 'gz'];
     // lambda carries four decimals — rounding it to 1 makes every row read 1.0
     const DEC = { lambda: 4, afr: 2, afr_can: 2, afr_v: 0, afr_status: 0, lap: 0,
-      rpm: 0, batt_v: 2, ax: 2, ay: 2, az: 2 };
+      rpm: 0, batt_v: 2, vin_v: 2, ax: 2, ay: 2, az: 2 };
     const keys = [], seen = {};
     for (const s of S) {
       for (const k in s) {

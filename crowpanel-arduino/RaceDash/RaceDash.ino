@@ -3,8 +3,9 @@
 //
 // UART0 (Serial) listens for two line types from the Teensy 4.1, 115200 8N1:
 //   GPS,<fix>,<sats>,<lat_deg>,<lon_deg>,<speed_mph>,<heading_deg>,<gps_status>
-//   ENG,<rpm>,<oil>[,<coolant>[,<direct_rpm>,<direct_coolant>]]  (1/3/5 fields)
+//   ENG,<rpm>,<oil>[,<coolant>[,<direct_rpm>,<direct_coolant>[,<direct_vin>]]]  (1/3/5/6 fields)
 //        fields 4-5 (v0.1.170) = PURE direct sensors (opto tach / NTC), never CAN/BT
+//        field 6 (v0.1.172) = DIRECT car volts x10 (Teensy A16 1:10 divider), -1 = off
 //
 // Two pages, swipeable:
 //   PAGE_DASH      — RPM bar + delta bar + huge speed; TEMP/PSI/VOLT bottom-left,
@@ -28,7 +29,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.171"
+#define FIRMWARE_VERSION "0.1.172"
 
 #include <Preferences.h>
 #include <time.h>
@@ -144,14 +145,15 @@ static MonCfg mon_cfg;
 // and the item page can tell a real source from a "none" one:
 //   TEMP D|B|C   OIL D|C      (CAN oil = RC35 bench frames ONLY: an MS3 broadcast has no oil;
 //                              BT has none either)
-//   VOLT B|C     (no battery ADC on this board)      AFR D|C  (D = AEM 30-0300 input)
+//   VOLT D|B|C   (D = 180k/20k divider on Teensy A16, v0.1.172 - opt-in, never seeded)
+//                                                    AFR D|C  (D = AEM 30-0300 input)
 //   IAT  B|C     MAP  C       (the dash polls no OBD MAP PID)
 //   TPS  B|C     RPM  D|C     (BLE is far too slow for RPM)
 #define MON_SRCBIT(x) ((uint8_t)(1u << (x)))
 static const uint8_t MON_SRC_MASK[MON_COUNT] = {
     /* TEMP */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
     /* OIL  */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_CAN),
-    /* VOLT */ MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
+    /* VOLT */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
     /* AFR  */ MON_SRCBIT(MON_SRC_DIRECT) | MON_SRCBIT(MON_SRC_CAN),
     /* IAT  */ MON_SRCBIT(MON_SRC_BT) | MON_SRCBIT(MON_SRC_CAN),
     /* MAP  */ MON_SRCBIT(MON_SRC_CAN),
@@ -444,6 +446,7 @@ struct EngState {
     int16_t  oil_psi_x10   = -1;
     int16_t  coolant_f_x10 = -1;   // mixed coolant (ENG field 3)
     int16_t  direct_coolant_f_x10 = -1;  // ENG field 5: PURE NTC coolant
+    int16_t  direct_vin_x10 = -1;  // ENG field 6 (v0.1.172): car volts x10 from the A16 divider, -1 = off
     uint32_t last_ms       = 0;
 };
 static EngState eng;
@@ -599,11 +602,15 @@ static uint32_t cloud_queue_depth  = 0;
 //                 WiFi stays hard-off until obd::isDown(), then -> NET_WIFI.
 //   NET_BT      - BLE owns the radio; wifiTick holds WiFi hard-off.
 // POLICY (user-chosen): BT owns the radio ONLY WHILE RECORDING (that's when
-// coolant matters), plus while the user is on the sensor/scan pages pairing.
-// All paddock time = WiFi: uploads, OTA, NTP just work, no manual handover.
-// netOwnerTick watches the `recording` edges: REC start -> radio to BT +
-// dongle reconnect; REC stop -> BLE full shutdown, WiFi back within seconds.
-// Tapping UPLOAD while BT somehow owns the radio still auto-hands to WiFi.
+// coolant matters), plus while the user is on the sensor/scan pages pairing,
+// in the sensor monitor menu with a Bluetooth item, or in Tools -> Bluetooth
+// test mode. All paddock time = WiFi: uploads, OTA, NTP just work.
+// v0.1.172: LEVEL-triggered. netOwnerTick() evaluates btWanted() every loop
+// and reconciles the radio to it (and self-heals a dead obd task / a lost
+// connect request). It used to fire ONCE on the recording edge, so anything
+// that made that one attempt miss - a handover still draining from the menu,
+// an upload flag, a low-heap bail-out - left BT dead for the whole session.
+// Tapping UPLOAD while BT owns the radio still auto-hands to WiFi.
 // ---------------------------------------------------------------------------
 #define NET_WIFI    0
 #define NET_TO_WIFI 1
@@ -612,6 +619,14 @@ static uint8_t  net_owner          = NET_WIFI;
 static bool     net_pending_upload = false;   // start upload flow once WiFi connects
 static bool     net_pending_sel    = false;   // pending upload is "selected files" (Sessions page)
 static uint32_t net_owner_ms       = 0;
+// Tools -> "Bluetooth test mode" (v0.1.172): BT-ONLY, WiFi hard-off, the paired dongle
+// connected, until tapped off. RAM only - a reboot always comes back on WiFi, so a unit can
+// never be stranded without OTA. An UPLOAD still borrows WiFi and BT returns afterwards.
+static bool     bt_test_mode       = false;
+static bool     bt_scan_pending    = false;   // a BLE scan was asked for before the obd task was up
+static uint32_t bt_restart_ms      = 0;       // last obd::begin() from the arbiter (rate limit)
+static uint32_t bt_reconnect_ms    = 0;       // last arbiter-issued connect (rate limit)
+static uint32_t bt_restarts        = 0;       // self-heal restarts since boot (BT test readout)
 
 // Firmware version tracking. Dash version is compile-time (FIRMWARE_VERSION).
 // Teensy version arrives via VER,teensy,<ver> on Teensy boot, and on demand
@@ -1661,6 +1676,10 @@ static void monDefaults() {
         mon_cfg.src[i]     = pick;
         mon_cfg.can_bus[i] = MON_CAN_MS3;
     }
+    // VOLT DIRECT (v0.1.172) is the A16 car-voltage divider - added hardware, like the AEM
+    // input, so a seed must never pick it (an unwired pin floats). Same choice as before it
+    // existed: a Direct-mode unit gets CANBUS.
+    if (mon_cfg.src[MON_VOLT] == MON_SRC_DIRECT) mon_cfg.src[MON_VOLT] = MON_SRC_CAN;
     // One control: the AEM analogue input (s.aem_afr) IS the AFR item's DIRECT source, and
     // legacy AEM-wins-over-everything is preserved - aem_afr on => AFR source DIRECT.
     if (s.aem_afr) mon_cfg.src[MON_AFR] = MON_SRC_DIRECT;
@@ -1951,6 +1970,9 @@ static void sendCfgToTeensy() {
     Serial.println("CFG,inet,1");  // compatibility: force WiFi on older Teensy firmware
     Serial.printf("CFG,srctyp,%u\n",    (unsigned)s.sensor_type);
     Serial.printf("CFG,afraem,%d\n",    (int)s.aem_afr);
+    // v0.1.172: the car-voltage divider on Teensy A16 is read + logged only while the VOLT
+    // item's Source is DIRECT (persisted in the "mon" blob - no separate NVS key).
+    Serial.printf("CFG,vdir,%d\n",      (mon_cfg.src[MON_VOLT] == MON_SRC_DIRECT) ? 1 : 0);
     Serial.printf("CFG,rpmppr,%u\n",    (unsigned)s.rpm_ppr_x10);
     Serial.printf("CFG,gpsbaud,%lu\n",  (unsigned long)s.gps_baud);
     Serial.printf("CFG,gpshz,%u\n",     (unsigned)s.gps_nav_hz);
@@ -2217,6 +2239,9 @@ static bool parseEngLine(const String& line) {
     // old Teensy (3-field ENG) still has something to show for Source = DIRECT.
     eng.direct_rpm           = (n >= 5) ? clampRpm(field(3).toInt()) : eng.rpm;
     eng.direct_coolant_f_x10 = (n >= 5) ? (int16_t)field(4).toInt()  : eng.coolant_f_x10;
+    // Field 6 (v0.1.172): DIRECT car voltage. Absent on an older Teensy -> no data (-1), never
+    // a guess - there is nothing to mirror it from.
+    eng.direct_vin_x10       = (n >= 6) ? (int16_t)field(5).toInt()  : (int16_t)-1;
     eng.last_ms = millis();
     resolveEngRpm();
     return true;
@@ -4329,13 +4354,9 @@ static void closeUploadModal() {
     settingsDirty      = true;
     invalidateAll();
     ufReset();   // ensure UPLOAD button next tap starts a fresh flow
-    // If a session is RECORDING (auto-start can begin one mid-upload), BT
-    // needs the radio back for coolant; otherwise WiFi keeps it (paddock).
-    if (recording && (s.sensor_type == 2 || monWantsBt()) && s.bt_addr[0] && !obd::blocked()) {
-        btAcquireRadio();
-        obd::begin();
-        obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
-    }
+    // If a session is RECORDING (auto-start can begin one mid-upload) or BT test mode is
+    // on, BT gets the radio back: netOwnerTick() sees btWanted() flip once upload_active
+    // clears (v0.1.172 - no separate hand-back path to drift out of step).
 }
 
 static bool parseVerLine(const String& line) {
@@ -4777,7 +4798,7 @@ static void simTick() {
 
     char l[160];
     snprintf(l, sizeof(l), "GPS,3,14,%.6f,%.6f,%.1f,%.1f,2", lat, lon, sim_mph, hdg);  simInject(l);
-    snprintf(l, sizeof(l), "ENG,%u,%d,%d,%u,%d", rpm, psi_x10, clt_x10, rpm, clt_x10);          simInject(l);
+    snprintf(l, sizeof(l), "ENG,%u,%d,%d,%u,%d,%d", rpm, psi_x10, clt_x10, rpm, clt_x10, bat_x10); simInject(l);
     snprintf(l, sizeof(l), "ECU,%u,%d,%d,%d,%d,%d,%d", rpm, clt_x10, map_x10, tps_x10, afr_x10, iat_x10, bat_x10); simInject(l);
     const aemafr::Reading ar = s.aem_afr
         ? aemafr::fromMillivolts(3000 + (int)(400.0f * sinf(t / 7.0f))) : aemafr::Reading{};
@@ -5446,7 +5467,7 @@ static void formatAemStatus(char* buf, size_t cap) {
 //   item  DIRECT                    BLUETOOTH (OBD2)            CANBUS (MS3, needs !ecuStale)
 //   TEMP  eng.direct_coolant_f_x10  obd::coolantF_x10 (fresh)   ecu.coolant_f_x10
 //   OIL   eng.oil_psi_x10           none (not an OBD PID here)  ecu.oil_x10 (RC35 bench frames only)
-//   VOLT  none (no battery ADC)     obd::voltX10 (fresh)        ecu.bat_x10     [engine-running gate]
+//   VOLT  eng.direct_vin_x10 (A16)  obd::voltX10 (fresh)        ecu.bat_x10     [engine-running gate]
 //   AFR   AEM 30-0300 (s.aem_afr)   none                        ecu.afr_x10
 //   IAT   none                      obd::iatF_x10 (fresh)       ecu.iat_f_x10
 //   MAP   none                      none (no MAP PID polled)    ecu.map_x10
@@ -5489,9 +5510,10 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
     case MON_VOLT: {
         // Valid only while the engine is RUNNING and a live source exists (BT ATRV /
         // MS3 CAN bat) - parked ignition-on reads ~12.4 V, which is normal, not a fault.
-        // DIRECT has none: this board has no battery-voltage ADC. Hidden, not "---".
+        // DIRECT (v0.1.172) = the Teensy's own 180k/20k divider on A16 (ENG field 6).
         int16_t bv = -1;
-        if (btOk && obd::voltX10() > 0)           bv = obd::voltX10();
+        if (direct && eng.direct_vin_x10 > 0)     bv = eng.direct_vin_x10;
+        else if (btOk && obd::voltX10() > 0)      bv = obd::voltX10();
         else if (canOk && ecu.bat_x10 > 0)        bv = ecu.bat_x10;
         // v0.1.158: the DISPLAY is no longer gated on the engine running — "I selected VOLT
         // and see nothing" was the complaint, and a parked ignition-on voltage is useful
@@ -7339,8 +7361,14 @@ static uint8_t       wifi_scan_count = 0;
 static WifiScanState wifi_scan_state = WSC_IDLE;
 static bool          wifi_scan_dirty = false;
 
+static bool wifi_scan_bt_busy = false;   // v0.1.172: scan refused - Bluetooth owns the radio
 static void startWifiScan() {
     wifi_scan_count = 0;
+    // Never touch the WiFi radio while BLE owns (or is releasing) it - running both crashes
+    // this core (see the radio arbiter). Reachable now that Tools -> Bluetooth test mode keeps
+    // BT up outside a recording.
+    wifi_scan_bt_busy = (net_owner != NET_WIFI);
+    if (wifi_scan_bt_busy) { wifi_scan_state = WSC_DONE; wifi_scan_dirty = true; return; }
     wifi_scan_state = WSC_RUNNING;
     wifi_scan_dirty = true;
     WiFi.disconnect(false, false);
@@ -7404,61 +7432,118 @@ static void btReleaseRadio() {
     net_owner_ms = millis();
     Serial.println("[net] radio -> WiFi (BLE draining)");
 }
-// v0.1.157: the sensor monitor menu is a place BLE is ALLOWED to own the radio. While an
-// item is configured to read over Bluetooth (and a dongle is paired), bring BLE up so the
-// OBD settings can be checked against what the monitor shows — previously that only happened
-// while RECORDING or on the pairing pages, because WiFi and BLE cannot coexist on this chip
-// (see the radio time-share notes). Leaving the menu hands the radio back to WiFi.
-static void monBtMenuTick() {
-    static uint32_t last_ms = 0;
-    if (millis() - last_ms < 500) return;
-    last_ms = millis();
-    const bool inMenu  = (currentPage == PAGE_MON_CFG || currentPage == PAGE_MON_ITEM);
-    const bool pairing = (currentPage == PAGE_SENSOR || currentPage == PAGE_BT_SCAN ||
-                          currentPage == PAGE_PID_SCAN);
-    // Only ever take the radio from a SETTLED WiFi state — never mid-handover, and never
-    // while recording (netOwnerTick owns the recording edges).
-    if (inMenu && monWantsBt() && s.bt_addr[0] && !recording && !upload_active &&
-        !obd::blocked() && net_owner == NET_WIFI) {
-        btAcquireRadio();
-        obd::begin();
-        if (obd::isDown()) obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
-        Serial.println("[net] radio -> BLE (sensor monitor has a Bluetooth item)");
-        return;
-    }
-    if (!inMenu && net_owner == NET_BT && !recording && !pairing && s.sensor_type != 2) {
-        btReleaseRadio();
-        Serial.println("[net] radio -> WiFi (left sensor monitor)");
-    }
+// Pages on which the user is pairing / mapping the dongle - BLE must own the radio there.
+static bool btPairingPage() {
+    return currentPage == PAGE_SENSOR || currentPage == PAGE_BT_SCAN || currentPage == PAGE_PID_SCAN;
 }
 
-static void netOwnerTick() {
-    // Recording-edge watcher (single choke point — catches the START button,
-    // auto-start, Teensy-side stops, everything that flips `recording`).
-    static bool prev_rec = false;
-    if (recording != prev_rec) {
-        prev_rec = recording;
-        if (recording) {
-            // v0.1.156: also when any visible monitor item reads from Bluetooth (monWantsBt()).
-            if ((s.sensor_type == 2 || monWantsBt()) && s.bt_addr[0] && !obd::blocked() && !upload_active) {
-                btAcquireRadio();
-                obd::begin();
-                obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
-            }
-        } else {
-            // Session over — give WiFi the radio back (uploads/OTA), unless
-            // the user is mid-pairing on the sensor/scan pages.
-            if (currentPage != PAGE_SENSOR && currentPage != PAGE_BT_SCAN &&
-                currentPage != PAGE_PID_SCAN)
-                btReleaseRadio();
-        }
+// v0.1.172: THE single answer to "should Bluetooth own the radio right now?". netOwnerTick()
+// re-evaluates it every loop, so BT comes up (and back) whenever the answer is yes - no matter
+// how the state was reached - instead of only on the one recording edge.
+//   - never while an upload is running or waiting for WiFi (uploads need WiFi; BT returns
+//     on its own once the upload closes, if it is still wanted)
+//   - Tools -> Bluetooth test mode, and the pairing pages: always (no dongle needed to scan)
+//   - with a paired dongle: while RECORDING and BT is a source (global srctyp==2 or a visible
+//     monitor item on BLUETOOTH), or while the sensor monitor menu is open with a BT item
+//     (v0.1.157 - check the OBD settings against what the monitor shows).
+// A WiFi job is in flight on core 0 (speed test, coach fetch, OTA). BT never yanks the radio
+// out from under one - the level-triggered arbiter simply takes it a moment later, once the
+// job ends (the old REC-edge handover killed WiFi mid-request).
+static bool wifiJobBusy() {
+    return nettest_state == 1 || coach_busy ||
+           ota_state == OTA_S_CHECKING || ota_state == OTA_S_TEENSY_DOWNLOADING ||
+           ota_state == OTA_S_TEENSY_WAITING || ota_state == OTA_S_DOWNLOADING ||
+           ota_state == OTA_S_APPLYING;
+}
+
+static bool btWanted() {
+    if (upload_active || net_pending_upload) return false;
+    if (net_owner == NET_WIFI && wifiJobBusy()) return false;   // let it finish, then hand over
+    if (obd::blocked()) return false;   // a crash-attributed block; explicit user actions clear it
+    if (bt_test_mode || btPairingPage()) return true;
+    if (!s.bt_addr[0]) return false;
+    const bool btSource = (s.sensor_type == 2) || monWantsBt();
+    if (recording && btSource) return true;
+    const bool monMenu = (currentPage == PAGE_MON_CFG || currentPage == PAGE_MON_ITEM);
+    return monMenu && monWantsBt();
+}
+
+// Start the obd task (if it isn't running) and point it at what the user wants: the paired
+// dongle (not on the scan page - the user is choosing one), plus any scan asked for while the
+// task was still coming up / going down.
+static void btStartClient() {
+    obd::begin();
+    if (obd::isDown()) return;   // spawn refused (low heap); retried by netOwnerTick
+    if (s.bt_addr[0] && currentPage != PAGE_BT_SCAN && !obd::connected() && !obd::connectPending()) {
+        bt_reconnect_ms = millis();
+        obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
     }
-    if (net_owner == NET_TO_WIFI) {
-        if (obd::isDown() || millis() - net_owner_ms > 12000) {
+    if (bt_scan_pending) { bt_scan_pending = false; obd::startScan(); }
+}
+
+// Ask for a BLE scan; issued as soon as the obd task can take it (see netOwnerTick).
+static void btRequestScan() {
+    bt_scan_pending = true;
+    if (net_owner == NET_BT && !obd::isDown()) { bt_scan_pending = false; obd::startScan(); }
+}
+
+// WiFi <-> BLE radio arbiter, LEVEL-triggered (v0.1.172). Runs every loop, before wifiTick().
+static void netOwnerTick() {
+    const uint32_t now  = millis();
+    const bool     want = btWanted();
+    if (net_owner == NET_WIFI) {
+        if (want) {
+            btAcquireRadio();             // synchronous WiFi hard-off BEFORE any BLE init (coex)
+            bt_restart_ms = now;
+            btStartClient();
+        }
+    } else if (net_owner == NET_BT) {
+        if (!want) {
+            btReleaseRadio();
+        } else if (obd::isDown()) {
+            // SELF-HEAL: BT should own the radio but the obd task is gone (a low-heap bail-out,
+            // a refused spawn, or a shutdown that raced a re-acquire). Restart it, rate-limited.
+            if (now - bt_restart_ms >= 5000) {
+                bt_restart_ms = now;
+                bt_restarts++;
+                btStartClient();
+                Serial.printf("DBG,bt client restart #%lu\n", (unsigned long)bt_restarts);
+            }
+        } else if (bt_scan_pending) {
+            bt_scan_pending = false;
+            obd::startScan();
+        } else if (s.bt_addr[0] && currentPage != PAGE_BT_SCAN && obd::state() == obd::IDLE &&
+                   !obd::connectPending() && !obd::scanning() && !obd::scanPending() &&
+                   now - bt_reconnect_ms >= 5000) {
+            // Up, idle and paired but not connecting (the user just left the scan page, or a
+            // connect request died with a previous task): connect. The obd task retries a
+            // FAILED/lost link on its own; this only covers "nobody asked".
+            bt_reconnect_ms = now;
+            obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
+        }
+    } else {   // NET_TO_WIFI: BLE draining
+        if (obd::isDown()) {
+            net_owner_ms = now;
+            if (want) {
+                // Wanted again before the handover finished (START right after leaving the
+                // menu / a pairing page): go straight back to BT. Re-acquiring while the drain
+                // was still pending used to lose the connect request -> no BT all session.
+                net_owner     = NET_BT;
+                bt_restart_ms = now;
+                btStartClient();
+                Serial.println("[net] radio -> BT (wanted again; skipped WiFi)");
+            } else {
+                net_owner = NET_WIFI;
+                wifiForceReconfigure();   // wifiTick brings the link up within ~1 s
+                Serial.println("[net] radio -> WiFi (BLE down, connecting)");
+            }
+        } else if (now - net_owner_ms > 12000) {
+            // Failsafe. Every BLE wait now aborts on a shutdown request, so the task normally
+            // goes down in well under a second (worst case: one 5 s connect / 8 s scan).
             net_owner    = NET_WIFI;
-            net_owner_ms = millis();
-            wifiForceReconfigure();   // wifiTick brings the link up within ~1 s
-            Serial.println("[net] radio -> WiFi (BLE down, connecting)");
+            net_owner_ms = now;
+            wifiForceReconfigure();
+            Serial.println("[net] radio -> WiFi (BLE drain timeout)");
         }
         return;
     }
@@ -7468,8 +7553,8 @@ static void netOwnerTick() {
             if (net_pending_sel) { net_pending_sel = false; ufStartSelected(); }
             else                 { ufStartListing(); }   // modal is already open
         } else if (millis() - net_owner_ms > 45000) {
-            // WiFi never came up — abort the pending upload; closeUploadModal's
-            // hook hands the radio back to BT if that's still the source.
+            // WiFi never came up — abort the pending upload; once the modal closes
+            // btWanted() hands the radio back to BT if it is still wanted.
             net_pending_upload = false;
             net_pending_sel    = false;
             snprintf(upload_result_msg, sizeof(upload_result_msg), "WiFi didn't connect");
@@ -7637,17 +7722,15 @@ namespace {
 }
 
 static void openSensorPage() {
-    // Bring BLE up so the page shows live status (never mid-recording — netOwnerTick
-    // owns the recording edges; a monitor item on BLUETOOTH already has it up).
-    if (!recording) {
-        obd::setBlocked(false);   // explicit user action -> allow the (re)try even after a prior crash
-        btAcquireRadio();         // WiFi hard-off BEFORE any BLE init (coex crash)
-        obd::begin();
-        if (s.bt_addr[0] && obd::isDown()) obd::connectTo(s.bt_addr, s.bt_atype, s.bt_name);
-    }
+    // Bring BLE up so the page shows live status.
+    // v0.1.172: also while recording, and it now actually CONNECTS - the old code called
+    // obd::begin() and then connectTo() only `if (obd::isDown())`, which begin() had just made
+    // false, so the paired dongle was never connected from this page (or the monitor menu).
+    obd::setBlocked(false);   // explicit user action -> allow the (re)try even after a prior crash
     currentPage       = PAGE_SENSOR;
     pageJustEntered   = true;
     sensor_page_dirty = true;
+    netOwnerTick();           // radio -> BT now (WiFi hard-off first), client up, dongle connect
 }
 
 static void drawSensorPage() {
@@ -7750,7 +7833,8 @@ static void handleSensorPageTap(int x, int y) {
     if (y >= SS_FOOT_Y && y <= SS_FOOT_Y + SS_FOOT_H &&
         x >= SS_BACK_X && x <= SS_BACK_X + SS_FOOT_W) {
         saveSettings();                       // persist bt_* (pairing already saved its own)
-        if (!recording) btReleaseRadio();     // leaving pairing UI: WiFi gets the radio back
+        // Leaving the pairing UI: netOwnerTick() hands the radio back to WiFi unless BT is still
+        // wanted (recording with a BT source, or Tools -> Bluetooth test mode).
         currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true;
     }
 }
@@ -7765,13 +7849,12 @@ static void openBtScan() {
     // Explicit user action: clear a prior-crash block too, else after a BLE
     // crash the SCAN button silently did nothing (begin() no-ops when blocked).
     obd::setBlocked(false);
-    btAcquireRadio();   // WiFi hard-off BEFORE any BLE init (coex crash)
-    obd::begin();
-    obd::startScan();
     currentPage     = PAGE_BT_SCAN;
     pageJustEntered = true;
     bt_scan_dirty   = true;
     bt_scan_scroll  = 0;
+    bt_scan_pending = true;   // issued the moment the obd task can take it (even mid-handover)
+    netOwnerTick();           // radio -> BT now (WiFi hard-off BEFORE any BLE init - coex crash)
 }
 
 static void selectBtDevice(int i) {
@@ -8017,7 +8100,7 @@ static void handleBtScanTap(int x, int y) {
         if (i >= 0 && i < n && (rel % BT_ROW_H) < BT_ROW_H - 6) { selectBtDevice(i); return; }
     }
     if (y >= BT_FOOT_Y && y <= BT_FOOT_Y + BT_FOOT_H) {
-        if (x >= BT_RESCAN_X && x <= BT_RESCAN_X + BT_FOOT_W) { obd::startScan(); bt_scan_dirty = true; return; }
+        if (x >= BT_RESCAN_X && x <= BT_RESCAN_X + BT_FOOT_W) { btRequestScan(); bt_scan_dirty = true; return; }
         if (x >= BT_BACK_X   && x <= BT_BACK_X   + BT_FOOT_W) { currentPage = PAGE_SENSOR; pageJustEntered = true; sensor_page_dirty = true; return; }
     }
 }
@@ -9274,6 +9357,8 @@ static void cancelMonCfg() {
         aem_reading = aemafr::Reading{}; aem_seen = false;
         Serial.printf("CFG,afraem,%d\n", (int)s.aem_afr);
     }
+    // ... and the VOLT DIRECT (A16 divider) read/log switch, which follows mon_cfg (v0.1.172).
+    Serial.printf("CFG,vdir,%d\n", (mon_cfg.src[MON_VOLT] == MON_SRC_DIRECT) ? 1 : 0);
     currentPage = PAGE_SETTINGS; pageJustEntered = true; settingsDirty = true;
 }
 
@@ -9352,6 +9437,13 @@ static void monAfrSyncAem() {
     s.aem_afr = want;
     aem_reading = aemafr::Reading{}; aem_seen = false;
     Serial.printf("CFG,afraem,%d\n", (int)s.aem_afr);
+}
+
+// v0.1.172: VOLT Source = DIRECT tells the Teensy to read + log its A16 car-voltage divider
+// (CFG,vdir). Sent on every change so the preview is live; DONE re-sends it with the whole
+// CFG burst and CANCEL re-sends the restored value.
+static void monVoltSyncDirect() {
+    Serial.printf("CFG,vdir,%d\n", (mon_cfg.src[MON_VOLT] == MON_SRC_DIRECT) ? 1 : 0);
 }
 
 // Adjust step, in x10 of the natural unit: 5 F / 1 psi / 0.1 V / 0.1 AFR / 5 F / 1 kPa / 1 % / 100 rpm.
@@ -9550,6 +9642,7 @@ static void handleMonItemTap(int x, int y) {
         if (x >= MI_PILL_X && x < MI_PILL_X + MI_PILL_W) {
             mon_cfg.src[item] = (uint8_t)((mon_cfg.src[item] + 1) % MON_SRC_COUNT);   // DIRECT -> BLUETOOTH -> CANBUS
             if (item == MON_AFR) monAfrSyncAem();
+            if (item == MON_VOLT) monVoltSyncDirect();   // v0.1.172: A16 divider read/log on|off
             if (item == MON_RPM) resolveEngRpm();   // v0.1.170: re-resolve the displayed RPM now
             ld.sens_tag = 0;                      // the block must re-resolve with the new source
             moni.dirty = true;
@@ -9646,7 +9739,7 @@ static void drawMonCfg() {
 static void handleMonCfgTap(int x, int y) {
     if (y >= MON_FOOT_Y) {
         if (x < 240)       cancelMonCfg();
-        else if (x < 510) { monDefaults(); resolveEngRpm(); monp.dirty = true; }   // legacy show flags kept
+        else if (x < 510) { monDefaults(); resolveEngRpm(); monVoltSyncDirect(); monp.dirty = true; }   // legacy show flags kept
         else               saveMonCfg();
         return;
     }
@@ -9953,7 +10046,8 @@ static void drawWifiScannerPage() {
         tft.setFont(&fonts::Font4);
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
         tft.setTextDatum(textdatum_t::middle_center);
-        tft.drawString("No networks found.", 400, (50 + WSC_LIST_BOT)/2);
+        tft.drawString(wifi_scan_bt_busy ? "Bluetooth has the radio - exit BT test mode / stop recording"
+                                         : "No networks found.", 400, (50 + WSC_LIST_BOT)/2);
         tft.setTextDatum(textdatum_t::top_left);
         return;
     }
@@ -11392,12 +11486,15 @@ static void handleOtaModalTap(int x, int y) {
 // ---------------------------------------------------------------------------
 namespace {
     constexpr int TOOLS_BTN_X = 40,  TOOLS_BTN_W = 720;
-    constexpr int TOOLS_BTN_H = 64,  TOOLS_GAP   = 12;   // 5 buttons since v0.1.116
+    // 6 buttons since v0.1.172 (Bluetooth test mode); 56 px tall, title/subtitle offsets below.
+    constexpr int TOOLS_BTN_H = 56,  TOOLS_GAP   = 8;
+    constexpr int TOOLS_TITLE_DY = 19, TOOLS_SUB_DY = 42;   // text centres inside a button
     constexpr int TOOLS_BTN1_Y = 50;
     constexpr int TOOLS_BTN2_Y = TOOLS_BTN1_Y + TOOLS_BTN_H + TOOLS_GAP;
     constexpr int TOOLS_BTN3_Y = TOOLS_BTN2_Y + TOOLS_BTN_H + TOOLS_GAP;
     constexpr int TOOLS_BTN4_Y = TOOLS_BTN3_Y + TOOLS_BTN_H + TOOLS_GAP;
     constexpr int TOOLS_BTN5_Y = TOOLS_BTN4_Y + TOOLS_BTN_H + TOOLS_GAP;   // WiFi speed test
+    constexpr int TOOLS_BTN6_Y = TOOLS_BTN5_Y + TOOLS_BTN_H + TOOLS_GAP;   // Bluetooth test mode
 }
 
 static const char* sdStatusText() {
@@ -11761,7 +11858,7 @@ static void drawToolsPage() {
     tft.setTextColor(TFT_WHITE, b1_fill);
     tft.setTextDatum(textdatum_t::middle_center);
     tft.drawString("Check for updates",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + 22);
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + TOOLS_TITLE_DY);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b1_fill);
     char b1sub[80];
@@ -11770,7 +11867,7 @@ static void drawToolsPage() {
     } else {
         snprintf(b1sub, sizeof(b1sub), "current v%s", FIRMWARE_VERSION);
     }
-    tft.drawString(b1sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + 47);
+    tft.drawString(b1sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN1_Y + TOOLS_SUB_DY);
 
     // ---- Button 2: Format SD card (two-tap arming) ----
     const bool armed = sd_format_armed && (millis() - sd_format_arm_ms < 5000);
@@ -11784,7 +11881,7 @@ static void drawToolsPage() {
     tft.setFont(&fonts::Font4);
     tft.setTextColor(TFT_WHITE, b2_fill);
     tft.drawString(armed ? "TAP AGAIN TO CONFIRM" : "Format SD card",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 22);
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + TOOLS_TITLE_DY);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b2_fill);
     char b2sub[64];
@@ -11796,7 +11893,7 @@ static void drawToolsPage() {
                                (unsigned long)sd_free_mb, (unsigned long)sd_total_mb);
         strncat(b2sub, ssz, sizeof(b2sub) - strlen(b2sub) - 1);
     }
-    tft.drawString(b2sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + 47);
+    tft.drawString(b2sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN2_Y + TOOLS_SUB_DY);
 
     // ---- Button 3: Test mode ----
     // Generates synthetic GPS/RPM/IMU on the Teensy and writes a real SD
@@ -11815,7 +11912,7 @@ static void drawToolsPage() {
     tft.drawString(sim_active        ? "Stop test mode  (SCREEN sim)"
                  : test_mode_active ? "Stop test mode  (TEENSY)"
                                     : "Start test mode",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 22);
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + TOOLS_TITLE_DY);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b3_fill);
     const char* b3sub = sim_active
@@ -11823,7 +11920,7 @@ static void drawToolsPage() {
         : test_mode_active
         ? "Teensy recording synthetic data — tap to stop + upload"
         : "synthetic data: you'll be asked TEENSY (records to SD) or SCREEN (no Teensy)";
-    tft.drawString(b3sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + 47);
+    tft.drawString(b3sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN3_Y + TOOLS_SUB_DY);
 
     // ---- Button 4: CAN sniffer ----
     // Records every raw CAN frame to /cansniff/ on the SD card so the MS3Pro
@@ -11838,7 +11935,7 @@ static void drawToolsPage() {
     tft.setFont(&fonts::Font4);
     tft.setTextColor(TFT_WHITE, b4_fill);
     tft.drawString(cansniff_active ? "Stop CAN capture" : "Start CAN capture",
-                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 22);
+                   TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + TOOLS_TITLE_DY);
     tft.setFont(&fonts::Font2);
     tft.setTextColor(TFT_LIGHTGREY, b4_fill);
     char b4sub[80];
@@ -11850,7 +11947,7 @@ static void drawToolsPage() {
     } else {
         snprintf(b4sub, sizeof(b4sub), "record raw CAN frames to SD for analysis");
     }
-    tft.drawString(b4sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + 47);
+    tft.drawString(b4sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN4_Y + TOOLS_SUB_DY);
 
     // ---- Button 5: WiFi speed test (v0.1.116) ----
     {
@@ -11863,7 +11960,7 @@ static void drawToolsPage() {
         tft.setFont(&fonts::Font4);
         tft.setTextColor(TFT_WHITE, b5_fill);
         tft.setTextDatum(textdatum_t::middle_center);
-        tft.drawString("WiFi speed test", TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN5_Y + 22);
+        tft.drawString("WiFi speed test", TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN5_Y + TOOLS_TITLE_DY);
         tft.setFont(&fonts::Font2);
         tft.setTextColor(TFT_LIGHTGREY, b5_fill);
         char b5sub[96];
@@ -11872,7 +11969,64 @@ static void drawToolsPage() {
         else if (!wifi_ok)              snprintf(b5sub, sizeof(b5sub), "requires WiFi connected");
         else                            snprintf(b5sub, sizeof(b5sub),
                                                  "2MB dash->server, no Teensy - result is logged server-side");
-        tft.drawString(b5sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN5_Y + 47);
+        tft.drawString(b5sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN5_Y + TOOLS_SUB_DY);
+        tft.setTextDatum(textdatum_t::top_left);
+    }
+
+    // ---- Button 6: Bluetooth test mode (v0.1.172) ----
+    // BT-ONLY: WiFi hard-off, BLE up, the paired dongle connected - and it STAYS that way when
+    // you leave this page, so the dash / Sensor monitoring / STATUS can be checked against live
+    // OBD data without recording. Tap again to give the radio back to WiFi. RAM only: a reboot
+    // always comes back on WiFi.
+    {
+        const bool     on     = bt_test_mode;
+        const bool     paired = (s.bt_addr[0] != 0);
+        const bool     conn   = obd::connected();
+        const uint16_t b6_fill = on ? (conn ? TFT_DARKGREEN : 0x7A00 /*dark amber*/) : TFT_NAVY;
+        tft.fillRect(TOOLS_BTN_X, TOOLS_BTN6_Y, TOOLS_BTN_W, TOOLS_BTN_H, b6_fill);
+        tft.drawRect(TOOLS_BTN_X, TOOLS_BTN6_Y, TOOLS_BTN_W, TOOLS_BTN_H, TFT_WHITE);
+        tft.drawRect(TOOLS_BTN_X+1, TOOLS_BTN6_Y+1, TOOLS_BTN_W-2, TOOLS_BTN_H-2, TFT_WHITE);
+        tft.setFont(&fonts::Font4);
+        tft.setTextColor(TFT_WHITE, b6_fill);
+        tft.setTextDatum(textdatum_t::middle_center);
+        tft.drawString(on ? "Bluetooth test: ON  (WiFi off) - tap to exit" : "Bluetooth test mode",
+                       TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN6_Y + TOOLS_TITLE_DY);
+        tft.setFont(&fonts::Font2);
+        tft.setTextColor(TFT_LIGHTGREY, b6_fill);
+        char b6sub[112];
+        if (!on) {
+            if (paired)
+                snprintf(b6sub, sizeof(b6sub), "BT only, WiFi OFF: connect %.20s and watch live OBD data",
+                         s.bt_name[0] ? s.bt_name : s.bt_addr);
+            else
+                snprintf(b6sub, sizeof(b6sub), "BT only, WiFi OFF - no dongle paired yet (opens pairing)");
+        } else if (upload_active || net_pending_upload) {
+            snprintf(b6sub, sizeof(b6sub), "paused for the upload - BT returns when it finishes");
+        } else if (net_owner != NET_BT) {
+            snprintf(b6sub, sizeof(b6sub), "handing the radio to Bluetooth...");
+        } else if (conn) {
+            char vals[64] = {0}; int vn = 0;
+            if (obd::coolantF_x10() >= 0)
+                vn += snprintf(vals + vn, sizeof(vals) - vn, " %dF", (int)((obd::coolantF_x10() + 5) / 10));
+            if (obd::voltX10() > 0 && vn < (int)sizeof(vals))
+                vn += snprintf(vals + vn, sizeof(vals) - vn, " %d.%dV", obd::voltX10() / 10, obd::voltX10() % 10);
+            if (obd::iatF_x10() >= 0 && vn < (int)sizeof(vals))
+                vn += snprintf(vals + vn, sizeof(vals) - vn, " IAT %dF", (int)((obd::iatF_x10() + 5) / 10));
+            if (obd::tpsX10() >= 0 && vn < (int)sizeof(vals))
+                vn += snprintf(vals + vn, sizeof(vals) - vn, " TPS %d%%", (int)((obd::tpsX10() + 5) / 10));
+            snprintf(b6sub, sizeof(b6sub), "CONNECTED %.16s%s%s", s.bt_name[0] ? s.bt_name : s.bt_addr,
+                     vals[0] ? " -" : " - no ECU reply yet", vals);
+        } else if (obd::lastErr()[0]) {
+            snprintf(b6sub, sizeof(b6sub), "%s", obd::lastErr());
+        } else if (!paired) {
+            snprintf(b6sub, sizeof(b6sub), "BT up, no dongle paired - Settings > Bluetooth OBD-II > SCAN");
+        } else {
+            snprintf(b6sub, sizeof(b6sub), "%s %.16s  (try %lu, ok %lu, heap %uK)", obd::stateStr(),
+                     s.bt_name[0] ? s.bt_name : s.bt_addr,
+                     (unsigned long)obd::connAttempts(), (unsigned long)obd::connOk(),
+                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+        }
+        tft.drawString(b6sub, TOOLS_BTN_X + TOOLS_BTN_W / 2, TOOLS_BTN6_Y + TOOLS_SUB_DY);
         tft.setTextDatum(textdatum_t::top_left);
     }
 
@@ -11882,8 +12036,8 @@ static void drawToolsPage() {
     //   fresh + high dup% / ACK err             -> STORM   (red) — termination/ACK
     //   0 fps / stale                           -> NO BUS  (grey) — wiring/broadcast
     {
-        const int CAN_Y = TOOLS_BTN5_Y + TOOLS_BTN_H + 4;   // below button 5 (v0.1.116)
-        tft.fillRect(0, CAN_Y - 2, 800, 54, TFT_BLACK);   // 54: room for the UART row (v0.1.162)
+        const int CAN_Y = TOOLS_BTN6_Y + TOOLS_BTN_H + 4;   // below the last button (6 since v0.1.172)
+        tft.fillRect(0, CAN_Y - 2, 800, 480 - (CAN_Y - 2), TFT_BLACK);   // CAN row + UART row
         const bool fresh = (candiag_ms != 0) && (millis() - candiag_ms < 3000);
         char line[96]; uint16_t col;
         // Classify by FRAME RATE, not dup%. A real no-ACK retransmit storm runs
@@ -11933,7 +12087,7 @@ static void drawToolsPage() {
         tft.setFont(&fonts::Font2);
         tft.setTextColor(col, TFT_BLACK);
         tft.setTextDatum(textdatum_t::middle_center);
-        tft.drawString(line, 400, CAN_Y + 10);
+        tft.drawString(line, 400, CAN_Y + 9);
         // v0.1.162: the MEASURED arrival rate. This is the number that splits "the screen is
         // slow" in half: if this reads >=250 lines/s the data is arriving fine and any lag is
         // the display's; if it reads single digits, the bottleneck is UPSTREAM of the screen
@@ -11946,7 +12100,7 @@ static void drawToolsPage() {
                      link_ok ? "(link OK)" : "(NO TELEMETRY)");
             tft.setTextColor((link_ok && uart_tele_lines_s >= 200) ? TFT_GREEN
                            : link_ok ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
-            tft.drawString(rl, 400, CAN_Y + 38);
+            tft.drawString(rl, 400, CAN_Y + 29);
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
         }
     }
@@ -12008,6 +12162,22 @@ static void handleToolsTap(int x, int y) {
             nettest_state = 2;
             snprintf(nettest_result, sizeof(nettest_result), "task spawn failed");
         }
+        return;
+    }
+    // Button 6: Bluetooth test mode (v0.1.172) - toggles BT-ONLY. netOwnerTick() does the
+    // actual handover both ways (WiFi hard-off BEFORE any BLE init; BLE fully deinit BEFORE
+    // WiFi comes back), so this only flips the wish.
+    if (x >= TOOLS_BTN_X && x <= TOOLS_BTN_X + TOOLS_BTN_W &&
+        y >= TOOLS_BTN6_Y && y <= TOOLS_BTN6_Y + TOOLS_BTN_H) {
+        if (upload_active || net_pending_upload) return;    // let the upload finish first
+        bt_test_mode = !bt_test_mode;
+        if (bt_test_mode) {
+            obd::setBlocked(false);                         // explicit user action clears a crash block
+            ble_diag[0] = '\0';
+            if (!s.bt_addr[0]) { openSensorPage(); return; } // nothing paired: go pair it
+        }
+        netOwnerTick();
+        pageJustEntered = true;
         return;
     }
     // Button 4: CAN sniffer toggle
@@ -12733,7 +12903,7 @@ static void drawStatusPage() {
     // BT — OBD dongle link (only meaningful with sensor source = Bluetooth, or a monitor item on BT)
     {
         char buf[40]; uint16_t col;
-        if (s.sensor_type != 2 && !monWantsBt()) {
+        if (s.sensor_type != 2 && !monWantsBt() && !bt_test_mode) {
             strncpy(buf, "OFF", sizeof(buf)); col = TFT_DARKGREY;
         } else if (obd::connected()) {
             const char* nm = s.bt_name[0] ? s.bt_name : s.bt_addr;
@@ -12747,6 +12917,9 @@ static void drawStatusPage() {
             }
         } else if (net_owner != NET_BT) {
             strncpy(buf, "waiting (BT on at REC)", sizeof(buf)); col = TFT_DARKGREY;
+        } else if (obd::lastErr()[0]) {
+            snprintf(buf, sizeof(buf), "%.38s", obd::lastErr());
+            col = TFT_ORANGE;
         } else {
             snprintf(buf, sizeof(buf), "%.24s...", obd::stateStr());
             col = TFT_YELLOW;
@@ -13297,15 +13470,37 @@ void setup() {
                 const bool crashy = (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
                                      rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT ||
                                      rr == ESP_RST_BROWNOUT);
-                if (crashy) {
+                // v0.1.172: a BROWNOUT while the link was already up (phase 4) is the CAR's
+                // supply - cranking the engine with the dash on - not BLE. Blocking for that
+                // left Bluetooth dead for the whole next session ("it doesn't connect once I
+                // hit START"). And a single crash no longer blocks: it takes TWO consecutive
+                // BLE-attributed crashes ("strk" in the blediag namespace) - still enough to
+                // stop a crash loop, no longer enough to lose BT to one bad moment. Any reset
+                // that is NOT a BLE-attributed crash clears the count.
+                const bool power_dip = (rr == ESP_RST_BROWNOUT && ph == 4);
+                if (crashy && !power_dip) {
                     static const char* PH[] = { "?", "init", "scan", "connect", "link" };
-                    snprintf(ble_diag, sizeof(ble_diag), "BT %s reset the board: %s",
-                             PH[ph <= 4 ? ph : 0], resetReasonStr(rr));
-                    obd::setBlocked(true);
-                    Serial.printf("[ble] %s -> BLE auto-init BLOCKED this boot\n", ble_diag);
+                    const uint8_t strikes = (uint8_t)(p.getUChar("strk", 0) + 1);
+                    p.putUChar("strk", strikes);
+                    snprintf(ble_diag, sizeof(ble_diag), "BT %s reset the board: %s%s",
+                             PH[ph <= 4 ? ph : 0], resetReasonStr(rr),
+                             strikes >= 2 ? " (x2: BT paused)" : "");
+                    if (strikes >= 2) {
+                        obd::setBlocked(true);
+                        Serial.printf("[ble] %s -> BLE auto-init BLOCKED this boot\n", ble_diag);
+                    } else {
+                        Serial.printf("[ble] %s -> strike 1, BLE stays enabled\n", ble_diag);
+                    }
+                } else {
+                    if (power_dip)
+                        Serial.printf("[ble] brownout while BT linked (supply dip) -> NOT blocked\n");
+                    if (p.getUChar("strk", 0) != 0) p.putUChar("strk", 0);   // not a BLE crash
                 }
                 p.putUChar("ph", 0);
                 p.putBool("try", false);
+            } else if (p.getUChar("strk", 0) != 0) {
+                // The last reset was not during BLE activity: strikes must be CONSECUTIVE.
+                p.putUChar("strk", 0);
             }
             p.end();
         }
@@ -13412,8 +13607,7 @@ void loop() {
     handleTouch();
     dashHealthTick();  // 1 Hz ESP32 temp -> Teensy (heat diagnostics)
     videoHudTick();    // 5 Hz lap overlay to Pi 5 via Teensy Serial1
-    netOwnerTick();   // WiFi<->BLE radio time-share arbiter (must run before wifiTick)
-    monBtMenuTick();  // v0.1.157: the same arbiter rule for the sensor monitor menu
+    netOwnerTick();   // WiFi<->BLE radio time-share arbiter, level-triggered (must run before wifiTick)
     wifiTick();   // WiFi state machine + one-shot NTP push to Teensy (1 Hz tick)
     uploadTick(); // Dash-initiated upload state machine (UF_*)
 

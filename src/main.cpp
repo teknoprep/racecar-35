@@ -9,7 +9,8 @@
 // Wire format on Serial3, 115200 8N1, '\n'-terminated, line types:
 //
 //   GPS,<fix>,<sats>,<lat_deg>,<lon_deg>,<speed_mph>,<heading_deg>,<gps_status>
-//   ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>
+//   ENG,<rpm>,<oil_psi_x10>,<coolant_f_x10>,<direct_rpm>,<direct_coolant_f_x10>,<direct_vin_x10>
+//        (fields 4-5 v0.1.170 pure direct sensors; field 6 v0.1.172 car volts from A16, -1 = off)
 //   ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>   [planned]
 //   IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
 //   SD,REC,<0|1>,<filename>,<samples>     emitted on session open/close + 1 Hz during
@@ -67,7 +68,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.171"
+#define FIRMWARE_VERSION "0.1.172"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -162,6 +163,16 @@ namespace {
   constexpr float COOLANT_SH_B       = 1.346e-4f;
   constexpr float COOLANT_SH_C       = 8.387e-7f;
 
+  // ---- Car input voltage, DIRECT (v0.1.172) ----
+  // 180 k (top, from the car's +12 V) / 20 k (bottom, to GND) divider = exactly 1:10, into
+  // pin 40 = A16 - the SAME divider, ratio and pin as the Rev F board's input-voltage monitor,
+  // so a breadboard build and the PCB run identical firmware. 12-16 V reads 1.2-1.6 V at the
+  // pin; full scale (3.3 V) is 33 V, so a charging spike / jump start stays below the ADC
+  // limit even before the clamp. Opt-in (CFG,vdir - the dash's VOLT item Source = DIRECT):
+  // an unwired pin floats, and a floating pin must never be logged as a battery voltage.
+  constexpr int   VIN_ADC_PIN        = A16;         // physical pin 40 (ADC1)
+  constexpr float VIN_DIVIDER_RATIO  = 10.0f;       // (180k + 20k) / 20k
+
   // EMA smoothing for both analog sensors. Alpha=0.2 -> ~5-sample time
   // constant at 25 Hz = ~200 ms tau. Kills the per-sample ADC jitter that
   // cheap industrial transducers exhibit without lagging real changes.
@@ -200,6 +211,7 @@ static struct {
     bool     rec_cl     = false;
     uint8_t  sensor_type = 0;     // 0=Direct (opto tach + ADC), 1=MegaSquirt (CAN)
     bool     aem_afr = false;    // opt-in; old hardware must not sample a floating A6
+    bool     vin_direct = false; // opt-in (CFG,vdir); car voltage divider on A16 / pin 40
     uint16_t rpm_ppr_x10 = 20;    // tach pulses/rev x10 (20 = 2.0). Divides the
                                   // opto-tach frequency into RPM in Direct mode.
     int8_t   rpm_smooth  = 0;     // RPM display smoothing trim from the dash slider
@@ -1847,6 +1859,25 @@ static int16_t readOilPsiX10() {
     return (int16_t)v;
 }
 
+// Car input voltage x10 from the 1:10 divider on A16 (v0.1.172). Same EMA as the other
+// analog channels. Returns the measured value even near 0 V (car power off while the Teensy
+// runs from USB reads ~0.0 V, which the dash shows as no data) - it is only ever called when
+// the divider is declared present (g_cfg.vin_direct).
+static int16_t readVinX10() {
+    const int   raw = analogRead(VIN_ADC_PIN);
+    const float v   = (float)raw * (3.3f / 4095.0f) * VIN_DIVIDER_RATIO;
+    static float ema = -1.0f;
+    if (ema < 0.0f) ema = v;
+    else            ema = ema * (1.0f - SENSOR_EMA_ALPHA) + v * SENSOR_EMA_ALPHA;
+    int x = (int)(ema * 10.0f + 0.5f);
+    if (x < 0)   x = 0;
+    if (x > 400) x = 400;
+    return (int16_t)x;
+}
+// Latest DIRECT car voltage x10, -1 while the input is off. Updated once per emit window;
+// read by the SD sample writer, HLTH and the .dbg health line.
+static int16_t vin_x10 = -1;
+
 static int16_t readCoolantFx10() {
     const int raw = analogRead(COOLANT_ADC_PIN);
     // Saturated low = thermistor open; saturated high = shorted to GND.
@@ -2521,6 +2552,7 @@ static void dbgHealth() {
     float batt = (can_ecu.bat_x10 >= 0) ? can_ecu.bat_x10 / 10.0f : -1.0f;
     if (batt < 0 && bt_last_ms != 0 && now - bt_last_ms <= 10000 && bt_volt_x10 > 0)
         batt = bt_volt_x10 / 10.0f;   // BT dongle ATRV fallback
+    if (batt < 0 && vin_x10 > 0) batt = vin_x10 / 10.0f;   // direct A16 divider (v0.1.172)
     char line[360];
     int n = snprintf(line, sizeof(line),
         "{\"t\":%lu,\"ev\":\"h\",\"loop_ms\":%lu,\"sdwr_ms\":%lu,\"fresh\":%lu,\"avail\":%d,"
@@ -2570,6 +2602,7 @@ static void healthTick() {
     int16_t batt_x10 = can_ecu.bat_x10;   // -1 if no CAN
     if (batt_x10 < 0 && bt_last_ms != 0 && millis() - bt_last_ms <= 10000 && bt_volt_x10 > 0)
         batt_x10 = bt_volt_x10;
+    if (batt_x10 < 0 && vin_x10 > 0) batt_x10 = vin_x10;   // direct A16 divider (v0.1.172)
     dashTele("HLTH,%d,%d,%d,%d\n", t_die_x10, t_mpu_x10, t_esp_x10, batt_x10);
     Serial.printf("[health] die=%.1fC mpu=%.1fC esp=%.1fC batt_x10=%d%s\n",
                   t_die, imu_temp_c, dash_temp_c, (int)batt_x10,
@@ -2825,6 +2858,10 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
         // Bench oil expires on its own clock (pumpCAN clears oil_x10/bench_ms).
         if (can_ecu.oil_x10 >= 0)
             append("\"oil_can_psi\":%.1f,", can_ecu.oil_x10 * 0.1f);
+        // v0.1.172: DIRECT car voltage (the logger's own A16 divider) - its own key, never
+        // folded into batt_v (that one is the ECU's / dongle's measurement).
+        if (g_cfg.vin_direct && vin_x10 >= 0)
+            append("\"vin_v\":%.1f,", vin_x10 * 0.1f);
     }
 
     append(
@@ -2904,6 +2941,11 @@ static void handleCfgLine(const String& line) {
         if (val != "0" && val != "1") return;
         g_cfg.aem_afr = (val == "1");
         aem_reading = aemafr::Reading{};
+    }
+    else if (key == "vdir") {      // v0.1.172: car-voltage divider on A16 present (VOLT Source = DIRECT)
+        if (val != "0" && val != "1") return;
+        g_cfg.vin_direct = (val == "1");
+        if (!g_cfg.vin_direct) vin_x10 = -1;
     }
     else if (key == "dbg_on")   { g_cfg.debug_enabled = (val.toInt() != 0);
         Serial.printf("[cfg] debug logging = %s\n", g_cfg.debug_enabled ? "ON" : "OFF"); }
@@ -4016,6 +4058,7 @@ void setup() {
     pinMode(OIL_ADC_PIN,     INPUT_PULLDOWN);
     pinMode(COOLANT_ADC_PIN, INPUT_PULLDOWN);
     pinMode(AEM_AFR_ADC_PIN, INPUT); // NO internal pull: external 20k/20k defines gain
+    pinMode(VIN_ADC_PIN,     INPUT); // NO internal pull: the external 180k/20k sets the 1:10 ratio
     Serial.println(F("Analog: oil PSI on A2, coolant degF on A3 (12-bit, x16 avg, pulldown)"));
 
     // IMU on Wire (SDA=18, SCL=19). Non-fatal if absent.
@@ -4382,7 +4425,12 @@ static void emitToDash() {
     // CAN frame arrived). Trailing fields: old dashes ignore them.
     const uint16_t dRpm  = test_mode_active ? rpm        : directRpm;
     const int16_t  dCool = test_mode_active ? cool_f_x10 : directCool;
-    dashTele("ENG,%u,%d,%d,%u,%d\n", rpm, oil_psi_x10, cool_f_x10, dRpm, dCool);
+    // Field 6 (v0.1.172) = DIRECT car voltage x10 from the A16 divider, -1 while the input is
+    // off (CFG,vdir). Same snapshot feeds the SD sample below.
+    vin_x10 = !g_cfg.vin_direct ? (int16_t)-1
+            : test_mode_active  ? (int16_t)(138 + (int)(3.0f * sinf(millis() * 0.0005f)))
+                                : readVinX10();
+    dashTele("ENG,%u,%d,%d,%u,%d,%d\n", rpm, oil_psi_x10, cool_f_x10, dRpm, dCool, (int)vin_x10);
     usbTele("ENG,%u,%d,%d  [src=%s]\n", rpm, oil_psi_x10, cool_f_x10,
                   use_can ? (g_cfg.sensor_type == 1 ? "CAN" : "CAN(auto)") : "direct");
     // ECU line: full MS3Pro CAN dataset. Dash uses these when sensor_type==1

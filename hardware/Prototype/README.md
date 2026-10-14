@@ -11,11 +11,12 @@ sheet: schematic on top, warnings, then a tick-list.
 
 | Sheet | Covers |
 | --- | --- |
-| [00-Teensy-pin-map.png](00-Teensy-pin-map.png) | Every wire on the Teensy, pin by pin, plus the J1–J7 terminal map |
+| [00-Teensy-pin-map.png](00-Teensy-pin-map.png) | Every wire on the Teensy, pin by pin, plus the J1–J8 terminal map |
 | [01-Power-and-ground.png](01-Power-and-ground.png) | 12 V → buck → J1, the 5 V and 3.3 V rails, star ground, pre-power checks |
 | [02-UART-screen-and-video.png](02-UART-screen-and-video.png) | J2 → CrowPanel J10 (921600) and J3 → Pi 5 (115200, 3.3 V) |
 | [03-GPS-and-IMU.png](03-GPS-and-IMU.png) | NEO-M9N on Serial2, MPU-6050 on Wire, boot banner, IMU mounting |
 | [04-Analogue-inputs.png](04-Analogue-inputs.png) | Oil 10k/20k, coolant 150 Ω, AEM 20k/20k, optional CAN transceiver + SD |
+| [05-Car-voltage-sensor.png](05-Car-voltage-sensor.png) | J8 VBATT: car 12–16 V → 180k/20k (1:10) + 1 kΩ/100 nF + 2 Schottky clamps → pin 40 (A16), diode orientation, bench check, enabling VOLT = DIRECT (firmware v0.1.172+) |
 
 ## Terminals — left edge, top to bottom
 
@@ -28,6 +29,7 @@ sheet: schematic on top, warnings, then a tick-list.
 | J5 OIL | 5V · SIG · GND | 0.5–4.5 V transducer, divider at A2 |
 | J6 NTC | SIG · GND | Coolant sender, 150 Ω pull-up at A3, own ground wire |
 | J7 AEM | WHT · BRN | AEM 30-0300 pin 9 / pin 10, divider at A6 |
+| J8 VBATT | V+ · GND | Fused car +12 V (buck input feed), 1:10 divider at A16 / pin 40 |
 
 ## Numbers that are firmware contracts
 
@@ -35,6 +37,7 @@ sheet: schematic on top, warnings, then a tick-list.
 - Coolant pull-up **150 Ω** to 3.3 V, VDO 1600–22 Ω curve (Steinhart-Hart in `src/main.cpp`).
 - AEM divider **20 kΩ / 20 kΩ 0.1%** + 1 kΩ/100 nF ⇒ 0.500 gain, `AFR = 2.3750·V + 7.3125`.
 - Tach: PC817 plus **4.7 kΩ** pull-up to 3.3 V on pin 9; pulses/rev default **2.0**.
+- Car voltage **180 kΩ / 20 kΩ 1 %** ⇒ exactly 1:10 (`VIN_DIVIDER_RATIO = 10.0`), 33 V full scale — same as Rev F.
 - Teensy 3.3V pin: about **250 mA** of external load (PJRC). GPS + IMU + pull-ups only.
 - Baud: screen **921600**, Pi **115200**, GPS raised to **230400**.
 
@@ -42,6 +45,7 @@ sheet: schematic on top, warnings, then a tick-list.
 
 ```bash
 python3 generate.py        # writes the .svg and, with cairosvg, the .png
+# (no system cairosvg? python3 -m venv /tmp/cv && /tmp/cv/bin/pip install cairosvg && /tmp/cv/bin/python generate.py)
 ```
 
 Edit `generate.py` rather than the generated files. Keep this folder in sync with

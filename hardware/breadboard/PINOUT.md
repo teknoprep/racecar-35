@@ -51,7 +51,7 @@ before soldering; pin numbers below are the GPIO numbers used in code.
                           12 -|  [RESERVED NET]     |- 13  LED     [heartbeat - LEAVE ALONE]
                         3.3V -|                     |- GND         [-> GND rail]
                           24 -|                     |- 41
-                          25 -|                     |- 40
+                          25 -|                     |- 40   A16    [J8 VBATT (1:10 divider)]
                           26 -|                     |- 39
                           27 -|                     |- 38
                           28 -|                     |- 37
@@ -76,6 +76,7 @@ before soldering; pin numbers below are the GPIO numbers used in code.
 | 17 (A3) | Coolant NTC ADC | Serial4 lost |
 | 18 / 19 | Wire SDA / SCL → MPU-6050 (0x68) | 3.3 V only, keep wires short |
 | 20 (A6) | AEM 30-0300 gauge output through the 20k/20k divider | **never** AEM WHITE directly |
+| 40 (A16) | Car voltage through the 180k/20k (1:10) divider — §6b (firmware v0.1.172+) | **never** 12 V directly |
 | 22 / 23 | CAN1 TX / RX → SN65HVD230 (only for MegaSquirt mode) | never an MCP2551 (5 V — it will damage the Teensy) |
 | 3.3V | GPS, IMU, tach pull-up, coolant pull-up, CAN transceiver | don't hang the screen or a 5 V load off it |
 | 5V (VIN) | J1 5 V in | cut **VUSB–VIN** (pad on the Teensy underside) if USB and J1 are both live |
@@ -297,6 +298,52 @@ optional, and its ratio is a firmware constant (`AFR = 2.3750·V + 7.3125`).
 
 ---
 
+## 6b. J8 VBATT — car voltage, 180 kΩ / 20 kΩ (1:10) → pin 40 (A16)
+
+**Wiring sheet: [../Prototype/05-Car-voltage-sensor.png](../Prototype/05-Car-voltage-sensor.png)**
+(schematic, diode orientation, bench check, solder order).
+
+The car's 12–16 V must arrive at the Teensy as **1.2–1.6 V**. This is the same divider,
+ratio and pin as the Rev F board's input-voltage monitor, so the firmware is identical on
+the breadboard and on the PCB (`VIN_DIVIDER_RATIO = 10.0`, firmware v0.1.172+).
+
+```
+ J8 V+  ── 180 kΩ ──●── 1 kΩ ──●── Teensy pin 40 (A16)
+  (fused 12 V)      │          │
+                   20 kΩ     100 nF
+                    │          │
+ J8 GND ── board GND ┴──────────┘
+
+ clamps at the ● divider midpoint (Schottky, e.g. BAT85 / BAT43 / 1N5817):
+   midpoint ──|>|── 3.3 V rail        (anode at the midpoint: catches over-voltage)
+   GND      ──|>|── midpoint          (anode at GND: catches reverse / negative spikes)
+```
+
+- **Tap point:** the same fused +12 V that feeds the 5 V buck (after the fuse), so the
+  reading is what the logger itself sees — that is exactly what you want when chasing a
+  brownout. Ground at the star point, not a random chassis screw.
+- **Why 1:10 and not "1–3 V":** full scale is 33 V, so a charging spike or jump start is
+  still below the ADC limit *before* the clamp does anything, and resolution is still
+  8 mV per count. (47 k / 10 k would put 12–16 V at 2.1–2.8 V but clips at 18.8 V and needs
+  a different firmware ratio — don't.)
+- **The 180 kΩ is the real protection:** even 100 V on J8 pushes only ~0.5 mA into the
+  clamp. The Schottky then holds the pin under ~3.6 V and the 1 kΩ / 100 nF filters
+  ignition noise and gives the ADC a stiff source to sample.
+- **Don't use a 3.3 V Zener as the clamp.** Low-voltage Zeners leak long before their knee
+  (a 1N4728A is rated up to 100 µA at 1 V); on an 18 kΩ source that pulls the reading low
+  by several percent. Schottky-to-rail (or the Rev F LM4040-3.0 shunt) doesn't.
+- Use **1 % metal film** (±2 % worst-case ratio ≈ ±0.3 V at 14 V); 0.1 % parts if you want
+  it tighter. The divider draws ~70 µA — negligible even on an always-on feed.
+- With the Teensy unpowered and the car live, the upper Schottky leaks ~70 µA into the
+  dead 3.3 V rail. Harmless (it cannot power anything); the Rev F TMUX1511 is the
+  production fix.
+- Bench check: **12.00 V on J8 must read 1.200 V on pin 40** (and 0 V with J8 open).
+- Enable: dash **Settings → Sensor monitoring → VOLT → Source = DIRECT** (sends
+  `CFG,vdir,1`). Only then does the Teensy read pin 40, show it as VOLT and log `vin_v`.
+  Leave it off until the divider exists — an unwired pin 40 floats.
+
+---
+
 ## 7. J2 SCREEN — CrowPanel UART, 921600
 
 | From | To | Note |
@@ -423,6 +470,11 @@ the protoboard so the card can be removed.
 | 1 | 20 kΩ 0.1 % | divider midpoint | J7 `BRN` / GND |
 | 1 | 1 kΩ | divider midpoint | Teensy pin 20 (A6) |
 | 1 | 100 nF | Teensy pin 20 (A6) | GND |
+| 1 | 180 kΩ 1 % | J8 `V+` (fused 12 V) | VBATT divider midpoint |
+| 1 | 20 kΩ 1 % | VBATT divider midpoint | GND |
+| 1 | 1 kΩ | VBATT divider midpoint | Teensy pin 40 (A16) |
+| 1 | 100 nF | Teensy pin 40 (A16) | GND |
+| 2 | BAT85 (or BAT43 / 1N5817) | midpoint → 3.3 V rail (anode at midpoint); GND → midpoint (anode at GND) | |
 | 2 | 1 kΩ | Teensy pin 1 / pin 0 | J3 `TX` / J3 `RX` (series, in the cable) |
 | 1 each | 100 nF ×3, 10 µF (opt) | 5 V rail / 3.3 V rail | GND (decoupling, near the Teensy) |
 | — | PC817 (DIP-4) | see §3 | |
@@ -443,6 +495,8 @@ With the 5 V buck **off** and the Teensy **out of its socket** if possible:
 - [ ] J6 `SIG` to 3.3 V = **150 Ω**; J6 `SIG` to Teensy pin 17 = **0 Ω**.
 - [ ] J5 `SIG` to Teensy pin 16 = **10 kΩ**; pin 16 to GND = **20 kΩ**.
 - [ ] J7 `WHT` to J7 `BRN` = **40 kΩ** (both 0.1 % legs); midpoint to pin 20 = **1 kΩ**.
+- [ ] J8 `V+` to J8 `GND` ≈ **200 kΩ**; midpoint to pin 40 = **1 kΩ**; nothing from J8 `V+`
+      reaches the 3.3 V or 5 V rail directly.
 - [ ] J2 `TX`/`RX` land on Teensy **14**/**15** (not swapped, not 43/44).
 - [ ] J3 `TX`/`RX` land on Teensy **1**/**0**, with the 1 kΩ in series.
 
@@ -459,6 +513,7 @@ and RPM/Coolant/Oil responding before turning on AEM or the video link.
 | Sensor data source | Direct (opto tach + ADCs) unless you wired CAN or BLE |
 | Tach pulses/rev | after comparing tach RPM against a trusted reference |
 | AEM 30-0300 AFR input | J7 soldered and **pin 20 meters 2.50 V at 5.00 V in** |
+| Sensor monitoring → VOLT → Source = DIRECT | J8 soldered and **pin 40 meters 1.200 V at 12.00 V in** |
 | Video interconnect | J3 wired and the Pi UART answers |
 | Debug logging (SD) | only when chasing a problem (default OFF) |
 | RPM spike filter / GPS drift filter | default Normal — leave alone until the car runs |

@@ -4,7 +4,7 @@
 Same visual language as ../breadboard/OPTO_WIRING.svg (which covers the PC817
 tach front end — deliberately NOT repeated here).
 
-    python3 generate.py          # writes 00..04 .svg and .png next to this file
+    python3 generate.py          # writes 00..05 .svg and .png next to this file
 """
 import math
 import os
@@ -58,9 +58,16 @@ def DOT(x, y, r=7, c=None):
 
 
 def RECT(x, y, w, h, cls='box', rx=8, fill=None, stroke=None, sw=None):
-    s = f' fill="{fill}"' if fill else ''
-    s += f' stroke="{stroke}"' if stroke else ''
-    s += f' stroke-width="{sw}"' if sw else ''
+    # Inline style, not presentation attributes: the .box/.panel CSS class would otherwise
+    # win and every warning box / tinted panel rendered plain beige.
+    st = []
+    if fill:
+        st.append(f'fill:{fill}')
+    if stroke:
+        st.append(f'stroke:{stroke}')
+    if sw:
+        st.append(f'stroke-width:{sw}')
+    s = f' style="{';'.join(st)}"' if st else ''
     return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" class="{cls}"{s}/>'
 
 
@@ -194,7 +201,7 @@ def doc(h, *body):
 def sheet_pinmap():
     head, y0 = HEADER(
         'Prototype board — Teensy 4.1 pin map',
-        'Every wire that lands on the Teensy. Car connections are the screw terminals J1–J7 on the left edge.',
+        'Every wire that lands on the Teensy. Car connections are the screw terminals J1–J8 on the left edge.',
         ['Header order follows the standard Teensy 4.1 layout — confirm the 5V / GND / 3.3V pins against the silkscreen on YOUR board before soldering.',
          'Teensy 4.1 pins are NOT 5 V tolerant. The 3.3V pin is rated for about 250 mA of external load (PJRC).'])
     left = [
@@ -240,7 +247,7 @@ def sheet_pinmap():
         ('13', 'heartbeat LED — leave alone', 'res'),
         ('GND', 'GND rail', 'used'),
         ('41', 'not used', 'free'),
-        ('40', 'not used', 'free'),
+        ('40', 'A16  <-  car volts via 180k/20k + 1 kΩ  (sheet 05)', 'used'),
         ('39', 'not used', 'free'),
         ('38', 'not used', 'free'),
         ('37', 'not used', 'free'),
@@ -286,7 +293,7 @@ def sheet_pinmap():
     o.append(T(48, top + 62, 'no dot = not used', 'v', fill='#9a9a9a'))
 
     ty = body_top + body_h + 70
-    o.append(PANEL(48, ty, 1604, 250, 'Screw terminals — left edge of the board, top to bottom', [
+    o.append(PANEL(48, ty, 1604, 282, 'Screw terminals — left edge of the board, top to bottom', [
         ('v', 'J1 POWER   5V · GND                       <- 5 V buck only, never 12 V'),
         ('v', 'J2 SCREEN  GND · 5V · TX · RX              -> CrowPanel J10 (XH2.54), 921600'),
         ('v', 'J3 VIDEO   GND · TX · RX                   -> Raspberry Pi 5 header 6/10/8, 3.3 V, 115200'),
@@ -294,9 +301,10 @@ def sheet_pinmap():
         ('v', 'J5 OIL     5V · SIG · GND                  -> 0.5-4.5 V transducer, divider at A2'),
         ('v', 'J6 NTC     SIG · GND                       -> coolant sender, 150 Ω pull-up at A3'),
         ('v', 'J7 AEM     WHT · BRN                       -> AEM 30-0300 pin 9 / pin 10, divider at A6'),
+        ('v', 'J8 VBATT   V+ · GND                        -> fused car +12 V, 1:10 divider at A16 / pin 40 (sheet 05)'),
         ('xs', 'Full pin-by-pin build sheet: ../breadboard/PINOUT.md  ·  tach front end: ../breadboard/OPTO_WIRING.svg'),
     ]))
-    return doc(ty + 290, *o)
+    return doc(ty + 322, *o)
 
 
 # ---------------------------------------------------------------- sheet 01
@@ -571,12 +579,193 @@ def sheet_analog():
     return doc(yf + 250, *o)
 
 
+# ---------------------------------------------------------------- sheet 05
+def DIODE_UP(x, y_bot, y_top, schottky=True):
+    """Vertical diode, conventional current flows UP: anode at y_bot, cathode (bar) at y_top."""
+    o = [f'<polygon points="{x - 20},{y_bot} {x + 20},{y_bot} {x},{y_top}" '
+         f'fill="#f7f4ee" stroke="{INK}" stroke-width="2.5"/>',
+         L(x - 20, y_top, x + 20, y_top, w=3.5, c=INK)]
+    if schottky:   # the little S-hooks that mark a Schottky bar
+        o.append(L(x - 20, y_top, x - 20, y_top + 7, w=3, c=INK))
+        o.append(L(x - 20, y_top + 7, x - 26, y_top + 7, w=3, c=INK))
+        o.append(L(x + 20, y_top, x + 20, y_top - 7, w=3, c=INK))
+        o.append(L(x + 20, y_top - 7, x + 26, y_top - 7, w=3, c=INK))
+    return ''.join(o)
+
+
+def CAP_V(x, y, gap=14, w=46):
+    """Vertical capacitor: plates centred on x, top plate at y."""
+    return (L(x - w / 2, y, x + w / 2, y, w=4, c=INK) +
+            L(x - w / 2, y + gap, x + w / 2, y + gap, w=4, c=INK))
+
+
+def GLASS_DIODE(x, y, label, band_note):
+    """Physical BAT85 / 1N5817: body with the cathode BAND on the right."""
+    o = [L(x - 110, y, x - 50, y), L(x + 50, y, x + 110, y),
+         RECT(x - 50, y - 18, 100, 36, rx=10, fill='#e8d7b0', stroke=INK, sw=2.5),
+         RECT(x + 26, y - 18, 16, 36, rx=2, fill='#1b2420', stroke=INK, sw=1),
+         T(x - 118, y + 6, 'A', 'pin', anchor='end'),
+         T(x + 118, y + 6, 'K', 'pin'),
+         T(x, y - 30, label, 'xs', anchor='middle'),
+         T(x, y + 44, band_note, 'xs', anchor='middle', fill='#666')]
+    return ''.join(o)
+
+
+def sheet_vbatt():
+    head, y0 = HEADER(
+        'Car voltage sensor \u2014 12\u201316 V in, 1.2\u20131.6 V on Teensy pin 40 (A16)',
+        'Two resistors divide the car voltage by exactly 10. Same divider, same pin, same firmware as the Rev F board.',
+        ['NEVER connect 12 V (or any wire from the car) straight to a Teensy pin \u2014 it dies above 3.6 V. Always through R1 180 k\u03a9.',
+         'The 1:10 ratio is a firmware constant (VIN_DIVIDER_RATIO = 10.0). Use exactly 180 k\u03a9 over 20 k\u03a9, 1 % metal film. Needs firmware v0.1.172 or newer.'])
+    o = [head]
+
+    # ======================= 1. THE CIRCUIT =======================
+    y = y0
+    o.append(T(48, y, '1. Solder exactly this \u2014 four parts and two small diodes', 'h'))
+    ym = y + 210                  # main signal line
+    yg = ym + 300                 # ground rail
+    ax, bx = 640, 930             # divider midpoint A, ADC node B
+
+    # J8 terminals
+    o.append(TERM(70, ym - 32, 200, 64, 'J8  V+', 'fused car +12 V'))
+    o.append(TERM(70, yg - 32, 200, 64, 'J8  GND', 'car ground'))
+    o.append(T(170, ym - 70, 'same fused feed as the', 'xs', anchor='middle', fill='#666'))
+    o.append(T(170, ym - 50, '5 V buck input (after the fuse)', 'xs', anchor='middle', fill='#666'))
+
+    # V+ -> R1 -> A -> R3 -> B -> pin 40
+    o.append(L(270, ym, 340, ym))
+    o.append(ZIG(340, ym, 170))
+    o.append(T(425, ym - 30, 'R1  180 k\u03a9  1 %', 's', anchor='middle'))
+    o.append(T(425, ym - 78, 'sets the ratio AND limits fault', 'xs', anchor='middle', fill='#666'))
+    o.append(T(425, ym - 58, 'current (100 V \u2192 0.5 mA)', 'xs', anchor='middle', fill='#666'))
+    o.append(L(510, ym, 760, ym))
+    o.append(DOT(ax, ym, r=9))
+    o.append(T(ax - 14, ym - 16, 'A', 'pin', anchor='end'))
+    o.append(ZIG(760, ym, 110))
+    o.append(T(815, ym - 30, 'R3  1 k\u03a9', 's', anchor='middle'))
+    o.append(L(870, ym, 1150, ym))
+    o.append(DOT(bx, ym, r=8))
+    o.append(T(bx + 14, ym - 16, 'B', 'pin'))
+    o.append(RECT(1150, ym - 30, 300, 60, cls='chip'))
+    o.append(T(1300, ym - 4, 'Teensy 4.1  pin 40', 's', anchor='middle'))
+    o.append(T(1300, ym + 18, 'A16  (ADC1)', 'xs', anchor='middle', fill='#666'))
+
+    # D1: A -> 3.3 V (anode at A, band up)
+    o.append(L(ax, ym, ax, ym - 60))
+    o.append(DIODE_UP(ax, ym - 60, ym - 104))
+    o.append(L(ax, ym - 104, ax, ym - 150))
+    o.append(DOT(ax, ym - 150, r=7))
+    o.append(T(ax + 16, ym - 144, '3.3 V  (Teensy 3.3V pin / rail)', 'v'))
+    o.append(T(ax + 40, ym - 92, 'D1  BAT85 Schottky', 'xs'))
+    o.append(T(ax + 40, ym - 72, 'band (K) UP toward 3.3 V', 'xs', fill='#a33'))
+
+    # R2: A -> GND
+    o.append(L(ax, ym, ax, ym + 100))
+    o.append(ZIG(ax, ym + 100, 120, vertical=True))
+    o.append(T(ax + 26, ym + 150, 'R2  20 k\u03a9  1 %', 's'))
+    o.append(T(ax + 26, ym + 172, 'bottom of the divider', 'xs', fill='#666'))
+    o.append(L(ax, ym + 220, ax, yg))
+    o.append(DOT(ax, yg))
+
+    # D2: GND -> A (anode at GND, band up toward A), wired into the top of R2's lead
+    dx2 = 520
+    o.append(L(ax, ym + 60, dx2, ym + 60))
+    o.append(DOT(ax, ym + 60))
+    o.append(L(dx2, ym + 60, dx2, ym + 150))
+    o.append(DIODE_UP(dx2, ym + 194, ym + 150))
+    o.append(L(dx2, ym + 194, dx2, yg))
+    o.append(DOT(dx2, yg))
+    o.append(T(dx2 - 30, ym + 168, 'D2  BAT85 Schottky', 'xs', anchor='end'))
+    o.append(T(dx2 - 30, ym + 188, 'band (K) UP toward A', 'xs', anchor='end', fill='#a33'))
+    o.append(T(dx2 - 30, ym + 208, 'catches reverse / negative spikes', 'xs', anchor='end', fill='#666'))
+
+    # C1: B -> GND
+    o.append(L(bx, ym, bx, ym + 150))
+    o.append(CAP_V(bx, ym + 150))
+    o.append(L(bx, ym + 164, bx, yg))
+    o.append(DOT(bx, yg))
+    o.append(T(bx + 36, ym + 152, 'C1  100 nF ceramic', 's'))
+    o.append(T(bx + 36, ym + 174, 'at pin 40: filters noise,', 'xs', fill='#666'))
+    o.append(T(bx + 36, ym + 194, 'feeds the ADC sample', 'xs', fill='#666'))
+
+    # ground rail
+    o.append(L(270, yg, 340, yg, c='#0a6', w=8))
+    o.append(RAIL(270, 1450, yg))
+    o.append(T(290, yg + 36, 'GND rail \u2014 the star point, shared with J1 GND and the Teensy GND pins', 's'))
+
+    # measured values beside the Teensy box
+    tx = 1300
+    o.append(RECT(tx - 20, ym + 70, 320, 200, rx=8, fill='#ffffff', stroke=INK, sw=2))
+    o.append(T(tx, ym + 100, 'J8 V+      pin 40', 'v'))
+    o.append(L(tx - 6, ym + 110, tx + 286, ym + 110, w=1.5, c='#999'))
+    for i, (vin, vpin) in enumerate((('12.0 V', '1.20 V'), ('13.8 V', '1.38 V'),
+                                     ('14.4 V', '1.44 V'), ('16.0 V', '1.60 V'),
+                                     ('33.0 V', '3.30 V  (ADC max)'))):
+        o.append(T(tx, ym + 136 + i * 26, f'{vin:<10} {vpin}', 'v',
+                   fill='#a33' if i == 4 else None))
+
+    # ======================= 2. DIODE ORIENTATION =======================
+    y = yg + 90
+    o.append(T(48, y, '2. Which way round the diodes go \u2014 the BAND is the cathode (K)', 'h'))
+    o.append(GLASS_DIODE(330, y + 90, 'D1:  A = midpoint A   \u00b7   K (band) = 3.3 V rail',
+                         'conducts only if A rises above about 3.6 V'))
+    o.append(GLASS_DIODE(1000, y + 90, 'D2:  A = GND rail   \u00b7   K (band) = midpoint A',
+                         'conducts only if A goes below about \u22120.3 V'))
+    o.append(T(1370, y + 76, 'BAT85, BAT43, 1N5817,', 'xs'))
+    o.append(T(1370, y + 98, '1N5819 \u2014 any small', 'xs'))
+    o.append(T(1370, y + 120, 'Schottky is fine.', 'xs'))
+
+    # ======================= 3. BENCH CHECK =======================
+    y = y + 170
+    o.append(RECT(48, y, 1604, 150, rx=8, fill='#fffbe8', stroke='#c9a227', sw=2))
+    o.append(T(70, y + 32, '3. Bench check \u2014 BEFORE the car or the dash setting', 'h'))
+    o.append(T(70, y + 64, '1)  Power OFF, ohmmeter: J8 V+ to J8 GND \u2248 200 k\u03a9.   A to pin 40 = 1 k\u03a9.   J8 V+ must NOT read 0 \u03a9 to 3.3 V or 5 V.', 'v'))
+    o.append(T(70, y + 92, '2)  Teensy powered, bench supply 12.00 V on J8:  pin 40 must read 1.200 V  (\u00b10.03 V with 1 % parts).', 'v'))
+    o.append(T(70, y + 120, '3)  Bench supply off / J8 open:  pin 40 reads 0 V.    Anything near 3.3 V = R2 missing or R1/R2 swapped \u2014 STOP.', 'v'))
+
+    # ======================= 4. SOLDER ORDER =======================
+    y = y + 170
+    o.append(RECT(48, y, 1604, 300, rx=8, fill='#ffffff', stroke=INK, sw=2))
+    o.append(T(66, y + 32, '4. Solder order \u2014 divider first, protection second, Teensy wire last', 'h'))
+    for i, ln in enumerate((
+            '1.  J8 V+  \u2192  R1 180 k\u03a9  \u2192  a free row = midpoint A.',
+            '2.  R2 20 k\u03a9 from A  \u2192  GND rail.           (now meter step 1 above)',
+            '3.  D1: anode on A, BAND to the 3.3 V rail.     D2: anode on the GND rail, BAND on A.',
+            '4.  R3 1 k\u03a9 from A  \u2192  node B.     C1 100 nF from B  \u2192  GND rail, as close to pin 40 as you can.',
+            '5.  J8 GND  \u2192  GND rail.     Bench check step 2 with a 12 V supply on J8.',
+            '6.  LAST: node B  \u2192  Teensy pin 40 (A16).     Pin 40 is on the long edge, between 39 and 41.',
+            '7.  Dash: Settings \u2192 Sensor monitoring \u2192 tap VOLT \u2192 Source = DIRECT \u2192 BACK \u2192 DONE.',
+            '     The Teensy only reads / logs pin 40 after that (CFG,vdir,1). Leave it off until the divider exists.')):
+        o.append(T(66, y + 66 + i * 29, ln, 'v'))
+
+    # ======================= 5. NOTES + PARTS =======================
+    y = y + 320
+    o.append(PANEL(48, y, 792, 236, 'Why not \u201c1\u20133 V\u201d, and why not a Zener', [
+        ('xs', '1:10 reads up to 33 V before the ADC saturates, so a charging spike or a'),
+        ('xs', 'jump start never reaches the pin \u2014 and 8 mV per step is plenty of resolution.'),
+        ('xs', 'A 3.3 V Zener as the clamp LEAKS long before its knee (up to 100 \u00b5A at 1 V):'),
+        ('xs', 'on this 18 k\u03a9 source that drags the reading several percent low.'),
+        ('xs', 'Schottky-to-rail does not. Rev F uses an LM4040-3.0 shunt for the same reason.'),
+        ('xs', 'Divider draws ~70 \u00b5A \u2014 fine even on an always-on feed.'),
+    ]))
+    o.append(PANEL(864, y, 788, 236, 'Parts \u2014 everything for this sensor', [
+        ('v', 'R1  180 k\u03a9  1 % metal film  \u00bc W'),
+        ('v', 'R2   20 k\u03a9  1 % metal film  \u00bc W'),
+        ('v', 'R3    1 k\u03a9  \u00bc W      C1  100 nF ceramic'),
+        ('v', 'D1, D2  BAT85 / BAT43 / 1N5817 Schottky'),
+        ('v', 'J8  2-position 5.08 mm screw terminal'),
+        ('xs', '0.1 % resistors tighten the \u00b10.3 V (at 14 V) worst case to \u00b10.03 V.'),
+    ]))
+    return doc(y + 276, *o)
+
+
 SHEETS = [
     ('00-Teensy-pin-map', sheet_pinmap),
     ('01-Power-and-ground', sheet_power),
     ('02-UART-screen-and-video', sheet_uart),
     ('03-GPS-and-IMU', sheet_gps_imu),
     ('04-Analogue-inputs', sheet_analog),
+    ('05-Car-voltage-sensor', sheet_vbatt),
 ]
 
 

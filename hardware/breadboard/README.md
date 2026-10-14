@@ -21,6 +21,7 @@ and the USB stick do **not** plug into this board.
 | Oil 10 kΩ / 20 kΩ divider | ELP cameras + USB stick (on the Pi) |
 | Coolant 150 Ω pull-up | AEM 30-0300 **gauge** (powered from the car, not us) |
 | AEM 20 kΩ / 20 kΩ + 1 kΩ / 100 nF | 12 V → 5 V buck (feeds J1, not raw 12 V) |
+| Car-voltage 180 kΩ / 20 kΩ + 1 kΩ / 100 nF + 2× Schottky | |
 | Optional: GPS + IMU modules | |
 
 ## Screw terminals — LEFT edge, top to bottom
@@ -36,6 +37,7 @@ Same idea as Rev C: one edge, labelled, nothing on the other three sides.
 | **J5 OIL** | `5V` · `SIG` · `GND` | 5 V 0.5–4.5 V transducer (150 PSI typical). |
 | **J6 NTC** | `SIG` · `GND` | Two-wire coolant sender. Dedicated GND — do not rely on the engine block. |
 | **J7 AEM** | `WHT` · `BRN` | AEM 30-0300 Power/IO **pin 9 WHITE** and **pin 10 BROWN**. Gauge keeps its own 12 V / 5 A fuse. We take analogue only. |
+| **J8 VBATT** | `V+` · `GND` | Fused car +12 V (same feed as the buck input) → 1:10 divider → pin 40 (A16). Measures only; carries ~70 µA. |
 
 ## Circuits you solder (values are firmware contracts)
 
@@ -92,6 +94,21 @@ J7 WHT ── 20 kΩ 0.1% ──●── 20 kΩ 0.1% ── J7 BRN ── board
 Settings → **AEM 30-0300 AFR input** stays OFF until this is soldered and
 metered: 5.00 V on WHT-BRN must read ~2.50 V on pin 20.
 
+### Car voltage — 180 kΩ / 20 kΩ = 1:10 (J8 → pin 40 / A16, firmware v0.1.172+)
+
+12–16 V in → 1.2–1.6 V at the pin; full scale 33 V. Same divider/pin as the Rev F board.
+
+```
+J8 V+ ── 180 kΩ ──●── 1 kΩ ── Teensy pin 40 (A16) ── 100 nF ── GND
+                  ├── 20 kΩ ── GND
+                  ├──|>|── 3.3 V   (Schottky, anode at ●)
+             GND ──|>|──┘          (Schottky, anode at GND)
+```
+
+Meter 1.200 V on pin 40 with 12.00 V on J8, then Settings → Sensor monitoring → VOLT →
+Source = **DIRECT**. Full notes (why not a Zener, tolerances, tap point):
+[PINOUT.md §6b](PINOUT.md).
+
 ## UART (two different links — do not mix)
 
 | Link | Teensy | Other end | Baud | Levels |
@@ -132,7 +149,7 @@ errors. Full analysis and the un-foolable acceptance tests:
 | ---:| --- | --- |
 | 1 | Solderable protoboard ≥ 100 × 150 mm (plated holes, 2.54 mm) | Everything lives here |
 | 1 | Teensy 4.1 + 2× 24-pin headers (socket if you want it removable) | |
-| 7 | Screw-terminal blocks, 5.08 mm, mix of 2- and 3-position (J2 is 4-pos) | Left-edge harness |
+| 8 | Screw-terminal blocks, 5.08 mm, mix of 2- and 3-position (J2 is 4-pos) | Left-edge harness (J8 VBATT added) |
 | 1 | PC817 (or 4N35) DIP-4 | Tach |
 | 1 | 1 kΩ ¼ W (tach LED) | |
 | 1 | 4.7 kΩ ¼ W (tach pull-up) | 10 kΩ is also fine |
@@ -144,17 +161,21 @@ errors. Full analysis and the un-foolable acceptance tests:
 | 2 | 1 kΩ (video UART series) | |
 | 3 | 100 nF ceramic | AEM filter + decoupling |
 | 1 | 10 nF ceramic | Oil (optional) |
+| 1 + 1 | 180 kΩ 1 % + 20 kΩ 1 % metal film | Car-voltage divider (ratio is a firmware constant) |
+| 1 + 1 | 1 kΩ + 100 nF | Car-voltage filter at pin 40 |
+| 2 | BAT85 / BAT43 / 1N5817 Schottky | Car-voltage clamps (NOT a 3.3 V Zener) |
 | 1 | 5 V ≥ 3 A buck, 12 V in, screw terminals out | Feeds J1. Not the Pi 5 supply. |
 
 ## Solder order
 
 1. Headers / socket for the Teensy. Confirm pin 0 is the corner next to GND/USB.
-2. Seven terminal blocks on the **left** edge. Label them **before** wires go in.
+2. Eight terminal blocks (J1–J8) on the **left** edge. Label them **before** wires go in.
 3. Star GND: one fat jumper from J1 GND to a ground rail, then every circuit GND to that rail. Do not daisy-chain sensor grounds through each other.
 4. Tach PC817 + 1 kΩ + 4.7 kΩ. Bench: pulse J4 SIG with 12 V through the 1 kΩ, pin 9 should toggle.
 5. Oil divider. Meter A2 < 3.3 V with the sender at 5 V full-scale.
 6. Coolant 150 Ω.
 7. AEM divider. Meter pin 20 with a 5 V bench supply on J7 **before** enabling `afraem`.
+7b. Car-voltage divider (J8). Meter 1.200 V on pin 40 with 12.00 V on J8 **before** setting VOLT Source = DIRECT.
 8. J2 four wires to CrowPanel J10. Disconnect them whenever you USB-flash the screen.
 9. J3 three wires + 1 kΩ series to the Pi 5. Power the Pi from its own 5 V 5 A USB-C.
 

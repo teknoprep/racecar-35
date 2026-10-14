@@ -122,7 +122,8 @@ uint32_t micros() { return 10000000; }
 uint32_t session_start_ms = 5000, session_start_unix = 1788966000;
 uint32_t session_last_flush_ms = 10000, session_samples = 0, dbg_sdwr_max_us = 0;
 bool session_file_open = true;
-struct { bool aem_afr = true; } g_cfg;
+struct { bool aem_afr = true; bool vin_direct = true; } g_cfg;
+int16_t vin_x10 = 138;   // v0.1.172 direct car voltage (A16 divider)
 aemafr::Reading aem_reading;
 // Full CAN / BLE stub: the sample writer now logs every live channel
 // (map/iat/batt/afr_can/oil_can_psi), not just the dash's display set.
@@ -173,6 +174,8 @@ int main() {
         self.assertEqual(rows[0]['batt_v'], 13.9)
         self.assertEqual(rows[0]['afr_can'], 14.7)
         self.assertEqual(rows[0]['oil_can_psi'], 42.1)
+        # v0.1.172: the logger's own A16 car-voltage divider is its own key, never batt_v.
+        self.assertEqual(rows[0]['vin_v'], 13.8)
         # afr_can/oil_can_psi are SEPARATE keys from the AEM afr/lambda and the
         # direct-transducer oil_psi: provenance must never be ambiguous, so both
         # oil channels ride the same line with their own key.

@@ -48,7 +48,14 @@ struct ScanItem { char name[24]; char addr[18]; uint8_t atype; int8_t rssi; };
 
 // ---- shared state (task writes, UI reads; scalars = lock-free enough) -------
 static volatile State    g_state   = OFF;
-static bool              g_inited  = false;   // NimBLE + task started
+static volatile bool     g_inited  = false;   // NimBLE + task started (cleared by the task when it exits)
+// v0.1.172: TRUE only while the GATT link is up and subscribed. Set by the obd task,
+// cleared by the disconnect callback (NimBLE host task) and by stop/shutdown. The UI's
+// connected() reads THIS instead of dereferencing g_client from core 1 (the task may be
+// deleting the client / deinit-ing NimBLE at that very moment).
+static volatile bool     g_link_up = false;
+static volatile uint32_t g_conn_attempts = 0;  // connect attempts since boot (Tools BT test readout)
+static volatile uint32_t g_conn_ok       = 0;  // successful ELM inits since boot
 static bool              g_blocked = false;   // app sets this if a prior BLE init crashed the board
 static TaskHandle_t      g_task    = nullptr;
 
@@ -130,6 +137,18 @@ static int pidByte(const char* resp, const char* tag, int nthByte) {
   return (hi << 4) | lo;
 }
 
+// Any reason to abandon a blocking wait RIGHT NOW: a radio handover (shutdown), a stop, or
+// the link dropping under us. Every ELM wait polls this, so a handover that lands in the
+// middle of the ~17 s connect + ELM init no longer leaves the task deaf to it (v0.1.172 -
+// the arbiter's 12 s failsafe used to turn WiFi back on with BLE still alive).
+static inline bool abortReq() { return g_req_shutdown || g_req_stop; }
+
+// Abortable delay for the task's retry waits.
+static void waitMs(uint32_t ms) {
+  const uint32_t t0 = millis();
+  while (millis() - t0 < ms && !abortReq()) vTaskDelay(pdMS_TO_TICKS(50));
+}
+
 static void notifyCB(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
   portENTER_CRITICAL(&g_mux);
   for (size_t i = 0; i < len; i++) {
@@ -143,15 +162,24 @@ static void notifyCB(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, boo
 
 // send one ELM command, wait (blocking on THIS task only) for the '>' prompt.
 static bool elmCmd(const char* cmd, uint32_t timeout_ms) {
-  if (!g_tx) return false;
+  // Local copy: g_tx is only ever written by THIS task now (the disconnect callback used to
+  // null it from the NimBLE host task between our check and our use - a null-deref panic,
+  // which the BLE crash forensics then turned into "BT blocked this boot").
+  NimBLERemoteCharacteristic* tx = g_tx;
+  if (!tx || !g_link_up || abortReq()) return false;
   portENTER_CRITICAL(&g_mux); g_rx_len = 0; g_prompt = false; g_rx_buf[0] = 0; portEXIT_CRITICAL(&g_mux);
   char b[24];
   int n = snprintf(b, sizeof(b), "%s\r", cmd);
   // Use the write mode the characteristic supports: a write-WITH-response-only
   // char silently ignores ATT Write Commands (review fix).
-  g_tx->writeValue((uint8_t*)b, n, !g_tx->canWriteNoResponse());
+  // (Result not checked - unchanged from the field-proven behaviour; a lost write simply
+  // times out below.)
+  tx->writeValue((uint8_t*)b, n, !tx->canWriteNoResponse());
   uint32_t t0 = millis();
-  while (!g_prompt && (millis() - t0) < timeout_ms) vTaskDelay(pdMS_TO_TICKS(10));
+  while (!g_prompt && (millis() - t0) < timeout_ms) {
+    if (!g_link_up || abortReq()) return false;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
   return g_prompt;
 }
 // snapshot the accumulated response into a C string for parsing
@@ -165,9 +193,11 @@ static void snapResp(char* out, size_t outsz) {
 // ---- client callbacks (NimBLE 1.4.x: onDisconnect has no reason arg) --------
 class ClientCB : public NimBLEClientCallbacks {
   void onDisconnect(NimBLEClient*) override {
-    g_tx = g_rx = nullptr;
+    // Runs on the NimBLE HOST task. Only flag it - never touch g_tx/g_rx here (the obd task
+    // may be mid-write through them); the task re-discovers them on the next connect.
+    g_link_up = false;
     // only auto-reconnect if the user still wants BT (not a deliberate stop)
-    if (g_state != OFF && !g_req_stop) g_state = RECONNECT;
+    if (g_state != OFF && !g_req_stop && !g_req_shutdown) g_state = RECONNECT;
   }
 };
 static ClientCB g_clientCB;
@@ -233,8 +263,10 @@ static bool connFail() {   // shared failure path for connectAndInit
 }
 
 static bool connectAndInit() {
-  if (!g_target_addr[0]) return false;
+  if (!g_target_addr[0] || abortReq()) return false;
   g_state = CONNECTING;
+  g_link_up = false;
+  g_conn_attempts++;
   blePhase(3);
   if (!g_client) {
     g_client = NimBLEDevice::createClient();
@@ -245,7 +277,14 @@ static bool connectAndInit() {
     g_client->setConnectTimeout(5);
   }
   NimBLEAddress addr(std::string(g_target_addr), g_target_atype);
+  // Already linked to a DIFFERENT dongle (a new one was just picked from the scan list):
+  // drop it first, else the old device was silently re-discovered and kept.
+  if (g_client->isConnected() && g_client->getPeerAddress() != addr) {
+    g_client->disconnect();
+    waitMs(300);
+  }
   if (!g_client->isConnected() && !g_client->connect(addr)) return connFail();
+  if (abortReq()) { blePhase(0); return false; }   // handover landed during connect()
 
   g_state = DISCOVER;
   g_tx = g_rx = nullptr;
@@ -276,7 +315,10 @@ static bool connectAndInit() {
   if (!g_tx || !g_rx) { g_client->disconnect(); return connFail(); }
   // Subscribe with the mode the characteristic actually supports — subscribing
   // for notifications (CCCD=1) on an indicate-only char silently gets nothing.
+  // (Result deliberately not fatal: some clones NAK the CCCD write yet notify anyway.)
   g_rx->subscribe(g_rx->canNotify(), notifyCB);
+  g_link_up = g_client->isConnected();
+  if (!g_link_up) return connFail();
 
   // NAME FALLBACK: if the scan never yielded a name, read the GAP Device Name
   // characteristic (0x1800/0x2A00) — mandatory on every BLE device, so we get
@@ -313,8 +355,12 @@ static bool connectAndInit() {
     strncpy(g_last_resp, r, sizeof(g_last_resp) - 1);
     g_last_resp[sizeof(g_last_resp) - 1] = 0;
   }
+  if (abortReq()) { blePhase(0); return false; }   // handover landed during the ELM init
+  if (!g_link_up) return connFail();                // link dropped during the ELM init
   d_last_ms = millis();
   g_conn_fails = 0;   // clean link — reset the client-recycle counter
+  g_last_err[0] = 0;  // a stale "low heap" / "wedged" message must not outlive a good link
+  g_conn_ok++;
   g_state = POLL;
   blePhase(4);   // connected — stays set while linked (power-off reads POWERON = ignored)
   return true;
@@ -458,8 +504,16 @@ static void obdTask(void*) {
     snprintf(g_last_err, sizeof(g_last_err), "BT skipped: low heap (%uKB free)",
              (unsigned)(free_int / 1024));
     blePhase(0);
-    g_state = FAILED;
-    for (;;) vTaskDelay(pdMS_TO_TICKS(1000));   // parked — no BLE this boot
+    // v0.1.172: EXIT instead of parking forever. The parked task kept g_inited set, so it
+    // never processed a shutdown and every later begin() was a no-op - one low-heap moment
+    // killed Bluetooth until the next reboot. The controller was never enabled, so simply
+    // ending the task is safe; the dash's radio arbiter retries begin() a few seconds later.
+    g_req_connect = g_req_scan = g_req_pidscan = g_req_stop = g_req_shutdown = false;
+    g_pidscan = false;
+    g_state  = FAILED;
+    g_task   = nullptr;
+    g_inited = false;
+    vTaskDelete(nullptr);
   }
   // Heavy BLE stack init on the task's own stack (never the UI stack).
   NimBLEDevice::init("racedash");
@@ -471,6 +525,7 @@ static void obdTask(void*) {
   NimBLEDevice::setPower(ESP_PWR_LVL_N0, ESP_BLE_PWR_TYPE_ADV);
   NimBLEDevice::setPower(ESP_PWR_LVL_N0, ESP_BLE_PWR_TYPE_SCAN);
   blePhase(0);   // init survived -> phase back to inactive
+  g_last_err[0] = 0;   // a previous attempt's "low heap" / "spawn failed" no longer applies
   g_state = IDLE;
   for (;;) {
     if (g_req_shutdown) {
@@ -480,20 +535,29 @@ static void obdTask(void*) {
       // WiFi up, and a ppTask/pm_set_sleep_type panic from the WiFi side).
       // WiFi may only start after the BT controller is fully DEINITED — a mere
       // disconnect leaves the controller running and coex still asserts.
-      g_req_shutdown = false;
+      // State OFF + link down BEFORE the teardown, so nothing on the UI core can read
+      // this as "connected" while the client is being freed under it.
+      g_state   = OFF;
+      g_link_up = false;
       if (g_client && g_client->isConnected()) { g_client->disconnect(); vTaskDelay(pdMS_TO_TICKS(300)); }
       NimBLEDevice::deinit(true);   // stops host+controller, frees clients
       g_client = nullptr; g_tx = g_rx = nullptr;
       d_coolant_f_x10 = d_iat_f_x10 = d_volt_x10 = -1;
+      d_tps_x10 = -1; d_spark_x10 = -1000;
       g_scan_n = 0; g_scanning = false;
+      // Requests made for THIS task die with it; the arbiter re-issues what it still wants.
+      g_req_connect = g_req_scan = g_req_pidscan = g_req_stop = false;
+      g_pidscan = false;
+      g_conn_fails = 0;
       blePhase(0);
-      g_state  = OFF;
       g_task   = nullptr;
+      g_req_shutdown = false;   // cleared LAST: isDown() flips true right after this
       g_inited = false;   // begin() may re-create us later (radio handed back)
       vTaskDelete(nullptr);   // task ends here
     }
     if (g_req_stop) {
       g_req_stop = false;
+      g_link_up = false;
       if (g_client && g_client->isConnected()) g_client->disconnect();
       g_tx = g_rx = nullptr;
       d_coolant_f_x10 = d_iat_f_x10 = d_volt_x10 = -1;
@@ -528,12 +592,12 @@ static void obdTask(void*) {
         break;
       case RECONNECT:
         d_coolant_f_x10 = d_iat_f_x10 = d_volt_x10 = -1;
-        vTaskDelay(pdMS_TO_TICKS(1500));   // was 2.5 s — snappier retry
-        connectAndInit();
+        waitMs(1500);   // was 2.5 s — snappier retry; abortable (handover)
+        if (!abortReq()) connectAndInit();
         break;
       case FAILED:
-        vTaskDelay(pdMS_TO_TICKS(1500));   // was 3 s (+2.5 s) between attempts
-        if (g_state == FAILED) g_state = RECONNECT;
+        waitMs(1500);   // was 3 s (+2.5 s) between attempts; abortable (handover)
+        if (g_state == FAILED && !abortReq()) g_state = RECONNECT;
         break;
       default:        vTaskDelay(pdMS_TO_TICKS(50)); break;   // SCANNING/CONNECTING/etc handled above
     }
@@ -543,6 +607,10 @@ static void obdTask(void*) {
 // ---- public API (called from the UI / setup / loop, core 1) ----------------
 static void begin() {
   if (g_inited || g_blocked) return;
+  // No task exists here, so a shutdown/stop flag still set can only be a stale leftover from
+  // the previous task's exit (a request that raced it) - it must not kill the new task.
+  g_req_shutdown = false;
+  g_req_stop     = false;
   g_inited = true;
   g_state  = IDLE;
   blePhase(1);   // covers init; the task moves the phase along (see blePhase)
@@ -552,7 +620,16 @@ static void begin() {
   // it runs on the task's own stack, on core 0 (the BT/WiFi core), so it never
   // touches the UI loop. 16 KB stack: NimBLE init + the BT/coex bring-up is
   // stack-heavy; 8 KB was marginal (a possible crash cause).
-  xTaskCreatePinnedToCore(obdTask, "obd", 16384, nullptr, 1, &g_task, 0);
+  if (xTaskCreatePinnedToCore(obdTask, "obd", 16384, nullptr, 1, &g_task, 0) != pdPASS) {
+    // No room for the 16 KB stack: report it and stay DOWN (g_inited false), so the arbiter
+    // can retry later - a set g_inited with no task behind it was a dead BT until reboot.
+    snprintf(g_last_err, sizeof(g_last_err), "BT task spawn failed (%uKB free)",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    g_task   = nullptr;
+    g_state  = FAILED;
+    blePhase(0);
+    g_inited = false;
+  }
 }
 
 static void setBlocked(bool b) { g_blocked = b; }
@@ -578,7 +655,12 @@ static void requestShutdown() { if (g_inited) g_req_shutdown = true; }
 static bool isDown()          { return !g_inited; }
 
 static State    state()        { return g_state; }
-static bool     connected()    { return g_state == POLL && (g_client && g_client->isConnected()); }
+static bool     connected()    { return g_state == POLL && g_link_up; }   // never touches g_client (core-1 safe)
+static bool     connectPending(){ return g_req_connect; }
+static bool     scanPending()  { return g_req_scan; }
+static uint32_t connAttempts() { return g_conn_attempts; }
+static uint32_t connOk()       { return g_conn_ok; }
+static uint32_t lastDataMs()   { return d_last_ms; }
 static bool     dataFresh()    { return d_last_ms != 0 && (millis() - d_last_ms) < 5000; }
 static int16_t  coolantF_x10() { return d_coolant_f_x10; }
 static int16_t  iatF_x10()     { return d_iat_f_x10; }
