@@ -89,6 +89,16 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   `pcbway/JLCPCB-REPLY-2026-10-11.md`.
   Re-export with `fabrication/export.py --engineering-prototype`. **No automotive
   transient qualification, and no built, measured or independently reviewed board.**
+  Rev F also ships a **shareable 3D model**: `Racecar-RevF-3D.html` (one self-contained
+  1.4 MB file — orbit, part list, labels; no server/CDN/network) + `Racecar-RevF-3D.glb`
+  (plain glTF 2.0, standard viewers/Blender/case designers) + a still preview PNG. Built by
+  `electrical/export3d.py` then `electrical/make_3d_share.py`, both working on a COPY of the
+  routed CAD (hash-asserted, source never touched); see that README's "Rebuilding the 3D
+  outputs" for what is real and what is a generated box. Landmines learned here: KiCad's GLB/STEP
+  exporters **ignore VRML entirely** (`kicad-cli` only loads STEP, so `kicad-packages3d` must be
+  installed — `sudo apt-get install kicad-packages3d`, 4.6 GB), and KiCad's **3D model space
+  negates Y**, so a `(model … (offset (xyz x y z)))` places a part at board `-y` unless the offset's
+  Y is flipped (proved with a two-box board, not guessed).
 - Revision **E** (DELETED — superseded by Rev F; its only content not carried into Rev F
   was the external CAN-module header `J7`, which Rev F removes):
   first revision with the 5 V rail as our own **TPS54560BDDAR** buck and the car
@@ -300,14 +310,45 @@ python3 ~/.arduino15/packages/esp32/tools/esptool_py/4.5.1/esptool.py --port /de
 **Always disconnect the Teensy↔CrowPanel UART jumpers before flashing the CrowPanel.** UART0 (GPIO 43/44) is shared with the CH340 used for upload — Teensy contention silently corrupts the flash, or you get `The serial TX path seems to be down` from esptool.
 
 **⚠️ Advance UART connectors — only ONE accepts 5 V (a board died learning this, 2026-09-02).**
-Per the Elecrow V1.1 schematic: **J10, the XH2.54 (2.54 mm, larger) UART header = GND / +5V_IN /
-TXD0_H / RXD0_H** — 5 V input via Schottky into the buck; TX/RX sit behind BSS138 level shifters
-pulled to VIN, so it is the 5 V-tolerant, power-capable UART. **J2, the HY2.0 (2.0 mm, small)
-UART header = GND / 3V3_OUT / ESP_TXD0 / ESP_RXD0** — `3V3_OUT` is an OUTPUT tied to the ESP32's
-3.3 V rail through an always-on AO3401 (gate grounded, no reverse blocking); 5 V there = 5 V on
-the ESP32-S3's VDD (abs max 3.6 V) → dead chip. Symptom: CH340 still enumerates (its VCC is USB
-VBUS, not 3V3) but the ROM bootloader is silent (`esptool` "No serial data received") and the
-green PWR LED (fed from 3V3) tells you whether the rail itself survived.
+Pin orders below are taken from the **vendor Eagle schematics themselves** (checked 2026-10-14
+against 5" Advance V1.0/V1.1/V1.2/V1.3 and 7" Advance V1.5 — identical in every revision), because
+the earlier note here had **J2 reversed**; the vendor repos also carry `Eagle_SCH&PCB/` with a PDF
+schematic per revision, which is the place to re-check anything about this board.
+
+| Conn | Type | Pin 1 | Pin 2 | Pin 3 | Pin 4 |
+| --- | --- | --- | --- | --- | --- |
+| `J10` | XH2.54 2.54 mm (large) | `RXD0_H` | `TXD0_H` | **`+5V_IN`** | GND |
+| `J2` | HY2.0/PH2.0 2.0 mm (small) | `ESP_RXD0` | `ESP_TXD0` | **`3V3_OUT`** | GND |
+| `J13` | HY2.0 (small) | `SCL` (IO16) | `SDA` (IO15) | **`3V3_OUT`** | GND |
+
+`J2`/`J12`/`J13` also have two shield tabs (`SS1`/`SS2`) — both are **GND**. Verify with a meter
+before plugging anything in (pin 4 → continuity to GND/USB-C shell).
+
+- **`J10` is the powered link**: 5 V is fed in through a **Schottky (`D2`/`D4`/`D6`) into `VIN`**,
+  so it is an INPUT — it can never source current back out to an accessory. TX/RX sit behind
+  BSS138-class level shifters pulled to VIN, so it is the 5 V-tolerant, power-capable UART
+  (this is the port the Teensy link and the car's 5 V use — breadboard J2 SCREEN).
+- **`J2` is the 3.3 V port**: `3V3_OUT` is an output hung on the ESP32's own 3.3 V rail through an
+  always-on P-FET (`Q8` 5", `Q4` 7", gate grounded, no reverse blocking). **5 V there = 5 V on
+  the ESP32-S3's VDD (abs max 3.6 V) → dead chip.** Symptom: CH340 still enumerates (its VCC is
+  USB VBUS, not 3V3) but the ROM bootloader is silent (`esptool` "No serial data received") and
+  the green PWR LED (fed from 3V3) tells you whether the rail itself survived.
+- **⚠️ That 3.3 V rail is only a 1 A buck** — `U3 = HM3416H` (1 A / 1.5 MHz synchronous
+  step-down), and it feeds the ESP32-S3 module (via ferrite `FB2`), the RGB panel logic, the SD
+  card, the backlight MCU and the audio amp. So **`3V3_OUT` has NO meaningful current budget**:
+  treat ~100–150 mA as the usable limit for an accessory, and heavy/low-impedance loads (LED
+  matrices, motors, incandescent bulbs) are out — see `hardware/shift-light/` for the accessory
+  rail analysis.
+- **`J9` (7-pin header) is the only 5 V OUT on the back**: `1` = IO20 (5", via R49) / `1` =
+  digital (7"), `2` = `IO5_W_CLK`, `3` = `IO4_W_MISO`, `4` = `IO6_W_MOSI`, `5` = `3V3`, `6` = GND,
+  **`7` = `IOT_5V` (5 V, through inductor `L3` from `VIN`)**. That SPI is the bus that also serves
+  the SD card through the `CH486F` selector (`U11`/`U8`, `SEL0`/`SEL1`), so it is NOT free for
+  another device while the card is in use. This header is the socket the vendor's plug-in
+  "wireless module" (ESP32-H2) occupies.
+
+Note: the display's **UART0 is shared with the CH340** (`U1`) — `R8`/`R10` couple the CH340 to
+`TXD0_H`/`RXD0_H` — so anything listening on `J2` pin 1 also hears esptool/CH340 traffic while the
+board is on USB, and the Teensy↔screen jumpers must still be pulled before flashing.
 
 ## ⚠️ PUBLISH VERIFICATION MUST FAIL HARD (learned the hard way, v0.1.138)
 
@@ -2743,6 +2784,13 @@ tools/teensy_check.py                    Reboot a unit and report what the boot 
                                          IMU detected/calibrated/live, GPS link + baud + PVT freshness +
                                          fix/sats, SD card. Exits non-zero on a fault. Reads the port RAW -
                                          a tty with ECHO on echoes the Teensy's own telemetry back at it.
+hardware/teensy-integrated-revf/
+  electrical/export3d.py                 Export the Rev F board as a shareable glTF/GLB (presentation copy of
+                                         the PCB + real KiCad STEP bodies + generated boxes for the Teensy 4.1,
+                                         NEO-M9N and Nano2 fuse; source PCB hash-asserted). ~10 s.
+  electrical/make_3d_share.py            Pack model + three.js + hotspots into ONE offline HTML viewer
+                                         (`Racecar-RevF-3D.html`); meshopt-compresses via npx gltf-transform.
+  Racecar-RevF-3D.html/.glb/.png         the shipped deliverables (see its README), 1.4 MB / 4.7 MB / 0.6 MB
 crowpanel-arduino/RaceDash_v0139_orig/    Pre-touch-rework backup of RaceDash (swap/revert screens easily)
 crowpanel-arduino/PanelTest/PanelTest.ino Bare panel bring-up sketch — display only, NO touch (not a touch baseline)
 crowpanel-baseline/                       Dead PIO experiments — do not touch

@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RACECAR-35 · Rev F integrated logger — 3D</title>
+<meta name="description" content="Interactive 3D model of the RACECAR-35 Rev F four-layer integrated trunk logger PCB.">
+<style>
+  :root{
+    --bg:#0b0f14; --bg2:#111823; --line:#1f2b3a; --ink:#e8eef6; --dim:#8fa3b8;
+    --accent:#57e08a; --accent-d:#123a25; --warn:#ffce6b; --warn-d:#3d2f10;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:
+      radial-gradient(1200px 700px at 78% -10%, #16273a 0%, transparent 60%),
+      radial-gradient(900px 600px at 10% 110%, #14202c 0%, transparent 55%),
+      var(--bg);
+    color:var(--ink);
+    font:15px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
+    overflow:hidden; -webkit-font-smoothing:antialiased;
+  }
+  a{color:var(--accent)}
+  header{
+    position:fixed;inset:14px 14px auto 14px;z-index:20;display:flex;gap:14px;align-items:flex-start;
+    justify-content:space-between;pointer-events:none
+  }
+  .title h1{margin:0;font-size:19px;font-weight:650;letter-spacing:.2px}
+  .title h1 b{color:var(--accent)}
+  .title p{margin:2px 0 0;font-size:12.5px;color:var(--dim)}
+  .title .chips{margin-top:7px;display:flex;flex-wrap:wrap;gap:6px}
+  .chip{
+    font-size:11px;color:var(--dim);border:1px solid var(--line);border-radius:999px;
+    padding:2px 9px;background:#0e1620cc;backdrop-filter:blur(6px)
+  }
+  .chip.warn{color:var(--warn);border-color:#5a4715;background:var(--warn-d)}
+  .btns{display:flex;gap:8px;pointer-events:auto;flex-wrap:wrap;justify-content:flex-end}
+  button.tool{
+    border:1px solid var(--line);background:#0e1620d9;color:var(--ink);border-radius:9px;
+    padding:7px 11px;font:inherit;font-size:12.5px;cursor:pointer;backdrop-filter:blur(6px)
+  }
+  button.tool:hover{border-color:#33475f;background:#152131}
+  button.tool.on{border-color:#2c6d48;background:var(--accent-d);color:#b8ffd5}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+  /* ---------- parts panel ---------- */
+  #panel{
+    position:fixed;left:14px;top:118px;bottom:60px;width:268px;z-index:15;
+    background:#0c141ddd;border:1px solid var(--line);border-radius:14px;backdrop-filter:blur(8px);
+    display:flex;flex-direction:column;overflow:hidden;transition:transform .25s ease,opacity .25s ease
+  }
+  #panel.closed{transform:translateX(-300px);opacity:0}
+  #panel .head{padding:10px 13px 8px;border-bottom:1px solid var(--line);font-size:11.5px;
+    letter-spacing:.9px;text-transform:uppercase;color:var(--dim)}
+  #parts{overflow:auto;padding:6px;scrollbar-width:thin}
+  .part{
+    display:block;width:100%;text-align:left;border:1px solid transparent;background:none;color:var(--ink);
+    font:inherit;font-size:13px;padding:7px 9px;border-radius:9px;cursor:pointer
+  }
+  .part em{display:block;font-style:normal;font-size:11.5px;color:var(--dim);margin-top:1px}
+  .part.key span::before{content:"■ ";color:var(--accent);font-size:10px;vertical-align:1px}
+  .part:hover{background:#16222f;border-color:#22323f}
+  .part.on{background:var(--accent-d);border-color:#2c6d48}
+  #panel .foot{padding:9px 13px;border-top:1px solid var(--line);font-size:11.5px;color:var(--dim)}
+  /* ---------- 3D tags ---------- */
+  #tags{position:fixed;inset:0;pointer-events:none;z-index:12}
+  .tag{
+    position:absolute;left:0;top:0;white-space:nowrap;font-size:11.5px;padding:2px 7px 2px 5px;
+    border-radius:999px;background:#0b111ad9;border:1px solid var(--line);color:var(--ink);
+    transform:translate(-50%,-50%);pointer-events:auto;cursor:pointer;display:none;
+    box-shadow:0 6px 18px #0006
+  }
+  .tag i{display:inline-block;width:6px;height:6px;border-radius:50%;background:#7f93a8;margin-right:5px;vertical-align:1px}
+  .tag.key i{background:var(--accent)}
+  .tag.key{border-color:#2c6d48}
+  .tag.hl,.tag:hover{background:#16222f;border-color:var(--accent);color:#fff}
+  /* ---------- footer + loading ---------- */
+  footer{
+    position:fixed;left:14px;right:14px;bottom:12px;z-index:20;display:flex;gap:14px;align-items:flex-end;
+    justify-content:space-between;font-size:11.5px;color:var(--dim);pointer-events:none
+  }
+  footer .note{max-width:min(760px,72vw);background:#0c141dcc;border:1px solid var(--line);
+    border-radius:11px;padding:8px 11px;backdrop-filter:blur(6px)}
+  footer .note b{color:var(--warn);font-weight:600}
+  #legend{background:#0c141dcc;border:1px solid var(--line);border-radius:11px;padding:8px 11px;
+    backdrop-filter:blur(6px);text-align:right}
+  #legend .k{color:var(--accent)}
+  #loading{
+    position:fixed;inset:0;display:grid;place-items:center;z-index:30;color:var(--dim);font-size:13px;
+    background:#0b0f14
+  }
+  #loading .bar{width:190px;height:3px;background:#1c2734;border-radius:3px;overflow:hidden;margin-top:10px}
+  #loading .bar i{display:block;height:100%;width:38%;background:var(--accent);animation:sl 1.1s ease-in-out infinite}
+  @keyframes sl{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}
+  @media (max-width:760px){
+    #panel{top:auto;bottom:64px;left:10px;right:10px;width:auto;max-height:38vh}
+    #panel.closed{transform:translateY(140%);opacity:0}
+    .title p{display:none}
+    footer .note{max-width:100%;font-size:11px}
+    #legend{display:none}
+  }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="tags"></div>
+
+<header>
+  <div class="title">
+    <h1>RACECAR-35 <b>· Rev F</b> integrated trunk logger</h1>
+    <p>Interactive 3D view of the four-layer PCB — drag to orbit, scroll or pinch to zoom, click a part to fly to it.</p>
+    <div class="chips">
+      <span class="chip">150 × 155 mm</span>
+      <span class="chip">4 layers · 1 oz outer</span>
+      <span class="chip">193 footprints · 104 nets</span>
+      <span class="chip">Teensy 4.1 · ESP32-S3 · NEO-M9N · TCAN1042</span>
+      <span class="chip warn">unbuilt engineering prototype</span>
+    </div>
+  </div>
+  <div class="btns">
+    <button class="tool on" id="b-spin">auto-rotate</button>
+    <button class="tool on" id="b-labels">labels</button>
+    <button class="tool" id="b-reset">reset view</button>
+    <button class="tool" id="b-panel">parts</button>
+  </div>
+</header>
+
+<aside id="panel">
+  <div class="head">What is on the board</div>
+  <div id="parts"></div>
+  <div class="foot">Drag to orbit · scroll to zoom · click a row to fly there</div>
+</aside>
+
+<footer>
+  <div class="note">
+    <b>Illustrative 3D only.</b> Bodies are KiCad library STEP models plus generated boxes for the socketed
+    Teensy 4.1, the u-blox NEO-M9N, the Nano2 fuse holder and two near-twin substitutions. This is not a
+    mechanical, fit or thermal model, and it is not evidence the board works — Rev F is unbuilt, unmeasured
+    and not independently reviewed.
+  </div>
+  <div id="legend">
+    <div>built from <span class="k">design/racecar-integrated-revf.kicad_pcb</span></div>
+    <div id="stat">one file · no network · drag to orbit</div>
+  </div>
+</footer>
+
+<div id="loading"><div style="text-align:center">building the board…<div class="bar"><i></i></div></div></div>
+
+<script>window.RC3D_DATA = /*__DATA__*/null;</script>
+<script type="module">/*__BUNDLE__*/</script>
+</body>
+</html>

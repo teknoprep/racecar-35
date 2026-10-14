@@ -23,6 +23,41 @@ and `J14` presents `CANH` / `CANL` / `GND` with switchable split termination. Se
   **PTH and NPTH** Excellon drills with maps, schematic PDF, BOM, assembly
   positions CSV, fabrication/assembly/bring-up notes, editable CAD, validation
   reports and a SHA-256 manifest. Verified CRC and per-file hashes.
+- **`Racecar-RevF-3D.html`** — the whole board in 3D as **one self-contained file**
+  (1.4 MB): orbit/zoom, a clickable list of what is fitted, and labels on the parts.
+  No server, no CDN, no network — open it from anywhere, or send it to someone.
+- **`Racecar-RevF-3D.glb`** — the same board as a standard glTF model (4.7 MB),
+  for Blender, Windows 3D Viewer, any online glTF viewer, a fab/shop or a case
+  designer. Plain glTF 2.0, no extensions to install.
+- **`Racecar-RevF-3D-preview.png`** — still image of the viewer, for documents.
+
+### Rebuilding the 3D outputs
+
+```bash
+cd hardware/teensy-integrated-revf
+python3 electrical/export3d.py      # presentation copy + Racecar-RevF-3D.glb (+ raw copper)
+python3 electrical/make_3d_share.py # the single-file viewer (needs node + a local three)
+```
+
+Both scripts work on a **copy**; the routed CAD in `design/` is hashed before and
+after and is never modified by them. Every model substitution, the generated bodies and
+the caveats are recorded in `render/3D-EXPORT-REPORT.json` for audit.
+
+**How the bodies were obtained (and what is not real):**
+
+* KiCad's official 3D library supplies the STEP bodies (`sudo apt-get install
+  kicad-packages3d`). Without it, `kicad-cli` cannot export component bodies at all —
+  **VRML models are ignored** by the GLB/STEP exporters.
+* **No vendor model exists** for a Teensy 4.1, a u-blox NEO-M9N or a Littelfuse Nano2
+  holder, so those are **generated boxes** of the correct size and colour (the Teensy is
+  built from nine of them: two 1×24 sockets, the board, MCU, flash, micro-USB, microSD and
+  the two pin fields).
+* Two library parts are replaced by a **named near-twin** because the exact model is not
+  in the package: the SMA jack → `SMA_Amphenol_132289_EdgeMount`, the SOIC-8-EP buck →
+  `HSOP-8-1EP_3.9x4.9mm_P1.27mm_EP2.41x3.1mm`.
+* Consequently the 3D model is **illustrative**: it is not a mechanical, fit, RF or thermal
+  model, it is not evidence that the board works, and it does not change the fact that
+  Rev F is an unbuilt, unmeasured, not-independently-reviewed prototype.
 
 ## Status at export
 
