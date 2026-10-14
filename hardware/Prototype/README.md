@@ -16,7 +16,8 @@ sheet: schematic on top, warnings, then a tick-list.
 | [02-UART-screen-and-video.png](02-UART-screen-and-video.png) | J2 → CrowPanel J10 (921600) and J3 → Pi 5 (115200, 3.3 V) |
 | [03-GPS-and-IMU.png](03-GPS-and-IMU.png) | NEO-M9N on Serial2, MPU-6050 on Wire, boot banner, IMU mounting |
 | [04-Analogue-inputs.png](04-Analogue-inputs.png) | Oil 10k/20k, coolant 150 Ω, AEM 20k/20k, optional CAN transceiver + SD |
-| [05-Car-voltage-sensor.png](05-Car-voltage-sensor.png) | J8 VBATT: car 12–16 V → 180k/20k (1:10) + 1 kΩ/100 nF + 2 Schottky clamps → pin 40 (A16), diode orientation, bench check, enabling VOLT = DIRECT (firmware v0.1.172+) |
+| [05-Car-voltage-sensor.png](05-Car-voltage-sensor.png) | J8 VBATT: car 12–16 V → 180k/20k (1:10) + 1 kΩ/100 nF + 2 clamp diodes → pin 40 (A16), diode orientation, bench check, enabling VOLT = DIRECT (firmware v0.1.172+) |
+| [06-Car-voltage-sensor-1M.png](06-Car-voltage-sensor-1M.png) | The same sensor built as **1 MΩ + 100 kΩ + 10 kΩ** (10.09:1, reads 0.9 % low) — for when you don't have 180 kΩ. Includes the meter-loading warning that a 1 MΩ divider needs |
 
 ## Terminals — left edge, top to bottom
 
