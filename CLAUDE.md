@@ -1419,6 +1419,21 @@ VID,<HELLO|READY|REC|ERR>,...   (v0.1.150, Pi 5 video box status, forwarded from
 - The dash parser tolerates short forms for back-compat (e.g. `ENG` with 1 or 3 fields).
 - **Rate-limiting**: emit only when `myGNSS.getPVT(0)` returns true OR every 1 s. `getPVT(0)` is non-blocking — never use the blocking variant or the 25 Hz loop chokes.
 - **GPS UART RX buffer (v0.1.66 fix) — DO NOT remove.** Serial2's default RX ring is only tens of bytes — SMALLER than one ~100-byte UBX-NAV-PVT frame. GPS is parsed by *polling* `getPVT()` in `loop()` (RPM is NOT — CAN + `FreqMeasureMulti` are interrupt/FIFO-driven). So any loop stall >~25 ms overflows the ring, desyncs the autoPVT stream, and with a sub-frame buffer it can NEVER re-sync → GPS "freezes at last position" (STALE) while RPM keeps running. The stalls come from **SD `sync()`/`write()` latency during recording** (this is why it only happened once a session started, after "half a lap or two"). Fix: `Serial2.addMemoryForRead(gpsRxBuf, 32768)` in `setup()` BEFORE `begin()` (mirrors the dash Serial3 buffer) — ~8.5 s of slack at 38400 baud so the parser rides through SD spikes. `addMemoryForRead()` is on the concrete `Serial2`, not the `HardwareSerial&` alias.
+- **⚠️ GPS STALE with fix 0 / sats 0 on a module that answers — config-LOCKED u-blox (v0.1.173).**
+  Bench 2026-10-14, identical on 0.1.171 (NOT caused by the 0.1.172 changes; library unchanged since
+  Aug): a genuine M9 (PROTVER 32) answered every READ but **NACKed every WRITE** (CFG-VALSET / PRT / RATE
+  / MSG) because `CFG-SEC-CFG_LOCK = 1` (RAM; absent from BBR/flash; survives a hot hardware reset — a
+  vendor/OTP lock firmware cannot clear). Its locked config was already ours (UBX-only, 38400, 25 Hz
+  PVT + NAV-STATUS streaming), but `setAutoPVT()`'s NACK made the SparkFun lib treat auto-PVT as OFF, so
+  `getPVT(0)` returned false forever while PVT arrived 25×/s. **A module with NO FIX still streams PVT,
+  so no-antenna must read status 2 with fix 0 — STALE means the stream isn't being parsed.** Fix:
+  shared `gpsApplyConfig()` for every connect path (boot / late / re-begin / baud change): NMEA-off via
+  VALSET, every call checked + logged, `assumeAutoPVT()` when auto-PVT won't ACK, save only a config that
+  really applied; and the stale watchdog no longer ignores "connected but NO PVT ever" (re-applies every
+  10 s ×3, then 1/min). Boot log tells you: `[gps] config @ … autoPVT=OK|ASSUMED (no ACK)` and
+  `module config is LOCKED`. On a locked module the dash's GPS baud/Hz buttons cannot apply.
+  Check: `tools/teensy_check.py` → `status [2]`. (Diag lesson: count UBX sync `B5 62`, never `$` — 0x24
+  appears inside binary PVT.)
 - **GPS module-reset forensics (v0.1.102).** Auto **UBX-NAV-STATUS** (every 5th nav solution)
   rides the PVT stream; its `msss` (ms since MODULE startup) feeds `navStatusCB()` — if msss goes
   BACKWARDS the u-blox rebooted (power glitch), counted in `gps_module_resets` and logged in the

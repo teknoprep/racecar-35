@@ -68,7 +68,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.172"
+#define FIRMWARE_VERSION "0.1.173"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -1069,6 +1069,52 @@ static bool tryConnectGNSS(uint32_t baud, uint16_t maxWait = 1100) {
     return false;
 }
 
+// millis() of the last gpsApplyConfig(): the watchdog's "connected but NO PVT ever" timer.
+static uint32_t gnss_connect_ms = 0;
+
+// v0.1.173: apply our UART / nav-rate / auto-PVT config - and survive a module that REFUSES it.
+// Bench bug 2026-10-14 (identical on 0.1.171: not caused by the 0.1.172 changes): a genuine
+// u-blox M9 (PROTVER 32) answered every READ (port, rate) but NACKed every WRITE - CFG-VALSET,
+// CFG-PRT, CFG-RATE, CFG-MSG - because its configuration lock is set (CFG-SEC-CFG_LOCK = 1 in
+// RAM, absent from BBR/flash, and NOT cleared by a hot hardware reset: a vendor-locked/OTP
+// config). Its locked config was already exactly ours (UBX-only out, 38400, 25 Hz NAV-PVT +
+// NAV-STATUS streaming), but setAutoPVT()'s NACK made the u-blox library treat auto-PVT as OFF,
+// so getPVT() returned false FOREVER while perfect PVT packets arrived 25x/s: GPS STALE, fix 0 /
+// sats 0 (it must read status OK with fix 0 on a bench with no antenna), and nothing retried.
+// So:
+//   1. NMEA off on UART1 via CFG-VALSET (needs no read-back, unlike CFG-PRT) - harmless when
+//      already off or NACKed, and fixes a module that DOES accept writes but has NMEA on;
+//   2. every call is checked and the results are printed (they were silently ignored);
+//   3. if auto-PVT won't ACK, tell the library to parse the module's own PVT stream anyway
+//      (assumeAutoPVT) - a module that never streams simply stays STALE, as before.
+// Returns true when auto-PVT was ACKed = the config really applied, i.e. the only state worth
+// saveConfiguration()-ing (a locked module can't save, and must not be told to).
+// NOTE: on a locked module the dash's GPS baud / Hz buttons cannot take effect either.
+// Field check: tools/teensy_check.py -> "status [2]" + the [gps] config line below.
+static bool gpsApplyConfig(uint16_t maxWait) {
+    bool nmeaOff = false;
+    for (int i = 0; i < 3 && !nmeaOff; i++) {
+        nmeaOff = myGNSS.setVal8(UBLOX_CFG_UART1OUTPROT_NMEA, 0,
+                                 VAL_LAYER_RAM | VAL_LAYER_BBR, maxWait) != 0;
+        if (!nmeaOff) delay(60);   // let the module's TX queue drain a little (M8 = NAK, harmless)
+    }
+    const bool ubx  = myGNSS.setUART1Output(COM_TYPE_UBX, maxWait);
+    const bool rate = myGNSS.setNavigationFrequency(gps_nav_hz, maxWait);
+    bool apvt = false;
+    for (int i = 0; i < 3 && !apvt; i++) apvt = myGNSS.setAutoPVT(true, (uint16_t)maxWait);
+    if (!apvt) myGNSS.assumeAutoPVT(true, true);
+    myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB, maxWait);   // reset forensics (msss)
+    myGNSS.setAutoNAVSTATUSrate(5, true, maxWait);                // every 5th solution, not 25 Hz
+    Serial.printf("[gps] config @ %lu baud: nmeaOff=%d ubxOut=%d rate(%uHz)=%d autoPVT=%s\n",
+                  (unsigned long)gps_baud_now, (int)nmeaOff, (int)ubx, (unsigned)gps_nav_hz,
+                  (int)rate, apvt ? "OK" : "ASSUMED (no ACK)");
+    if (!apvt && myGNSS.getVal8(UBLOX_CFG_SEC_CFG_LOCK, VAL_LAYER_RAM, maxWait) == 1)
+        Serial.println(F("[gps] module config is LOCKED (CFG-SEC-CFG_LOCK=1): writes are refused, "
+                         "using its own output as-is"));
+    gnss_connect_ms = millis();
+    return apvt;
+}
+
 // Status code matching the wire format documented at the top of the file.
 static uint8_t gpsStatus() {
     const uint32_t age = millis() - gnss_last_fresh_ms;
@@ -1101,18 +1147,35 @@ static void gpsStaleWatchdog() {
             for (uint32_t b : scan) if (tryConnectGNSS(b, 400)) { ok = true; break; }
         }
         if (ok) {
-            myGNSS.setUART1Output(COM_TYPE_UBX, 250);
-            myGNSS.setNavigationFrequency(gps_nav_hz, 250);
-            myGNSS.setAutoPVT(true, (uint16_t)250);
-            myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB, 250);
-            myGNSS.saveConfiguration(250);
+            if (gpsApplyConfig(250)) myGNSS.saveConfiguration(250);
             gnss_lib_ok = true;
             Serial.printf("[gps] LATE connect @ %lu baud (dead at boot, recovered)\n",
                           (unsigned long)gps_baud_now);
         }
         return;
     }
-    if (gnss_last_fresh_ms == 0) return;
+    if (gnss_last_fresh_ms == 0) {
+        // CONNECTED BUT NO PVT EVER (v0.1.173). This was a bare `return` ("no-op until the
+        // first PVT", so cold-start acquisition isn't disturbed) - which ALSO meant a module
+        // that handshakes but whose PVT never parses was NEVER retried: no flush, no re-begin,
+        // STALE until a power cycle. But a module with no fix still streams PVT (fix 0) at the
+        // nav rate, so 10 s of nothing after a config is a fault, not acquisition. Re-apply
+        // the config every 10 s for 3 tries, then once a minute (each try can block ~2 s, so a
+        // module that genuinely never streams can't stutter RPM every 10 s forever).
+        static uint8_t nopvt_tries = 0;
+        const uint32_t nowc = millis();
+        const uint32_t gap  = (nopvt_tries < 3) ? GPS_REINIT_INTERVAL_MS : 60000UL;
+        if (gnss_connect_ms != 0 && nowc - gnss_connect_ms >= GPS_REINIT_MS &&
+            nowc - gnss_last_reinit_ms >= gap) {
+            gnss_last_reinit_ms = nowc;
+            gnss_reinit_count++;
+            if (nopvt_tries < 255) nopvt_tries++;
+            Serial.printf("[gps] connected but NO PVT for %lus -> re-applying config (try %u)\n",
+                          (unsigned long)((nowc - gnss_connect_ms) / 1000), (unsigned)nopvt_tries);
+            if (gpsApplyConfig(250)) myGNSS.saveConfiguration(250);
+        }
+        return;
+    }
     const uint32_t now = millis();
     const uint32_t age = now - gnss_last_fresh_ms;
     if (age < GPS_STALE_RECOVER_MS) return;            // healthy — nothing to do
@@ -1161,10 +1224,7 @@ static void gpsStaleWatchdog() {
         }
         if (reok) {
             heavy_fail_streak = 0;
-            myGNSS.setUART1Output(COM_TYPE_UBX, 250);
-            myGNSS.setNavigationFrequency(gps_nav_hz, 250);
-            myGNSS.setAutoPVT(true, (uint16_t)250);
-            myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB, 250);   // keep reset forensics alive
+            gpsApplyConfig(250);             // shared, flood-proof config (v0.1.173)
             gnss_last_fresh_ms = millis();   // grace window so we don't re-trip instantly
             Serial.printf("[gps] re-begin OK @ %lu baud\n", (unsigned long)gps_baud_now);
         } else {
@@ -1201,11 +1261,10 @@ static void applyGpsBaud(uint32_t target) {
         for (uint32_t b : scan) { if (tryConnectGNSS(b, GPS_BEGIN_WAIT_FAST)) { ok = true; break; } }
     }
     if (ok) {
-        myGNSS.setUART1Output(COM_TYPE_UBX);
-        myGNSS.setNavigationFrequency(gps_nav_hz);
-        myGNSS.setAutoPVT(true);
-        myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB, 250);
-        myGNSS.saveConfiguration();      // persist new baud+config so a reset restores it (stale fix)
+        // Shared, flood-proof config (v0.1.173). Persist only a config that really applied -
+        // saving a half-applied one is what locked a module into flooding mode.
+        if (gpsApplyConfig(1100))
+            myGNSS.saveConfiguration();  // persist new baud+config so a reset restores it (stale fix)
         gnss_lib_ok = true;
         gnss_last_fresh_ms = millis();   // grace so the watchdog doesn't instantly trip
     } else {
@@ -4094,13 +4153,10 @@ void setup() {
         || tryConnectGNSS(115200, GPS_BEGIN_WAIT_FAST)
         || tryConnectGNSS(460800, GPS_BEGIN_WAIT_FAST)) {
         Serial.printf("u-blox connected @ %lu baud\n", (unsigned long)gps_baud_now);
-        myGNSS.setUART1Output(COM_TYPE_UBX);     // we don't need NMEA on this link
-        myGNSS.setNavigationFrequency(gps_nav_hz);
-        myGNSS.setAutoPVT(true);
-        // Module-reset forensics: auto NAV-STATUS (every 5th nav solution = 5 Hz
-        // at 25 Hz nav rate — ~120 B/s, minimal UART cost) with msss callback.
-        myGNSS.setAutoNAVSTATUScallbackPtr(&navStatusCB);
-        myGNSS.setAutoNAVSTATUSrate(5);
+        // UBX-only output, nav rate, auto-PVT, and module-reset forensics (auto NAV-STATUS
+        // every 5th nav solution with the msss callback) - flood-proof since v0.1.173, see
+        // gpsApplyConfig(). Only a config that really applied is saved below.
+        const bool cfg_ok = gpsApplyConfig(1100);
         // Persist this config (UBX out + nav rate + auto-PVT + baud) to the
         // module's flash + BBR. THE STALE FIX: the debug logs show the module
         // going silent for ~10s repeatedly (a reset, most likely a brownout) and
@@ -4108,7 +4164,9 @@ void setup() {
         // until the stale watchdog re-asserts UBX. With the config saved, a reset
         // reboots STRAIGHT into UBX auto-PVT and resumes almost immediately — no
         // ~10s silent gap. (Doesn't fix the underlying reset, but kills the stale.)
-        if (myGNSS.saveConfiguration())
+        if (!cfg_ok)
+            Serial.println(F("[gps] config NOT saved (module refused writes) - parsing its own stream"));
+        else if (myGNSS.saveConfiguration())
             Serial.println(F("[gps] config saved to flash/BBR (reset-resilient)"));
         else
             Serial.println(F("[gps] saveConfiguration FAILED"));
