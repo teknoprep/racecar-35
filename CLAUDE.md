@@ -2730,6 +2730,21 @@ current release and vice-versa.
   `cloud_queue_depth` counts the active session file while recording, which is why the
   `!recording` guard is mandatory (auto-start can open a session mid-idle).
 
+### Stale track selection prompt (v0.1.175)
+`farFromSelectedTrack()` (next to `closestTrackIdx()`): true only when there is a usable fix
+(`g.fix >= 2`), a known `last_track_idx`, and the car is more than `TRACK_STALE_KM`
+(16.0934 km = 10 miles) from that track's centre. Both START paths check it **before**
+recording — the manual START tap in `handleDashTap()` and the auto-start fire in
+`parseGpsLine()`. When stale they open `openTrackPicker(true)` with `tp.stale = true`
+instead of sending `TRACK`/`REC,1`: the header reads "Which track are you at?", a yellow
+subtitle names the stale track, and the footer button becomes START.
+`buildTrackOrder()` already puts the GPS-closest first and `openTrackPicker()` pre-selects
+row 0, so CONFIRM/START is the one-tap answer. Auto-start spends its latch
+(`autostart_fired = true`) when it prompts, so the picker is not re-opened on every GPS
+line; auto-start only ever gets there with `active_track_name` set (it requires one).
+A cancel leaves recording stopped until the next START. No fix / no known selection =
+unmeasurable -> never blocks a start.
+
 ### NTP sync
 On Teensy boot: DHCP → NTP query to `0.pool.ntp.org` → set the Teensy's RTC. GPS time is the secondary source (UTC from PVT). When neither NTP nor GPS-fix is available, fall back to `millis()`-relative timestamps until one becomes available.
 

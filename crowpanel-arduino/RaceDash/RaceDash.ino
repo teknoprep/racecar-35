@@ -29,7 +29,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.174"
+#define FIRMWARE_VERSION "0.1.175"
 
 #include <Preferences.h>
 #include <time.h>
@@ -1385,6 +1385,21 @@ static int closestTrackIdx() {
     return best;
 }
 
+// v0.1.175: is the SELECTED track stale? More than 10 miles from it means the
+// car is at a different track than the last session's selection, so START asks
+// which track you're at instead of silently recording under the wrong one. The
+// picker pre-selects the GPS-closest (already row 0), so the answer is a single
+// CONFIRM tap. No usable fix / no known selection = unmeasurable -> never
+// blocks a start.
+static constexpr float TRACK_STALE_KM = 16.0934f;   // 10 miles
+static bool farFromSelectedTrack() {
+    if (g.fix < 2) return false;
+    if (last_track_idx < 0 || last_track_idx >= N_TRACKS) return false;
+    return trackDistanceKm(g.lat_deg, g.lon_deg,
+                           TRACKS[last_track_idx].lat,
+                           TRACKS[last_track_idx].lon) > TRACK_STALE_KM;
+}
+
 // The track that LAP TIMING and SET START/FINISH should operate on: the
 // user's SELECTED track wins whenever the car is actually within its radius
 // (so picking "Summit Point Jefferson" beats GPS guessing the main circuit
@@ -1618,6 +1633,10 @@ struct TrackPickerState {
     int     scrollY;
     bool    dirty;
     bool    for_recording = false; // true = confirm starts REC,1; false = track-select only
+    // v0.1.175: opened because the selected track is >10 miles away (START /
+    // auto-start asked "which track are you at?"). Header shows that and the
+    // list still leads with the GPS-closest, so CONFIRM is the quick answer.
+    bool    stale = false;
 };
 static TrackPickerState tp;
 
@@ -2218,10 +2237,18 @@ static bool parseGpsLine(const String& line) {
             if (above_since_ms == 0) above_since_ms = millis();
             if (!autostart_fired && !recording
                 && (millis() - above_since_ms) >= hold_ms) {
-                Serial.printf("TRACK,%s\n", active_track_name);
-                Serial.printf("REC,1\n");
-                recording = true; rec_start_ms = millis();
-                autostart_fired = true;
+                autostart_fired = true;   // spend the latch either way
+                if (farFromSelectedTrack()) {
+                    // Stale selection (drove to another track): ask which track
+                    // we're at instead of recording under the wrong one — the
+                    // picker leads with the GPS-closest and CONFIRM starts.
+                    openTrackPicker(true);
+                    tp.stale = true;
+                } else {
+                    Serial.printf("TRACK,%s\n", active_track_name);
+                    Serial.printf("REC,1\n");
+                    recording = true; rec_start_ms = millis();
+                }
             }
         }
         if (recording) autostart_fired = true;            // any session spends the latch
@@ -5406,6 +5433,15 @@ static void handleDashTap(int x, int y) {
         if (recording) {
             recording = false;
             Serial.printf("REC,0\n");
+            return;
+        }
+        // START — with a stale selection (car >10 miles from the selected
+        // track, i.e. you drove to another track) ask which track you're at
+        // first; the picker leads with the GPS-closest and CONFIRM starts.
+        // Manual and auto start share this prompt (v0.1.175).
+        if (farFromSelectedTrack()) {
+            openTrackPicker(true);
+            tp.stale = true;
             return;
         }
         // START — try GPS auto-select first (only when enabled).
@@ -9251,6 +9287,7 @@ static void openTrackPicker(bool for_recording) {
     tp.scrollY       = 0;
     tp.dirty         = true;
     tp.for_recording = for_recording;
+    tp.stale         = false;
     currentPage      = PAGE_TRACK_PICKER;
     pageJustEntered  = true;
 }
@@ -9858,7 +9895,17 @@ static void drawTrackPicker() {
         tft.setTextSize(1);
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.setTextDatum(textdatum_t::top_left);
-        tft.drawString("Select Track", 20, 18);
+        tft.drawString(tp.stale ? "Which track are you at?" : "Select Track", 20, 18);
+        if (tp.stale) {
+            tft.setFont(&fonts::Font2);
+            tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+            char sub[104];
+            snprintf(sub, sizeof(sub), "far from %s - closest pre-selected",
+                     active_track_name[0] ? active_track_name : "the last selection");
+            tft.drawString(sub, 20, 42);
+            tft.setFont(&fonts::Font4);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        }
 
         // Footer (sticky): CANCEL on the left, CONFIRM on the right.
         // Drawn by drawPickerFooter() so it can refresh when selection
@@ -9933,7 +9980,7 @@ static void drawTrackPicker() {
     tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
     tft.drawString("CANCEL", 200, TP_BODY_BOTTOM + 35);
     tft.setTextColor(TFT_WHITE, (tp.selected >= 0) ? TFT_DARKGREEN : TFT_DARKGREY);
-    tft.drawString("CONFIRM", 600, TP_BODY_BOTTOM + 35);
+    tft.drawString(tp.for_recording ? "START" : "CONFIRM", 600, TP_BODY_BOTTOM + 35);
     tft.setTextDatum(textdatum_t::top_left);
 }
 
