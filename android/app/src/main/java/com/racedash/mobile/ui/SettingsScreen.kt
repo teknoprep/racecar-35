@@ -149,6 +149,12 @@ fun SettingsScreen(vm: DashViewModel, onBack: () -> Unit) {
                 }
             }
             item {
+                Toggle("Auto-upload when Wi-Fi connects", s.autoUploadOnWifi) {
+                    vm.settingsRepo.update { it.copy(autoUploadOnWifi = !it.autoUploadOnWifi) }
+                    vm.onUploadSettingsChanged()
+                }
+            }
+            item {
                 ActionRow(
                     "Upload now",
                     "${st.pendingUploads} pending" +
@@ -160,6 +166,20 @@ fun SettingsScreen(vm: DashViewModel, onBack: () -> Unit) {
             item {
                 Toggle("Auto-select closest track on START", s.autoSelectTrack) {
                     vm.settingsRepo.update { it.copy(autoSelectTrack = !it.autoSelectTrack) }
+                }
+            }
+            item {
+                Toggle("Auto-stop recording at 0 speed", s.autoStopEnabled) {
+                    vm.settingsRepo.update { it.copy(autoStopEnabled = !it.autoStopEnabled) }
+                }
+            }
+            if (s.autoStopEnabled) {
+                item {
+                    Stepper("Stop after at 0 speed", s.autoStopSeconds.toString(), suffix = "s") { up ->
+                        vm.settingsRepo.update {
+                            it.copy(autoStopSeconds = it.autoStopSeconds + if (up) 5 else -5)
+                        }
+                    }
                 }
             }
             item { Header("About") }

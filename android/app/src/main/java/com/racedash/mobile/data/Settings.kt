@@ -27,6 +27,11 @@ data class Settings(
 
     // --- Recording ---
     val autoSelectTrack: Boolean = true,
+    // Auto-stop: end the session after N seconds at a standstill (0 speed).
+    // Armed only once the car has actually moved, so a session started parked
+    // survives the wait before the first lap.
+    val autoStopEnabled: Boolean = false,
+    val autoStopSeconds: Int = 30,
 
     // --- Cloud upload (After Race) ---
     val cloudEnabled: Boolean = false,
@@ -34,6 +39,7 @@ data class Settings(
     val userEmail: String = "",          // sent as X-User-Email
     val apiKey: String = "",             // sent as X-API-Key
     val autoUpload: Boolean = true,      // upload automatically when a session stops
+    val autoUploadOnWifi: Boolean = true, // upload pending sessions as soon as Wi-Fi appears
 ) {
     /** Power strokes per crank revolution. 4-stroke = cyl/2, 2-stroke = cyl. */
     val firingsPerRev: Double
@@ -63,9 +69,11 @@ class SettingsRepository(context: Context) {
         val barMax = s.rpmBarMax.coerceIn(2000, 20000)
         val barMin = s.rpmBarMin.coerceIn(0, barMax - 1000)
         val shift = s.shiftRpm.coerceIn(barMin + 500, barMax)
+        val stopS = s.autoStopSeconds.coerceIn(5, 600)
         return s.copy(
             cylinders = cyl, strokes = strokes, idleRpm = idle, redlineRpm = redline,
             rpmBarMax = barMax, rpmBarMin = barMin, shiftRpm = shift,
+            autoStopSeconds = stopS,
         )
     }
 
@@ -80,11 +88,14 @@ class SettingsRepository(context: Context) {
         useMph = prefs.getBoolean("mph", true),
         audioRpmEnabled = prefs.getBoolean("audio_rpm", true),
         autoSelectTrack = prefs.getBoolean("auto_trk", true),
+        autoStopEnabled = prefs.getBoolean("rec_autostop", false),
+        autoStopSeconds = prefs.getInt("rec_autostop_s", 30),
         cloudEnabled = prefs.getBoolean("cl_en", false),
         uploadUrl = prefs.getString("cl_url", "") ?: "",
         userEmail = prefs.getString("cl_email", "") ?: "",
         apiKey = prefs.getString("cl_key", "") ?: "",
         autoUpload = prefs.getBoolean("cl_auto", true),
+        autoUploadOnWifi = prefs.getBoolean("cl_auto_wifi", true),
     )
 
     private fun save(s: Settings) {
@@ -99,11 +110,14 @@ class SettingsRepository(context: Context) {
             .putBoolean("mph", s.useMph)
             .putBoolean("audio_rpm", s.audioRpmEnabled)
             .putBoolean("auto_trk", s.autoSelectTrack)
+            .putBoolean("rec_autostop", s.autoStopEnabled)
+            .putInt("rec_autostop_s", s.autoStopSeconds)
             .putBoolean("cl_en", s.cloudEnabled)
             .putString("cl_url", s.uploadUrl)
             .putString("cl_email", s.userEmail)
             .putString("cl_key", s.apiKey)
             .putBoolean("cl_auto", s.autoUpload)
+            .putBoolean("cl_auto_wifi", s.autoUploadOnWifi)
             .apply()
     }
 }

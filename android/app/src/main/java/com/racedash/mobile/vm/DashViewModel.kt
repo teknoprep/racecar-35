@@ -3,6 +3,10 @@ package com.racedash.mobile.vm
 import android.annotation.SuppressLint
 import android.app.Application
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -29,6 +33,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 class DashViewModel(app: Application) : AndroidViewModel(app) {
@@ -85,6 +90,26 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     @Volatile private var uploadStatus = ""
     @Volatile private var pendingUploads = 0
 
+    // --- Auto-stop at 0 speed ---
+    // hasMoved arms the stop once the car has actually driven; zeroSpeedSince
+    // is the elapsedRealtime of the first standstill tick of this stretch.
+    @Volatile private var hasMoved = false
+    @Volatile private var zeroSpeedSince = 0L
+
+    /** One upload at a time: manual, after-STOP and Wi-Fi triggers all funnel here. */
+    private val uploadGate = AtomicBoolean(false)
+
+    // Auto-upload on Wi-Fi: the callback fires for an already-connected network
+    // on register and again on every (re)connect — e.g. back at the trailer.
+    private val connMgr: ConnectivityManager? =
+        app.getSystemService(ConnectivityManager::class.java)
+
+    private val wifiCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = maybeAutoUploadOnWifi()
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+            maybeAutoUploadOnWifi()
+    }
+
     init {
         // Push current engine geometry into the acoustic estimator and keep it
         // in sync as the user edits engine settings.
@@ -95,6 +120,17 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         }
         // Off the main thread: this loop does file I/O while recording.
         viewModelScope.launch(Dispatchers.Default) { ticker() }
+
+        // Watch for Wi-Fi and drain pending sessions as soon as it appears.
+        // No-op unless cloud upload + on-Wi-Fi auto-upload are both enabled.
+        runCatching {
+            connMgr?.registerNetworkCallback(
+                NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .build(),
+                wifiCallback,
+            )
+        }
     }
 
     /** Called by the Activity once runtime permissions are resolved. */
@@ -170,23 +206,61 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     // --- Recording --------------------------------------------------------
 
     fun toggleRecording(): Boolean {
-        if (recording) {
-            val closed = recorder.stop()
-            recording = false
-            val cfg = settingsRepo.current
-            if (closed != null && cfg.cloudEnabled && cfg.autoUpload) {
-                viewModelScope.launch(Dispatchers.IO) { uploadList(listOf(closed)) }
-            }
-        } else {
-            // Auto-pick the closest track if enabled and none chosen.
-            if (selectedTrack == null && settingsRepo.current.autoSelectTrack) {
-                nearest()?.let { (t, d) -> if (d <= t.radiusKm) selectTrack(t) }
-            }
-            val name = selectedTrack?.name ?: Track.UNKNOWN_NAME
-            recorder.start(name)
-            recording = recorder.isRecording
-        }
+        if (recording) stopRecording() else startRecording()
         return recording
+    }
+
+    private fun startRecording() {
+        // Auto-pick the closest track if enabled and none chosen.
+        if (selectedTrack == null && settingsRepo.current.autoSelectTrack) {
+            nearest()?.let { (t, d) -> if (d <= t.radiusKm) selectTrack(t) }
+        }
+        val name = selectedTrack?.name ?: Track.UNKNOWN_NAME
+        recorder.start(name)
+        recording = recorder.isRecording
+        hasMoved = false
+        zeroSpeedSince = 0L
+    }
+
+    /**
+     * Close the session and auto-upload it when that setting is on. Shared by
+     * the START/STOP button and the 0-speed auto-stop; [auto] only changes the
+     * status text.
+     */
+    private fun stopRecording(auto: Boolean = false) {
+        if (!recording) return
+        val closed = recorder.stop()
+        recording = false
+        hasMoved = false
+        zeroSpeedSince = 0L
+        val cfg = settingsRepo.current
+        if (closed != null && cfg.cloudEnabled && cfg.autoUpload) {
+            viewModelScope.launch(Dispatchers.IO) { uploadList(listOf(closed)) }
+        } else if (auto) {
+            uploadStatus = "auto-stopped: ${cfg.autoStopSeconds}s at 0 speed"
+        }
+    }
+
+    /**
+     * Stop the session after [Settings.autoStopSeconds] at a standstill. Needs a
+     * live fix (a GPS dropout must not end a session) and only arms after the
+     * car has moved once, so hitting START while parked doesn't kill it.
+     */
+    private fun maybeAutoStop(now: Long, fixOk: Boolean) {
+        val cfg = settingsRepo.current
+        val speed = speedMph.coerceAtLeast(0f)
+        if (speed >= MOVING_MPH) hasMoved = true
+        if (!cfg.autoStopEnabled || !hasMoved || !fixOk) {
+            zeroSpeedSince = 0L
+            return
+        }
+        if (speed >= STOPPED_MPH) {
+            zeroSpeedSince = 0L
+        } else if (zeroSpeedSince == 0L) {
+            zeroSpeedSince = now
+        } else if (now - zeroSpeedSince >= cfg.autoStopSeconds * 1000L) {
+            stopRecording(auto = true)
+        }
     }
 
     val isRecording: Boolean get() = recording
@@ -200,24 +274,57 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun uploadList(files: List<File>) {
+    /**
+     * Drain every pending session the moment Wi-Fi is available — the phone
+     * usually records on the road, so this gets yesterday's sessions off the
+     * device once it is back on a home/trailer network.
+     */
+    fun maybeAutoUploadOnWifi() {
         val cfg = settingsRepo.current
-        when {
-            !cfg.cloudEnabled -> { uploadStatus = "cloud upload is off"; return }
-            cfg.uploadUrl.isBlank() -> { uploadStatus = "set an upload URL first"; return }
-            files.isEmpty() -> { uploadStatus = "nothing to upload"; return }
+        if (!cfg.cloudEnabled || !cfg.autoUploadOnWifi) return
+        if (uploadGate.get() || !onWifi()) return
+        // Quiet no-op when there is nothing waiting, so the frequent Wi-Fi
+        // capability callbacks don't keep re-writing the status line.
+        val pending = store.pending(recorder.currentFile)
+        if (pending.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) { uploadList(pending) }
+    }
+
+    /** Re-check Wi-Fi auto-upload after the user flips a cloud setting. */
+    fun onUploadSettingsChanged() = maybeAutoUploadOnWifi()
+
+    private fun onWifi(): Boolean {
+        val cm = connMgr ?: return false
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork ?: return false) ?: return false
+        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
+
+    private suspend fun uploadList(files: List<File>) {
+        if (!uploadGate.compareAndSet(false, true)) {
+            uploadStatus = "upload already in progress"
+            return
         }
-        val ucfg = Uploader.Config(cfg.uploadUrl, cfg.apiKey, cfg.userEmail)
-        var ok = 0
-        var fail = 0
-        files.forEachIndexed { i, f ->
-            uploadStatus = "uploading ${i + 1}/${files.size}\u2026"
-            val r = uploader.upload(f, ucfg)
-            if (r.isSuccess) { store.markUploaded(f); ok++ }
-            else { fail++; uploadStatus = "failed: ${r.exceptionOrNull()?.message ?: "error"}" }
+        try {
+            val cfg = settingsRepo.current
+            when {
+                !cfg.cloudEnabled -> { uploadStatus = "cloud upload is off"; return }
+                cfg.uploadUrl.isBlank() -> { uploadStatus = "set an upload URL first"; return }
+                files.isEmpty() -> { uploadStatus = "nothing to upload"; return }
+            }
+            val ucfg = Uploader.Config(cfg.uploadUrl, cfg.apiKey, cfg.userEmail)
+            var ok = 0
+            var fail = 0
+            files.forEachIndexed { i, f ->
+                uploadStatus = "uploading ${i + 1}/${files.size}\u2026"
+                val r = uploader.upload(f, ucfg)
+                if (r.isSuccess) { store.markUploaded(f); ok++ }
+                else { fail++; uploadStatus = "failed: ${r.exceptionOrNull()?.message ?: "error"}" }
+            }
+            uploadStatus = if (fail == 0) "uploaded $ok ✓" else "uploaded $ok, $fail failed"
+            pendingUploads = store.pending(recorder.currentFile).size
+        } finally {
+            uploadGate.set(false)
         }
-        uploadStatus = if (fail == 0) "uploaded $ok ✓" else "uploaded $ok, $fail failed"
-        pendingUploads = store.pending(recorder.currentFile).size
     }
 
     // --- OTA self-update --------------------------------------------------
@@ -299,6 +406,10 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
                         lap = lap.lapCount, lapMs = lap.currentLapMs,
                     )
                 )
+                maybeAutoStop(now, fixOk)
+            } else {
+                hasMoved = false
+                zeroSpeedSince = 0L
             }
 
             val near = if (haveFix) Tracks.nearest(lat, lon) else null
@@ -332,9 +443,15 @@ class DashViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         super.onCleared()
         if (recording) recorder.stop()
+        runCatching { connMgr?.unregisterNetworkCallback(wifiCallback) }
         location.stop()
         motion.stop()
         acoustic.stop()
+    }
+
+    private companion object {
+        const val MOVING_MPH = 3f   // car has driven: auto-stop may arm
+        const val STOPPED_MPH = 1f  // treated as 0 speed for auto-stop
     }
 }
 

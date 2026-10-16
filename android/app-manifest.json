@@ -1,7 +1,7 @@
 {
-  "versionCode": 6,
-  "versionName": "0.1.5",
-  "url": "https://github.com/teknoprep/racecar-35/releases/download/android-v0.1.5/RaceDash-0.1.5-debug.apk",
-  "sha256": "23b6ec5cbd3b50c93d644af4ea95a68f56c1f98e12b3f79e54e8d3b2cac809ce",
-  "notes": "Fix cloud upload (allow HTTP/cleartext + auto-prepend scheme, clearer errors). Acoustic RPM: band-pass isolation to the firing band + harmonics with an in-band SNR gate so wind/road/voices are rejected."
+  "versionCode": 7,
+  "versionName": "0.1.6",
+  "url": "https://github.com/teknoprep/racecar-35/releases/download/android-v0.1.6/RaceDash-0.1.6-debug.apk",
+  "sha256": "45b2cf686ed1c6199e6187f0ad34b5193c57f745e3c483e638b2563e11c8939a",
+  "notes": "Auto-stop recording at 0 speed (Settings > Recording): switch it on and pick the standstill seconds (5-600 s, default 30). It only arms after the car has actually moved and needs a live GPS fix, so starting the logger in the paddock survives the grid wait and a GPS dropout cannot end a session. Auto-upload on Wi-Fi (Settings > Cloud upload): pending sessions drain the moment Wi-Fi connects, or right away when switched on while already on Wi-Fi."
 }
