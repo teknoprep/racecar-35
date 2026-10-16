@@ -2703,6 +2703,33 @@ parse live in `ufOpenStream`/`ufFlushChunk`/`UF_STREAM_FINISH`. Do NOT reintrodu
 
 This means the car can have zero connectivity at the track and still get all data — power on at home with internet and the dash flushes the backlog.
 
+### Auto-stop recording + auto-upload on WiFi (v0.1.174)
+
+Both settings live in **Settings → Recording**, default OFF, and are **dash-side only** — no
+CFG key and no UART protocol change, so the v0.1.174 dash works with any Teensy ≥ the
+current release and vice-versa.
+
+- **Auto stop recording** (NVS `autostp` bool) + **Auto stop after (sec)** (NVS `astpsec`,
+  bounds 5–600 s, step 5, default 30). `parseGpsLine()` ends the session —
+  `recording = false` + `REC,0`, exactly like a STOP tap — once GPS speed has sat under
+  0.5 mph for that many seconds. Two guards make it trustworthy: the stop only ARMS after
+  the car has actually moved ≥ 3 mph during this session (so START while parked in the grid
+  or paddock is never killed before the first lap), and a live fix (`p_fix >= 2`) is
+  required, so a GPS dropout — where speed freezes at its last value — cannot end a
+  recording. The dwell runs on GPS lines, so no lines (dead GPS) means no stop.
+  `recHandshakeTick()` re-sends the `REC,0` until the Teensy's `SD,REC` heartbeat agrees.
+- **Auto upload on WiFi** (NVS `autoupl` bool): a loop check, deliberately NOT the WiFi
+  connect edge — `CLD,<live_ok>,<queue_depth>` only arrives after the link is up, and a
+  pass may have to wait out a coach fetch / OTA. When WiFi is connected, the queue is
+  non-empty, and nothing else owns the flow (`!recording`, `uf.state == UF_IDLE`,
+  `sl.state == SL_IDLE`, no `upload_active`/`net_pending_upload`, `!wifiJobBusy()`, and
+  not on PAGE_OTA / PAGE_SESSIONS) it calls `startQueueUpload()` — the same entry point
+  the manual UPLOAD button now uses. Passes are spaced by `AUTO_UPLOAD_RETRY_MS` (120 s),
+  so a failed batch retries on that cadence rather than hammering the server; toggling the
+  setting ON resets the deadline, so it fires on the next loop when already on WiFi.
+  `cloud_queue_depth` counts the active session file while recording, which is why the
+  `!recording` guard is mandatory (auto-start can open a session mid-idle).
+
 ### NTP sync
 On Teensy boot: DHCP → NTP query to `0.pool.ntp.org` → set the Teensy's RTC. GPS time is the secondary source (UTC from PVT). When neither NTP nor GPS-fix is available, fall back to `millis()`-relative timestamps until one becomes available.
 

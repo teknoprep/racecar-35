@@ -29,7 +29,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.173"
+#define FIRMWARE_VERSION "0.1.174"
 
 #include <Preferences.h>
 #include <time.h>
@@ -80,6 +80,8 @@ enum SettingId : uint8_t {
     ST_CL_AUTH_USER, ST_CL_AUTH_PASS,
     ST_AUTO_TRACK,
     ST_AUTO_START, ST_AUTO_START_MPH, ST_AUTO_START_SEC,   // auto-start recording + threshold + hold time
+    // v0.1.174: auto-stop recording at 0 speed + auto-upload of the /queue when WiFi appears.
+    ST_AUTO_STOP, ST_AUTO_STOP_SEC, ST_AUTO_UPLOAD,
     ST_TIMEZONE,    // ENUM: cycle through TIMEZONES[]
     ST_GPS_BAUD,    // ENUM: GPS UART baud (sent to Teensy as CFG,gpsbaud,<n>)
     ST_GPS_STATUS,  // INFO: Teensy's GPSBAUD report (locked baud + OK/NO DATA)
@@ -590,6 +592,11 @@ static char     upload_result_msg[180]   = "";       // banner after DONE: statu
 // Cloud state — updated from CLD,<live_ok>,<queue_depth> lines.
 static bool     cloud_live_ok      = false;
 static uint32_t cloud_queue_depth  = 0;
+// v0.1.174: auto-upload-on-WiFi pacing. The loop starts a queue pass whenever
+// the setting is on, WiFi is up, work is pending and this deadline has passed;
+// a failed batch retries on the same cadence instead of hammering the server.
+static uint32_t auto_upload_next_ms = 0;
+static constexpr uint32_t AUTO_UPLOAD_RETRY_MS = 120000;   // 2 min between passes
 
 // ---------------------------------------------------------------------------
 // WiFi <-> BLE radio TIME-SHARING arbiter. WiFi and Bluetooth may NEVER run at
@@ -888,6 +895,19 @@ struct Settings {
     bool     auto_start       = false;
     uint16_t auto_start_mph   = 25;
     uint16_t auto_start_sec   = 4;     // seconds the speed must be HELD (1-30)
+
+    // Auto-stop recording (v0.1.174): when ON, a session ends on its own after
+    // GPS speed has sat at 0 for auto_stop_sec seconds. The stop is armed only
+    // after the car has actually MOVED this session (>= AUTO_STOP_ARM_MPH in
+    // the parser), so hitting START while parked doesn't kill the recording
+    // during the grid wait; a live fix is required so a GPS dropout can't end
+    // a session either. Manual START/STOP is unaffected.
+    bool     auto_stop        = false;
+    uint16_t auto_stop_sec    = 30;    // seconds at 0 speed before stopping (5-600)
+    // Auto-upload on WiFi (v0.1.174): when ON, the dash drains the on-SD
+    // upload queue by itself as soon as a WiFi link is up (and the radio and
+    // the link are free) - no need to tap UPLOAD.
+    bool     auto_upload_wifi = false;
 
     // Time zone — index into TIMEZONES[] (defined below). Display only;
     // the Teensy's RTC + the wire-format TIME line are always UTC.
@@ -1759,6 +1779,9 @@ static void loadSettings() {
     s.auto_start         = prefs.getBool  ("autost",   s.auto_start);
     s.auto_start_mph     = prefs.getUShort("astmph",   s.auto_start_mph);
     s.auto_start_sec     = prefs.getUShort("astsec",   s.auto_start_sec);
+    s.auto_stop          = prefs.getBool  ("autostp",  s.auto_stop);
+    s.auto_stop_sec      = prefs.getUShort("astpsec",  s.auto_stop_sec);
+    s.auto_upload_wifi   = prefs.getBool  ("autoupl",  s.auto_upload_wifi);
     s.timezone_idx       = prefs.getUChar ("tz",       s.timezone_idx);
     s.auto_time          = prefs.getBool  ("atime",    s.auto_time);
     s.auto_tz            = prefs.getBool  ("atz",      s.auto_tz);
@@ -1871,6 +1894,9 @@ static void saveSettings() {
     prefs.putBool  ("autost",   s.auto_start);
     prefs.putUShort("astmph",   s.auto_start_mph);
     prefs.putUShort("astsec",   s.auto_start_sec);
+    prefs.putBool  ("autostp",  s.auto_stop);
+    prefs.putUShort("astpsec",  s.auto_stop_sec);
+    prefs.putBool  ("autoupl",  s.auto_upload_wifi);
     // (sendCfgToTeensy() is called at end of this function so any save also
     // re-syncs the cloud config to the Teensy.)
     prefs.putUChar ("tz",       s.timezone_idx);
@@ -2202,6 +2228,46 @@ static bool parseGpsLine(const String& line) {
         autostart_pending_ms = (!recording && s.auto_start && above_since_ms != 0
                                 && hold_ms > (millis() - above_since_ms))
                              ? (hold_ms - (millis() - above_since_ms)) : 0;
+    }
+
+    // Auto-stop recording (v0.1.174): with the setting ON, end the session on
+    // its own once the car has been at 0 speed for auto_stop_sec seconds. Two
+    // guards make it trustworthy:
+    //   - ARMED only after the car has MOVED this session (>= 3 mph). A session
+    //     started parked in the grid/paddock is never stopped before it has
+    //     run; manual START/STOP is unaffected either way.
+    //   - a LIVE fix (p_fix >= 2) is required, so a GPS dropout — where speed
+    //     freezes at the last value — can never end a recording.
+    // Runs on every GPS line, so the dwell is wall-clock between real fixes:
+    // no GPS lines, no stop. REC,0 goes out exactly like a STOP tap, and
+    // recHandshakeTick() re-sends it until the Teensy's SD,REC heartbeat agrees.
+    {
+        static constexpr float ARM_MPH  = 3.0f;   // "the car has driven"
+        static constexpr float ZERO_MPH = 0.5f;   // GPS noise at rest stays under this
+        static bool     autostop_armed = false;   // car has driven since START
+        static uint32_t zero_since_ms  = 0;       // first 0-speed line of this standstill
+        if (!recording) {
+            autostop_armed = false;
+            zero_since_ms  = 0;
+        } else {
+            if (p_mph >= ARM_MPH) autostop_armed = true;
+            if (!s.auto_stop || !autostop_armed || p_fix < 2) {
+                zero_since_ms = 0;
+            } else if (fabsf(p_mph) < ZERO_MPH) {
+                if (zero_since_ms == 0) {
+                    zero_since_ms = millis();
+                } else if (millis() - zero_since_ms >= (uint32_t)s.auto_stop_sec * 1000UL) {
+                    recording      = false;
+                    autostop_armed = false;
+                    zero_since_ms  = 0;
+                    Serial.printf("REC,0\n");
+                    Serial.printf("DBG,auto-stop: %us at 0 speed\n",
+                                  (unsigned)s.auto_stop_sec);
+                }
+            } else {
+                zero_since_ms = 0;   // any motion restarts the dwell
+            }
+        }
     }
     return true;
 }
@@ -2843,6 +2909,22 @@ static void ufStartListing() {
     ufEnter(UF_LISTING);
     Serial.println("Q,LIST");
     Serial.flush();
+}
+
+// v0.1.174: single entry point for "upload the queue" — the manual UPLOAD
+// button and the auto-upload-on-WiFi trigger both come through here.
+static void startQueueUpload() {
+    if (net_owner != NET_WIFI) {
+        // Bluetooth owns the radio — hand it to WiFi first (running both
+        // crashes the core). netOwnerTick starts the upload once WiFi
+        // connects; closeUploadModal hands the radio back to BT.
+        openUploadModal("waiting for WiFi (BT paused)...", 0);
+        net_pending_upload = true;
+        btReleaseRadio();
+    } else {
+        openUploadModal("", 0);
+        ufStartListing();
+    }
 }
 
 
@@ -5311,20 +5393,9 @@ static void handleDashTap(int x, int y) {
     if (x >= UPBTN_X && x < UPBTN_X + UPBTN_W &&
         y >= UPBTN_Y && y < UPBTN_Y + UPBTN_H) {
         if (!recording && cloud_queue_depth > 0) {
-            // Dash-initiated upload (v0.1.34+). Pop the modal locally and
-            // kick the state machine, which sends Q,LIST to the Teensy and
-            // drives the rest of the upload flow.
-            if (net_owner != NET_WIFI) {
-                // Bluetooth owns the radio — hand it to WiFi first (running
-                // both crashes the core). netOwnerTick starts the upload once
-                // WiFi connects; closeUploadModal hands the radio back to BT.
-                openUploadModal("waiting for WiFi (BT paused)...", 0);
-                net_pending_upload = true;
-                btReleaseRadio();
-            } else {
-                openUploadModal("", 0);
-                ufStartListing();
-            }
+            // Dash-initiated upload (v0.1.34+). Pops the modal, then the queue
+            // flow sends Q,LIST to the Teensy and drives the rest.
+            startQueueUpload();
         }
         return;
     }
@@ -6817,6 +6888,9 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_AUTO_START,    "Auto start recording", SettingRow::TOGGLE  },
     { ST_AUTO_START_MPH,"Auto start at (mph)",  SettingRow::NUMERIC },
     { ST_AUTO_START_SEC,"Auto start hold (sec)",SettingRow::NUMERIC },
+    { ST_AUTO_STOP,     "Auto stop recording",  SettingRow::TOGGLE  },
+    { ST_AUTO_STOP_SEC, "Auto stop after (sec)",SettingRow::NUMERIC },
+    { ST_AUTO_UPLOAD,   "Auto upload on WiFi",  SettingRow::TOGGLE  },
     { ST_CL_HOST,      "Cloud host (DNS/IP)",   SettingRow::TEXT    },
     { ST_CL_PORT,      "Cloud port",            SettingRow::TEXT    },
     { ST_CL_PROTO,     "Cloud protocol",        SettingRow::ENUM    },
@@ -6867,6 +6941,7 @@ static NumBounds numBounds(SettingId id) {
         case ST_AFR_WARN_HI:  return {  80, 200, 1 };
         case ST_AUTO_START_MPH: return { 5, 150, 5 };  // speed to trigger auto-record
         case ST_AUTO_START_SEC: return { 1,  30, 1 };  // seconds it must be HELD
+        case ST_AUTO_STOP_SEC:  return { 5, 600, 5 };  // seconds at 0 speed before stopping
         case ST_LAP_OVERLAY:    return { 0,   9, 1 };  // lap popup seconds (0 = off)
         default:         return {    0,     0,   0 };
     }
@@ -6888,6 +6963,7 @@ static uint16_t getNum(SettingId id) {
         case ST_AFR_WARN_HI:  return s.afr_warn_hi_x10;
         case ST_AUTO_START_MPH: return s.auto_start_mph;
         case ST_AUTO_START_SEC: return s.auto_start_sec;
+        case ST_AUTO_STOP_SEC:  return s.auto_stop_sec;
         case ST_LAP_OVERLAY:    return s.lap_overlay_s;
         default:         return 0;
     }
@@ -6908,6 +6984,7 @@ static void setNum(SettingId id, uint16_t v) {
         case ST_AFR_WARN_HI:  s.afr_warn_hi_x10 = v; break;
         case ST_AUTO_START_MPH: s.auto_start_mph = v; break;
         case ST_AUTO_START_SEC: s.auto_start_sec = (uint16_t)(v < 1 ? 1 : (v > 30 ? 30 : v)); break;
+        case ST_AUTO_STOP_SEC:  s.auto_stop_sec  = (uint16_t)(v < 5 ? 5 : (v > 600 ? 600 : v)); break;
         case ST_LAP_OVERLAY:    s.lap_overlay_s  = (uint8_t)(v > 9 ? 9 : v); break;
         default: break;
     }
@@ -6976,6 +7053,8 @@ static const char* boolValueOnRow(SettingId id) {
         case ST_AUTO_TZ:     return s.auto_tz   ? "ON" : "OFF";
         case ST_DEBUG_LOG:   return s.debug_enabled ? "ON" : "OFF";
         case ST_AUTO_START:  return s.auto_start        ? "ON" : "OFF";
+        case ST_AUTO_STOP:   return s.auto_stop         ? "ON" : "OFF";
+        case ST_AUTO_UPLOAD: return s.auto_upload_wifi  ? "ON" : "OFF";
         case ST_SHOW_TEMP:   return s.show_coolant      ? "ON" : "OFF";
         case ST_SHOW_VOLT:   return s.show_volt         ? "ON" : "OFF";
         case ST_COACH_SHOW:  return s.coach_show        ? "ON" : "OFF";
@@ -6994,6 +7073,8 @@ static bool boolValueOnState(SettingId id) {
         case ST_AUTO_TRACK:  return s.auto_select_track;
         case ST_DEBUG_LOG:   return s.debug_enabled;
         case ST_AUTO_START:  return s.auto_start;
+        case ST_AUTO_STOP:   return s.auto_stop;
+        case ST_AUTO_UPLOAD: return s.auto_upload_wifi;
         case ST_SHOW_TEMP:   return s.show_coolant;
         case ST_SHOW_VOLT:   return s.show_volt;
         case ST_COACH_SHOW:  return s.coach_show;
@@ -8206,6 +8287,8 @@ static bool rowShouldShow(SettingId id) {
 
         // Auto-start speed/hold only matter when auto-start is enabled.
         case ST_AUTO_START_MPH: case ST_AUTO_START_SEC: return s.auto_start;
+        // Auto-stop seconds only matter when auto-stop is enabled.
+        case ST_AUTO_STOP_SEC: return s.auto_stop;
         default:           return true;
     }
 }
@@ -8233,6 +8316,7 @@ static int rowGroup(SettingId id) {
         case ST_REC_SD: case ST_REC_CLOUD: case ST_AUTO_TRACK:
         case ST_AUTO_START: case ST_AUTO_START_MPH:
         case ST_AUTO_START_SEC:
+        case ST_AUTO_STOP: case ST_AUTO_STOP_SEC: case ST_AUTO_UPLOAD:
         case ST_VIDEO_EN: case ST_VIDEO_STATUS: return SG_RECORDING;
         case ST_CL_HOST: case ST_CL_PORT: case ST_CL_PROTO:
         case ST_CL_AUTH_USER: case ST_CL_AUTH_PASS: return SG_CLOUD;
@@ -8617,6 +8701,10 @@ static void handleSettingsTap(int x, int y) {
                     case ST_DEBUG_LOG:  s.debug_enabled = !s.debug_enabled;
                                         Serial.printf("CFG,dbg_on,%d\n", (int)s.debug_enabled); break;
                     case ST_AUTO_START: s.auto_start        = !s.auto_start;        break;
+                    case ST_AUTO_STOP:  s.auto_stop         = !s.auto_stop;         break;
+                    case ST_AUTO_UPLOAD: s.auto_upload_wifi = !s.auto_upload_wifi;
+                                        if (s.auto_upload_wifi) auto_upload_next_ms = 0;  // fire now
+                                        break;
                     case ST_SHOW_TEMP:  s.show_coolant      = !s.show_coolant;      break;
                     case ST_SHOW_VOLT:  s.show_volt         = !s.show_volt;         break;
                     case ST_COACH_SHOW: s.coach_show        = !s.coach_show;        break;
@@ -13641,6 +13729,22 @@ void loop() {
             coach_refetch_at_ms = 0;
             coachKick(nullptr);
         }
+    }
+
+    // Auto-upload on WiFi (v0.1.174). A loop check, not a connect edge: the
+    // queue depth arrives in CLD lines AFTER the link comes up, and a pass may
+    // have to wait for the coach fetch / an OTA to clear. AUTO_UPLOAD_RETRY_MS
+    // spaces passes, so a failed batch retries on that cadence instead of
+    // hammering the server (the upload flow itself already retries each file).
+    if (s.auto_upload_wifi && wifiConnectedNow()
+        && !recording && !upload_active && !net_pending_upload
+        && uf.state == UF_IDLE && sl.state == SL_IDLE
+        && cloud_queue_depth > 0 && !wifiJobBusy()
+        && currentPage != PAGE_OTA && currentPage != PAGE_SESSIONS
+        && (int32_t)(millis() - auto_upload_next_ms) >= 0) {
+        auto_upload_next_ms = millis() + AUTO_UPLOAD_RETRY_MS;
+        Serial.printf("DBG,auto-upload: queue=%lu\n", (unsigned long)cloud_queue_depth);
+        startQueueUpload();
     }
 
     // ---- REC handshake watchdog (v0.1.147) ----
