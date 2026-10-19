@@ -1744,6 +1744,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `alerts` | bool | Master alerts on/off |
 | `a1_rpm` / `a1_col` / `a1_hz` | uint16/uint8/uint8 | Alert 1 threshold/colour/blink-Hz |
 | `am_rpm` / `am_col` / `am_hz` | uint16/uint8/uint8 | MAX alert ditto |
+| `flarea` | bool | **Shift-alert flash area** (v0.1.176, default OFF = the v0.1.147 top band). ON = the WHOLE screen flashes the alert colour (the pre-0.1.147 behaviour). Settings → "Alert flash area" (`Top band` / `Whole screen`); dash-only (no CFG). Whole-screen repaints the entire dash on every colour flip, which is the PSRAM/DMA load "THE SHAKE" was fixed by removing — hence opt-in. |
 | `rec_sd` / `rec_cl` | bool | Record-to-SD / record-to-cloud master switches |
 | `cl_host` | string | Cloud DNS or IP |
 | `cl_port` | uint16 | Cloud port. **Default 443** (HTTPS). Cycling `cl_proto` auto-snaps this to the protocol's well-known port (HTTP→80 / HTTPS→443 / FTP→21), still editable. The `racecar.api.blueuc.com` endpoint is HTTPS-only: port 80 just 301-redirects (which the dash won't follow), so HTTPS+443 is the only working combo. NOTE: existing units have the old `80` stored in NVS — change it on-device or it stays 80. |
@@ -1925,14 +1926,26 @@ Why it changed: the old full-screen `fillScreen` twice a second was the same PSR
 tearing mechanism as the shift flash (see "THE SHAKE" below) and hid the speed/laps
 exactly when you least want to lose them.
 
-### Shift-alert FLASH BAND (v0.1.147; was full-screen)
-`computeBgColor()` now paints ONLY the top band `y 0..FLASH_BAND_H (130)`: the RPM bar
+### Shift-alert FLASH BAND (v0.1.147; was full-screen) — whole screen is a setting again (v0.1.176)
+`computeBgColor()` paints the top band `y 0..FLASH_BAND_H (130)`: the RPM bar
 (fill colour stays the gradient, empty part = alert colour), the RPM number (black text on
 a lit band) and the delta bar. On a colour flip, `drawDashPage()` fills just the band's
 background-only strips (~63 KB) and invalidates the three band elements; nothing below
 y=130 is repainted, so speed/laps/buttons never strobe. `flashBg` is the band colour;
-`bg` (always `TFT_BLACK`) is what every other element paints behind itself. The lap popup
-now starts at `FLASH_BAND_H` (the bar + delta bar stay visible under it).
+`bg` (`TFT_BLACK` in this mode) is what every other element paints behind itself. The lap
+popup starts at `FLASH_BAND_H` (the bar + delta bar stay visible under it).
+
+**Whole-screen is opt-in (v0.1.176).** v0.1.147 removed the full-screen flash OUTRIGHT — there
+was never a setting; it was the only behaviour before and gone after. It is now Settings →
+**"Alert flash area"** (`Top band` default / `Whole screen`, NVS `flarea`, dash-only, no CFG).
+With `Whole screen`, `bg = flashBg`, so every element (speed sprite, sensor block, labels,
+buttons, clock) paints the alert colour behind itself; a colour flip does `fillScreen(bg)` +
+`invalidateAll()`, which is the pre-0.1.147 cost (384 KB framebuffer fill + full redraw per
+half-cycle — the PSRAM/DMA load "THE SHAKE" was fixed by removing) and why it is not the
+default. `dash_body_bg` carries the current body colour into `monPaintBlock()` and the
+sensor-warning block's off phase, so those follow the flash instead of leaving a black
+rectangle. `ld.bg` is the repaint key and must NOT be reset by `invalidateAll()` (it would
+loop). The sensor-warning BLOCK still flashes on its own, independently of this setting.
 
 ### v0.1.152 — panel RTC, automatic time/timezone, wall clock
 

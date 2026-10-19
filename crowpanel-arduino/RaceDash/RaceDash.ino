@@ -29,7 +29,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.175"
+#define FIRMWARE_VERSION "0.1.176"
 
 #include <Preferences.h>
 #include <time.h>
@@ -57,6 +57,7 @@ enum SettingId : uint8_t {
     ST_PANEL_REV,                 // Advance only: 0x30 backlight coprocessor dialect (v0.1.145)
     ST_WIFI_SSID, ST_WIFI_PASS, ST_WIFI_STATUS,
     ST_RPM_MIN, ST_RPM_MAX, ST_RPM_DIV, ST_RPM_SMOOTH, ST_RPM_SPIKE, ST_GPS_FILTER, ST_LAP_OVERLAY, ST_ALERTS,
+    ST_ALERT_FULL,                // shift alert flashes the top band (v0.1.147) or the WHOLE screen (v0.1.176)
     ST_A1_RPM, ST_A1_COL, ST_A1_HZ,
     ST_AM_RPM, ST_AM_COL, ST_AM_HZ,
     // Coolant temp warn-color + oil PSI warn-color. Each has a master
@@ -795,6 +796,12 @@ struct Settings {
     uint16_t alertmax_rpm     = 7500;
     uint8_t  alertmax_color_idx = 0;   // RED
     uint8_t  alertmax_hz      = 8;
+    // Shift-alert flash AREA (v0.1.176, NVS "flarea"). false = the v0.1.147
+    // top FLASH BAND (RPM bar / number / delta bar); true = the WHOLE screen
+    // flashes the alert colour, as it did through v0.1.146. The band exists
+    // because a full-screen fillScreen + full redraw per half-cycle is the
+    // PSRAM/DMA load described under "THE SHAKE"; whole-screen is opt-in.
+    bool     flash_fullscreen = false;
 
     // Recording / streaming
     bool     record_sd        = false;
@@ -948,6 +955,9 @@ static Settings s;
 
 // Names for ENUM-style settings (cycle-on-tap).
 const char* const PROTOCOL_NAMES[] = { "HTTP", "HTTPS", "FTP" };
+// Shift-alert flash area (v0.1.176): v0.1.147 confined the flash to the top
+// band; whole-screen was removed outright then, not offered as an option.
+const char* const FLASH_AREA_NAMES[] = { "Top band", "Whole screen" };
 constexpr int N_PROTOCOL = 3;
 const char* const SENSOR_TYPE_NAMES[] = { "Direct", "MegaSquirt", "Bluetooth" };
 // RPM spike filter (Teensy-side slew gate): rejects tach pulses implying a
@@ -1779,6 +1789,7 @@ static void loadSettings() {
     s.alertmax_rpm       = prefs.getUShort("am_rpm",   s.alertmax_rpm);
     s.alertmax_color_idx = prefs.getUChar ("am_col",   s.alertmax_color_idx);
     s.alertmax_hz        = prefs.getUChar ("am_hz",    s.alertmax_hz);
+    s.flash_fullscreen   = prefs.getBool  ("flarea",   s.flash_fullscreen);
     s.record_sd          = prefs.getBool  ("rec_sd",   s.record_sd);
     s.record_cloud       = prefs.getBool  ("rec_cl",   s.record_cloud);
     prefs.getString      ("cl_host",  s.cloud_host, sizeof(s.cloud_host));
@@ -1897,6 +1908,7 @@ static void saveSettings() {
     prefs.putUShort("am_rpm",   s.alertmax_rpm);
     prefs.putUChar ("am_col",   s.alertmax_color_idx);
     prefs.putUChar ("am_hz",    s.alertmax_hz);
+    prefs.putBool  ("flarea",   s.flash_fullscreen);   // shift flash: top band vs whole screen
     prefs.putBool  ("rec_sd",   s.record_sd);
     prefs.putBool  ("rec_cl",   s.record_cloud);
     prefs.putString("cl_host",  s.cloud_host);
@@ -5750,12 +5762,19 @@ static uint16_t computeBgColor() {
     return on ? color : TFT_BLACK;
 }
 
+// Body background the dash is painting right now. Black in the default
+// band-flash mode; the alert colour while the opt-in WHOLE-SCREEN flash
+// (v0.1.176, Settings -> "Alert flash area") is lit. The sensor monitor block
+// and the sensor-warning block's off phase follow it so the flash really does
+// cover the whole panel instead of leaving a black rectangle behind.
+static uint16_t dash_body_bg = TFT_BLACK;
+
 // Cache the last-drawn value of every dynamic field. Drawing happens only
 // when the new value differs from the cached one — this is what eliminates
 // the per-frame flicker. Dirtied to force-redraw on bg state changes.
 struct LastDrawn {
     char     clock_str[8] = "";      // v0.1.152 local wall clock (HH:MM), bottom-right
-    uint16_t bg          = 0xDEAD;   // (kept for compat; the dash body bg is always black now) - intentionally not invalidated
+    uint16_t bg          = 0xDEAD;   // dash body bg last painted — intentionally NOT invalidated (it is the whole-screen-flash repaint key; resetting it would loop)
     uint16_t flash_bg    = 0xDEAD;   // shift-alert band colour last painted (v0.1.147)
     int16_t  rpm_fillW   = -1;       // last drawn bar fill width in px
     uint16_t rpm_color   = 0;        // last drawn bar fill color - intentionally not invalidated (rpm_fillW = -1 forces the repaint that refreshes it)
@@ -5883,7 +5902,7 @@ static uint32_t monRowsTag(const MonRow* rows, int n) {
 // bottom of the block, the first is the top of the stack. pitch = min(34, H/n);
 // font steps down Font4 -> Font2 -> Font0 as the stack gets denser.
 static void monPaintBlock(lgfx::LGFXBase* g, int ox, int oy, const MonRow* rows, int n) {
-    g->fillRect(ox, oy, WARN_W, WARN_H, TFT_BLACK);
+    g->fillRect(ox, oy, WARN_W, WARN_H, dash_body_bg);
     if (n <= 0) return;
     int pitch = WARN_H / n;
     if (pitch > 34) pitch = 34;
@@ -5894,7 +5913,7 @@ static void monPaintBlock(lgfx::LGFXBase* g, int ox, int oy, const MonRow* rows,
     g->setTextDatum(textdatum_t::middle_left);
     for (int k = 0; k < n; ++k) {
         const int ry = WARN_H - (n - k) * pitch;            // row top inside the block
-        g->setTextColor(rows[k].col, TFT_BLACK);
+        g->setTextColor(rows[k].col, dash_body_bg);
         g->drawString(rows[k].text, ox + MON_SENS_X, oy + ry + pitch / 2);
     }
     g->setTextDatum(textdatum_t::top_left);
@@ -5968,10 +5987,16 @@ static void drawDashPage() {
     }
 
     // v0.1.147: the shift-alert colour is confined to the top FLASH BAND; the
-    // body of the dash is ALWAYS black. `flashBg` is what the band paints,
-    // `bg` (black) is what every other element paints behind itself.
+    // body of the dash is black. `flashBg` is what the band paints, `bg` is
+    // what every other element paints behind itself.
+    // v0.1.176: Settings -> "Alert flash area" can restore the pre-0.1.147
+    // WHOLE-SCREEN flash (bg = flashBg). That mode repaints the entire dash on
+    // every colour flip - the PSRAM/DMA load "THE SHAKE" was fixed by removing
+    // - so it is opt-in; "Top band" stays the default.
     const uint16_t flashBg = computeBgColor();
-    const uint16_t bg      = TFT_BLACK;
+    const bool     whole_flash = s.flash_fullscreen;
+    const uint16_t bg      = whole_flash ? flashBg : TFT_BLACK;
+    dash_body_bg = bg;   // monitor block / warn-block off phase follow the body
 
     // ---- sensor warning BLOCK (v0.1.147; was full-screen since v0.1.110) ----
     // When a sensor warning (OIL / TEMP / VOLT / AFR) is active, the bottom-
@@ -6015,20 +6040,22 @@ static void drawDashPage() {
                 ld.warn_tag = tag;
             }
         } else if (ld.warn_tag != 0) {
-            // Leaving the ON phase (or warning cleared): black the block and
+            // Leaving the ON phase (or warning cleared): repaint the block in
+            // the body colour (black, or the whole-screen flash colour) and
             // force the sensor monitor to repaint itself over it.
             ld.warn_tag = 0;
-            tft.fillRect(WARN_X, WARN_Y, WARN_W, WARN_H, TFT_BLACK);
+            tft.fillRect(WARN_X, WARN_Y, WARN_W, WARN_H, dash_body_bg);
             ld.sens_tag = 0;
         }
     }
 
-    // Full repaint ONLY on page entry (v0.1.147 — no longer on every alert
-    // flash). After that, every element repaints only when its value changed;
-    // text uses textColor(fg, bg) so cells redraw their own bg and we never
-    // go through a "blanked" intermediate frame.
-    if (pageJustEntered) {
-        tft.fillScreen(TFT_BLACK);
+    // Full repaint on page entry, and - WHOLE-SCREEN flash mode only - whenever
+    // the body background flips with the alert colour (v0.1.176). Band mode
+    // never gets here on a flash: every element then repaints only when its
+    // value changed; text uses textColor(fg, bg) so cells redraw their own bg
+    // and we never go through a "blanked" intermediate frame.
+    if (pageJustEntered || bg != ld.bg) {
+        tft.fillScreen(bg);
 
         // Static labels — drawn once on entry/bg-flip, not per frame.
         // Force size 1 explicitly: previous draws (boot, settings exit) may
@@ -6890,6 +6917,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_RPM_SPIKE,  "RPM spike filter",     SettingRow::ENUM    },
     { ST_GPS_FILTER, "GPS drift filter",     SettingRow::ENUM    },
     { ST_ALERTS,     "Enable RPM alerts",    SettingRow::TOGGLE  },
+    { ST_ALERT_FULL, "Alert flash area",     SettingRow::ENUM    },
     { ST_A1_RPM,     "Alert 1 RPM",          SettingRow::NUMERIC },
     { ST_A1_COL,     "Alert 1 color",        SettingRow::COLOR   },
     { ST_A1_HZ,      "Alert 1 blink (Hz)",   SettingRow::NUMERIC },
@@ -8229,6 +8257,7 @@ static const char* enumValue(SettingId id) {
         case ST_SENSOR_TYPE: return SENSOR_TYPE_NAMES[s.sensor_type % N_SENSOR_TYPE];
         case ST_RPM_SPIKE:   return SPIKE_FILTER_NAMES[s.rpm_spike % N_SPIKE_FILTER];
         case ST_GPS_FILTER:  return SPIKE_FILTER_NAMES[s.gps_filter % N_SPIKE_FILTER];
+        case ST_ALERT_FULL:  return FLASH_AREA_NAMES[s.flash_fullscreen ? 1 : 0];
         case ST_PANEL_REV:   return ADV_REV_NAMES[s.adv_rev % N_ADV_REV];
         case ST_RPM_DIV:     return RPM_PPR_NAMES[rpmPprIndex()];
         case ST_GPS_BAUD: {
@@ -8338,6 +8367,7 @@ static int rowGroup(SettingId id) {
         case ST_WIFI_SSID: case ST_WIFI_PASS: case ST_WIFI_STATUS: return SG_NET;
         case ST_RPM_MIN: case ST_RPM_MAX: case ST_RPM_DIV: case ST_RPM_SMOOTH: case ST_RPM_SPIKE:
         case ST_GPS_FILTER: case ST_ALERTS:
+        case ST_ALERT_FULL:
         case ST_A1_RPM: case ST_A1_COL: case ST_A1_HZ:
         case ST_AM_RPM: case ST_AM_COL: case ST_AM_HZ: return SG_RPM;
         case ST_SENSOR_TYPE:
@@ -8797,6 +8827,10 @@ static void handleSettingsTap(int x, int y) {
                     // dialect drives this unit's backlight (Auto is always safe).
                     s.adv_rev = (s.adv_rev + 1) % N_ADV_REV;
                     applyBrightness(s.brightness);
+                } else if (r.id == ST_ALERT_FULL) {
+                    // v0.1.176: whole-screen shift flash is back as an OPTION.
+                    // The next dash repaint picks it up (page entry refills).
+                    s.flash_fullscreen = !s.flash_fullscreen;
                 } else if (r.id == ST_RPM_SPIKE) {
                     s.rpm_spike = (s.rpm_spike + 1) % N_SPIKE_FILTER;
                     Serial.printf("CFG,rpmspk,%u\n", (unsigned)s.rpm_spike);
