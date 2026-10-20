@@ -6,8 +6,8 @@ The `design/` PCB has assigned nets, components and routed copper: **193 footpri
 104 nets, 1,647 routed segments, 131 vias**. Its native schematic uses manufacturer
 pin/function symbols, actual pin numbers and electrical types. A full connected-pad
 comparison runs in addition to ERC and DRC (KiCad 9.0.8): **0 ERC violations, 0 DRC
-violations, 0 unconnected items, 749 pin/geometry/calculation
-assertions, 538 schematic ↔ PCB connected pads agree** (multi-pad through-hole pins
+violations, 0 unconnected items, 1,078 pin/geometry/calculation
+assertions (incl. the silkscreen-legend checks added 2026-10-19), 538 schematic ↔ PCB connected pads agree** (multi-pad through-hole pins
 collapse to a single entry).
 
 Those are statements about files, not about a board. Nothing here has been built,

@@ -106,10 +106,38 @@ D21, D22, C40 — all ordinary parts.
   PCBWay's convention).
 * `PCBWAY-ORDER-GUIDE.md` — **read this before quoting**: board settings, the fit/no-fit
   list for U1 / JP1 / JP2 / BT1 / J9, and the CAN notes.
+* `addon-silkscreen/` — **replacement `F.Silkscreen` layer only** (2026-10-19): every
+  connector, jumper and the RTC cell named at the part with its pin labels, the Teensy
+  insertion orientation and the crossed screen-lead table. Same-named file to overwrite
+  inside the gerber ZIP above; every other layer was verified geometry-identical, so the
+  package above stays valid. `design/` already holds this silk, so `fabrication/export.py`
+  and `make_package.py` reproduce it — see `addon-silkscreen/SILKSCREEN-ADDON.md`.
+
+## 5b. Silk fix for the package already uploaded (2026-10-19)
+
+The uploaded silkscreen had gaps a builder would hit. The fix ships as **one
+replacement gerber** (`addon-silkscreen/racecar-integrated-revf-F_Silkscreen.gbr`), so
+the copper/mask/paste/drill/BOM/CPL that PCBWay already holds are untouched
+(`addon-silkscreen/verify_addon.py` re-proves this layer by layer and exits 1 otherwise):
+
+1. **12 field-terminal labels were missing** (a finishing step deleted silk text by string):
+   J5 had no name or pin labels at all, J3/J4/J11/J12 showed only `3 SIG`. Every terminal
+   now has its name (with designator, e.g. `J5 COOLANT`) just above it and one
+   left-aligned label per pad;
+2. **five parts were unlabelled or labelled 28-44 mm away** — `GPS SMA`, `PI 5 VIDEO UART
+   3V3` and `RTC 3V NO CHARGE` had drifted from J8, J13 and BT1 when placement changed, and
+   J9, J10 and JP1 had nothing. All are now named at the part; J13 (`2 TX>PI 10`,
+   `3 RX<PI 8`), J9, J10 and J14 carry pin labels;
+3. the Teensy socket got an orientation marker — the 2×24 array accepts the module
+   rotated 180°, and backwards this board feeds +5 V to a GPIO, shorts TX2 to GND and
+   drives 3.3 V into A3;
+4. the screen lead's crossover is printed under J2 as a column-aligned table — a 1-to-1
+   cable would put +5 V on the panel's TXD0_H;
+5. all board text raised to a 0.16 mm stroke (was 0.13 mm; fab minimum ~0.153 mm).
 
 ## 6. Verification status (CAD only)
 
-ERC **0**, DRC **0**, unconnected **0**, 749 pin/geometry/calculation assertions passed,
+ERC **0**, DRC **0**, unconnected **0**, 1,078 pin/geometry/calculation assertions passed,
 538 schematic↔PCB connected pads agree, 193 footprints / 104 nets / 1,647 routed segments
 with 131 vias. This is a CAD check, **not** a physical or thermal validation, and it is not
 an independent human review. The CAN interface in particular has never been built, measured

@@ -21,6 +21,20 @@ Pin numbers increase **top to bottom**; connector entries point outward.
 | J1 | POWER | 1 +10–20 V IN, 2 GND |
 | J2 | SCREEN | 1 GND, 2 fused +5 V OUT, 3 RX FROM screen, 4 TX TO screen |
 
+⚠️ **The screen master cable is CROSSED — do not make a 1-to-1 cable.** J2 counts
+GND first, the panel's J10 counts its UART first, so the wires swap:
+
+| J2 (this board) | Function | CrowPanel Advance J10 |
+|---|---|---|
+| 1 | GND | **4** GND |
+| 2 | fused +5 V OUT | **3** +5V_IN |
+| 3 | RX from screen | **2** TXD0_H |
+| 4 | TX to screen | **1** RXD0_H |
+
+A straight-through cable puts +5 V on the panel's TXD0_H and grounds nothing useful.
+The mapping is also printed on the silkscreen under J2, digits in columns so each J2 pin
+sits over its partner (`J2 -> SCREEN J10: CROSSED` / `J2 1 2 3 4` / `J10 4 3 2 1`).
+
 ⚠️ **`J14` (CAN) is mid-board, not on the left edge.** It is a third Phoenix
 **1729021** 3-position 5.08 mm terminal, next to the onboard transceiver rather than
 with the left-edge bank (that edge cannot hold a ninth screw terminal with usable
@@ -39,6 +53,27 @@ Other field connectors: **J8** GPS SMA, **J9** RTC cell lead, **J10** NET 3V3
 service/programming 2×3 header, **J13** Pi 5 video UART (JST XH), **J14** CAN
 (Phoenix 1729021). The old `J7` CAN-module header is deleted — the transceiver is on
 the board and its `STB` pin is tied to GND, so there is no receive-only module to fit.
+Every one of them (and JP1, JP2, BT1) is **named on the silkscreen at the part** — no
+reference designators are printed, so the name (`J13 PI 5 VIDEO 3V3`, `J8 GPS ANT`, …)
+is the identification.
+
+**J13 — Raspberry Pi 5 video recorder UART** (JST XH 4-pin 2.50 mm, right side of the
+board; pin 1 = the square pad, left). Teensy `Serial1`, **115200 8N1, 3.3 V logic both
+ends**, no power on the connector (the Pi has its own supply). The lead is **straight,
+not crossed** — the board's TX already goes to the Pi's RX:
+
+| J13 pin | Board signal | Pi 5 40-pin header |
+|---|---|---|
+| 1 | GND | **pin 6** (or any GND) |
+| 2 | TX out — Teensy pin 1 (TX1) via R1 1 kΩ + D3 ESD | **pin 10** — GPIO15 RXD |
+| 3 | RX in — Teensy pin 0 (RX1) via R2 1 kΩ + D4 ESD | **pin 8** — GPIO14 TXD |
+| 4 | GND | (second ground, optional) |
+
+The 1 kΩ series resistors are already on the board — do not add the breadboard's
+extra 1 kΩ pair. On the Pi: `dtparam=uart0=on`, device `/dev/serial0`
+(`../../video-recorder/README.md`); do **not** use the Pi 5's tiny 3-pin JST debug
+UART. Turn on Settings → **Video interconnect** on the dash (`CFG,viden,1`). **Never**
+connect J13 to the screen's J10 — that is a 5 V port.
 
 **J2 goes ONLY to the verified screen J10 5V_IN / TXD0_H / RXD0_H interface.** It must
 NEVER feed the small screen HY2.0/J2 **3V3_OUT** pin — +5 V there destroys the
@@ -89,6 +124,14 @@ specific car's waveform and pulses/revolution with a scope.
 5. **Physically cut and verify the Teensy VUSB–VIN bridge before simultaneous USB and
    carrier power.** The carrier diode/jumper is NOT a substitute. Leave JP1 open until
    power-stage tests pass; fit a standard 2.54 mm shunt afterward.
+
+   ⚠️ **Insert the Teensy with its USB connector at the board's TOP edge** — the edge
+   the silkscreen arrow points to (`TEENSY` / `USB END` / `THIS EDGE`, with the pin
+   numbers `1` and `25` at that end, added by `../pcbway/addon-silkscreen/`). The 2×24
+   socket is symmetric, so the module also fits 180° rotated or one pin out — and
+   inserted backwards this board would feed +5 V (through D2/JP1) onto Teensy pin 32,
+   short TX2 to ground and drive 3.3 V into A3. Before seating it, check that **socket
+   pad 1 (marked `1`) takes the Teensy pin next to the USB connector, i.e. GND**.
 6. RTC: J9 uses a short, keyed two-wire lead (JST XHP-2 housing, matching
    SXH-001T-P0.6 contacts) to the Teensy's labelled auxiliary **VBAT and GND** pads.
    J9 pin 1 → VBAT; pin 2 → GND. This manual lead is REQUIRED: the outer-row sockets

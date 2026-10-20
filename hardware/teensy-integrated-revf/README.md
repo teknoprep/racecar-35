@@ -24,9 +24,9 @@ and `J14` presents `CANH` / `CANL` / `GND` with switchable split termination. Se
   positions CSV, fabrication/assembly/bring-up notes, editable CAD, validation
   reports and a SHA-256 manifest. Verified CRC and per-file hashes.
 - **`Racecar-RevF-3D.html`** — the whole board in 3D as **one self-contained file**
-  (1.4 MB): orbit/zoom, a clickable list of what is fitted, and labels on the parts.
+  (1.5 MB): orbit/zoom, a clickable list of what is fitted, and labels on the parts.
   No server, no CDN, no network — open it from anywhere, or send it to someone.
-- **`Racecar-RevF-3D.glb`** — the same board as a standard glTF model (4.7 MB),
+- **`Racecar-RevF-3D.glb`** — the same board as a standard glTF model (5.4 MB),
   for Blender, Windows 3D Viewer, any online glTF viewer, a fab/shop or a case
   designer. Plain glTF 2.0, no extensions to install.
 - **`Racecar-RevF-3D-preview.png`** — still image of the viewer, for documents.
@@ -37,7 +37,13 @@ and `J14` presents `CANH` / `CANL` / `GND` with switchable split termination. Se
 cd hardware/teensy-integrated-revf
 python3 electrical/export3d.py      # presentation copy + Racecar-RevF-3D.glb (+ raw copper)
 python3 electrical/make_3d_share.py # the single-file viewer (needs node + a local three)
+cp render/Racecar-RevF-3D.glb render/Racecar-RevF-3D.html .
+/home/chris/racecar-tools/servervenv/bin/python3 electrical/render_stills.py
+                                    # render/check/{top,angle}.png + Racecar-RevF-3D-preview.png
 ```
+
+The 3D outputs carry whatever silkscreen `design/` holds, so re-run all four steps after a
+silk change (the stills used to lag the board: they still showed the 2026-10-11 silk).
 
 Both scripts work on a **copy**; the routed CAD in `design/` is hashed before and
 after and is never modified by them. Every model substitution, the generated bodies and
@@ -53,8 +59,17 @@ the caveats are recorded in `render/3D-EXPORT-REPORT.json` for audit.
   built from nine of them: two 1×24 sockets, the board, MCU, flash, micro-USB, microSD and
   the two pin fields).
 * Two library parts are replaced by a **named near-twin** because the exact model is not
-  in the package: the SMA jack → `SMA_Amphenol_132289_EdgeMount`, the SOIC-8-EP buck →
-  `HSOP-8-1EP_3.9x4.9mm_P1.27mm_EP2.41x3.1mm`.
+  in the package: the SMA jack → `SMA_Molex_73251-2200_Horizontal`, the SOIC-8-EP buck →
+  `HSOP-8-1EP_3.9x4.9mm_P1.27mm_EP2.41x3.1mm`. The 901-143 is a right-angle THROUGH-HOLE
+  jack (a straight jack turned on its side: square body standing on 5 pins, barrel out
+  sideways past the board edge); the Molex twin has the same construction, the same pin
+  pattern (centre + 4 grounds at ±2.54 mm) and the same frame, so it needs no transform.
+  Its barrel is ~5 mm longer — take enclosure dimensions from Amphenol's drawing. (Until
+  2026-10-20 the twin was the 132289 **edge-mount**, a flat bracket that clamps over a board
+  edge, and it was also rotated 90° — it rendered lying along the top edge. Render-only:
+  the copper/Gerbers come from the footprint, KiCad's stock 901-143 placed exactly on its
+  own board-edge marker, y = −4.5 mm.) `SUBST_TRANSFORM` in `export3d.py` exists for a
+  twin whose frame does NOT match; check any new twin against its own stock footprint.
 * Consequently the 3D model is **illustrative**: it is not a mechanical, fit, RF or thermal
   model, it is not evidence that the board works, and it does not change the fact that
   Rev F is an unbuilt, unmeasured, not-independently-reviewed prototype.

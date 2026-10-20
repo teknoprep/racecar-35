@@ -1,0 +1,58 @@
+Subject: Re: Quotation T-2SJ3W1113248A (Racecar-35 Rev F) - one replacement layer (F.Silkscreen) + via-in-pad answer
+
+Hi Kelly,
+
+Two things for the Rev F package you already have.
+
+1) VIA IN SMD PAD - please use option A, and only for 2 vias
+   Please use option A (via in pad: filled with resin, then capped and plated over).
+   Only 2 vias on this board sit inside SMD paste apertures: 0.6 mm land / 0.3 mm
+   drill, front side, in the pads of R35 and R34 (0805). Those are the only ones
+   that need the fill.
+   Please do NOT quote option B (all vias filled): the board has 125 through vias
+   in total and the other 123 are ordinary mask-tented signal vias with no paste
+   opening over them, so filling them adds cost with no benefit.
+   No paste-aperture reduction is needed - the capped vias end up flush with the pad.
+   (If your DFM list also includes the 12 x 0.3 mm holes inside the ESP32-S3
+   module's 3.9 mm centre ground pad, those carry no paste aperture at all, so no
+   solder can flow into them. They need no treatment, but including them in the same
+   fill operation is fine.)
+   -> Please confirm the price for the via-in-pad fill on 2 vias so I can approve it.
+
+2) ONE REPLACEMENT GERBER FILE - F.Silkscreen only (no electrical change)
+   Attached: racecar-integrated-revf-F_Silkscreen.gbr
+   Please replace the file of that same name inside the gerber package you already
+   have. Everything else is unchanged - I re-exported all layers from the updated
+   board and compared them with the package you have: F.Cu, In1.Cu, In2.Cu, B.Cu,
+   F.Mask, B.Mask, F.Paste, B.Paste, B.Silkscreen, Edge.Cuts and both drill files are
+   geometry-identical. Only F.Silkscreen differs. No net, track, via, pad, footprint
+   or BOM/CPL row changed, so the assembly data you already have is still correct.
+   Why: the first silkscreen was missing markings the assembler and the end user need.
+   - Every connector, jumper and the coin-cell holder is now named at the part, with
+     pin labels beside each screw terminal and header (several labels were missing,
+     and three had been left 28-44 mm from their parts by an earlier placement).
+   - The Teensy 4.1 socket is a symmetric 2x24 array, so the module can physically be
+     inserted rotated 180 degrees; backwards it would put +5 V on a GPIO, short a UART
+     TX pin to ground and drive 3.3 V into an analogue input. The layer now prints
+     "TEENSY / USB END / THIS EDGE" with a chevron toward the USB end and the pin
+     numbers 1 and 25 at the socket corners.
+   - The screen cable is CROSSED (our J2: 1 GND / 2 +5V / 3 RX / 4 TX; the panel's
+     J10: 1 RXD0_H / 2 TXD0_H / 3 +5V_IN / 4 GND). A small table under J2 shows it.
+   All legend text is now at least 0.9 mm high with a 0.16 mm stroke (was 0.8 mm / 0.13 mm),
+   on silk only, clear of every pad opening and the board edge; KiCad DRC is clean on
+   all silk checks. I do not expect any new DFM question from it. The attached PNG
+   shows the whole layer and close-ups.
+   One bookkeeping note: the package's -job.gbrjob XML carries per-file checksums, so
+   its entry for F_Silkscreen is stale once this layer is substituted - the layer
+   files are authoritative, and the job file can be regenerated or dropped.
+
+Nothing else in the order changes. Please confirm you received the replacement layer
+and the via-in-pad choice, and send the updated quotation at 5 units.
+
+Thanks,
+Chris
+
+------------------------------------------------------------------------------
+Attachments:
+  racecar-integrated-revf-F_Silkscreen.gbr          (replaces the same-named file)
+  Racecar-RevF-SILKSCREEN-ADDON-preview.png        (the layer + close-ups)

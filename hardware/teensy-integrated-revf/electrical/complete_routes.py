@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Rev F final finishing: close the connections the autorouter could not, remove
-one dead-end stub, and drop silkscreen labels that no longer clear the mask.
+one dead-end stub. (It also used to delete silkscreen pin labels that touched a
+solder-mask opening - see step 1: that removed 12 labels and left whole screw
+terminals unmarked, so it is gone.)
 
 Run ONCE after route.py --finish on the frozen autorouter result.
 
@@ -49,12 +51,17 @@ def via(net, x, y):
 
 
 # ---------------------------------------------------------------- 1. cleanup --
-CLIP = {'1 +5V', '2 RET', 'NTC', '1 NTC', '2 +5V', '3V3 NET'}
-gone = []
-for item in list(b.GetDrawings()):
-    if isinstance(item, k.PCB_TEXT) and item.GetText() in CLIP:
-        gone.append(item.GetText()); b.RemoveNative(item)
-print('silkscreen labels removed (pinouts remain in ASSEMBLY.md):', sorted(set(gone)))
+# HISTORY (do not reintroduce): this step used to delete every F.SilkS text whose
+# STRING was in a hand-written set {'1 +5V', '2 RET', 'NTC', '1 NTC', '2 +5V',
+# '3V3 NET'} because a few instances touched a solder-mask opening. Keying on the
+# string removed ALL 12 instances of those strings, including the clear ones: J5
+# (COOLANT) lost its title AND both pin labels, and J3/J4/J11/J12 kept only their
+# SIG pin, so the shipped silkscreen labelled the eight field screw terminals with
+# nothing but '3 SIG'. generate.py now nudges a colliding label along its column
+# instead (SILK_NUDGE), so nothing needs clipping here; electrical/verify.py asserts
+# every terminal keeps its title and one label per pad.
+# ('3V3 NET' at 136,104 was the one legitimately unplaceable label - it sat on U18's
+# pads - and it stays dropped: the +3V3_NET rail is marked by test pad TP4's silk.)
 
 # ------------------------------------------------------------------ 2. paths --
 # +5V_SCREEN -> C33 pin 1. The rail already reaches U5 pin 6; this closes the

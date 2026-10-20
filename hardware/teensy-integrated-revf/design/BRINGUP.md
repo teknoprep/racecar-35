@@ -23,7 +23,12 @@ thermometer.** Do not connect a Li-ion car battery directly to an untested assem
 4. Confirm C1 is on the protected rail, diode orientation, and no charging/backfeed
    on VBAT. Perform power-off/source-sequencing checks with limited fault energy; do
    not improvise destructive reverse-battery or load-dump tests.
-5. Fit the Teensy only after the rails pass. Verify 3V3, baseline supply current,
+5. Fit the Teensy only after the rails pass. **Check the insertion orientation first:**
+   USB connector at the board's TOP edge, i.e. Teensy pin 1 (GND, next to the USB
+   connector) into socket pad 1, which the silkscreen marks `1` beside the arrow
+   (`TEENSY / USB END / THIS EDGE`). The socket is symmetric, so a 180° or one-pin-off
+   insertion also fits and would apply +5 V to a GPIO, short TX2 to GND and drive 3.3 V
+   into A3. Verify 3V3, baseline supply current,
    CPU health and UART. Test carrier-only, USB-only (bridge cut), and controlled dual
    power. Test GPS/NET powered with the MCU off and vice versa for unintended
    backfeed on the Ioff buffers.
@@ -35,7 +40,9 @@ thermometer.** Do not connect a Li-ion car battery directly to an untested assem
    inrush, ripple, cable drop and steady-state temperature. Do not label the assembly
    'continuous 5 A' until worst-case enclosure/ambient testing supports it.
 8. Confirm the particular Advance screen's J10 pinout; use its 5V_IN interface, not
-   3V3_OUT. Initially power with current limiting. Verify touch, boot identity and
+   3V3_OUT. **The lead is crossed** — J2.1 GND → J10.4, J2.2 +5 V → J10.3, J2.3 RX →
+   J10.2 (TXD0_H), J2.4 TX → J10.1 (RXD0_H); a 1-to-1 cable puts +5 V on TXD0_H.
+   Initially power with current limiting. Verify touch, boot identity and
    bidirectional 921600-baud communication over the intended full cable length.
 9. Apply a low-energy test waveform to conditioned TACH: scope loading, trip levels
    (≈1.84 V rising / 1.56 V falling input-referred, before tolerance), optocoupler

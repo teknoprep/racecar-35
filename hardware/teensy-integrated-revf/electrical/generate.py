@@ -438,21 +438,21 @@ def line(a,b,layer=k.Edge_Cuts,width=.05):
 outline=[(20,20),(170,20),(170,175),(92,175),(92,169),(44,169),(44,175),(20,175),(20,20)]
 for a,b in zip(outline,outline[1:]):line(a,b)
 def text(s,x,y,size=.9):
- t=k.PCB_TEXT(B);t.SetText(s);t.SetPosition(P(x,y));t.SetTextSize(P(max(.8,size),max(.8,size)));t.SetTextThickness(MM(.13));t.SetLayer(k.F_SilkS);B.Add(t)
+ # >= 0.9 mm high / 0.16 mm stroke: fab legend minimums are ~0.81 mm / ~0.153 mm.
+ t=k.PCB_TEXT(B);t.SetText(s);t.SetPosition(P(x,y));t.SetTextSize(P(max(.9,size),max(.9,size)));t.SetTextThickness(MM(.16));t.SetLayer(k.F_SilkS);B.Add(t)
 text('RACECAR-35 REV F',150,150,1.0);text('ENGINEERING PROTOTYPE',150,153,.8)
-# CAN island: J14 pinout on the silkscreen and the bus-end rule next to the jumper.
-# CAN island: J14's pins run LEFT->RIGHT (pad 1 is the square pad), so each label sits
-# directly BELOW ITS OWN pad. A vertical label stack beside a horizontal pin row is read
-# as pin 1 = top and miswires CANH/CANL.
-for _x,lab in [(110.0,'1 CANH'),(115.08,'2 CANL'),(120.16,'3 GND')]:text(lab,_x,67.3,.5)
-text('CAN TERM FIT ONLY AT BUS END',146,52.0,.55)
-text('CUT TEENSY VUSB-VIN',74,23,.8);text('GPS SMA',160,23,.8)
-for ref,title,labels in [('J_TACH','TACH',['1 SIG','2 RET']),('J_OIL','OIL',['1 +5V','2 RET','3 SIG']),('J_COOL','NTC',['1 NTC','2 RET']),('J_AFR','AEM AFR',['1 WHT+','2 BRN-']),('J_TPS','THROTTLE',['1 +5V','2 RET','3 SIG']),('J_BRAKE','BRAKE',['1 +5V','2 RET','3 SIG']),('J1','10-20V IN',['1 VIN+','2 GND']),('J2','SCREEN J10',['1 GND','2 +5V','3 RX','4 TX'])]:
- y=k.ToMM(FPS[ref].GetPosition().y);text(title,38,y-(7.5 if ref=='J_TACH' else 3.0 if ref=='J_OIL' else 5.5),.8)
- for i,lab in enumerate(labels):text(lab,38,y+i*5.08+(2.0 if ref=='J1' and i==1 else 0),.8)
-text('NO COIL / INJECTOR',58,22,.65);text('RTC 3V NO CHARGE',120,171,.75)
-text('INTERNAL WIFI',68,147,.8);text('3V3 NET',136,104,.8)
-text('PI 5 VIDEO UART 3V3',152,100,.5)
+text('CUT TEENSY VUSB-VIN',74,23,.8)
+# ('3V3 NET' used to be printed at 136,104 - on top of U18's pads - and a later step
+# clipped it. It is simply not emitted now; TP4 marks the +3V3_NET rail.)
+text('INTERNAL WIFI',68,147,.8)
+# Every connector / jumper / cell label is laid out by silk_legends.apply() further down,
+# AFTER the reference designators are final (each name carries its designator, e.g.
+# 'J2 SCREEN', 'J13 PI 5 VIDEO 3V3'): the eight field terminals, J8 J9 J10 J13 J14,
+# JP1 JP2, BT1, the tach 'NO COIL / INJECTOR' warning, the Teensy orientation marks and
+# the crossed screen-harness table. The first artwork pass hard-coded several of these
+# at fixed coordinates that drifted 28-44 mm from their parts when placement changed
+# ('GPS SMA', 'PI 5 VIDEO UART 3V3', 'RTC 3V NO CHARGE'), so they are placed from
+# the parts themselves now.
 B.GetTitleBlock().SetTitle('Racecar integrated controller'); B.GetTitleBlock().SetRevision('F')
 ds=B.GetDesignSettings();ds.m_TrackMinWidth=MM(.15);ds.m_MinClearance=MM(.15);ds.m_CopperEdgeClearance=MM(.3);ds.m_HoleClearance=MM(.25);ds.m_SilkClearance=MM(.1)
 # Manufacturing/EDA references must have numeric suffixes; keep readable aliases
@@ -496,6 +496,11 @@ for p in PARTS:
             aliases[alias]=prefix+str(i);used.add(aliases[alias])
     p['alias']=alias;p['ref']=aliases[alias];FPS[alias].SetReference(p['ref'])
 (D/'COMPONENT-ALIASES.json').write_text(json.dumps(aliases,indent=2)+'\n')
+# Board-level legends (terminal names + pin labels, Teensy orientation, harness table):
+# ONE table shared with pcbway/addon-silkscreen/addon_silk.py. It places every label
+# against the real pads and raises rather than drop one.
+import silk_legends
+silk_legends.apply(B)
 k.SaveBoard(str(D/(NAME+'.kicad_pcb')),B)
 project={'meta':{'filename':NAME+'.kicad_pro','version':1},'board':{'design_settings':{'rules':{'min_clearance':.15,'min_track_width':.15,'min_via_diameter':.6,'min_through_hole_diameter':.3,'min_copper_edge_clearance':.3}}},'net_settings':{'classes':[{'name':'Default','clearance':.15,'track_width':.2,'via_diameter':.7,'via_drill':.3,'microvia_diameter':.3,'microvia_drill':.1,'diff_pair_width':.25,'diff_pair_gap':.25,'diff_pair_via_gap':.25,'bus_width':12,'line_style':0,'pcb_color':'rgba(0, 0, 0, 0.000)','schematic_color':'rgba(0, 0, 0, 0.000)','wire_width':6}], 'meta':{'version':4},'netclass_assignments':{},'netclass_patterns':[]}}
 (D/(NAME+'.kicad_pro')).write_text(json.dumps(project,indent=2)+'\n')

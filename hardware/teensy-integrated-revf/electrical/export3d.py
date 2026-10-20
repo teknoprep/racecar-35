@@ -45,14 +45,27 @@ KICAD3D = Path("/usr/share/kicad/3dmodels")
 
 # Exact models missing from kicad-packages3d -> the nearest named library twin.
 SUBSTITUTIONS = {
+    # The 901-143 is a right-angle THROUGH-HOLE jack: a square body standing on 5 pins
+    # (centre + 4 grounds at +/-2.54 mm) with the barrel coming out sideways, off the board
+    # edge. Molex 73251-2200 is the same construction with the SAME pin pattern and the
+    # same frame (barrel -y), so it needs no transform. (It used to be the 132289 EDGE-MOUNT,
+    # a flat bracket that clamps over a board edge - the wrong kind of part, and rotated 90
+    # deg on top of that.) Its barrel is ~5 mm longer than the 901-143's.
     "Connector_Coaxial.3dshapes/SMA_Amphenol_901-143_Horizontal":
-        "Connector_Coaxial.3dshapes/SMA_Amphenol_132289_EdgeMount",
+        "Connector_Coaxial.3dshapes/SMA_Molex_73251-2200_Horizontal",
     "Package_SO.3dshapes/SOIC-8-1EP_3.9x4.9mm_P1.27mm_EP2.41x3.3mm":
         "Package_SO.3dshapes/HSOP-8-1EP_3.9x4.9mm_P1.27mm_EP2.41x3.1mm",
     # u-blox NEO / Nano2 holder: generated boxes, see generated_models()
     "RF_GPS.3dshapes/ublox_NEO": "@GEN/gps_neo",
     "Fuse.3dshapes/Fuse_Littelfuse-NANO2-451_453": "@GEN/fuse_nano2",
 }
+
+# A substitute is a DIFFERENT part's model, so its native frame need not match the footprint.
+# key -> (offset in FOOTPRINT coords (x right, y down, z up, mm), rotation about Z in degrees).
+# Check a new twin against ITS OWN stock footprint before trusting it: same pin pattern, same
+# barrel / pin-1 direction. Note KiCad's model rotate-z runs opposite to the footprint sense
+# (a +90 here turns the model clockwise on the top view). Empty while every twin matches.
+SUBST_TRANSFORM: dict[str, tuple[tuple[float, float, float], float]] = {}
 
 # name -> (size_x, size_y, size_z, offset_x, offset_y, offset_z) in mm, footprint-local.
 # Offset is the box CENTRE relative to the footprint origin; z=0 is the PCB top surface.
@@ -133,15 +146,16 @@ def teensy_models() -> list[tuple[Path, tuple[float, float, float]]]:
     return out
 
 
-def model_line(path: Path, offset=(0.0, 0.0, 0.0)) -> str:
+def model_line(path: Path, offset=(0.0, 0.0, 0.0), rot_z: float = 0.0) -> str:
     """A `(model ...)` block. `offset` is in FOOTPRINT coordinates (x right, y DOWN, z up
     from the PCB top): KiCad's 3D model space negates Y, so it is flipped here - the 3D
-    renderer otherwise puts a part at +y where the footprint has -y."""
+    renderer otherwise puts a part at +y where the footprint has -y. `rot_z` is KiCad's own
+    model rotation about Z (degrees)."""
     ox, oy, oz = offset
     return (f'\t\t(model "{path}"\n'
             f'\t\t\t(offset (xyz {ox:.4f} {-oy:.4f} {oz:.4f}))\n'
             f'\t\t\t(scale (xyz 1 1 1))\n'
-            f'\t\t\t(rotate (xyz 0 0 0))\n'
+            f'\t\t\t(rotate (xyz 0 0 {rot_z:.4f}))\n'
             f'\t\t)')
 
 
@@ -173,6 +187,10 @@ def main() -> int:
             return m.group(0)
         if target == key:
             notes.append({"ref": rel, "model": target, "kind": "library"})
+        if key in SUBST_TRANSFORM:
+            off, rz = SUBST_TRANSFORM[key]
+            notes[-1]["transform"] = {"offset_footprint_mm": off, "rotate_z_deg": rz}
+            return model_line(p, off, rz)
         return f'\t\t(model "{p}"{mid}'
 
     text = block_re.sub(lib_repl, text)

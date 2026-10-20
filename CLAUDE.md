@@ -42,7 +42,7 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   superseding the unbuilt Rev E, which is deleted): **4 copper layers**
   (F.Cu signals, **In1.Cu continuous GND plane with no routing**, In2.Cu signals, B.Cu
   signals), **1 oz outer copper**, **150 x 155 mm**, **193 footprints, 104 nets, 538
-  connected pads, 131 vias, 749 pin/geometry/calculation assertions; ERC/DRC/unconnected
+  connected pads, 131 vias, 1,078 pin/geometry/calculation assertions; ERC/DRC/unconnected
   all zero**. All EIGHT field screw terminals face ONE LEFT edge (**J3 TACH, J4 OIL,
   J5 NTC, J6 AEM, J11 THROTTLE, J12 BRAKE, J1 POWER, J2 SCREEN**); the screen branch fuse
   is **3 A** (`0451003.MRL`). Rev E added our own **TPS54560B 5 V/5 A buck (U2 — there is
@@ -80,6 +80,31 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   electrolytic polarity mark or outline (0 of 193 footprints had any `F.SilkS`); Rev F
   keeps library footprint silk (only the ESP32 module outline over the antenna notch stays
   on `F.Fab`), so `U21` has a printed pin-1 dot and polarity is visible on the board.
+  **2026-10-19 silk ADD-ON** (`pcbway/addon-silkscreen/`) — one replacement
+  `F.Silkscreen` gerber for the already-uploaded package (`verify_addon.py` proves every
+  other layer + both drills geometry-identical and **exits 1** otherwise). The uploaded silk
+  was not buildable as-is: (1) **12 field-terminal labels were missing** — `complete_routes.py`
+  deleted silk text by STRING, so J5 had no name or pins and J3/J4/J11/J12 showed only
+  `3 SIG`; (2) `GPS SMA`, `PI 5 VIDEO UART 3V3`, `RTC 3V NO CHARGE` sat **28-44 mm from
+  J8/J13/BT1** (hard-coded coordinates from an older placement) and J9/J10/JP1 had nothing;
+  (3) no Teensy orientation mark (a 180° insertion feeds **+5 V via D2/JP1 onto Teensy
+  pin 32**, shorts TX2 to GND, drives 3.3 V into A3); (4) no warning that the screen lead is
+  **crossed** (J2 = 1 GND / 2 +5V / 3 RX / 4 TX; panel J10 = 1 RXD0_H / 2 TXD0_H / 3 +5V_IN /
+  4 GND). **No reference designators are printed on this board**, so names carry them.
+  ALL board-level legends now come from **`electrical/silk_legends.py`** — ONE table used
+  by `generate.py` and by `addon_silk.py` (idempotent, in place on the routed board):
+  terminal names centred just above each body + one LEFT-ALIGNED pin label per pad row
+  (slides ≤1.8 mm along its column to clear a mask opening 0.15 mm / other silk 0.35 mm,
+  and **raises rather than drop a label**); J13/J9/J14 pin rows, J10 odd/even sides, J8 JP1
+  JP2 BT1 names; the tach `NO COIL / INJECTOR` warning above `J3 TACH`; the Teensy marks;
+  a column-aligned harness table; 0.90 mm / **0.16 mm stroke** (fab minimum ~0.153 mm).
+  `design/` already holds the final silk. `electrical/verify.py` (now **1,078 assertions**)
+  checks every J/JP/BT part is named within 6 mm of itself, each pin label is in line with
+  its pad, the harness digits against J2's nets, J13's TX/RX against Teensy pins 1/0, and
+  the stroke minimum. `render_gerber.py` rasterises the shipped `.gbr` itself (read the
+  FILE, not the board). **J13 (Pi 5 video, straight lead, 3.3 V, 115200):** 1 GND→Pi pin 6,
+  2 TX (Teensy pin 1)→Pi pin 10 GPIO15 RXD, 3 RX (Teensy pin 0)←Pi pin 8 GPIO14 TXD,
+  4 GND; 1 kΩ series + ESD already on board.
   Order day: `pcbway/Racecar-RevF-PCBWAY-GERBERS.zip` +
   `Racecar-RevF-BOM-pcbway-assembly.csv` + `Racecar-RevF-CPL.csv` (regenerate all three
   with `pcbway/make_package.py` — it now HARD-FAILS if the BOM and CPL designator sets
@@ -90,11 +115,18 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   Re-export with `fabrication/export.py --engineering-prototype`. **No automotive
   transient qualification, and no built, measured or independently reviewed board.**
   Rev F also ships a **shareable 3D model**: `Racecar-RevF-3D.html` (one self-contained
-  1.4 MB file — orbit, part list, labels; no server/CDN/network) + `Racecar-RevF-3D.glb`
+  1.5 MB file — orbit, part list, labels; no server/CDN/network) + `Racecar-RevF-3D.glb`
   (plain glTF 2.0, standard viewers/Blender/case designers) + a still preview PNG. Built by
   `electrical/export3d.py` then `electrical/make_3d_share.py`, both working on a COPY of the
   routed CAD (hash-asserted, source never touched); see that README's "Rebuilding the 3D
-  outputs" for what is real and what is a generated box. Landmines learned here: KiCad's GLB/STEP
+  outputs" for what is real and what is a generated box. `electrical/render_stills.py` rebuilds
+  `render/check/{top,angle}.png` + `Racecar-RevF-3D-preview.png` (Playwright screenshot of the
+  viewer) — run it after any silk change, the stills had lagged the board. The SMA 3D twin is
+  `SMA_Molex_73251-2200_Horizontal` — a right-angle THT jack with the 901-143's exact pin
+  pattern and frame (no transform). The old twin, the 132289 EDGE-MOUNT, was the wrong kind of
+  part and also rotated 90° (it lay along the top edge) — render-only; the footprint/Gerbers
+  were always right. Check any twin against its own stock footprint (`SUBST_TRANSFORM` exists
+  for one whose frame differs; KiCad's model rotate-z runs opposite to the footprint sense). Landmines learned here: KiCad's GLB/STEP
   exporters **ignore VRML entirely** (`kicad-cli` only loads STEP, so `kicad-packages3d` must be
   installed — `sudo apt-get install kicad-packages3d`, 4.6 GB), and KiCad's **3D model space
   negates Y**, so a `(model … (offset (xyz x y z)))` places a part at board `-y` unless the offset's

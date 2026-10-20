@@ -170,6 +170,99 @@ check(any(z.GetIsRuleArea() for z in fps[alias['U_NET']].Zones()),'WiFi antenna 
 check(any(z.GetIsRuleArea() for z in b.Zones()),'GNSS reference-plane keepout missing')
 cell=[(f.GetReference(),p.GetNumber()) for f in b.GetFootprints() for p in f.Pads() if p.GetNetname()=='VBAT_CELL']
 check(set(cell)=={('BT1','1'),(alias['J_BAT'],'1')},'Unexpected load/charger on RTC cell')
+# ---- silkscreen legends (regression guard, 2026-10-19) -------------------------------
+# The first upload lost 12 terminal labels: a finishing step deleted F.SilkS texts by
+# STRING, so J5 had no name or pin labels and J3/J4/J11/J12 showed only '3 SIG'. The
+# legends now come from ONE table (silk_legends.py) that slides a crowded label along its
+# column and raises instead of deleting. These checks read the BOARD, not the table.
+import silk_legends as SL
+stexts=[t for t in b.GetDrawings() if isinstance(t,k.PCB_TEXT) and t.GetLayer()==k.F_SilkS]
+def tbox(t):
+ r=t.GetEffectiveTextShape().BBox();return k.ToMM(r.GetLeft()),k.ToMM(r.GetTop()),k.ToMM(r.GetRight()),k.ToMM(r.GetBottom())
+for t in stexts:
+ check(t.GetTextThickness()>=k.FromMM(.153),f'silk text {t.GetText()!r}: stroke below the 0.153 mm legend minimum')
+ check(t.GetTextHeight()>=k.FromMM(.9)-1,f'silk text {t.GetText()!r}: height below 0.9 mm')
+col_hits=0
+for ref,title,labels in SL.TERMINALS:
+ fp=fps[ref];bx0,by0,bx1,by1=SL._body(fp)
+ hits=[t for t in stexts if t.GetText()==title]
+ check(len(hits)==1,f'{ref}: expected exactly one title {title!r}, found {len(hits)}')
+ x0,y0,x1,y1=tbox(hits[0])
+ check(abs((x0+x1)/2-(bx0+bx1)/2)<=.6,f'{ref}: title {title!r} not centred over the connector')
+ check(.05<=by0-y1<=1.0,f'{ref}: title {title!r} is not just above the connector body')
+ rows=sorted(k.ToMM(p.GetPosition().y) for p in fp.Pads())
+ check(len(rows)==len(labels),f'{ref}: {len(rows)} pads but {len(labels)} labels')
+ colx=bx1+SL.PIN_GAP_X
+ for n,(lab,ry) in enumerate(zip(labels,rows),1):
+  check(lab.split(' ')[0]==str(n),f'{ref}: label {lab!r} does not start with its pin number {n}')
+  c=[t for t in stexts if t.GetText()==lab and t.GetHorizJustify()==k.GR_TEXT_H_ALIGN_LEFT
+     and abs(k.ToMM(t.GetPosition().x)-colx)<=.02 and abs(k.ToMM(t.GetPosition().y)-ry)<=SL.PIN_MAX_SLIDE+1e-6]
+  check(len(c)==1,f'{ref} pin {n}: no left-aligned label {lab!r} on its pad row')
+  ly=k.ToMM(c[0].GetPosition().y)
+  check(all(abs(ly-ry)<abs(ly-o) for o in rows if o!=ry),f'{ref} pin {n}: label nearer another pin')
+ col_hits+=sum(1 for t in stexts if t.GetHorizJustify()==k.GR_TEXT_H_ALIGN_LEFT
+               and abs(k.ToMM(t.GetPosition().x)-colx)<=.02 and by0-1<k.ToMM(t.GetPosition().y)<by1+1)
+check(col_hits==sum(len(l) for _,_,l in SL.TERMINALS),'stray or duplicate text in the pin-label column')
+# Crossed harness table: each J2 digit must sit directly above the screen-J10 pin it is
+# wired to, and that pairing must be electrically right for the nets on J2's pads.
+PANEL_J10={1:'RXD0_H',2:'TXD0_H',3:'+5V_IN',4:'GND'}   # CrowPanel Advance J10, all revisions
+MATE={'GND':'GND','+5V_SCREEN':'+5V_IN','DASH_RX_CABLE':'TXD0_H','DASH_TX_CABLE':'RXD0_H'}
+j2nets={int(p.GetNumber()):p.GetNetname() for p in fps['J2'].Pads()}
+check(sum(1 for t in stexts if t.GetText()==SL.CROSS_TITLE)==1,'harness legend title missing')
+table={}
+for (lab,digits),y in zip(SL.CROSS_ROWS,SL.CROSS_Y[1:]):
+ check(any(t.GetText()==lab and abs(k.ToMM(t.GetPosition().y)-y)<.02 for t in stexts),f'harness row label {lab} missing')
+ for x in SL.CROSS_COL_X:
+  d=[t.GetText() for t in stexts if abs(k.ToMM(t.GetPosition().x)-x)<.02 and abs(k.ToMM(t.GetPosition().y)-y)<.02]
+  check(len(d)==1 and d[0].isdigit(),f'harness {lab} column x={x}: expected one digit, found {d}')
+  table.setdefault(x,{})[lab]=int(d[0])
+for x,pair in table.items():
+ check(MATE[j2nets[pair['J2']]]==PANEL_J10[pair['J10']],
+       f"harness legend wrong: J2.{pair['J2']} ({j2nets[pair['J2']]}) printed over J10.{pair['J10']} ({PANEL_J10[pair['J10']]})")
+check(sorted(p['J2'] for p in table.values())==[1,2,3,4],'harness legend must list every J2 pin once')
+# Teensy socket orientation: '1'/'25' beside socket pads 1 (GND) and 25 (TEENSY_VIN), at the USB end.
+u1={p.GetNumber():p for p in fps['U1'].Pads()}
+check(u1['1'].GetNetname()=='GND' and u1['25'].GetNetname()=='TEENSY_VIN','Teensy socket pin 1/25 nets changed')
+for num in ('1','25'):
+ q=u1[num].GetPosition()
+ check(any(t.GetText()==num and abs(k.ToMM(t.GetPosition().y-q.y))<1 and abs(k.ToMM(t.GetPosition().x-q.x))<3.5
+       for t in stexts),f'Teensy socket pin {num} number missing from the silkscreen')
+usb=[t for t in stexts if t.GetText()=='USB END']
+check(len(usb)==1 and k.ToMM(usb[0].GetPosition().y)<k.ToMM(u1['5'].GetPosition().y),'USB END mark missing or not at pin 1 end')
+# EVERY connector, jumper and the cell is named AT the part. No reference designators are
+# printed on this board, so the name is the only identification - and the first artwork had
+# 'GPS SMA', 'PI 5 VIDEO UART 3V3' and 'RTC 3V NO CHARGE' 28-44 mm from their parts.
+def gap_mm(a,b):
+ return max(a[0]-b[2],b[0]-a[2],0)+max(a[1]-b[3],b[1]-a[3],0)
+for f in b.GetFootprints():
+ r=f.GetReference()
+ if not (r.startswith('J') or r.startswith('BT')):continue      # J*, JP*, BT*
+ o=SL._outline(f)
+ named=[t for t in stexts if t.GetText().startswith(r+' ') and t.GetText()!=SL.CROSS_TITLE]
+ check(len(named)==1,f'{r}: expected exactly one silkscreen name starting {r!r}, found {len(named)}')
+ check(gap_mm(tbox(named[0]),o)<=6.0,f'{r}: its name {named[0].GetText()!r} is not at the part')
+for part in SL.PARTS:
+ f=fps[part['ref']];o=SL._outline(f)
+ pads=sorted(f.Pads(),key=lambda p:int(p.GetNumber()))
+ for lab,p in zip(part.get('labels',[]),pads):
+  px,py=k.ToMM(p.GetPosition().x),k.ToMM(p.GetPosition().y)
+  c=[tbox(t) for t in stexts if t.GetText()==lab and gap_mm(tbox(t),o)<=1.5]
+  check(len(c)==1,f"{part['ref']}: pin label {lab!r} missing beside the part")
+  x0,y0,x1,y1=c[0]
+  if part['style']=='row':check(x0<=px<=x1,f"{part['ref']}: label {lab!r} is not in line with its pad")
+  else:check(y0<=py<=y1,f"{part['ref']}: label {lab!r} is not level with its pad")
+# J13's printed directions match the copper: pad 2 drives OUT from Teensy pin 1 (TX1,
+# socket pad 3) through R1, pad 3 feeds Teensy pin 0 (RX1, socket pad 2) through R2.
+j13={p.GetNumber():p.GetNetname() for p in fps['J13'].Pads()}
+check(j13=={'1':'GND','2':'VID_TX_CABLE','3':'VID_RX_CABLE','4':'GND'},'J13 pinout changed - fix its silkscreen')
+r1={p.GetNetname() for p in fps['R1'].Pads()};r2={p.GetNetname() for p in fps['R2'].Pads()}
+check(r1=={'VID_TX_CABLE','VID_TX_MCU'} and u1['3'].GetNetname()=='VID_TX_MCU','J13.2 is not Teensy TX1 (pin 1)')
+check(r2=={'VID_RX_CABLE','VID_RX_MCU'} and u1['2'].GetNetname()=='VID_RX_MCU','J13.3 is not Teensy RX1 (pin 0)')
+j9={p.GetNumber():p.GetNetname() for p in fps['J9'].Pads()}
+check(j9=={'1':'VBAT_CELL','2':'GND'},'J9 pinout changed - fix its silkscreen')
+j10={p.GetNumber():p.GetNetname() for p in fps['J10'].Pads()}
+check(j10=={'1':'GND','2':'+3V3_NET','3':'NET_UART_TX','4':'NET_UART_EXT_RX','5':'NET_BOOT','6':'NET_EN'},
+      'J10 pinout changed - fix its silkscreen')
 # Numeric sanity across the operating domain (not an analog simulation).
 for v in [0,.5,1,2.5,4.5,5]:check(v*.5<=2.5,'Expected normal ADC range')
 for rs in [22,100,1000,2490,10000,100000]:
