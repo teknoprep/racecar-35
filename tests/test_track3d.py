@@ -49,7 +49,13 @@ def _page_html() -> str:
                     ns[n.targets[0].id] = ev(n.value, ns)
                 except Exception:
                     pass
-    return ns["_TRACK3D_HTML"]
+    html = ns["_TRACK3D_HTML"]
+    # The route substitutes these before the page ever reaches a browser; do the
+    # same here so the extracted module is valid JavaScript. __TRACK__ is the
+    # session's track name as the DASH spells it (JSON literal, injected).
+    return (html.replace("__USER__", "test-user")
+                .replace("__FILE__", "1700000000_Summit_Point_Main.ndjson")
+                .replace("__TRACK__", json.dumps("Summit Point Main")))
 
 
 DRIVER = r"""

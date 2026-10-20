@@ -48,6 +48,9 @@ WANTED_FUNCS = (
     "get_share", "create_share", "revoke_share",
     "admin_user_share_get", "admin_user_share_create", "admin_shares",
     "admin_share_revoke",
+    # track names are the DASH's (the shared list prints _display_track_name)
+    "_track_norm", "_dash_tracks", "_dash_track_names", "_track_canon",
+    "_display_track_name",
 )
 WANTED_VARS = (
     "DATA_DIR", "SESSION_COOKIE", "SHARE_DIR", "SESSION_SHARE_DIR", "LAPCACHE_DIR", "USERS_FILE",
@@ -56,6 +59,7 @@ WANTED_VARS = (
     "ALLOWED_EMAILS", "ADMIN_EMAILS", "SESSION_SECRET",
     "EPOCH_REASONABLE_MIN", "EPOCH_REASONABLE_MAX", "_LAP_SUMMARY_MAX_PER_CALL",
     "_SHARED_LIST_HTML", "_BASE_CSS", "_FONTS_LINK",
+    "_TRACK_MIRROR",
 )
 
 
@@ -117,6 +121,8 @@ def _extract(data_dir: pathlib.Path) -> dict:
         "Response": lambda content=None, **kw: content,
         "Query": lambda default=None, **kw: default,
         "log": __import__("logging").getLogger("test"),
+        # _dash_tracks() reads sf_picker.html beside main.py
+        "__file__": str(MAIN),
     }
     exec(compile(ast.fix_missing_locations(module), str(MAIN), "exec"), ns)
     return ns

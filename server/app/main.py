@@ -1506,17 +1506,14 @@ def _shared_with_you_html(viewer_email: str) -> tuple:
         n += 1
         epoch = int(display_epoch_for(p))
         when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(epoch))
-        track = r["filename"][: -len(".ndjson")] if r["filename"].endswith(".ndjson") else r["filename"]
-        track = re.sub(r"^\d+_", "", track) or "?"
-        if track.endswith("-combined"):
-            track = track[: -len("-combined")]
+        track = _display_track_name(r["filename"])
         owner = html.escape(r["user"])
         name = html.escape(r["filename"])
         who = html.escape(r["by"] or r["user"])
         rows.append(
             f'<div class="share-row">'
             f'<span class="badge">session</span>'
-            f'<span class="who">{html.escape(track.replace("_", " "))}</span>'
+            f'<span class="who">{html.escape(track)}</span>'
             f'<span class="when">{html.escape(when)}</span>'
             f'<span class="when">from {who}</span>'
             f'<span class="num best" data-best="{owner}/{name}" '
@@ -3035,25 +3032,105 @@ async def admin_update_status(request: Request) -> JSONResponse:
     })
 
 
-_KNOWN_TRACKS: list = []
+_TRACK_MIRROR = {}               # cache: tracks[], names[], canon{norm: name}
+
+
+def _track_norm(name: str) -> str:
+    """Comparison key for track names: case, punctuation and spacing insensitive.
+
+    The same circuit arrives spelled several ways — the dash's `TRACKS[]` says
+    "Mid-Ohio Full + Chicane", the Teensy's filename sanitizer turns every
+    illegal character into '_' ("Mid_Ohio_Full___Chicane"), and `_track_key()`
+    lowercases. All three must collapse to one key so the SERVER can print the
+    DASH's spelling instead of whichever form it happened to read.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+
+
+def _dash_tracks() -> list:
+    """The dash firmware's TRACKS[] — as mirrored in the shipped sf_picker.html.
+
+    That file is regenerated from `crowpanel-arduino/RaceDash/RaceDash.ino` by
+    `tools/gen_dash_tracks.py` (and a test fails if it drifts), because the
+    Docker image only ships `app/`; it cannot read the firmware source.
+    """
+    if "tracks" in _TRACK_MIRROR:
+        return _TRACK_MIRROR["tracks"]
+    tracks: list = []
+    try:
+        html_src = (pathlib.Path(__file__).parent / "sf_picker.html").read_text("utf-8")
+        m = re.search(r"const TRACKS = (\[.*?\]);", html_src, re.S)
+        if m:
+            tracks = json.loads(m.group(1))
+    except Exception as e:
+        log.warning("tracks parse failed: %s", e)
+    _TRACK_MIRROR["tracks"] = tracks
+    return tracks
+
+
+def _dash_track_names() -> list:
+    """Every track name the DASH can put in a session filename.
+
+    `confirmConfigAndStart()` writes "<base> <config>" for a track that has
+    configs — "Summit Point Main", "Watkins Glen Grand Prix" — and the bare
+    base name otherwise (and for sessions recorded before configs existed), so
+    the set the server must offer/recognise is base names + every config.
+    """
+    if "names" in _TRACK_MIRROR:
+        return _TRACK_MIRROR["names"]
+    seen, out = set(), []
+    for t in _dash_tracks():
+        base = str(t.get("name") or "").strip()
+        if not base:
+            continue
+        for name in [base] + [base + " " + str(c) for c in (t.get("cfgs") or [])]:
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+    out.sort(key=str.lower)
+    _TRACK_MIRROR["names"] = out
+    return out
+
+
+def _track_canon() -> dict:
+    """normalized name -> the DASH's spelling (base name wins over a config)."""
+    if "canon" not in _TRACK_MIRROR:
+        canon: dict = {}
+        for name in _dash_track_names():
+            canon.setdefault(_track_norm(name), name)
+        _TRACK_MIRROR["canon"] = canon
+    return _TRACK_MIRROR["canon"]
+
+
+def _display_track_name(raw: str) -> str:
+    """A session filename (or bare track stem) as the DASH names that track.
+
+    `1788543989_Summit_Point_Main.ndjson` -> "Summit Point Main",
+    `..._Mid_Ohio_Full___Chicane` -> "Mid-Ohio Full + Chicane" (the '+' only
+    survives in the dash's own table — the filename cannot carry it), and a
+    name no dash track matches is shown de-underscored rather than hidden.
+    """
+    t = str(raw or "").strip()
+    if t.endswith(".ndjson"):
+        t = t[: -len(".ndjson")]
+    t = re.sub(r"^(?:session_)?\d+_", "", t)      # <sid>_ / session_<sid>_
+    combined = t.endswith("-combined")
+    if combined:
+        t = t[: -len("-combined")]
+    name = _track_canon().get(_track_norm(t)) or t.replace("_", " ").strip() or "?"
+    return name + (" \u00b7 combined" if combined else "")
+
 
 @app.get("/tracks")
 async def known_tracks(request: Request) -> JSONResponse:
-    """Known track names for the rename dropdown — parsed once from the
-    S/F picker's embedded firmware TRACKS[] (kept current by the release
-    process), primary entries only."""
-    global _KNOWN_TRACKS
-    if not _KNOWN_TRACKS:
-        try:
-            import re as _re
-            html_src = (pathlib.Path(__file__).parent / "sf_picker.html").read_text("utf-8")
-            m = _re.search(r"const TRACKS = (\[.*?\]);", html_src, _re.S)
-            if m:
-                _KNOWN_TRACKS = sorted(t["name"] for t in json.loads(m.group(1))
-                                       if not t.get("aux"))
-        except Exception as e:
-            log.warning("tracks parse failed: %s", e)
-    return JSONResponse({"ok": True, "tracks": _KNOWN_TRACKS})
+    """Known track names for the rename dropdown — the DASH's names.
+
+    Base names AND every config variant, i.e. exactly the strings the dash puts
+    in a filename ("Summit Point Main", "Watkins Glen Grand Prix", ...). A
+    list of bare base names only made the rename dropdown offer names the dash
+    never writes, and left the current name unmatched -> "(custom...)".
+    """
+    return JSONResponse({"ok": True, "tracks": _dash_track_names()})
 
 
 # ---------------------------------------------------------------------------
@@ -3438,7 +3515,10 @@ async def session_track_asset(request: Request, user: str, filename: str) -> JSO
         _kick_enrich(asset)
     if not asset:
         raise HTTPException(status_code=404, detail=json.dumps(
-            {"missing": True, "track": _track_key(p.name), "slug": slug,
+            {"missing": True, "track": _track_key(p.name),
+             # the DASH's name for this track: the viewer prints THIS (the raw
+             # _track_key is lowercase + sanitized, which is not a track name)
+             "name": _display_track_name(p.name), "slug": slug,
              "prepared": _available_slugs()[:40]}))
     return JSONResponse(asset)
 
@@ -3481,8 +3561,8 @@ def session_track_prep(request: Request, user: str, filename: str,
                                 time.time() - (st0.get("started") or 0) < 300):
             return JSONResponse({"ok": True, "slug": slug, "state": cur,
                                  "already": True})
-        _PREP[slug] = {"state": "queued", "track": track, "started": int(time.time()),
-                       "log": []}
+        _PREP[slug] = {"state": "queued", "track": _display_track_name(p.name),
+                       "started": int(time.time()), "log": []}
     try:
         points = _session_lap_centreline(p)
         _prep_log(slug, "centreline from the fastest logged lap: %d points" % len(points))
@@ -4693,6 +4773,10 @@ async def list_sessions(request: Request) -> dict:
                         "display_epoch": display_epoch_for(f),
                         "size_bytes": st.st_size,
                         "mtime": int(st.st_mtime),
+                        # The dash's own name for the track (the filename is the
+                        # sanitized form); the review page's compare list and
+                        # anything else reading this JSON show THIS.
+                        "track": _display_track_name(f.name),
                     }
                 )
     return {"sessions": out, "count": len(out)}
@@ -6985,7 +7069,9 @@ async def track3d(request: Request, user: str, filename: str) -> Response:
     gate_view_session(request, safe_name(user), filename)
     p = _resolve_session(user, filename)
     return _TRACK3D_HTML.replace("__USER__", safe_name(user)) \
-                        .replace("__FILE__", p.name)
+                        .replace("__FILE__", p.name) \
+                        .replace("__TRACK__", json.dumps(_display_track_name(p.name))
+                                 .replace("<", "\\u003c"))
 
 
 # ---------------------------------------------------------------------------
@@ -7363,13 +7449,13 @@ def _shared_list_html(meta: dict, token: str) -> str:
             continue
         epoch = int(display_epoch_for(f))
         when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(epoch))
-        track = re.sub(r"^\d+_", "", f.name[: -len(".ndjson")]) or "?"
-        track = track[: -len("-combined")] if track.endswith("-combined") else track
+        # the DASH's name for the track, not the sanitized filename middle bit
+        track = _display_track_name(f.name)
         name = html.escape(f.name)
         url = f"/shared/{html.escape(token)}/s/{urllib.parse.quote(f.name)}"
         rows.append(
             f'<tr><td class="mono" data-sort="{epoch}">{html.escape(when)}</td>'
-            f'<td>{html.escape(track.replace("_", " "))}</td>'
+            f'<td>{html.escape(track)}</td>'
             f'<td class="num best" data-best="{name}">\u2026</td>'
             f'<td class="num">{_human_bytes(st.st_size)}</td>'
             f'<td><a class="btn" href="{url}">view</a></td></tr>')
@@ -8624,11 +8710,12 @@ async def index(request: Request) -> Response:
                     time.gmtime(epoch),
                 )
                 size_str = _human_bytes(st.st_size)
-                # Track name = filename middle bit: <sid>_<track>.ndjson
-                track = f.name
-                if track.endswith(".ndjson"):
-                    track = track[:-7]
-                track = re.sub(r"^\d+_", "", track) or "?"
+                # Track name = the DASH's name for it, NOT the raw filename middle
+                # bit. The Teensy's sanitizer turns every illegal character into
+                # '_' ("Mid-Ohio Full + Chicane" -> "Mid_Ohio_Full___Chicane"), so
+                # reading the name back through the firmware TRACKS[] table is
+                # what makes this column agree with what the driver saw.
+                track = _display_track_name(f.name)
                 # user_h goes into ATTRIBUTES (data-user / data-file / data-best
                 # and the review URL), so it stays the bare slug; anything shown
                 # goes in user_cell. Appending markup here put the badge inside
@@ -9544,7 +9631,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // Signals the (non-module) watchdog below that the CDN import succeeded: if
   // this never runs, the page shows a way out instead of a stuck "loading".
   window.__track3dReady = true;
-  var USER = "__USER__", FILE = "__FILE__";
+  var USER = "__USER__", FILE = "__FILE__", MYTRACK = __TRACK__;
   var q = new URLSearchParams(location.search);
   var pts = (q.get("pts") || "").split("|").map(function (s) {
     return s.split(",").map(Number);
@@ -15538,6 +15625,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     RAW_ASSET = asset;
     ASSET = asset;
     if (!asset || !PATH) return;
+    // The session's track as the DASH names it (injected) — "Summit Point Main"
+    // — not the prepared asset's facility name ("Summit Point"). The asset is
+    // still named so a driver can see WHICH bake is being shown when the two
+    // differ (a config uses its parent circuit's imagery + line).
+    var TNAME = MYTRACK || asset.track || "";
+    var TNOTE = (asset.track && asset.track !== TNAME)
+      ? " \u00b7 prepared as " + asset.track : "";
     var dems = loadDems(asset);
     // A prepared track is worth SHOWING first: open on the whole circuit over
     // the real imagery (that is the "how big is the track" view), one click from
@@ -15550,9 +15644,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       el("b-groundsel").title += " (satellite imagery is available for this track)";
     }
     if (asset.length_m) {
-      notice("prepared track: " + asset.track + " " +
+      notice("prepared track: " + TNAME + " " +
              (asset.length_m / 1000).toFixed(2) + " km, " +
-             (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide");
+             (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide" + TNOTE);
       setTimeout(hideNotice, 4500);
     }
     var attr = (asset.texture && asset.texture.attrib) || "";
@@ -15560,22 +15654,22 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     el("lg-track").style.display = "flex";
     if (!applyAsset.announced && !window.__rc3AssetNote) {
       window.__rc3AssetNote = true;
-      notice("prepared track: " + asset.track +
+      notice("prepared track: " + TNAME +
              (asset.length_m ? " \u00b7 " + (asset.length_m / 1000).toFixed(2) + " km" : "") +
-             " \u00b7 real width + terrain from imagery");
+             " \u00b7 real width + terrain from imagery" + TNOTE);
       setTimeout(hideNotice, 4000);
     }
-    el("lg-track").textContent = asset.track +
+    el("lg-track").textContent = TNAME +
       (asset.length_m ? " (" + (asset.length_m / 1000).toFixed(2) + " km)" : "") +
       " — " + (asset.width_osm_m || asset.width_imagery_m || "?") + " m wide (" +
-      (asset.width_source || "?") + "), line from " + src;
+      (asset.width_source || "?") + "), line from " + src + TNOTE;
     // updateTrackLegend() swaps the one-number width for the traced range
-    el("lg-track").dataset.head = asset.track +
-      (asset.length_m ? " (" + (asset.length_m / 1000).toFixed(2) + " km)" : "");
+    el("lg-track").dataset.head = TNAME +
+      (asset.length_m ? " (" + (asset.length_m / 1000).toFixed(2) + " km)" : "") + TNOTE;
     el("lg-track").dataset.tail = ", line from " + src;
     var note = el("notice");
     if (note && asset.width_agreement === false) {
-      notice("track " + asset.track + ": imagery says " + asset.width_imagery_m +
+      notice("track " + TNAME + ": imagery says " + asset.width_imagery_m +
              " m but OSM says " + asset.width_osm_m + " m — using the tag");
       setTimeout(hideNotice, 5000);
     }
@@ -15648,12 +15742,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         if (!d || !d.missing) return;
         var b = el("b-prep");
         b.style.display = "inline-block";
-        b.textContent = "prepare track (" + d.track + ")";
-        b.title = "pre-render " + d.track + " from satellite imagery + OSM";
+        var dName = d.name || d.track;
+        b.textContent = "prepare track (" + dName + ")";
+        b.title = "pre-render " + dName + " from satellite imagery + OSM";
         // No prepared track for this circuit yet: do NOT just sit on a
         // synthetic ribbon and hope somebody clicks. Bake it now (once per
         // track, cached) and tell the driver what is happening.
-        notice("no prepared track for \u201c" + d.track +
+        notice("no prepared track for \u201c" + dName +
                "\u201d — preparing it from satellite imagery (one-off, ~20 s)\u2026");
         prepareTrack(true);
       }).catch(function () {});
@@ -17402,7 +17497,7 @@ _REVIEW_HTML = (
       const ep=(s.display_epoch||s.mtime||0)*1000;
       const date=ep ? new Date(ep).toISOString().slice(0,16).replace('T',' ') : '';
       const name=s.filename.replace(/\\.ndjson$/,'');
-      const track=trackLabel(s.filename);
+      const track=s.track || trackLabel(s.filename);
       const tk=trackKey(s.filename);
       const e={ user:s.user, file:s.filename, date, name, track, ep,
                 best:null, bestTried:0, label:'', hay:'',
@@ -18026,13 +18121,17 @@ _REVIEW_HTML = (
       (COMBINED?'-combined':'')+'.ndjson';
   }
   function pickTrack(name){
-    const want=String(name||'').toLowerCase().replace(/_/g,' ');
+    // Compare on letters+digits only: the option list now carries the DASH
+    // spelling ("Mid-Ohio Full + Chicane") while the filename has '___'.
+    const norm=t=>String(t||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    const want=norm(name);
     for(let i=0;i<trk.options.length;i++){
-      if(trk.options[i].value.toLowerCase().replace(/_/g,' ')===want){
+      if(norm(trk.options[i].value)===want){
         trk.selectedIndex=i; trkc.style.display='none'; return;
       }
     }
-    trk.value='__custom__'; trkc.style.display=''; trkc.value=String(name||'').replace(/_/g,' ');
+    trk.value='__custom__'; trkc.style.display='';
+    trkc.value=String(name||'').replace(/_+/g,' ').trim();
   }
   trk.addEventListener('change', function(){
     trkc.style.display = trk.value==='__custom__' ? '' : 'none'; draw();
