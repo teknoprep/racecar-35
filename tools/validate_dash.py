@@ -347,6 +347,17 @@ def main():
     if not re.search(r"\baemn\s*=\s*EcuState\s*\{\s*\}", code):
         fail("17: the Teensy-silent path does not clear the AEMnet state")
 
+    # 18 (v0.1.177): every "int idx[N]" comma parser must have N >= its comma cap + 1, because it
+    # writes idx[n] = line.length() after the loop. parseCanDiagLine had idx[6] with a cap of 6 while
+    # the Teensy's CANDIAG line has 8 commas: one write past the end on every line, once a second.
+    for m in re.finditer(r"int\s+idx\[(\d+)\]\s*,\s*n\s*=\s*0\s*;(.{0,260})", code, re.S):
+        size, after = int(m.group(1)), m.group(2)
+        cap = re.search(r"n\s*<\s*(\d+)", after)
+        if cap and re.search(r"idx\s*\[\s*n\s*\]\s*=", after) and size < int(cap.group(1)) + 1:
+            line_no = code[:m.start()].count("\n") + 1
+            fail("18: line %d: idx[%d] with a cap of n < %s writes idx[n] past the end "
+                 "(needs idx[%d])" % (line_no, size, cap.group(1), int(cap.group(1)) + 1))
+
     if fails:
         print("validate_dash: FAIL (%d)  %s" % (len(fails), path))
         for f in fails:
@@ -370,6 +381,7 @@ def main():
     print(" 15 OIL has a CAN source bit; ECU parse reads oil_x10; monitor cap <= 20 ms")
     print(" 16 RPM carries no monitor warn rows (shift alerts own RPM)")
     print(" 17 AEMnet CAN bus: enum + name + AEMNET parse + per-input value/RPM + telemetry + clear")
+    print(" 18 every comma parser's idx[] has room for idx[n] after the loop (cap + 1)")
     return 0
 
 

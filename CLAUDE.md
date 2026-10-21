@@ -1508,7 +1508,8 @@ AEMNET,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>,<oi
                    # the SAME bus as the MS3 frames. Fields 1-8 are in the ECU line's order (the
                    # dash parses both with parseCanValues()); -1 = not received; uego_status
                    # 0 none / 1 valid / 2 not ready / 3 fault. Sent ONLY while an AEMnet device is
-                   # broadcasting. The UEGO gauge owns lambda/AFR while present (invalid -> -1, no
+                   # broadcasting, plus a final all -1 line (~50 ms) when it expires, so the dash
+                   # clears in 2 s, not ~4 s (bench-verified). The UEGO gauge owns lambda/AFR while present (invalid -> -1, no
                    # fall-back to the ECU's lambda). Full layout + sources: tools/AEMNET.md.
 IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
 AFR,<status>,<afr_x100>,<lambda_x10000>,<gauge_mV>  (v0.1.149, AEM gauge input)
@@ -2498,6 +2499,14 @@ are added in priority order only while the 640 B line has room — `SESSION_LINE
 (the upload window's static_assert is at 31488/31744 B), and with every source live the line would
 reach ~700 B, which used to drop the WHOLE sample. Authoritative layout, sources and the bench
 workflow (`can_sim.py bench --protocol aemnet`, `validate`): **tools/AEMNET.md**.
+**Bench-validated on a real Teensy (v0.1.177):** `validate` bit-exact for aemnet (ECU+UEGO, UEGO only,
+ECU only, gauge ID 16, warm-up, fault), megasquirt and rc35; MS3 + AEM gauge on ONE bus decode
+independently. ⚠️ **Dash comma parsers wrote one past their `idx[]`** — the array must be the
+comma cap + 1 because `idx[n] = line.length()` follows the loop: `parseCanDiagLine` had `idx[6]`
+against the Teensy's 8-comma CANDIAG line (an out-of-bounds write every second since the field
+was extended, and its RX-error/txtest fields never parsed); GPS/IMU overflowed on a corrupted
+line; the new shared ECU/AEMNET parser too (caught by UBSan before release). Fixed in v0.1.177;
+`tools/validate_dash.py` check 18 now enforces cap + 1 for every such parser.
 
 ## ### RC35 bench CAN frames (0x700 / 0x701) — v0.1.159
 The logger also parses **RC35 bench frames**, our own layout, which exist because the MS3

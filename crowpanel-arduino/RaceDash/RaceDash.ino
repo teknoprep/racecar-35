@@ -29,7 +29,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.176"
+#define FIRMWARE_VERSION "0.1.177"
 
 #include <Preferences.h>
 #include <time.h>
@@ -2187,7 +2187,7 @@ static uint32_t q_activity_ms  = 0;
 static bool     cfg_resend_req = false;
 
 static bool parseGpsLine(const String& line) {
-    int idx[8], n = 0;
+    int idx[9], n = 0;
     for (int i = 0; i < (int)line.length() && n < 8; ++i) {
         if (line[i] == ',') idx[n++] = i;
     }
@@ -2603,7 +2603,12 @@ static bool parseAemAfrLine(const String& line) {
 // AEMNET,<same 8>,<lambda_x10000>,<uego_status>                            (AEMnet, v0.1.177)
 // Both carry the CAN values in ONE field order, so one parser fills either EcuState.
 static bool parseCanValues(const String& line, EcuState& st) {
-    int idx[9], n = 0;
+    // Up to 9 commas are recorded (prefix + 8 value fields; the AEMNET line's extra lambda/status
+    // fields are not needed here) and idx[n] then marks the END of the last field - so the array
+    // needs n_max + 1 = 10 slots. It was idx[9]: harmless for the 8-comma ECU line, but the
+    // 10-comma AEMNET line wrote idx[9], one past the end, on every line (UBSan in
+    // tests/test_aem_afr.py caught it before it ever ran on a dash).
+    int idx[10], n = 0;
     for (int i = 0; i < (int)line.length() && n < 9; ++i)
         if (line[i] == ',') idx[n++] = i;
     if (n < 1) return false;
@@ -2634,7 +2639,7 @@ static bool parseAemnetLine(const String& line)  { return parseCanValues(line, a
 
 static bool parseImuLine(const String& line) {
     // IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
-    int idx[7], n = 0;
+    int idx[8], n = 0;
     for (int i = 0; i < (int)line.length() && n < 7; ++i)
         if (line[i] == ',') idx[n++] = i;
     if (n < 6) return false;
@@ -2744,10 +2749,13 @@ static bool parseCanSniffLine(const String& line) {
     return true;
 }
 
-// CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR> — CAN health, 1 Hz.
+// CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>,<RXerr>,<txtest> — CAN health, 1 Hz.
 static bool parseCanDiagLine(const String& line) {
-    int idx[6], n = 0;
-    for (int i = 0; i < (int)line.length() && n < 6; ++i)
+    // v0.1.177: was idx[6] with a cap of 6 commas. The Teensy's line has EIGHT fields (8 commas),
+    // so n always hit 6, idx[6] was written one past the end once a second (stack corruption), and
+    // the n >= 7 / n >= 8 fields (RX errors, tx test) were never parsed. Array = cap + 1.
+    int idx[10], n = 0;
+    for (int i = 0; i < (int)line.length() && n < 9; ++i)
         if (line[i] == ',') idx[n++] = i;
     if (n < 1) return false;
     idx[n] = line.length();

@@ -68,7 +68,7 @@ extern "C" {
 // publishing new firmware artifacts to firmware/manifest.json on main.
 // Format: "MAJOR.MINOR.PATCH" — dash compares versions as semver strings.
 // Teensy version is bumped in lock-step with the dash via scripts/release.sh.
-#define FIRMWARE_VERSION "0.1.176"
+#define FIRMWARE_VERSION "0.1.177"
 
 // Networking is WiFi-only on the CrowPanel. No SPI network device.
 #include <SdFat.h>
@@ -4584,9 +4584,17 @@ static void emitToDash() {
     //   AEMNET,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>,<oil_x10>,
     //          <lambda_x10000>,<uego_status 0 none/1 valid/2 not ready/3 fault>
     // -1 = not received. Sent ONLY while an AEMnet device is broadcasting (a bus without AEM
-    // costs the dash link nothing); the dash expires its copy after 2 s, so when the device
-    // stops, the values read as no data.
-    if (aemnet::anyLive(can_aem)) {
+    // costs the dash link nothing) - PLUS one final line the moment the last group expires, which
+    // then carries all -1 / status 0. Without that last line the dash only held the final LIVE
+    // values and needed its own 2 s timeout on top of ours: a frozen AFR for ~4 s after the gauge
+    // stopped (found by the bench staleness test), against 2 s for MegaSquirt.
+    // The final all -1 line is repeated on the next few emits (~50 ms): usbTele()/dashTele() DROP
+    // a line rather than block when their buffer is full, so a one-shot line could be lost.
+    static uint8_t aem_tail = 0;
+    const bool aem_live = aemnet::anyLive(can_aem);
+    if (aem_live) aem_tail = 5;
+    if (aem_live || aem_tail) {
+        if (!aem_live) aem_tail--;
         const int aemRpm = test_mode_active ? (int)rpm : (int)can_aem.rpm;
         dashTele("AEMNET,%d,%d,%d,%d,%d,%d,%d,%d,%ld,%u\n",
                  aemRpm, can_aem.clt_f_x10, can_aem.map_x10, can_aem.tps_x10,

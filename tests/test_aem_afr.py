@@ -72,37 +72,99 @@ int main() {
 '''.replace('#include <cmath>', '#include <cmath>\n#include <initializer_list>'))
 
     def test_actual_dash_selection_and_staleness(self):
-        funcs = block(DASH, 'static bool afrIsVisible()') + '\n' + block(DASH, 'static int16_t selectedAfrX10()')
-        host_run(f'#include "{HEADER}"\n' + '''
+        """The dash's REAL selection code (v0.1.177): the AEM analogue input owns AFR when it is the
+        AFR source (no fall-back to any CAN value), and an input with Source = CANBUS reads ITS OWN
+        bus - MegaSquirt (ECU line) or AEMnet (AEMNET line) - independently of every other input.
+        The two lines fed in are the ones the real Teensy printed on the bench (MS3 + a UEGO gauge
+        on one bus). Rewritten from the pre-0.1.171 afrIsVisible()/selectedAfrX10() version, whose
+        functions moved into monItemValueX10() when AEM became an AFR Source option."""
+        types = '\n'.join(block(DASH, sig) + ';' for sig in (
+            'enum MonItem : uint8_t', 'enum MonSrc : uint8_t', 'enum MonCanBus : uint8_t',
+            'struct MonCfg {', 'struct EngState {', 'struct EcuState {'))
+        funcs = '\n'.join(block(DASH, sig) for sig in (
+            'static int16_t aemAfrX10()', 'static void resolveEngRpm()',
+            'static bool parseCanValues(const String& line, EcuState& st)',
+            'static bool parseEcuLine(const String& line)', 'static bool parseAemnetLine(const String& line)',
+            'static bool monItemValueX10(uint8_t item, int32_t* outX10)'))
+        host_run(f'#include "{HEADER}"\n' + r'''
 #include <cassert>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
 uint32_t now = 10000;
 uint32_t millis() { return now; }
-struct { bool aem_afr = false, show_afr = true; int sensor_type = 0; } s;
-struct { uint32_t last_ms = 10000; int16_t afr_x10 = 147; } ecu;
+struct String {                      // just the Arduino String surface the parser uses
+    std::string v;
+    String(const char* c) : v(c) {}
+    String(std::string c) : v(std::move(c)) {}
+    unsigned length() const { return (unsigned)v.size(); }
+    char operator[](unsigned i) const { return v[i]; }
+    String substring(unsigned a, unsigned b) const { return String(v.substr(a, b - a)); }
+    long toInt() const { return atol(v.c_str()); }
+};
+constexpr int32_t MON_WARN_OFF = INT32_MIN;
+''' + types + r'''
+MonCfg mon_cfg;
+EngState eng;
+EcuState ecu, aemn;
+struct { bool aem_afr = false; } s;
 aemafr::Reading aem_reading;
 bool aem_seen = false;
 uint32_t aem_last_ms = 10000;
-''' + funcs + '''
+namespace obd { bool dataFresh() { return false; } int16_t coolantF_x10() { return -1; }
+    int16_t voltX10() { return -1; } int16_t iatF_x10() { return -1; } int16_t tpsX10() { return -1; } }
+''' + funcs + r'''
+int32_t val(uint8_t item) { int32_t v = -12345; return monItemValueX10(item, &v) ? v : -12345; }
+constexpr int32_t NONE = -12345;
+void src(uint8_t item, uint8_t source, uint8_t bus = MON_CAN_MS3) { mon_cfg.src[item] = source; mon_cfg.can_bus[item] = bus; }
 int main() {
-    assert(!afrIsVisible() && selectedAfrX10() == -1);
-    s.sensor_type = 1;
-    assert(afrIsVisible() && selectedAfrX10() == 147);
-    s.aem_afr = true;
-    assert(selectedAfrX10() == -1); // no AEM frame; must NOT fall back to live CAN
+    // exactly what the bench Teensy printed with MS3 + an AEM X-Series gauge on ONE bus
+    assert(parseEcuLine("ECU,4420,2030,880,610,131,1040,142,-1"));
+    assert(parseAemnetLine("AEMNET,-1,-1,-1,-1,124,-1,139,-1,8464,1"));
+    // the typical car: everything from the MS3, AFR from the AEM gauge over AEMnet
+    for (int i = 0; i < MON_COUNT; i++) src((uint8_t)i, MON_SRC_CAN, MON_CAN_MS3);
+    src(MON_AFR, MON_SRC_CAN, MON_CAN_AEMNET);
+    assert(val(MON_AFR) == 124);              // the gauge, not the MS3's 13.1
+    assert(val(MON_TEMP) == 2030 && val(MON_MAP) == 880 && val(MON_VOLT) == 142);
+    assert(val(MON_RPM) == 44200);            // RPM row: rpm x10, rounded to 10 rpm
+    resolveEngRpm(); assert(eng.rpm == 4420);
+    // the SAME input switched to MegaSquirt reads the MS3's AFR
+    src(MON_AFR, MON_SRC_CAN, MON_CAN_MS3); assert(val(MON_AFR) == 131);
+    // AEMnet inputs the gauge does not carry are NO DATA - never the MS3's value, never 0
+    src(MON_TEMP, MON_SRC_CAN, MON_CAN_AEMNET); assert(val(MON_TEMP) == NONE);
+    src(MON_RPM, MON_SRC_CAN, MON_CAN_AEMNET);  assert(val(MON_RPM) == NONE);
+    resolveEngRpm(); assert(eng.rpm == 0);
+    src(MON_VOLT, MON_SRC_CAN, MON_CAN_AEMNET); assert(val(MON_VOLT) == 139);   // gauge supply V
+    // an AEM ECU on AEMnet: RPM / oil come from it (AEMnet carries oil; the MS3 broadcast has none)
+    assert(parseAemnetLine("AEMNET,3000,1904,1000,400,147,1004,138,453,10034,1"));
+    assert(val(MON_RPM) == 30000); resolveEngRpm(); assert(eng.rpm == 3000);
+    src(MON_OIL, MON_SRC_CAN, MON_CAN_AEMNET); assert(val(MON_OIL) == 453);
+    src(MON_OIL, MON_SRC_CAN, MON_CAN_MS3);    assert(val(MON_OIL) == NONE);
+    // MS3 with no live CAN RPM (Teensy sends -1): no data, not a fake 0
+    assert(parseEcuLine("ECU,-1,-1,-1,-1,-1,-1,-1,-1"));
+    src(MON_RPM, MON_SRC_CAN, MON_CAN_MS3); assert(val(MON_RPM) == NONE);
+    // each bus expires on its OWN clock: AEMnet silent for >2 s -> no data, MS3 unaffected
+    assert(parseEcuLine("ECU,4420,2030,880,610,131,1040,142,-1"));
+    now = 12001; assert(parseEcuLine("ECU,4420,2030,880,610,131,1040,142,-1"));
+    src(MON_AFR, MON_SRC_CAN, MON_CAN_AEMNET); assert(val(MON_AFR) == NONE);
+    src(MON_AFR, MON_SRC_CAN, MON_CAN_MS3);    assert(val(MON_AFR) == 131);
+    now = 10000; parseAemnetLine("AEMNET,-1,-1,-1,-1,124,-1,139,-1,8464,1");
+    // an unknown (future / corrupt) bus value reads as no data, never garbage
+    src(MON_AFR, MON_SRC_CAN, 7); assert(val(MON_AFR) == NONE);
+    // the AEM ANALOGUE input as the AFR source owns AFR: no frame -> no value, even with
+    // BOTH CAN buses live (never a silent fall-back), then valid / stale / out of range
+    src(MON_AFR, MON_SRC_DIRECT); s.aem_afr = true;
+    assert(val(MON_AFR) == NONE);
     aem_seen = true; aem_reading = aemafr::fromMillivolts(3000);
-    for (int source=0; source<3; ++source) {
-        s.sensor_type = source;
-        assert(afrIsVisible() && selectedAfrX10() == 144);
-    }
-    now = 12000; assert(selectedAfrX10() == 144);
-    now = 12001; assert(selectedAfrX10() == -1);
+    assert(val(MON_AFR) == 144);
+    now = 12000; parseEcuLine("ECU,4420,2030,880,610,131,1040,142,-1"); assert(val(MON_AFR) == 144);
+    now = 12001; assert(val(MON_AFR) == NONE);
     now = 10000;
-    aem_reading = aemafr::fromMillivolts(499); assert(selectedAfrX10() == -1);
-    aem_reading = aemafr::fromMillivolts(4501); assert(selectedAfrX10() == -1);
+    aem_reading = aemafr::fromMillivolts(499);  assert(val(MON_AFR) == NONE);
+    aem_reading = aemafr::fromMillivolts(4501); assert(val(MON_AFR) == NONE);
     aem_reading = aemafr::fromMillivolts(3000);
-    now = 100; aem_last_ms = UINT32_MAX - 500;
-    assert(selectedAfrX10() == 144); // millis rollover
-    s.show_afr = false; assert(!afrIsVisible() && selectedAfrX10() == 144);
+    now = 100; aem_last_ms = UINT32_MAX - 500; assert(val(MON_AFR) == 144);   // millis rollover
+    s.aem_afr = false; assert(val(MON_AFR) == NONE);
 }
 ''')
 

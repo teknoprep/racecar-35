@@ -51,7 +51,9 @@ AEMNET,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>,<oi
 
 Same field order as the MegaSquirt `ECU` line (one parser on the dash), `-1` = not received,
 `uego_status` 0 none / 1 valid / 2 not ready / 3 fault. Sent only while an AEMnet device is
-broadcasting. The Teensy prints the same line on USB, plus once a second:
+broadcasting, plus a final all `-1` line (repeated for ~50 ms) when the last group expires, so the
+dash clears 2 s after the device stops (verified on the bench Teensy - without it the dash held the
+last live AFR for ~4 s). The Teensy prints the same line on USB, plus once a second:
 
 ```
 AEMNET frames/s=250 ecu=ELP uego=U(id 1, valid) rpm=3000 clt_f=1904 ... lambda=10034 afr=147 adv=182
