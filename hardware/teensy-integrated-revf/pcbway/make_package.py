@@ -10,6 +10,7 @@ Usage: python3 pcbway/make_package.py [revision-directory]
        (defaults to the directory containing this script's parent)
 """
 import csv
+import hashlib
 import json
 import subprocess
 import sys
@@ -94,6 +95,7 @@ with bom.open('w', newline='') as f:
         if r['mpn'] in NOT_PARTS:
             continue
         written += 1
+        r['no'] = written                      # the number PCBWay sees in the BOM
         bom_refs += r['refs']
         w.writerow([written, len(r['refs']), r['comment'], ' '.join(r['refs']),
                     r['fp'], r['mpn'], r['maker'], ''])
@@ -141,5 +143,45 @@ with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
         if p.is_file():
             z.write(p, p.name)
 
-print(f'Wrote {bom.name}, {cpl.name}, {zip_path.name} '
-      f'({written} BOM lines, {len(cpl_refs)} placements, {len(list(gz.iterdir()))} gerber/drill files)')
+# --- "Actual Purchase Mfg Part #" list, in PCBWay's own column layout -----------
+# PCBWay's quotation asks the CUSTOMER to confirm the exact part that will be
+# purchased for every line (`*Actual Purchase Mfg Part #`). Our BOM already names
+# one exact MPN + maker per line, so the answer IS that line; this file puts it in
+# their column order with the fit/no-fit instruction beside it. It is generated
+# from the same rows as the BOM, so the two can never disagree.
+mpn_csv = OUT / f'Racecar-{REV}-ACTUAL-PURCHASE-MPN.csv'
+with mpn_csv.open('w', newline='') as f:
+    w = csv.writer(f)
+    w.writerow(['Item #', 'Designator', 'Qty', 'Mfg Part #',
+                'Actual Purchase Mfg Part #', 'Manufacturer', 'Customer Reply / Note'])
+    for r in sorted((r for r in rows if r['mpn'] not in NOT_PARTS),
+                    key=lambda r: r['no']):
+        w.writerow([r['no'], ' '.join(r['refs']), len(r['refs']),
+                    r['mpn'], r['mpn'], r['maker'], r['comment']])
+
+# --- complete upload bundle (what we hand PCBWay) ------------------------------
+# PCBWay asked for the COMPLETE file set, not one layer, so ship every order input
+# in one ZIP: gerbers, BOM, CPL, the exact-purchase-part list, the order settings
+# and the full engineering package. Fail hard if the engineering ZIP is stale - a
+# bundle that disagrees with the routed board is exactly the kind of thing that
+# gets a board built to the wrong copper.
+eng = ROOT / f'Racecar-{REV}-GERBERS-ENGINEERING-PROTOTYPE.zip'
+if not eng.is_file():
+    raise SystemExit(f'ABORT: {eng.name} missing - run fabrication/export.py --engineering-prototype')
+if int(eng.stat().st_mtime) < int(PCB.stat().st_mtime):
+    raise SystemExit(f'ABORT: {eng.name} is older than {PCB.name} - re-export the engineering ZIP')
+members = [zip_path, bom, cpl, mpn_csv,
+           OUT / 'PCBWAY-ORDER-GUIDE.md', OUT / 'REVF-CHANGES-AND-ORDER.md', eng]
+missing = [m.name for m in members if not m.is_file()]
+if missing:
+    raise SystemExit('ABORT: bundle inputs missing: ' + ', '.join(missing))
+sums = ''.join(f'{hashlib.sha256(m.read_bytes()).hexdigest()}  {m.name}\n' for m in members)
+bundle = OUT / f'Racecar-{REV}-PCBWAY-UPLOAD-ALL-FILES.zip'
+with zipfile.ZipFile(bundle, 'w', zipfile.ZIP_DEFLATED) as z:
+    for m in members:
+        z.write(m, m.name)
+    z.writestr('SHA256SUMS.txt', sums)
+
+print(f'Wrote {bom.name}, {cpl.name}, {mpn_csv.name}, {zip_path.name}, {bundle.name} '
+      f'({written} BOM lines, {len(cpl_refs)} placements, {len(list(gz.iterdir()))} gerber/drill files, '
+      f'{len(members)} bundle files)')

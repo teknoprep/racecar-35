@@ -112,6 +112,19 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   are NOT rows, which is exactly the mismatch JLCPCB queried on 2026-10-08); order
   settings in `pcbway/REVF-CHANGES-AND-ORDER.md`; JLCPCB reply in
   `pcbway/JLCPCB-REPLY-2026-10-11.md`.
+  **2026-10-21 — the complete-set rule.** After the 2026-10-19 silk fix was sent as a single
+  replacement layer, PCBWay asked for the COMPLETE file set again. `make_package.py` now bakes
+  the silk straight into `Racecar-RevF-PCBWAY-GERBERS.zip` (16 files, all layers; only
+  `F.Silkscreen` differs from the 2026-10-11 upload — copper/mask/paste/outline/drill verified
+  identical) and additionally emits **`Racecar-RevF-ACTUAL-PURCHASE-MPN.csv`** (PCBWay's
+  `Actual Purchase Mfg Part #` column: one exact MPN + manufacturer per line, generated from
+  the BOM rows) and **`Racecar-RevF-PCBWAY-UPLOAD-ALL-FILES.zip`** (gerbers + BOM + CPL + MPN
+  list + order guide + changes doc + engineering ZIP + `SHA256SUMS.txt`) — the file to hand
+  PCBWay. It also ABORTS if the engineering ZIP is older than the routed PCB. Reply + paste-ready
+  Customer Reply text: `pcbway/PCBWAY-REPLY-2026-10-21.md`. ⚠️ The newest BOM list in
+  `hardware/` (`Quotation for …T-6C2W1148674A…(2026-10-21).xls`) is a DIFFERENT board
+  (PCA9955BTW / CREE CLW6A / 2×20 Pi-HAT socket, 9 lines) — not Rev F; don't answer it with
+  Rev F data.
   Re-export with `fabrication/export.py --engineering-prototype`. **No automotive
   transient qualification, and no built, measured or independently reviewed board.**
   Rev F also ships a **shareable 3D model**: `Racecar-RevF-3D.html` (one self-contained
