@@ -102,6 +102,7 @@ enum SettingId : uint8_t {
     ST_OTA_CHECK,
 };
 struct NumBounds { uint16_t lo, hi, step; };
+struct EcuState;   // v0.1.177: parseCanValues(..., EcuState&) - the auto-prototype rule above
 
 // ---------------------------------------------------------------------------
 // Sensor monitor (bottom-left dash block). The block is a user-ORDERED list of
@@ -121,10 +122,13 @@ enum MonSrc : uint8_t { MON_SRC_DIRECT = 0, MON_SRC_BT = 1, MON_SRC_CAN = 2, MON
 // CAN bus TYPE, only meaningful for an item whose source is CANBUS (MonCfg::can_bus).
 // EXTENDING: adding a CAN type = a new enum member here (before MON_CAN_COUNT), a new
 // entry in MON_CAN_NAMES, and a new decode branch in monItemValueX10() (the CAN column
-// of its source table). Only MegaSquirt (MS3Pro Simplified Dash) exists today.
-enum MonCanBus : uint8_t { MON_CAN_MS3 = 0, MON_CAN_COUNT };
+// of its source table). v0.1.177: MegaSquirt (MS3Pro Simplified Dash, 11-bit 0x5E8.., the Teensy's
+// ECU line) and AEMnet (AEM's 29-bit protocol - an AEM Infinity stream and/or an X-Series UEGO
+// wideband gauge - the Teensy's AEMNET line). Both can share one bus, so each input picks its own:
+// e.g. RPM/coolant from the MS3, AFR from the AEM gauge. APPEND ONLY (persisted in the mon blob).
+enum MonCanBus : uint8_t { MON_CAN_MS3 = 0, MON_CAN_AEMNET = 1, MON_CAN_COUNT };
 static const char* const MON_SRC_NAMES[MON_SRC_COUNT] = { "DIRECT", "BLUETOOTH", "CANBUS" };
-static const char* const MON_CAN_NAMES[MON_CAN_COUNT] = { "MegaSquirt" };
+static const char* const MON_CAN_NAMES[MON_CAN_COUNT] = { "MegaSquirt", "AEMnet" };
 // v0.1.155: the monitor owns every sensor DISPLAY + ALERT setting. Each item has its
 // own warn-low / warn-high threshold and warn colour. THRESHOLD UNITS are always x10
 // of the item's natural unit: degF (TEMP, IAT), psi (OIL), V (VOLT), AFR, kPa (MAP),
@@ -146,7 +150,7 @@ static MonCfg mon_cfg;
 // Which sources can EVER carry data for each item on THIS hardware (bit 1<<MonSrc). The
 // per-item resolution lives in monItemValueX10(); this mirrors it so the seed (monDefaults)
 // and the item page can tell a real source from a "none" one:
-//   TEMP D|B|C   OIL D|C      (CAN oil = RC35 bench frames ONLY: an MS3 broadcast has no oil;
+//   TEMP D|B|C   OIL D|C      (CAN oil = AEMnet oil pressure, or RC35 bench frames - an MS3 broadcast has no oil;
 //                              BT has none either)
 //   VOLT D|B|C   (D = 180k/20k divider on Teensy A16, v0.1.172 - opt-in, never seeded)
 //                                                    AFR D|C  (D = AEM 30-0300 input)
@@ -468,8 +472,12 @@ struct EcuState {
     int16_t  bat_x10       = -1;     // battery voltage, V × 10
     int16_t  oil_x10       = -1;     // oil pressure, psi × 10 - RC35 bench CAN frames ONLY (9th ECU field)
     uint32_t last_ms       = 0;
+    bool     rpm_ok        = false;  // v0.1.177: field 1 was >= 0 (the Teensy sends -1 while no CAN RPM is live)
 };
 static EcuState ecu;
+// v0.1.177: the AEMnet-decoded values (the Teensy's AEMNET line, same field order as ECU - so the
+// same struct and the same parser). Fed only while an AEMnet device is broadcasting; stale after 2 s.
+static EcuState aemn;
 static aemafr::Reading aem_reading;
 static uint32_t aem_last_ms = 0;
 static bool aem_seen = false;
@@ -2316,7 +2324,9 @@ static bool parseGpsLine(const String& line) {
 // silently showed CAN RPM the moment any CAN frame arrived, because ENG field 1 is the
 // Teensy's auto-prefer-CAN value.
 static void resolveEngRpm() {
-    eng.rpm = (mon_cfg.src[MON_RPM] == MON_SRC_CAN) ? ecu.rpm : eng.direct_rpm;
+    if (mon_cfg.src[MON_RPM] != MON_SRC_CAN) { eng.rpm = eng.direct_rpm; return; }
+    // v0.1.177: CANBUS = the RPM item's own bus (MegaSquirt -> ECU line, AEMnet -> AEMNET line)
+    eng.rpm = (mon_cfg.can_bus[MON_RPM] == MON_CAN_AEMNET) ? aemn.rpm : ecu.rpm;
 }
 
 static bool parseEngLine(const String& line) {
@@ -2589,7 +2599,10 @@ static bool parseAemAfrLine(const String& line) {
     return true;
 }
 
-static bool parseEcuLine(const String& line) {
+// ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>[,<oil_x10>]  (MegaSquirt)
+// AEMNET,<same 8>,<lambda_x10000>,<uego_status>                            (AEMnet, v0.1.177)
+// Both carry the CAN values in ONE field order, so one parser fills either EcuState.
+static bool parseCanValues(const String& line, EcuState& st) {
     int idx[9], n = 0;
     for (int i = 0; i < (int)line.length() && n < 9; ++i)
         if (line[i] == ',') idx[n++] = i;
@@ -2598,23 +2611,26 @@ static bool parseEcuLine(const String& line) {
     auto field = [&](int k) { return line.substring(idx[k] + 1, idx[k + 1]); };
 
     long rpm = field(0).toInt();
+    st.rpm_ok = (rpm >= 0);
     if (rpm < 0)     rpm = 0;
     if (rpm > 65535) rpm = 65535;
-    ecu.rpm = (uint16_t)rpm;
+    st.rpm = (uint16_t)rpm;
 
-    if (n >= 2) ecu.coolant_f_x10 = (int16_t)field(1).toInt();
-    if (n >= 3) ecu.map_x10       = (int16_t)field(2).toInt();
-    if (n >= 4) ecu.tps_x10       = (int16_t)field(3).toInt();
-    if (n >= 5) ecu.afr_x10       = (int16_t)field(4).toInt();
-    if (n >= 6) ecu.iat_f_x10     = (int16_t)field(5).toInt();
-    if (n >= 7) ecu.bat_x10       = (int16_t)field(6).toInt();
-    // 9th field (oil, psi x10) = RC35 bench CAN oil. An old-format line (no 9th field)
-    // RESETS it to -1 so a stale value can never outlive the format that carried it.
-    ecu.oil_x10 = (n >= 8) ? (int16_t)field(7).toInt() : (int16_t)-1;
-    ecu.last_ms = millis();
+    if (n >= 2) st.coolant_f_x10 = (int16_t)field(1).toInt();
+    if (n >= 3) st.map_x10       = (int16_t)field(2).toInt();
+    if (n >= 4) st.tps_x10       = (int16_t)field(3).toInt();
+    if (n >= 5) st.afr_x10       = (int16_t)field(4).toInt();
+    if (n >= 6) st.iat_f_x10     = (int16_t)field(5).toInt();
+    if (n >= 7) st.bat_x10       = (int16_t)field(6).toInt();
+    // 9th field (oil, psi x10) = RC35 bench CAN oil / AEMnet oil pressure. An old-format line (no
+    // 9th field) RESETS it to -1 so a stale value can never outlive the format that carried it.
+    st.oil_x10 = (n >= 8) ? (int16_t)field(7).toInt() : (int16_t)-1;
+    st.last_ms = millis();
     resolveEngRpm();   // v0.1.170: the RPM the dash shows may be this CAN value
     return true;
 }
+static bool parseEcuLine(const String& line)     { return parseCanValues(line, ecu); }
+static bool parseAemnetLine(const String& line)  { return parseCanValues(line, aemn); }
 
 static bool parseImuLine(const String& line) {
     // IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
@@ -4576,6 +4592,7 @@ static bool parseLine(const String& line) {
     }
     if (line.startsWith("ENG,")) return parseEngLine(line);
     if (line.startsWith("ECU,")) return parseEcuLine(line);
+    if (line.startsWith("AEMNET,")) return parseAemnetLine(line);   // v0.1.177
     if (line.startsWith("AFR,")) return parseAemAfrLine(line);
     if (line.startsWith("IMU,")) return parseImuLine(line);
     if (line.startsWith("ETH,"))  return true;  // ignore retired status from an older Teensy
@@ -4690,6 +4707,7 @@ static inline void uartRateTick() {
 
 static bool uartLineIsTelemetry(const String& s) {
     return s.startsWith("GPS,")  || s.startsWith("ENG,")  || s.startsWith("ECU,")
+        || s.startsWith("AEMNET,")
         || s.startsWith("IMU,")  || s.startsWith("TIME,") || s.startsWith("HLTH,")
         || s.startsWith("AFR,")
         || s.startsWith("SD,")   || s.startsWith("CLD,")
@@ -4921,6 +4939,9 @@ static void simTick() {
     snprintf(l, sizeof(l), "GPS,3,14,%.6f,%.6f,%.1f,%.1f,2", lat, lon, sim_mph, hdg);  simInject(l);
     snprintf(l, sizeof(l), "ENG,%u,%d,%d,%u,%d,%d", rpm, psi_x10, clt_x10, rpm, clt_x10, bat_x10); simInject(l);
     snprintf(l, sizeof(l), "ECU,%u,%d,%d,%d,%d,%d,%d", rpm, clt_x10, map_x10, tps_x10, afr_x10, iat_x10, bat_x10); simInject(l);
+    // v0.1.177: the same values as AEMnet (with oil, which AEMnet carries), lambda = AFR / 14.65
+    snprintf(l, sizeof(l), "AEMNET,%u,%d,%d,%d,%d,%d,%d,%d,%d,1", rpm, clt_x10, map_x10, tps_x10, afr_x10,
+             iat_x10, bat_x10, psi_x10, (int)(afr_x10 * 1000L / 1465)); simInject(l);
     const aemafr::Reading ar = s.aem_afr
         ? aemafr::fromMillivolts(3000 + (int)(400.0f * sinf(t / 7.0f))) : aemafr::Reading{};
     snprintf(l, sizeof(l), "AFR,%u,%d,%d,%d", (unsigned)ar.status,
@@ -5594,19 +5615,24 @@ static void formatAemStatus(char* buf, size_t cap) {
 //   RPM   eng.direct_rpm            none (BLE far too slow)     ecu.rpm
 //   (v0.1.170: DIRECT reads the PURE sensor fields, so a CAN frame on the bus can no
 //    longer leak into a "Direct" reading; ECU field 1 / ENG fields 4-5 are pure.)
-// Adding a CAN bus type = one more branch on mon_cfg.can_bus[item] in the CAN column.
+// CAN column = the item's CAN bus (v0.1.177): MegaSquirt -> `ecu` (ECU line), AEMnet -> `aemn`
+// (AEMNET line: AEM Infinity rpm/tps/iat/coolant/MAP/oil/battery, lambda from an X-Series UEGO
+// gauge when one broadcasts, else the ECU's lambda #1). Same field names, so one table serves both.
 // ---------------------------------------------------------------------------
 static bool monItemValueX10(uint8_t item, int32_t* outX10) {
     if (item >= MON_COUNT) return false;
     const uint32_t nowMs    = millis();
     const uint8_t  src      = mon_cfg.src[item];
     const bool     fromBt   = (src == MON_SRC_BT);    // BLE OBD-II dongle
-    // CAN column. MON_CAN_MS3 is the only bus today; every other (future) type reads as
-    // "no data" until its decode branch exists, so a half-added bus can never show garbage.
-    const bool     fromCan  = (src == MON_SRC_CAN) && (mon_cfg.can_bus[item] == MON_CAN_MS3);
+    // CAN column (v0.1.177): the item's OWN bus - MegaSquirt reads the Teensy's ECU line, AEMnet
+    // its AEMNET line (same field order, same struct). A bus type with no decode branch here reads
+    // as "no data", so a half-added bus can never show garbage.
+    const uint8_t  bus      = mon_cfg.can_bus[item];
+    const bool     fromCan  = (src == MON_SRC_CAN) && (bus == MON_CAN_MS3 || bus == MON_CAN_AEMNET);
+    const EcuState& cs      = (bus == MON_CAN_AEMNET) ? aemn : ecu;
     const bool     direct   = (src == MON_SRC_DIRECT);
-    // ECU staleness: no CAN frames received in ~2 s -> treat MS3 fields as faulted.
-    const bool     ecuStale = (ecu.last_ms == 0) || (nowMs - ecu.last_ms > 2000);
+    // Staleness: no line for that bus in ~2 s -> its fields are faulted.
+    const bool     ecuStale = (cs.last_ms == 0) || (nowMs - cs.last_ms > 2000);
     const bool     canOk    = fromCan && !ecuStale;
     const bool     btOk     = fromBt && obd::dataFresh();
     int32_t v = -1;
@@ -5615,15 +5641,14 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
     case MON_TEMP:
         // DIRECT reads the PURE NTC field (ENG field 5) - never the mixed field, which the
         // Teensy auto-switches to CAN the moment a frame arrives (v0.1.170).
-        v  = direct ? eng.direct_coolant_f_x10 : fromBt ? obd::coolantF_x10() : fromCan ? ecu.coolant_f_x10 : -1;
+        v  = direct ? eng.direct_coolant_f_x10 : fromBt ? obd::coolantF_x10() : fromCan ? cs.coolant_f_x10 : -1;
         ok = (v >= 0) && (direct || btOk || canOk);
         break;
     case MON_OIL:
-        // DIRECT = the A2 transducer. CANBUS = ecu.oil_x10, the RC35 bench frames' oil (the
-        // Teensy sends -1 when they are not live). An MS3's Simplified Dash broadcast has NO
-        // oil channel, so OIL-over-CANBUS is for the RC35 bench frames / a future aux CAN oil
-        // sender. OBD2 carries no oil pressure here.
-        v  = direct ? eng.oil_psi_x10 : fromCan ? ecu.oil_x10 : -1;
+        // DIRECT = the A2 transducer. CANBUS + AEMnet = the AEM ECU's oil pressure (0x01F0A004);
+        // CANBUS + MegaSquirt = the RC35 bench frames' oil (the Teensy sends -1 when they are not
+        // live) - an MS3's Simplified Dash broadcast has NO oil channel. OBD2 carries none here.
+        v  = direct ? eng.oil_psi_x10 : fromCan ? cs.oil_x10 : -1;
         ok = (v >= 0) && (direct || canOk);
         break;
     case MON_VOLT: {
@@ -5633,7 +5658,7 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
         int16_t bv = -1;
         if (direct && eng.direct_vin_x10 > 0)     bv = eng.direct_vin_x10;
         else if (btOk && obd::voltX10() > 0)      bv = obd::voltX10();
-        else if (canOk && ecu.bat_x10 > 0)        bv = ecu.bat_x10;
+        else if (canOk && cs.bat_x10 > 0)         bv = cs.bat_x10;
         // v0.1.158: the DISPLAY is no longer gated on the engine running — "I selected VOLT
         // and see nothing" was the complaint, and a parked ignition-on voltage is useful
         // information. The WARN is still gated on rpm >= ENGINE_RUNNING_RPM; that gate moved
@@ -5644,21 +5669,21 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
     case MON_AFR:
         // DIRECT = the AEM analogue input (kept in step with s.aem_afr by the item page);
         // BT has none. A bad/stale AEM reading is invalid - never a silent CAN fallback.
-        v  = direct ? aemAfrX10() : fromCan ? ecu.afr_x10 : -1;
+        v  = direct ? aemAfrX10() : fromCan ? cs.afr_x10 : -1;
         ok = (v >= 0) && (direct || canOk);
         break;
     case MON_IAT:
-        v  = fromBt ? obd::iatF_x10() : fromCan ? ecu.iat_f_x10 : -1;
+        v  = fromBt ? obd::iatF_x10() : fromCan ? cs.iat_f_x10 : -1;
         ok = (v >= 0) && (btOk || canOk);
         break;
     case MON_MAP:
         // CAN only: the dash polls no OBD MAP PID and there is no MAP ADC.
-        v  = fromCan ? ecu.map_x10 : -1;
+        v  = fromCan ? cs.map_x10 : -1;
         ok = canOk && (v >= 0);
         break;
     case MON_TPS:
         // BT = obd_ble.h's tpsX10() (PID 0111, the same value the Status page / BTD relay use).
-        v  = fromBt ? obd::tpsX10() : fromCan ? ecu.tps_x10 : -1;
+        v  = fromBt ? obd::tpsX10() : fromCan ? cs.tps_x10 : -1;
         ok = (v >= 0) && (btOk || canOk);
         break;
     case MON_RPM:
@@ -5669,7 +5694,9 @@ static bool monItemValueX10(uint8_t item, int32_t* outX10) {
         // value, not the raw one — same rule that fixed the TEMP/PSI tearing. The RPM bar
         // still shows every revolution; this row is the coarse one.
         if (direct)       { ok = true;   v = (int32_t)((eng.direct_rpm + 5) / 10) * 100; }
-        else if (canOk)   { ok = true;   v = (int32_t)((ecu.rpm + 5) / 10) * 100; }
+        // v0.1.177: CAN RPM needs a live RPM source on that bus (the Teensy sends -1 otherwise): a
+        // UEGO gauge alone puts AEMnet on the bus but carries no RPM - that is "no data", not 0.
+        else if (canOk && cs.rpm_ok) { ok = true; v = (int32_t)((cs.rpm + 5) / 10) * 100; }
         break;
     default: break;
     }
@@ -5982,6 +6009,7 @@ static void drawDashPage() {
         ecu.iat_f_x10     = -1;
         ecu.bat_x10       = -1;
         ecu.oil_x10       = -1;
+        aemn = EcuState{};   // v0.1.177: AEMnet arrives through the Teensy as well
         // Don't touch g.last_ms / eng.last_ms / ecu.last_ms — those are the
         // parser's freshness timestamps. The next received line refills.
     }

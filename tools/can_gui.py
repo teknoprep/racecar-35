@@ -12,13 +12,16 @@ Answers, in one window, the questions we keep asking each other over chat:
     otherwise unknowable from the adapter, whose slcan firmware does not implement
     the status commands.)
 
-It NEVER touches tools/can_sim.py — that file belongs to the bench-tool work. This
-app spawns it exactly as you would by hand:
+This app spawns tools/can_sim.py exactly as you would by hand:
 
-    python3 -u tools/can_sim.py bench -p /dev/ttyACM0 --hz 100
+    python3 -u tools/can_sim.py bench -p /dev/ttyACM0 --hz 100 --protocol aemnet
 
-and parses its stdout. It only *imports* it (no edits) to reuse rc35_frames() so the
-bytes shown are the bytes actually sent, not a re-implementation that could drift.
+and parses its stdout. PROTOCOL dropdown (v0.1.177): RC35 bench / MegaSquirt / AEMnet - the
+same values go out in whichever framing is picked, so the dash's per-input "CAN bus" choice can
+be tested against each. It *imports* can_sim only to reuse its encoders (protocol_frames(),
+decode_*()) so the bytes shown are the bytes actually sent, and its firmware-mirror decoders so
+the "teensy" row can be judged. VALIDATE runs `can_sim.py validate` - known values held still,
+the Teensy's decoded USB line compared field by field, PASS only on an exact match.
 
 Run:  python3 tools/can_gui.py            (or --port, --hz, --teensy to preset)
       python3 tools/can_gui.py --selftest (no GUI: checks parsing + frame encoding)
@@ -127,6 +130,30 @@ def parse_status(line):
             "load_pct": float(load), "tx_fail": int(fail or 0)}
 
 
+RE_VALUE_LINE = re.compile(r"^(ECU|AEMNET),(-?\d+(?:,-?\d+)+)\s*$")
+
+
+def parse_value_line(line):
+    """The Teensy's decoded CAN values -> (prefix, {channel: value or None}) in GUI units."""
+    m = RE_VALUE_LINE.match(line.strip())
+    if not m:
+        return None
+    f = [int(x) for x in m.group(2).split(",")]
+    if len(f) < 7:
+        return None
+    f += [-1] * (10 - len(f))
+
+    def x10(v):
+        return None if v < 0 else v / 10.0
+    vals = {"rpm": None if f[0] < 0 else float(f[0]), "clt": x10(f[1]), "map": x10(f[2]),
+            "tps": x10(f[3]), "afr": x10(f[4]), "iat": x10(f[5]),
+            "volt": None if f[6] <= 0 else f[6] / 10.0, "oil": x10(f[7])}
+    if m.group(1) == "AEMNET":
+        vals["lambda"] = None if f[8] < 0 else f[8] / 10000.0
+        vals["uego"] = f[9]
+    return m.group(1), vals
+
+
 def parse_candiag(line):
     m = RE_CANDIAG.search(line)
     if not m:
@@ -151,10 +178,13 @@ class Broadcaster:
     def running(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, port, hz, profile=None, bitrate="500k"):
+    def start(self, port, hz, profile=None, bitrate="500k", protocol="rc35", aem_devices="both"):
         if self.running():
             return False
-        cmd = [sys.executable, "-u", CAN_SIM, "bench", "-p", port, "--hz", str(hz)]
+        cmd = [sys.executable, "-u", CAN_SIM, "bench", "-p", port, "--hz", str(hz),
+               "--protocol", protocol]
+        if protocol == "aemnet":
+            cmd += ["--aem-devices", aem_devices]
         if profile:
             cmd += ["--profile", profile]
         if bitrate and bitrate != "500k":
@@ -241,6 +271,17 @@ class TeensyReader:
 # ---------------------------------------------------------------------------
 # the app
 # ---------------------------------------------------------------------------
+# How close the Teensy's decoded value must be to the value on the wire to show GREEN in the live
+# row: the protocol's own resolution plus a little for the Teensy line lagging a moving sweep.
+# (The EXACT test is VALIDATE, which holds each value still.)
+TEENSY_TOL = {
+    "rc35":       {"rpm": 60, "clt": 1.6, "oil": 0.6, "volt": 0.2, "afr": 0.2, "iat": 1.6, "map": 1.0, "tps": 1.2},
+    "megasquirt": {"rpm": 60, "clt": 0.6, "oil": 0.6, "volt": 0.2, "afr": 0.2, "iat": 0.6, "map": 1.0, "tps": 1.0},
+    # AEMnet: whole degC (1.8 F steps), oil 0.58 psi steps
+    "aemnet":     {"rpm": 60, "clt": 2.0, "oil": 0.9, "volt": 0.2, "afr": 0.2, "iat": 2.0, "map": 1.0, "tps": 1.0},
+}
+UEGO_TXT = {0: "not on the bus", 1: "valid", 2: "warming up / not valid", 3: "SENSOR FAULT"}
+
 CHANNELS = [("rpm", "RPM", "", 0), ("clt", "TEMP", "F", 1), ("oil", "OIL", "psi", 1),
             ("volt", "VOLT", "V", 2), ("afr", "AFR", "", 2), ("iat", "IAT", "F", 1),
             ("map", "MAP", "kPa", 1), ("tps", "TPS", "%", 1)]
@@ -262,6 +303,9 @@ class App:
         self._vt0 = time.time()
         self.history = {k: [] for k, *_ in CHANNELS}
         self.frame_lines = []
+        self.teensy_vals = {}         # decoded by the Teensy (its ECU / AEMNET USB line)
+        self.teensy_vals_t = 0.0
+        self.validating = None        # the `can_sim.py validate` subprocess while it runs
         # dash-clone feed: filled from the Teensy's lines when connected (faithful), else from
         # the broadcaster's values with a modelled speed (the bench has no GPS).
         self.dash_state = {}
@@ -303,6 +347,14 @@ class App:
         self.prof_var = tk.StringVar(value=self.args.profile or "sweep")
         ttk.Combobox(top, textvariable=self.prof_var, width=9,
                      values=("sweep", "chop", "pull", "steady")).pack(side="left", padx=4)
+        tk.Label(top, text="protocol", **P).pack(side="left")
+        self.proto_var = tk.StringVar(value=self.args.protocol)
+        ttk.Combobox(top, textvariable=self.proto_var, width=11, state="readonly",
+                     values=("rc35", "megasquirt", "aemnet")).pack(side="left", padx=4)
+        tk.Label(top, text="AEM", **P).pack(side="left")
+        self.aemdev_var = tk.StringVar(value=self.args.aem_devices)
+        ttk.Combobox(top, textvariable=self.aemdev_var, width=5, state="readonly",
+                     values=("both", "ecu", "uego")).pack(side="left", padx=4)
         self.start_btn = tk.Button(top, text="START broadcaster", command=self.start,
                                    bg="#1e5b2a", fg="white", activebackground="#2c7d3c")
         self.start_btn.pack(side="left", padx=8)
@@ -313,14 +365,18 @@ class App:
         self.state_lbl.pack(side="left", padx=10)
         tk.Button(top, text="DASH VIEW", command=self.open_dash,
                   bg="#1e3f5b", fg="white").pack(side="left", padx=8)
+        tk.Button(top, text="VALIDATE", command=self.validate,
+                  bg="#5b4a1e", fg="white").pack(side="left", padx=4)
 
         # ---- values ----
         mid = tk.Frame(self.root, bg="#101418")
         mid.pack(fill="x", **pad)
-        vals = tk.LabelFrame(mid, text="values on the wire (parsed from the broadcaster)",
+        vals = tk.LabelFrame(mid, text="values on the wire (big)  /  what the TEENSY decoded (small - "
+                                      "needs its USB connected below)",
                              bg="#101418", fg="#9fb4c8")
         vals.pack(side="left", fill="both", expand=True)
         self.val_lbls = {}
+        self.tval_lbls = {}
         for i, (key, name, unit, prec) in enumerate(CHANNELS):
             cell = tk.Frame(vals, bg="#101418")
             cell.grid(row=i // 4, column=i % 4, sticky="w", padx=10, pady=2)
@@ -330,8 +386,14 @@ class App:
             lbl.pack(side="left")
             tk.Label(cell, text=unit, bg="#101418", fg="#7f93a8", width=4, anchor="w").pack(side="left")
             self.val_lbls[key] = lbl
+            tl = tk.Label(cell, text="teensy --", bg="#101418", fg="#7f93a8",
+                          font=("DejaVu Sans Mono", 10), width=12, anchor="w")
+            tl.pack(side="left")
+            self.tval_lbls[key] = tl
         self.rate_lbl = tk.Label(vals, text="value updates: --/s", bg="#101418", fg="#ffcc66")
         self.rate_lbl.grid(row=2, column=0, columnspan=4, sticky="w", padx=10, pady=(6, 2))
+        self.tsrc_lbl = tk.Label(vals, text="", bg="#101418", fg="#9fb4c8", anchor="w", justify="left")
+        self.tsrc_lbl.grid(row=3, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 2))
 
         # ---- tool health ----
         health = tk.LabelFrame(mid, text="broadcaster health (their tool's own counters)",
@@ -375,7 +437,7 @@ class App:
         fr = tk.LabelFrame(self.root, text="frames on the wire (exact bytes, re-encoded with the tool's own encoder)",
                            bg="#101418", fg="#9fb4c8")
         fr.pack(fill="x", **pad)
-        self.frames_txt = tk.Text(fr, height=4, bg="#0b0f13", fg="#b8e0c0",
+        self.frames_txt = tk.Text(fr, height=5, bg="#0b0f13", fg="#b8e0c0",
                                   font=("DejaVu Sans Mono", 10), insertbackground="#d8e0e8")
         self.frames_txt.pack(fill="x", padx=6, pady=4)
 
@@ -392,10 +454,40 @@ class App:
             hz = float(self.hz_var.get())
         except ValueError:
             hz = 100.0
-        self.bc.start(self.port_var.get(), hz, self.prof_var.get())
+        self.bc.start(self.port_var.get(), hz, self.prof_var.get(),
+                      protocol=self.proto_var.get(), aem_devices=self.aemdev_var.get())
 
     def stop(self):
         self.bc.stop()
+
+    def validate(self):
+        """Exact end-to-end check: `can_sim.py validate` (needs both ports, so it borrows them)."""
+        if self.validating and self.validating.poll() is None:
+            return
+        tport = self.tport_var.get().strip()
+        if not tport:
+            self.verdict.config(text="verdict: VALIDATE needs the Teensy's USB port (pick it below)",
+                                fg="#ffcc66")
+            return
+        self.bc.stop()                     # the CANable is needed by validate...
+        self.disconnect_teensy()           # ...and so is the Teensy's serial port
+        cmd = [sys.executable, "-u", CAN_SIM, "validate", "-p", self.port_var.get(),
+               "--teensy", tport, "--protocol", self.proto_var.get()]
+        if self.proto_var.get() == "aemnet":
+            cmd += ["--aem-devices", self.aemdev_var.get()]
+
+        def run():
+            time.sleep(1.0)                # let the broadcaster release the adapter
+            self.q.put("[gui] VALIDATE: " + " ".join(cmd))
+            self.validating = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for ln in self.validating.stdout:
+                self.q.put(ln.rstrip("\n"))
+            rc = self.validating.wait()
+            self.q.put(f"[gui] VALIDATE {'PASSED' if rc == 0 else 'FAILED'} (rc={rc}) - "
+                       f"{self.proto_var.get()}")
+            self.q.put(("__validated__", rc))
+        threading.Thread(target=run, daemon=True).start()
 
     def connect_teensy(self):
         p = self.tport_var.get().strip()
@@ -423,6 +515,13 @@ class App:
         try:
             while True:
                 line = self.q.get_nowait()
+                if isinstance(line, tuple) and line[0] == "__validated__":
+                    ok = line[1] == 0
+                    self.verdict.config(
+                        text=(f"verdict: VALIDATE {'PASS - the Teensy decodes ' + self.proto_var.get() + ' EXACTLY' if ok else 'FAIL - see the MISMATCH rows in the log'}"),
+                        fg="#7fd07f" if ok else "#ff8080")
+                    self.connect_teensy()
+                    continue
                 self._line(line)
         except queue.Empty:
             pass
@@ -474,6 +573,12 @@ class App:
             self.candiag = c
             if c.get("state"):
                 self.candiag_state = c["state"]
+        pv = parse_value_line(line)
+        if pv:
+            want = "AEMNET" if self.proto_var.get() == "aemnet" else "ECU"
+            if pv[0] == want:
+                self.teensy_vals = pv[1]
+                self.teensy_vals_t = time.time()
         if "VER,teensy," in line:
             self.teensy_ver = line.split("VER,teensy,", 1)[1].strip()
         if line.startswith("BENCH "):
@@ -481,10 +586,34 @@ class App:
         self._feed_dash(line)
 
     def _tick(self):
+        fresh = time.time() - self.teensy_vals_t < 2.0
+        tol = TEENSY_TOL.get(self.proto_var.get(), TEENSY_TOL["rc35"])
         for key, name, unit, prec in CHANNELS:
             v = self.values.get(key)
             txt = "--" if v is None else f"{v:.{prec}f}"
             self.val_lbls[key].config(text=txt)
+            tv = self.teensy_vals.get(key) if fresh else None
+            if not fresh:
+                self.tval_lbls[key].config(text="teensy --", fg="#7f93a8")
+            elif tv is None:
+                # MegaSquirt carries no oil: "no data" is the CORRECT answer there
+                ok = key == "oil" and self.proto_var.get() == "megasquirt"
+                self.tval_lbls[key].config(text="teensy n/a", fg="#7fd07f" if ok else "#ff8080")
+            else:
+                close = v is not None and abs(tv - v) <= tol[key]
+                self.tval_lbls[key].config(text=f"teensy {tv:.{prec}f}",
+                                           fg="#7fd07f" if close else "#ffcc66")
+        if fresh and self.proto_var.get() == "aemnet":
+            lam, st = self.teensy_vals.get("lambda"), self.teensy_vals.get("uego", 0)
+            self.tsrc_lbl.config(text=(f"teensy AEMNET: lambda {lam:.4f}" if lam is not None
+                                       else "teensy AEMNET: lambda --")
+                                 + f"   UEGO gauge: {UEGO_TXT.get(st, st)}"
+                                 + "   (green = within the protocol's resolution; exact check: VALIDATE)")
+        elif fresh:
+            self.tsrc_lbl.config(text="teensy ECU line   (green = within the protocol's resolution; "
+                                      "exact check: VALIDATE)")
+        else:
+            self.tsrc_lbl.config(text="teensy row: connect the Teensy's USB below to see what it decoded")
         # THE wire rate: cycles/s x 2 (each RC35 cycle is a CORE + an AUX frame), cross-checked
         # against the tool's own "= N frames/s" line. The printed-value rate below is the tool's
         # DISPLAY cadence (~25/s at --hz 100) and says nothing about the frame rate - conflating
@@ -523,7 +652,11 @@ class App:
                     if int(p[3]) >= 0:
                         st["clt"] = int(p[3]) / 10.0
                 st["from_teensy"] = True
-            elif line.startswith("ECU,"):
+            elif line.startswith("AEMNET,") or line.startswith("ECU,"):
+                # mirror the dash: with AEMnet picked, the clone shows the AEMNET values
+                want = "AEMNET," if self.proto_var.get() == "aemnet" else "ECU,"
+                if not line.startswith(want):
+                    return
                 p = line.split(",")
                 if len(p) >= 8:
                     st["rpm"] = float(p[1])
@@ -558,21 +691,18 @@ class App:
     def _render_frames(self, v):
         if not _HAVE_ENCODER:
             return
+        proto = self.proto_var.get()
         try:
-            frames = _sim.rc35_frames(rpm=v["rpm"], clt_f=v["clt"], map_kpa=v["map"],
-                                      tps_pct=v["tps"], iat_f=v["iat"], afr=v["afr"],
-                                      batt_v=v["volt"], oil_psi=v["oil"], seq=0)
+            vals = {"rpm": v["rpm"], "clt_f": v["clt"], "map_kpa": v["map"], "tps_pct": v["tps"],
+                    "iat_f": v["iat"], "afr": v["afr"], "batt_v": v["volt"], "oil_psi": v["oil"]}
+            frames, ext = _sim.protocol_frames(proto, vals, aem_devices=self.aemdev_var.get())
         except Exception:
             return
         out = []
         for mid, payload in frames.items():
             hx = payload.hex().upper()
-            if mid == 0x700:
-                note = (f"rpm {int(v['rpm'])}  map {v['map']:.1f}kPa  tps {v['tps']:.1f}%  "
-                        f"clt {v['clt']:.0f}F  iat {v['iat']:.0f}F  seq 0")
-            else:
-                note = (f"afr {v['afr']:.2f}  batt {v['volt']:.2f}V  oil {v['oil']:.1f}PSI  adv")
-            out.append(f"0x{mid:03X}  {hx:<20} -> {note}")
+            idtxt = f"0x{mid:08X}x" if ext else f"0x{mid:03X}"
+            out.append(f"{idtxt}  {hx:<17} -> {_sim.decode_any(mid, payload, ext)}")
         txt = "\n".join(out)
         if txt != self.frames_txt.get("1.0", "end-1c"):
             self.frames_txt.delete("1.0", "end")
@@ -770,8 +900,19 @@ def selftest():
         print("0x701:", fr[0x701].hex().upper())
         ok &= fr[0x700][:2] == bytes([0x0B, 0xB8])         # 3000 rpm big-endian
         ok &= fr[0x701][0] == 147                          # 14.7 AFR x10
+        af, ext = _sim.protocol_frames("aemnet", {"rpm": 3000, "clt_f": 190, "map_kpa": 100,
+                                                  "tps_pct": 40, "iat_f": 100, "afr": 14.65,
+                                                  "batt_v": 13.8, "oil_psi": 45})
+        print("AEMnet:", {hex(k): v.hex().upper() for k, v in af.items()})
+        ok &= ext and af[0x01F0A000][:2] == bytes([0x1E, 0x00]) and af[0x180][:2] == bytes([0x27, 0x10])
     else:
         print("(can_sim not importable — byte display disabled)")
+    pv = parse_value_line("AEMNET,3000,1904,1000,400,147,1004,138,453,10034,1")
+    print("AEMNET line parse:", pv)
+    ok &= pv is not None and pv[0] == "AEMNET" and pv[1]["rpm"] == 3000 and pv[1]["oil"] == 45.3 \
+        and pv[1]["uego"] == 1 and abs(pv[1]["lambda"] - 1.0034) < 1e-9
+    pe = parse_value_line("ECU,3000,1900,1000,400,147,1000,138,-1")
+    ok &= pe is not None and pe[0] == "ECU" and pe[1]["oil"] is None
     print("SELFTEST:", "OK" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -781,6 +922,8 @@ def main():
     ap.add_argument("--port", default="/dev/ttyACM0")
     ap.add_argument("--hz", type=float, default=100)
     ap.add_argument("--profile", default=None)
+    ap.add_argument("--protocol", default="rc35", choices=("rc35", "megasquirt", "aemnet"))
+    ap.add_argument("--aem-devices", default="both", choices=("both", "ecu", "uego"))
     ap.add_argument("--teensy", default=None, help="Teensy USB serial port (e.g. /dev/ttyACM1)")
     ap.add_argument("--autostart", action="store_true", help="start broadcasting on launch")
     ap.add_argument("--dash-scale", type=float, default=1.0, help="dash clone zoom (0.5-1.5)")

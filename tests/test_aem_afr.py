@@ -11,6 +11,7 @@ import unittest
 from test_wifi_only import ROOT, DASH, TEENSY, block
 
 HEADER = ROOT / 'crowpanel-arduino/RaceDash/aem_afr.h'
+AEMNET_H = ROOT / 'src/aemnet.h'   # v0.1.177: the sample writer logs AEMnet keys too
 
 
 def host_run(source):
@@ -109,7 +110,7 @@ int main() {
         sig = 'static void writeSessionSample('
         start = TEENSY.index(sig, TEENSY.index(sig) + 1)  # skip forward declaration
         fn = block(TEENSY[start:], sig)
-        output = host_run(f'#include "{HEADER}"\n' + r'''
+        output = host_run(f'#include "{HEADER}"\n#include "{AEMNET_H}"\n' + r'''
 #include <cassert>
 #include <stdarg.h>
 #include <string>
@@ -130,6 +131,7 @@ aemafr::Reading aem_reading;
 struct { uint32_t last_ms = 10000; int tps_x10 = 999; int map_x10 = 1012;
          int iat_f_x10 = 882; int bat_x10 = 139; int afr_x10 = 147;
          int oil_x10 = 421; } can_ecu;
+aemnet::State can_aem;   // v0.1.177: no AEMnet device live -> no aem_* keys (test_aemnet covers them)
 uint32_t bt_last_ms = 10000;
 int bt_tps_x10 = 500, bt_spark_x10 = -35;
 int bt_iat_f_x10 = 900, bt_volt_x10 = 141;

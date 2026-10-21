@@ -28,3 +28,12 @@ The actual routed Rev C separately exercises the full engineering export path:
 schematic/PCB connections; export runs fresh full ERC/DRC and package checks.
 `fabrication/inspect_cam.py` re-reads Gerbers and compares drill locations/diameters
 using Gerbonara. None of these checks proves physical performance or approval.
+
+`test_aemnet.py` (v0.1.177) compiles the real AEMnet decoder `src/aemnet.h` under
+UndefinedBehaviorSanitizer and checks it three ways: the encoder's golden bytes against
+AEM's TA2 / 30-0300 tables (worked out by hand, not from the encoder), bit-exact agreement
+between the firmware decoder and the Python mirror `tools/can_sim.py validate` relies on
+(3 000 random frame sets incl. UEGO valid/warm-up/fault flags), and `can_sim.py validate`
+end to end against a fake CANable + a fake Teensy that decodes with the real header - it
+must PASS, and must FAIL when the fake Teensy is off by 1 rpm. It does not test a real
+transceiver, the Teensy's FlexCAN FIFO, or the dash; `validate` on the bench does that.

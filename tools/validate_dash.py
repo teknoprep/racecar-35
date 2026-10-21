@@ -303,8 +303,14 @@ def main():
     oil_m = re.search(r"/\*\s*OIL\s*\*/([^,]*?(?:\|[^,]*?)*),\s*(?=/\*)", raw[raw.find("MON_SRC_MASK["):][:1500])
     if not (oil_m and "MON_SRC_CAN" in oil_m.group(1)):
         fail("15: MON_SRC_MASK[MON_OIL] does not include MON_SRC_CAN (RC35 bench oil)")
+    # v0.1.177: parseEcuLine() delegates to the shared parseCanValues(line, ecu) - the ECU and
+    # AEMNET lines share one field order - so accept either shape, as long as the oil field is set.
     pe_body, _ = block_after(code, r"static\s+bool\s+parseEcuLine\s*\([^)]*\)\s*\{")
-    if pe_body is None or not re.search(r"\becu\s*\.\s*oil_x10\b", pe_body):
+    pc_body, _ = block_after(code, r"static\s+bool\s+parseCanValues\s*\([^)]*\)\s*\{")
+    direct_ok = pe_body is not None and re.search(r"\becu\s*\.\s*oil_x10\b", pe_body)
+    shared_ok = (pe_body is not None and re.search(r"parseCanValues\s*\(\s*line\s*,\s*ecu\s*\)", pe_body)
+                 and pc_body is not None and re.search(r"\bst\s*\.\s*oil_x10\b", pc_body))
+    if not (direct_ok or shared_ok):
         fail("15: parseEcuLine() does not set ecu.oil_x10 (9th ECU field)")
     cap = re.search(r"nowMs\s*-\s*sens_last_ms\s*>=\s*(\d+)", code)
     if not cap:
@@ -317,6 +323,29 @@ def main():
         fail("16: monItemRows() does not exclude the warn rows for MON_RPM")
     if re.search(r"item\s*==\s*MON_RPM\s*\)\s*return false", code) is None:
         fail("16: monItemWarnActive() does not force MON_RPM to never warn")
+
+    # 17 (v0.1.177): AEMnet is a CAN bus type, wired end to end - an input set to CANBUS +
+    # AEMnet must read the Teensy's AEMNET line, never the MegaSquirt ECU line.
+    if not re.search(r"MON_CAN_AEMNET\s*=\s*1\s*,\s*MON_CAN_COUNT", code):
+        fail("17: enum MonCanBus lacks MON_CAN_AEMNET = 1 (append-only, before MON_CAN_COUNT)")
+    if not re.search(r'MON_CAN_NAMES\s*\[\s*MON_CAN_COUNT\s*\]\s*=\s*\{[^}]*"AEMnet"', raw):
+        fail('17: MON_CAN_NAMES has no "AEMnet" entry')
+    if not re.search(r'startsWith\("AEMNET,"\)\)\s*return\s+parseAemnetLine\s*\(\s*line\s*\)', code):
+        fail("17: parseLine() does not dispatch the AEMNET line to parseAemnetLine()")
+    pa_body, _ = block_after(code, r"static\s+bool\s+parseAemnetLine\s*\([^)]*\)\s*\{")
+    if pa_body is None or not re.search(r"parseCanValues\s*\(\s*line\s*,\s*aemn\s*\)", pa_body):
+        fail("17: parseAemnetLine() does not fill the AEMnet state (parseCanValues(line, aemn))")
+    mv_body, _ = block_after(code, r"static\s+bool\s+monItemValueX10\s*\([^)]*\)\s*\{")
+    if mv_body is None or not re.search(r"MON_CAN_AEMNET\s*\)\s*\?\s*aemn\s*:\s*ecu", mv_body):
+        fail("17: monItemValueX10() does not read aemn for an AEMnet input")
+    rr_body, _ = block_after(code, r"static\s+void\s+resolveEngRpm\s*\(\s*\)\s*\{")
+    if rr_body is None or "MON_CAN_AEMNET" not in rr_body:
+        fail("17: resolveEngRpm() ignores the RPM item's CAN bus (AEMnet RPM)")
+    tl_body, _ = block_after(code, r"static\s+bool\s+uartLineIsTelemetry\s*\([^)]*\)\s*\{")
+    if tl_body is None or '"AEMNET,"' not in tl_body:
+        fail("17: uartLineIsTelemetry() does not count AEMNET lines as telemetry")
+    if not re.search(r"\baemn\s*=\s*EcuState\s*\{\s*\}", code):
+        fail("17: the Teensy-silent path does not clear the AEMnet state")
 
     if fails:
         print("validate_dash: FAIL (%d)  %s" % (len(fails), path))
@@ -340,6 +369,7 @@ def main():
     print(" 14 AEM is an AFR Source option (labelled AEM); Source drives s.aem_afr; hidden in Settings")
     print(" 15 OIL has a CAN source bit; ECU parse reads oil_x10; monitor cap <= 20 ms")
     print(" 16 RPM carries no monitor warn rows (shift alerts own RPM)")
+    print(" 17 AEMnet CAN bus: enum + name + AEMNET parse + per-input value/RPM + telemetry + clear")
     return 0
 
 

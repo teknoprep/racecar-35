@@ -348,6 +348,229 @@ def decode_ms3(msg_id, data):
 
 
 # ---------------------------------------------------------------------------
+# AEMnet — AEM's CAN protocol (Infinity ECU stream + X-Series UEGO gauge)
+# ---------------------------------------------------------------------------
+# Layout copied from AEM's own documents (fetched 2026-10-20):
+#   * "TA2 Infinity AEMnet Configuration" Rev A 2016-02-19, data stream "AEMnet v150609"
+#   * 30-0300 X-Series UEGO gauge manual (doc 10-0300), "AEMnet (CAN Bus) Output"
+# All frames: 29-bit EXTENDED ids, 500 kbit/s, DLC 8, big-endian (Motorola).
+#
+#   0x01F0A000  [0:2] rpm u16 0.39063/bit   [2:4] load (deprecated) = 0
+#               [4:6] throttle u16 0.0015259 %/bit   [6] IAT s8 degC   [7] coolant s8 degC
+#   0x01F0A003  [0] lambda#1 u8 0.00390625/bit +0.5   [1] lambda#2   [2:4] speed   [4] gear
+#               [5] ign timing u8 0.35156 deg/bit -17   [6:8] battery u16 0.0002455 V/bit
+#   0x01F0A004  [0:2] MAP u16 0.1 kPa/bit   [2] VE   [3] fuel P   [4] oil P u8 0.580151 psi/bit
+#               [5] lambda target   [6:8] flags              (Infinity V96.1+)
+#   0x180+n     X-Series UEGO "ID n+1": [0:2] lambda u16 0.0001/bit  [2:4] O2 s16 0.001 %/bit
+#               [4] supply V u8 0.1/bit  [6] 0x02 LSU4.9, 0x20 free-air, 0x80 VALID  [7] 0x40 FAULT
+#
+# The firmware decoder is src/aemnet.h; aemnet_line_from_frames() below mirrors its integer
+# maths EXACTLY (tests/test_aemnet.py compiles the header and checks they agree), so the
+# `validate` command can demand bit-exact agreement from a real Teensy.
+AEM_ID_ENGINE = 0x01F0A000
+AEM_ID_LAMBDA = 0x01F0A003
+AEM_ID_PRESSURE = 0x01F0A004
+AEM_ID_UEGO_1 = 0x00000180            # gauge menu "ID 1"; "ID 16" = 0x18F
+AEM_STOICH = 14.65                    # AEM's gasoline constant (30-0300 spec table)
+AEM_UEGO_LSU49, AEM_UEGO_FREE_AIR, AEM_UEGO_VALID = 0x02, 0x20, 0x80
+AEM_UEGO_FAULT = 0x40                 # byte 7
+AEM_DEVICES = ("both", "ecu", "uego")
+AEM_UEGO_STATES = ("valid", "warmup", "fault")
+
+
+def _f_to_c(f):
+    return (f - 32.0) / 1.8
+
+
+def aemnet_frames(rpm=0.0, clt_f=180.0, map_kpa=100.0, tps_pct=0.0, iat_f=90.0, afr=14.7,
+                  batt_v=13.8, oil_psi=45.0, adv_deg=18.0, devices="both", uego_id=1,
+                  uego_state="valid", **_unused):
+    """Build AEMnet frames from one value snapshot (same keys as bench_values()).
+
+    devices: "ecu" = an AEM Infinity stream (0x01F0A000/3/4), "uego" = an X-Series UEGO
+    gauge (0x180 + id-1), "both" = both on the bus (the realistic AEM car). Fields we have no
+    value for (load, speed, gear, VE, fuel pressure, flags) are sent as 0.
+    """
+    lam = afr / AEM_STOICH
+    frames = {}
+    if devices in ("both", "ecu"):
+        lam_raw = u8((lam - 0.5) / 0.00390625)
+        frames[AEM_ID_ENGINE] = (u16(rpm / 0.39063) + u16(0) + u16(tps_pct / 0.0015259)
+                                 + i8(_f_to_c(iat_f)) + i8(_f_to_c(clt_f)))
+        frames[AEM_ID_LAMBDA] = (lam_raw + lam_raw + u16(0) + u8(0)
+                                 + u8((adv_deg + 17.0) / 0.35156) + u16(batt_v / 0.0002455))
+        frames[AEM_ID_PRESSURE] = (u16(map_kpa * 10) + u8(0) + u8(0)
+                                   + u8(oil_psi / 0.580151) + lam_raw + b"\x00\x00")
+    if devices in ("both", "uego"):
+        o2 = max(-32.0, min(32.0, 20.9 * (1.0 - 1.0 / lam))) if lam > 0 else 0.0
+        f6 = AEM_UEGO_LSU49 | (AEM_UEGO_VALID if uego_state == "valid" else 0)
+        f7 = AEM_UEGO_FAULT if uego_state == "fault" else 0
+        frames[AEM_ID_UEGO_1 + (int(uego_id) - 1)] = (u16(lam * 10000) + s16(o2 * 1000)
+                                                       + u8(batt_v * 10) + b"\x00"
+                                                       + bytes([f6, f7]))
+    return frames
+
+
+def _rdiv(num, den):
+    """src/aemnet.h roundDiv(): integer division rounding half away from zero."""
+    return (num + den // 2) // den if num >= 0 else -((-num + den // 2) // den)
+
+
+def aemnet_decode_frame(msg_id, data):
+    """Mirror of aemnet::decode() for ONE frame -> dict of fixed-point fields."""
+    if len(data) < 8:
+        return {}
+    b = bytes(data)
+    if msg_id == AEM_ID_ENGINE:
+        return {"rpm": _rdiv(struct.unpack(">H", b[0:2])[0] * 39063, 100000),
+                "tps_x10": _rdiv(struct.unpack(">H", b[4:6])[0] * 15259, 1000000),
+                "iat_f_x10": 18 * struct.unpack(">b", b[6:7])[0] + 320,
+                "clt_f_x10": 18 * struct.unpack(">b", b[7:8])[0] + 320}
+    if msg_id == AEM_ID_LAMBDA:
+        return {"lambda1_x10000": 5000 + _rdiv(b[0] * 390625, 10000),
+                "adv_x10": _rdiv(b[5] * 35156, 10000) - 170,
+                "bat_x10": _rdiv(struct.unpack(">H", b[6:8])[0] * 2455, 1000000)}
+    if msg_id == AEM_ID_PRESSURE:
+        return {"map_x10": min(32767, struct.unpack(">H", b[0:2])[0]),
+                "oil_x10": _rdiv(b[4] * 580151, 100000)}
+    if AEM_ID_UEGO_1 <= msg_id <= AEM_ID_UEGO_1 + 15:
+        return {"uego_lambda_x10000": struct.unpack(">H", b[0:2])[0],
+                "uego_o2_x1000": struct.unpack(">h", b[2:4])[0],
+                "uego_sysv_x10": b[4], "uego_flags6": b[6], "uego_flags7": b[7],
+                "uego_index": msg_id - AEM_ID_UEGO_1 + 1}
+    return {}
+
+
+# Field order of the Teensy's ECU and AEMNET lines (both start with the same 8 fields).
+LINE_FIELDS = ("rpm", "clt_f_x10", "map_x10", "tps_x10", "afr_x10", "iat_f_x10",
+               "bat_x10", "oil_x10")
+AEMNET_LINE_FIELDS = LINE_FIELDS + ("lambda_x10000", "uego_status")
+
+
+def aemnet_line_from_frames(frames):
+    """What the Teensy's AEMNET line must carry after receiving `frames` (mirror of the
+    firmware: aemnet::decode + lambdaX10000/afrX10/batteryX10/uegoStatus)."""
+    s = {"rpm": -1, "tps_x10": -1, "iat_f_x10": -1, "clt_f_x10": -1, "lambda1_x10000": -1,
+         "bat_x10": -1, "map_x10": -1, "oil_x10": -1}
+    have_ecu_lambda = uego = False
+    for mid, payload in frames.items():
+        d = aemnet_decode_frame(mid, payload)
+        s.update(d)
+        have_ecu_lambda |= mid == AEM_ID_LAMBDA
+        uego |= "uego_index" in d
+    if not uego:
+        st = 0
+    elif s["uego_flags7"] & AEM_UEGO_FAULT:
+        st = 3
+    elif not (s["uego_flags6"] & AEM_UEGO_VALID):
+        st = 2
+    else:
+        st = 1
+    lam = s["uego_lambda_x10000"] if st == 1 else (-1 if st else s["lambda1_x10000"])
+    afr = -1 if lam < 0 else _rdiv(lam * 1465, 100000)
+    if have_ecu_lambda and s["bat_x10"] > 0:
+        bat = s["bat_x10"]
+    elif uego and s["uego_sysv_x10"] > 0:
+        bat = s["uego_sysv_x10"]
+    else:
+        bat = -1
+    return {"rpm": s["rpm"], "clt_f_x10": s["clt_f_x10"], "map_x10": s["map_x10"],
+            "tps_x10": s["tps_x10"], "afr_x10": afr, "iat_f_x10": s["iat_f_x10"],
+            "bat_x10": bat, "oil_x10": s["oil_x10"], "lambda_x10000": lam,
+            "uego_status": st}
+
+
+def ecu_line_from_ms3_frames(frames):
+    """What the Teensy's ECU line must carry for MS3 Simplified Dash frames (mirror of
+    pumpCAN's 0x5E8..0x5EB cases). Oil is -1: the MS3 broadcast has no oil channel."""
+    e = {k: -1 for k in LINE_FIELDS}
+    if 0x5E8 in frames:
+        e["map_x10"], e["rpm"], e["clt_f_x10"], e["tps_x10"] = struct.unpack(">hHhh", frames[0x5E8][:8])
+    if 0x5E9 in frames:
+        e["iat_f_x10"] = struct.unpack(">h", frames[0x5E9][4:6])[0]
+    if 0x5EA in frames:
+        e["afr_x10"] = frames[0x5EA][1]
+    if 0x5EB in frames:
+        e["bat_x10"] = struct.unpack(">h", frames[0x5EB][0:2])[0]
+    return e
+
+
+def ecu_line_from_rc35_frames(frames, core_id=RC35_CORE_ID, aux_id=RC35_AUX_ID):
+    """What the Teensy's ECU line must carry for RC35 bench frames (mirror of pumpCAN)."""
+    e = {k: -1 for k in LINE_FIELDS}
+    if core_id in frames:
+        c = frames[core_id]
+        e["rpm"], e["map_x10"] = struct.unpack(">HH", c[0:4])
+        e["tps_x10"], e["clt_f_x10"], e["iat_f_x10"] = c[4] * 5, c[5] * 10, c[6] * 10
+    if aux_id in frames:
+        a = frames[aux_id]
+        e["afr_x10"], e["bat_x10"] = a[0], a[1]
+        e["oil_x10"] = struct.unpack(">H", a[2:4])[0]
+    return e
+
+
+def decode_aemnet(msg_id, data, extended=True):
+    """Human-readable decode of an AEMnet frame ("" for anything else)."""
+    if not extended:
+        return ""
+    d = aemnet_decode_frame(msg_id, data)
+    if not d:
+        return ""
+    if msg_id == AEM_ID_ENGINE:
+        return (f"AEM ENGINE RPM {d['rpm']:5d}  TPS {d['tps_x10'] / 10:5.1f} %  "
+                f"IAT {d['iat_f_x10'] / 10:5.1f} F  CLT {d['clt_f_x10'] / 10:5.1f} F")
+    if msg_id == AEM_ID_LAMBDA:
+        return (f"AEM LAMBDA lambda1 {d['lambda1_x10000'] / 10000:5.3f}  "
+                f"TIMING {d['adv_x10'] / 10:5.1f}  BATT {d['bat_x10'] / 10:5.1f} V")
+    if msg_id == AEM_ID_PRESSURE:
+        return f"AEM PRESSURE MAP {d['map_x10'] / 10:6.1f} kPa  OIL {d['oil_x10'] / 10:5.1f} psi"
+    f6, f7 = d["uego_flags6"], d["uego_flags7"]
+    st = ("FAULT" if f7 & AEM_UEGO_FAULT else "valid" if f6 & AEM_UEGO_VALID else "not-valid")
+    return (f"AEM UEGO#{d['uego_index']} lambda {d['uego_lambda_x10000'] / 10000:6.4f}  "
+            f"O2 {d['uego_o2_x1000'] / 1000:6.2f}%  {d['uego_sysv_x10'] / 10:4.1f} V  {st}"
+            f"{'  LSU4.9' if f6 & AEM_UEGO_LSU49 else ''}")
+
+
+# One protocol switch for everything that sends fake data: bench, the GUI, validate.
+PROTOCOLS = ("rc35", "megasquirt", "aemnet")
+PROTOCOL_LABEL = {"rc35": "RC35 bench (0x700/0x701)",
+                  "megasquirt": "MegaSquirt Simplified Dash (0x5E8-0x5EB)",
+                  "aemnet": "AEMnet (29-bit 0x01F0A00x + UEGO 0x18x)"}
+
+
+def protocol_frames(protocol, values, seq=0, core_id=RC35_CORE_ID, aux_id=RC35_AUX_ID,
+                    aem_devices="both", uego_id=1, uego_state="valid"):
+    """(frames, extended) for one value snapshot in the chosen protocol."""
+    if protocol == "aemnet":
+        return aemnet_frames(**values, devices=aem_devices, uego_id=uego_id,
+                             uego_state=uego_state), True
+    if protocol == "megasquirt":
+        keys = ("rpm", "clt_f", "map_kpa", "tps_pct", "iat_f", "afr", "batt_v", "adv_deg")
+        return ms3_frames(**{k: values[k] for k in keys if k in values}), False
+    return rc35_frames(**values, seq=seq & 0xFF, core_id=core_id, aux_id=aux_id), False
+
+
+def expected_teensy_line(protocol, frames, core_id=RC35_CORE_ID, aux_id=RC35_AUX_ID):
+    """(line prefix, {field: value}) the Teensy must print after receiving `frames`."""
+    if protocol == "aemnet":
+        return "AEMNET", aemnet_line_from_frames(frames)
+    if protocol == "megasquirt":
+        return "ECU", ecu_line_from_ms3_frames(frames)
+    return "ECU", ecu_line_from_rc35_frames(frames, core_id, aux_id)
+
+
+def decode_any(msg_id, data, extended):
+    """Best human-readable decode across every protocol this tool speaks."""
+    if extended:
+        return decode_aemnet(msg_id, data, True)
+    return decode_rc35(msg_id, data) or decode_ms3(msg_id, data)
+
+
+# Bus bits per frame for load estimates: a 29-bit frame carries 18 more header bits.
+BITS_STD, BITS_EXT = 130, 155
+
+
+# ---------------------------------------------------------------------------
 # slcan transport
 # ---------------------------------------------------------------------------
 BITRATE_CODE = {"10k": "S0", "20k": "S1", "50k": "S2", "100k": "S3", "125k": "S4",
@@ -413,8 +636,12 @@ class SLCAN:
             frame = b"t%03X%d%s\r" % (msg_id, len(payload), payload.hex().upper().encode())
         self.ser.write(frame)
 
-    def send_many(self, frames):
+    def send_many(self, frames, extended=False):
         """Write a whole cycle (all of its frames) in ONE serial write.
+
+        extended=True sends every frame with a 29-bit id (slcan 'T'), as AEMnet requires.
+        ⚠️ The id is NOT inferred from its value: 0x180 is a valid id in BOTH formats and a
+        receiver treats them as different frames.
 
         One syscall per cycle instead of one per frame: larger, fewer writes are
         what keeps the injected cadence even on a USB CDC adapter. The write is
@@ -425,8 +652,12 @@ class SLCAN:
         out = bytearray()
         for msg_id, payload in frames.items():
             payload = bytes(payload)
-            out += b"t%03X%d%s\r" % (msg_id, len(payload),
-                                      payload.hex().upper().encode())
+            if extended:
+                out += b"T%08X%d%s\r" % (msg_id, len(payload),
+                                          payload.hex().upper().encode())
+            else:
+                out += b"t%03X%d%s\r" % (msg_id, len(payload),
+                                          payload.hex().upper().encode())
         t0 = time.time()
         n = self.ser.write(bytes(out))
         ms = (time.time() - t0) * 1000.0
@@ -498,10 +729,29 @@ class SLCAN:
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
-def _bench_cycle(bus, t, profile, rpm, seq, core_id, aux_id):
-    """One whole cycle: build every channel, one serial write."""
-    bus.send_many(rc35_frames(**bench_values(t, profile, rpm), seq=seq & 0xFF,
-                             core_id=core_id, aux_id=aux_id))
+def _bench_cycle(bus, t, profile, rpm, seq, core_id, aux_id, protocol="rc35",
+                 aem_devices="both", uego_id=1, uego_state="valid"):
+    """One whole cycle: build every channel, one serial write, in the chosen protocol."""
+    frames, ext = protocol_frames(protocol, bench_values(t, profile, rpm), seq=seq,
+                                  core_id=core_id, aux_id=aux_id, aem_devices=aem_devices,
+                                  uego_id=uego_id, uego_state=uego_state)
+    bus.send_many(frames, extended=ext)
+
+
+def _proto_kw(args):
+    """The protocol options of an argparse namespace, as _bench_cycle keywords."""
+    return {"protocol": getattr(args, "protocol", "rc35"),
+            "aem_devices": getattr(args, "aem_devices", "both"),
+            "uego_id": getattr(args, "uego_id", 1),
+            "uego_state": getattr(args, "uego_state", "valid")}
+
+
+def _frames_per_cycle(args):
+    """(frames per cycle, bus bits per frame) for the chosen protocol."""
+    kw = _proto_kw(args)
+    frames, ext = protocol_frames(kw["protocol"], bench_values(0.0), aem_devices=kw["aem_devices"],
+                                  uego_id=kw["uego_id"], uego_state=kw["uego_state"])
+    return len(frames), (BITS_EXT if ext else BITS_STD)
 
 
 def bench_autotune(bus, args, seconds_per_step=1.5, ceiling=2000.0):
@@ -514,11 +764,12 @@ def bench_autotune(bus, args, seconds_per_step=1.5, ceiling=2000.0):
     """
     print("[bench] --autotune: ramping the cycle rate until the link degrades")
     bps = BITRATE_BPS.get(args.bitrate, 500_000)
+    nfr, bits = _frames_per_cycle(args)
     hz = float(args.hz)
     best = 0.0
     while hz <= ceiling:
-        if bus_load_pct(hz * 2, bps) > args.max_load:
-            print(f"    stopped at {hz:.0f} Hz: {bus_load_pct(hz * 2, bps):.0f}% bus load "
+        if bus_load_pct(hz * nfr, bps, bits) > args.max_load:
+            print(f"    stopped at {hz:.0f} Hz: {bus_load_pct(hz * nfr, bps, bits):.0f}% bus load "
                   f"exceeds --max-load {args.max_load:.0f}% — a saturated bus starts "
                   f"starving the receiver, which is the bug you are trying to test for")
             break
@@ -529,7 +780,8 @@ def bench_autotune(bus, args, seconds_per_step=1.5, ceiling=2000.0):
         qmax = 0
         while time.time() - t0 < seconds_per_step:
             t = time.time() - t0
-            _bench_cycle(bus, t, args.profile, args.rpm, n, args.core_id, args.aux_id)
+            _bench_cycle(bus, t, args.profile, args.rpm, n, args.core_id, args.aux_id,
+                         **_proto_kw(args))
             n += 1
             now = time.time()
             if n > 1:
@@ -546,14 +798,14 @@ def bench_autotune(bus, args, seconds_per_step=1.5, ceiling=2000.0):
         achieved = n / el if el > 0 else 0
         ok = achieved >= hz * 0.90 and qmax < 256
         print(f"    asked {hz:6.0f} Hz -> got {achieved:6.0f} cycles/s "
-              f"({achieved * 2:5.0f} frames/s), worst gap {worst * 1000:5.1f} ms, "
+              f"({achieved * nfr:5.0f} frames/s), worst gap {worst * 1000:5.1f} ms, "
               f"tx queue max {qmax:4d} B   {'ok' if ok else 'TOO FAST'}")
         if not ok:
             break
         best = hz
         hz = hz * 2 if hz >= 100 else hz + 50
-    print(f"[bench] sustainable: ~{best:.0f} Hz cycles = {best * 2:.0f} frames/s "
-          f"(bus load ≈ {bus_load_pct(best * 2, bps):.1f}% at {args.bitrate}).")
+    print(f"[bench] sustainable: ~{best:.0f} Hz cycles = {best * nfr:.0f} frames/s "
+          f"(bus load ≈ {bus_load_pct(best * nfr, bps, bits):.1f}% at {args.bitrate}).")
     print("[bench] If that is lower than expected, the slcan serial link is the "
           "bottleneck, not the bus — try a higher --serial-baud.")
     return best
@@ -570,6 +822,11 @@ class PeerReader(threading.Thread):
     """
     RE_BENCH = re.compile(r"BENCH frames/s=(\d+)")
     RE_CANDIAG = re.compile(r"CANDIAG,(\d+),(\d+),")
+    RE_AEMSTAT = re.compile(r"AEMNET frames/s=(\d+)")
+    # The decoded-value lines the logger prints on USB (identical to what it sends the dash):
+    #   ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>,<oil_x10>
+    #   AEMNET,<same 8>,<lambda_x10000>,<uego_status>
+    RE_VALUE_LINE = re.compile(r"^(ECU|AEMNET),(-?\d+(?:,-?\d+)+)\s*$")
 
     def __init__(self, port, baud=115200, verbose=True):
         super().__init__(daemon=True)
@@ -579,6 +836,8 @@ class PeerReader(threading.Thread):
         self.bench_fps = None      # frames/s the RECEIVER counted (None = no line yet)
         self.bench_oil = None
         self.candiag_fps = None
+        self.aemnet_fps = None     # AEMnet frames/s the receiver decoded (firmware >= 0.1.177)
+        self.latest = {}           # "ECU"/"AEMNET" -> (monotonic time, {field: value})
         self.lines = 0
         self.err = None
         self._stop = threading.Event()
@@ -609,6 +868,21 @@ class PeerReader(threading.Thread):
             m = self.RE_CANDIAG.search(line)
             if m:
                 self.candiag_fps = int(m.group(1))
+            m = self.RE_AEMSTAT.search(line)
+            if m:
+                self.aemnet_fps = int(m.group(1))
+            m = self.RE_VALUE_LINE.match(line.strip())
+            if m:
+                names = AEMNET_LINE_FIELDS if m.group(1) == "AEMNET" else LINE_FIELDS
+                vals = [int(x) for x in m.group(2).split(",")]
+                self.latest[m.group(1)] = (time.monotonic(), dict(zip(names, vals)))
+
+    def value_line(self, prefix, newer_than=0.0):
+        """The latest decoded ECU/AEMNET line received after `newer_than` (monotonic), or None."""
+        got = self.latest.get(prefix)
+        if got and got[0] > newer_than:
+            return got[1]
+        return None
 
     def stop(self):
         self._stop.set()
@@ -641,7 +915,8 @@ def cmd_bench(args):
     """
     period = 1.0 / args.hz
     bps = BITRATE_BPS.get(args.bitrate, 500_000)
-    nframes = 2
+    pkw = _proto_kw(args)
+    nframes, bits = _frames_per_cycle(args)
     if not args.dry_run and args.autotune:
         bus = SLCAN(args.port, args.bitrate, serial_baud=args.serial_baud)
         try:
@@ -650,30 +925,43 @@ def cmd_bench(args):
             bus.close()
         return
     if args.dry_run:
-        print(f"[bench] --dry-run: {nframes} frames/cycle at {args.hz:g} Hz "
-              f"= {args.hz * nframes:g} frames/s. No serial port opened.\n")
+        print(f"[bench] --dry-run: {PROTOCOL_LABEL[pkw['protocol']]}, {nframes} frames/cycle at "
+              f"{args.hz:g} Hz = {args.hz * nframes:g} frames/s. No serial port opened.\n")
         for k in (0, 5, 50):
             t = k * period
             v = bench_values(t, args.profile, args.rpm)
             print(f"  t={t:5.2f}s  {fmt_values(v)}")
-            for mid, payload in rc35_frames(**v, seq=k & 0xFF,
-                                            core_id=args.core_id,
-                                            aux_id=args.aux_id).items():
-                print(f"    0x{mid:03X} [{len(payload)}] {payload.hex().upper():<18}"
-                      f"-> {decode_rc35(mid, payload, args.core_id, args.aux_id)}")
+            frames, ext = protocol_frames(pkw["protocol"], v, seq=k, core_id=args.core_id,
+                                          aux_id=args.aux_id, aem_devices=pkw["aem_devices"],
+                                          uego_id=pkw["uego_id"], uego_state=pkw["uego_state"])
+            for mid, payload in frames.items():
+                idtxt = f"0x{mid:08X}x" if ext else f"0x{mid:03X}"
+                dec = (decode_aemnet(mid, payload) if ext else
+                       decode_rc35(mid, payload, args.core_id, args.aux_id) or decode_ms3(mid, payload))
+                print(f"    {idtxt} [{len(payload)}] {payload.hex().upper():<18}-> {dec}")
+            prefix, line = expected_teensy_line(pkw["protocol"], frames, args.core_id, args.aux_id)
+            print(f"    Teensy must print: {prefix}," + ",".join(str(line[f]) for f in
+                  (AEMNET_LINE_FIELDS if prefix == 'AEMNET' else LINE_FIELDS)))
         return
 
     bus = SLCAN(args.port, args.bitrate, serial_baud=args.serial_baud)
-    print(f"[bench] RC35 bench frames 0x{args.core_id:03X} + 0x{args.aux_id:03X} at "
+    if pkw["protocol"] == "rc35":
+        what = f"RC35 bench frames 0x{args.core_id:03X} + 0x{args.aux_id:03X}"
+    elif pkw["protocol"] == "aemnet":
+        what = (f"AEMnet frames ({pkw['aem_devices']}; UEGO id {pkw['uego_id']}, "
+                f"{pkw['uego_state']}) 29-bit")
+    else:
+        what = "MegaSquirt Simplified Dash frames 0x5E8-0x5EB"
+    print(f"[bench] protocol {pkw['protocol']}: {what} at "
           f"{args.hz:g} Hz cycles = {args.hz * nframes:g} frames/s "
-          f"(bus load ≈ {bus_load_pct(args.hz * nframes, bps):.1f}% at {args.bitrate})")
+          f"(bus load ≈ {bus_load_pct(args.hz * nframes, bps, bits):.1f}% at {args.bitrate})")
     print("[bench] channels every cycle: RPM TEMP OIL VOLT AFR IAT MAP TPS (+ ADV)")
     print(f"[bench] profile: {args.profile}"
           + (f" (rpm {args.rpm:g})" if args.profile == 'steady' else ""))
     print("[bench] the dash's own monitor block repaints at ~10 Hz, so past ~20 Hz")
     print("[bench] cycles the SCREEN cannot show it — the wire still carries it.")
     print("[bench] Ctrl-C to stop.\n")
-    req_load = bus_load_pct(args.hz * nframes, bps)
+    req_load = bus_load_pct(args.hz * nframes, bps, bits)
     if req_load > args.max_load:
         print(f"[bench] ⚠️  {req_load:.0f}% bus load exceeds --max-load {args.max_load:.0f}%: "
               f"a saturated bus can starve the receiver's loop, which then LOOKS like "
@@ -691,7 +979,7 @@ def cmd_bench(args):
         while True:
             t = time.time() - t0
             v = bench_values(t, args.profile, args.rpm)
-            _bench_cycle(bus, t, args.profile, args.rpm, n, args.core_id, args.aux_id)
+            _bench_cycle(bus, t, args.profile, args.rpm, n, args.core_id, args.aux_id, **pkw)
             n += 1
             now = time.time()
             recent.append(now)
@@ -706,7 +994,7 @@ def cmd_bench(args):
                     backlog = -1
                 print(f"  t={t:6.1f}s  {len(recent):3d} cycles/s  "
                       f"worst gap {worst:5.1f} ms  tx queue {backlog:4d} B  "
-                      f"load {bus_load_pct(len(recent) * nframes, bps):4.1f}%  "
+                      f"load {bus_load_pct(len(recent) * nframes, bps, bits):4.1f}%  "
                       f"tx fail {bus.tx_err:4d} ({bus.tx_err - bus.tx_err_prev}/s)")
                 if bus.tx_err > bus.tx_err_prev:
                     print("  ⚠️  adapter-reported TX failures are RISING: frames are not "
@@ -717,9 +1005,10 @@ def cmd_bench(args):
                     print(f"           {peer.summary()}")
                 last_report = now
             for msg_id, payload, ext, remote in bus.poll():
-                print(f"  [rx] 0x{msg_id:03X} [{len(payload)}] {payload.hex().upper()}"
-                      f"  {decode_rc35(msg_id, payload, args.core_id, args.aux_id)}"
-                      f"{decode_ms3(msg_id, payload)}")
+                print(f"  [rx] 0x{msg_id:03X}{'x' if ext else ''} [{len(payload)}] "
+                      f"{payload.hex().upper()}  "
+                      f"{decode_aemnet(msg_id, payload) if ext else decode_rc35(msg_id, payload, args.core_id, args.aux_id)}"
+                      f"{'' if ext else decode_ms3(msg_id, payload)}")
             if args.duration and t > args.duration:
                 break
             nxt = t0 + n * period
@@ -772,6 +1061,92 @@ def cmd_bench(args):
                       f"— lower --hz, or raise --serial-baud if the adapter allows it")
 
 
+# Fixed, distinct test points for `validate`: each is held still while the receiver settles,
+# so the comparison is exact (no sweep skew). They span idle / cruise / WOT plus cold, and
+# deliberately land on values that exercise each protocol's rounding.
+VALIDATE_POINTS = [
+    {"name": "idle", "rpm": 850, "clt_f": 185, "map_kpa": 32.0, "tps_pct": 1.5, "iat_f": 88,
+     "afr": 14.7, "batt_v": 13.9, "oil_psi": 22.0, "adv_deg": 14.0},
+    {"name": "cruise", "rpm": 3210, "clt_f": 199, "map_kpa": 64.5, "tps_pct": 22.3, "iat_f": 97,
+     "afr": 15.3, "batt_v": 14.1, "oil_psi": 48.0, "adv_deg": 32.0},
+    {"name": "wot", "rpm": 6800, "clt_f": 215, "map_kpa": 101.3, "tps_pct": 99.5, "iat_f": 122,
+     "afr": 12.3, "batt_v": 13.6, "oil_psi": 72.0, "adv_deg": 24.0},
+    {"name": "cold", "rpm": 0, "clt_f": 41, "map_kpa": 100.0, "tps_pct": 0.0, "iat_f": 41,
+     "afr": 14.7, "batt_v": 12.4, "oil_psi": 0.0, "adv_deg": 0.0},
+]
+
+
+def cmd_validate(args):
+    """Send KNOWN values in the chosen protocol and prove the Teensy decodes them EXACTLY.
+
+    For each test point: broadcast it for --hold seconds, then compare the Teensy's latest
+    decoded USB line (ECU for rc35/megasquirt, AEMNET for aemnet) against what the firmware
+    MUST print for those frames (computed by this tool's mirror of the firmware decoder).
+    Every field must match exactly. Exit code 0 = all points pass.
+    """
+    pkw = _proto_kw(args)
+    proto = pkw["protocol"]
+    points = [dict(p) for p in VALIDATE_POINTS]
+    if proto == "aemnet" and pkw["aem_devices"] != "ecu":
+        # the UEGO status paths: warm-up and fault must read as NO lambda, never a value
+        points += [dict(VALIDATE_POINTS[1], name="uego-warmup", _uego_state="warmup"),
+                   dict(VALIDATE_POINTS[1], name="uego-fault", _uego_state="fault")]
+    peer = PeerReader(args.teensy, args.teensy_baud)
+    peer.start()
+    bus = SLCAN(args.port, args.bitrate, serial_baud=args.serial_baud)
+    print(f"[validate] {PROTOCOL_LABEL[proto]}"
+          + (f"  devices={pkw['aem_devices']} uego_id={pkw['uego_id']}" if proto == "aemnet" else "")
+          + f"  -> Teensy {args.teensy}\n")
+    period = 1.0 / args.hz
+    results = []
+    try:
+        for p in points:
+            values = {k: v for k, v in p.items() if not k.startswith("_") and k != "name"}
+            st = p.get("_uego_state", pkw["uego_state"])
+            frames, ext = protocol_frames(proto, values, aem_devices=pkw["aem_devices"],
+                                          uego_id=pkw["uego_id"], uego_state=st)
+            prefix, want = expected_teensy_line(proto, frames)
+            fields = AEMNET_LINE_FIELDS if prefix == "AEMNET" else LINE_FIELDS
+            t0 = time.monotonic()
+            n = 0
+            got = None
+            while time.monotonic() - t0 < args.hold:
+                bus.send_many(frames, extended=ext)
+                n += 1
+                for _ in bus.poll():
+                    pass
+                d = t0 + n * period - time.monotonic()
+                if d > 0:
+                    time.sleep(d)
+            # a line that arrived after the settle window, i.e. decoded from THIS point
+            got = peer.value_line(prefix, newer_than=t0 + args.settle)
+            bad = [f for f in fields if got is None or got.get(f) != want[f]]
+            ok = got is not None and not bad
+            results.append(ok)
+            print(f"  {p['name']:<12} {'PASS' if ok else 'FAIL'}   ({n} cycles sent)")
+            print(f"    {'field':<14}{'expected':>10}{'teensy':>10}")
+            for f in fields:
+                g = "-" if got is None else got.get(f, "-")
+                mark = "" if got is not None and g == want[f] else "   <-- MISMATCH"
+                print(f"    {f:<14}{want[f]:>10}{str(g):>10}{mark}")
+            if got is None:
+                print(f"    (no fresh {prefix} line from the Teensy: "
+                      + ("its firmware predates AEMnet (<0.1.177), or " if prefix == "AEMNET" else "")
+                      + "the frames are not reaching it - see CANDIAG)")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        bus.close()
+        time.sleep(0.2)
+        print(f"\n[validate] receiver: {peer.summary()}"
+              + (f", AEMnet decoded {peer.aemnet_fps}/s" if peer.aemnet_fps is not None else ""))
+        peer.stop()
+    passed = sum(results)
+    print(f"[validate] {passed}/{len(points)} points passed "
+          f"-> {'PASS: the Teensy decodes ' + proto + ' exactly' if passed == len(points) else 'FAIL'}")
+    return 0 if passed == len(points) else 1
+
+
 def cmd_probe(args):
     import glob
     candidates = args.port and [args.port] or sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
@@ -810,8 +1185,9 @@ def cmd_listen(args):
         while True:
             for msg_id, payload, ext, remote in bus.poll():
                 seen[msg_id] = seen.get(msg_id, 0) + 1
-                extra = decode_rc35(msg_id, payload) or decode_ms3(msg_id, payload)
-                print(f"  {msg_id:04X}{'x' if ext else ' '} [{len(payload)}] {payload.hex().upper():<16}"
+                extra = decode_any(msg_id, payload, ext)
+                idtxt = f"{msg_id:08X}x" if ext else f"{msg_id:04X} "
+                print(f"  {idtxt} [{len(payload)}] {payload.hex().upper():<16}"
                       f" {extra}{'  (REMOTE)' if remote else ''}")
             time.sleep(0.002)          # poll() is non-blocking now; don't spin a core
             if args.duration and time.time() - t0 > args.duration:
@@ -1071,6 +1447,19 @@ def main():
         sp.add_argument("-p", "--port", default="/dev/ttyACM0")
         sp.add_argument("-b", "--bitrate", default="500k", choices=sorted(BITRATE_CODE))
 
+    def protocol_opts(sp, default="rc35"):
+        sp.add_argument("--protocol", default=default, choices=PROTOCOLS,
+                        help="rc35 = our bench frames 0x700/0x701 (every channel incl. oil); "
+                             "megasquirt = MS3Pro Simplified Dash 0x5E8-0x5EB (no oil); "
+                             "aemnet = AEM 29-bit ECU stream 0x01F0A000/3/4 + X-Series UEGO 0x18x")
+        sp.add_argument("--aem-devices", default="both", choices=AEM_DEVICES,
+                        help="aemnet only: ecu = an AEM Infinity stream, uego = an X-Series "
+                             "UEGO gauge (lambda only), both = both on the bus (default)")
+        sp.add_argument("--uego-id", type=int, default=1, choices=range(1, 17), metavar="1-16",
+                        help="aemnet only: the gauge's menu CAN ID (1 = 0x180 ... 16 = 0x18F)")
+        sp.add_argument("--uego-state", default="valid", choices=AEM_UEGO_STATES,
+                        help="aemnet only: valid / warmup (Lambda Data Valid clear) / fault")
+
     sp = sub.add_parser("bench", help="fake data for the bench: RC35 frames with every channel, fast + steady")
     common(sp)
     sp.add_argument("--hz", type=float, default=200.0,
@@ -1102,7 +1491,22 @@ def main():
     sp.add_argument("--duration", type=float, default=0)
     sp.add_argument("--dry-run", action="store_true",
                     help="print the encoded frames + their decode, touch no hardware")
+    protocol_opts(sp)
     sp.set_defaults(func=cmd_bench)
+
+    sp = sub.add_parser("validate",
+                        help="send KNOWN values and prove the Teensy decodes them exactly "
+                             "(needs the CANable AND the Teensy's USB serial)")
+    common(sp)
+    sp.add_argument("--teensy", required=True, help="the Teensy's USB serial port, e.g. /dev/ttyACM1")
+    sp.add_argument("--teensy-baud", type=int, default=115200)
+    sp.add_argument("--serial-baud", type=int, default=115200)
+    sp.add_argument("--hz", type=float, default=50.0, help="cycles/s while holding a point (default 50)")
+    sp.add_argument("--hold", type=float, default=2.5, help="seconds each test point is held")
+    sp.add_argument("--settle", type=float, default=1.0,
+                    help="ignore Teensy lines older than this many seconds into a point")
+    protocol_opts(sp, default="aemnet")
+    sp.set_defaults(func=cmd_validate)
 
     sp = sub.add_parser("probe", help="find the slcan adapter and print its version")
     sp.add_argument("-p", "--port", default=None)
@@ -1166,7 +1570,10 @@ def main():
     sp.set_defaults(func=cmd_send)
 
     args = p.parse_args()
-    args.func(args)
+    rc = args.func(args)
+    # a command that returns an int (validate) sets the exit code: a check that cannot fail
+    # the pipeline is not a check
+    sys.exit(rc if isinstance(rc, int) else 0)
 
 
 if __name__ == "__main__":

@@ -1503,6 +1503,13 @@ ECU,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>[,<oil_
                    # stay distinguishable on the wire. Trailing fields are safe (the dash reads by
                    # index and tolerates short lines) — an old dash ignores it, and a real MS3
                    # yields -1 because its Simplified Dash broadcast has no oil channel at all.
+AEMNET,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>,<oil_x10>,<lambda_x10000>,<uego_status>
+                   # v0.1.177: AEMnet (AEM's 29-bit CAN protocol), decoded by src/aemnet.h from
+                   # the SAME bus as the MS3 frames. Fields 1-8 are in the ECU line's order (the
+                   # dash parses both with parseCanValues()); -1 = not received; uego_status
+                   # 0 none / 1 valid / 2 not ready / 3 fault. Sent ONLY while an AEMnet device is
+                   # broadcasting. The UEGO gauge owns lambda/AFR while present (invalid -> -1, no
+                   # fall-back to the ECU's lambda). Full layout + sources: tools/AEMNET.md.
 IMU,<ax>,<ay>,<az>,<gx>,<gy>,<gz>
 AFR,<status>,<afr_x100>,<lambda_x10000>,<gauge_mV>  (v0.1.149, AEM gauge input)
 SD,REC,<0|1>,<file>,<samples>   (+ SD,READY/FMT/NONE/ERR/ACTIVE status forms)
@@ -1845,7 +1852,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `atime` | bool | **Auto time** (v0.1.152, default **ON**). Settings → "Auto time". When ON: the panel RTC / NTP / the Teensy's GPS-derived `TIME,` may set the clock, and the panel writes NTP to its own coin-cell RTC and re-broadcasts `SETTIME` to the Teensy when they disagree. OFF freezes the clock — only Settings → "Set time" moves it. |
 | `atz` | bool | **Auto timezone** (v0.1.152, default **ON**). Settings → "Auto timezone". When ON the zone is derived from GPS at START: the venue's own `TRACKS[].tz` when the fix identifies the track, else a coordinate estimate (longitude → nearest whole-hour zone, DST-observing variant preferred). A manual pick in the timezone picker sets this OFF. |
 | `dbg2` | bool | **Debug logging master switch** (default **OFF** since v0.1.103 — diagnostic tool, enable when chasing a problem). Sent as `CFG,dbg_on,<0|1>`; when OFF the Teensy writes NO `.dbg` health log. Toggle: Settings → "Debug logging (SD)". Renamed from `dbg_on` (which had ON persisted on deployed units) so the new default takes effect everywhere; old key orphaned, never repurposed. |
-| `mon` | blob | **The whole sensor monitor config** (v0.1.154, extended v0.1.155) — `MonCfg` = `order[MON_COUNT]` (MonItem ids, top of the stack first — **which is also the warning-flash priority**), `mode[MON_COUNT]` (0 ALWAYS / 1 WARN ONLY / 2 HIDDEN), `warn_lo`/`warn_hi[MON_COUNT]` (int32, ×10 of the item's natural unit; `MON_WARN_OFF` = disabled) and `warn_col[MON_COUNT]` (PALETTE index), `src[MON_COUNT]` (v0.1.156: MonSrc — DIRECT / BLUETOOTH / CANBUS **per item**) and `can_bus[MON_COUNT]` (MonCanBus; only MegaSquirt exists today). THE control for what the bottom-left block shows and when it warns; edited on PAGE_MON_CFG and PAGE_MON_ITEM (Settings → "Sensor monitoring"). The load is length-guarded **and content-validated**; a size change (struct grew) or a damaged blob falls back to `monDefaults()`, which seeds modes AND thresholds/colours from the legacy `s_temp`/`s_psi`/`s_volt`/`s_afr`, `t_warn`/`p_warn`/`v_warn`/`afr_lo`/`afr_hi` and `*_col` keys — so an upgrading unit keeps the behaviour it had. The legacy **Show/warn** rows are no longer displayed (their keys, struct fields and load/save remain as the migration seed and the rollback path). |
+| `mon` | blob | **The whole sensor monitor config** (v0.1.154, extended v0.1.155) — `MonCfg` = `order[MON_COUNT]` (MonItem ids, top of the stack first — **which is also the warning-flash priority**), `mode[MON_COUNT]` (0 ALWAYS / 1 WARN ONLY / 2 HIDDEN), `warn_lo`/`warn_hi[MON_COUNT]` (int32, ×10 of the item's natural unit; `MON_WARN_OFF` = disabled) and `warn_col[MON_COUNT]` (PALETTE index), `src[MON_COUNT]` (v0.1.156: MonSrc — DIRECT / BLUETOOTH / CANBUS **per item**) and `can_bus[MON_COUNT]` (MonCanBus: 0 MegaSquirt, **1 AEMnet** since v0.1.177 — append-only; adding the value did not change the blob size, so no unit re-seeds). THE control for what the bottom-left block shows and when it warns; edited on PAGE_MON_CFG and PAGE_MON_ITEM (Settings → "Sensor monitoring"). The load is length-guarded **and content-validated**; a size change (struct grew) or a damaged blob falls back to `monDefaults()`, which seeds modes AND thresholds/colours from the legacy `s_temp`/`s_psi`/`s_volt`/`s_afr`, `t_warn`/`p_warn`/`v_warn`/`afr_lo`/`afr_hi` and `*_col` keys — so an upgrading unit keeps the behaviour it had. The legacy **Show/warn** rows are no longer displayed (their keys, struct fields and load/save remain as the migration seed and the rollback path). |
 | `viden` | bool | **Video interconnect** (v0.1.150, default OFF). Settings → "Video interconnect". `CFG,viden,0\|1`. When ON, Teensy Serial1 (pins 0/1, 115200) talks to a **separate Raspberry Pi 5** video box: forwards `REC`/`TRACK`/`HUD` for 1080p front + rear PIP + overlay. Does not block START if the Pi is missing. See `hardware/video-recorder/` and `hardware/breadboard/`. |
 | `sf_unk` | blob | **UNKNOWN-track S/F** (one `SfOverride`, v0.1.129) — the ONLY on-car S/F capture left. SET S/F (STATUS page / dash TRACK button while recording) works ONLY when `lapTrackIdx() < 0`; lap timing + Teensy `CFG,sf` stamping run against it at unmapped tracks. DELETE S/F clears it. |
 | `sf_ovr` | blob | **Per-track start/finish overrides** — array of `{used,lat,lon,lat2,lon2}` (a LINE; v0.1.82 grew it from a point) sized `N_TRACKS`, keyed by `TRACKS[]` index. **⚠️ IGNORED since v0.1.129 for KNOWN tracks** — the baked S/F (web-managed via `/tools/sfpicker`) is the ONLY source; a stale on-device capture used to silently beat a freshly baked line and kill lap timing (the Summit Point incident). Blob still loaded/saved for back-compat, never consulted. On-car capture now exists ONLY for UNKNOWN tracks (`sf_unk` above). The dash LAP row shows a CYAN `SF <dist>` countdown (pre-arm, while recording) so a misplaced S/F is visible on lap 1. Historical: struct size changed in 0.1.82 (pre-0.1.82 blobs ignored once).** Set from the STATUS-page **SET START/FINISH** button (captures current GPS as that track's S/F line); `effectiveSf()` prefers it over the baked approximate `sf_lat/sf_lon`. **v0.1.112: a capture below 5 mph stores a POINT (radius method) — GPS heading is garbage at rest, so the old parked capture built a line pointing anywhere and silently killed lap detection for the whole track (the Thompson incident). Rolling capture (≥5 mph) builds the perpendicular line. The STATUS button label now shows live distance to the effective S/F (`custom`/`default`, meters); a maroon **CLR S/F** sub-button (only when an override exists) wipes a bad override trackside; `updateLapTimer()` emits a 20 s `DBG,lap trk=… ovr=… d_sf=…m armed=… laps=…` breadcrumb.** Loaded in `loadSettings()`, written by a dedicated `saveSfOverrides()` (NOT `saveSettings()`, since it's mutated from the status page, not the settings-save path). Blob is restored only if its byte length still matches `sizeof(sfOverride)` — **TRACKS[] is append-only** (inserting a track mid-array shifts existing overrides onto the wrong track). |
@@ -1895,6 +1902,14 @@ now the **Bluetooth OBD-II** pairing page reached from Settings.
 | MAP  | — | — (no MAP PID is polled) | `ecu.map_x10` |
 | TPS  | — | `obd::tpsX10()` (PID 0111) | `ecu.tps_x10` |
 | RPM  | `eng.direct_rpm` | — (BLE is far too slow) | `ecu.rpm` |
+
+**v0.1.177 — CANBUS has a per-input bus: MegaSquirt or AEMnet.** The CANBUS column above reads
+`ecu` (the Teensy's ECU line) for **MegaSquirt** and `aemn` (its **AEMNET** line — same fields,
+same `EcuState`) for **AEMnet**: the item page's CAN bus row cycles the two, per item. An MS3Pro
+and an AEM X-Series wideband gauge commonly share one bus, so the typical car is everything on
+MegaSquirt and **AFR on AEMnet**. AEMnet carries oil pressure (AEM ECU `0x01F0A004`), so OIL over
+CANBUS+AEMnet is real; with only the UEGO gauge on AEMnet, the other AEMnet items read no data.
+CAN RPM now needs `rpm_ok` (field 1 >= 0) — a bus with no live RPM source shows no data, not 0.
 
 - A combination with **no data** is still selectable (uniform UI) but its pill is **maroon and
   reads "(no data)"** — an obvious dead choice instead of a mystery `---`.
@@ -2470,6 +2485,20 @@ for up to `TOUCH_RELEASE_MS` after the last real sample. Do not remove this.
 The pre-touch-work dash is preserved at `crowpanel-arduino/RaceDash_v0139_orig/` so a screen
 can be swapped/reverted easily.
 
+### AEMnet (v0.1.177) — AEM's CAN protocol on the same bus
+Same wiring/bit rate as the MS3 (500 kbit/s; FlexCAN's FIFO already accepts 29-bit frames — its
+global mask is 0), different messages: **29-bit ids**, big-endian, AEM's layouts — the AEM
+Infinity ECU stream `0x01F0A000/3/4` (rpm, TPS, IAT, coolant, lambda #1, timing, battery, MAP,
+oil) and the X-Series UEGO gauge `0x180`–`0x18F` (lambda, O2, supply V, valid/fault flags — the
+30-0300 in this car: WHITE/BLACK = CANH, GREEN/BLACK = CANL). Decoded by `src/aemnet.h` into its
+own `can_aem` struct (never merged into `can_ecu`). ⚠️ `pumpCAN()` now checks `msg.flags.extended`
+FIRST: an 11-bit and a 29-bit frame with the same number are different frames (the old switch
+matched the number alone). USB prints a 1 Hz `AEMNET frames/s=…` diagnostic. SD keys `aem_*`
+are added in priority order only while the 640 B line has room — `SESSION_LINE_CAP` cannot grow
+(the upload window's static_assert is at 31488/31744 B), and with every source live the line would
+reach ~700 B, which used to drop the WHOLE sample. Authoritative layout, sources and the bench
+workflow (`can_sim.py bench --protocol aemnet`, `validate`): **tools/AEMNET.md**.
+
 ## ### RC35 bench CAN frames (0x700 / 0x701) — v0.1.159
 The logger also parses **RC35 bench frames**, our own layout, which exist because the MS3
 Simplified Dash broadcast has **no oil channel at all** (so OIL could never come from CAN on a
@@ -2895,6 +2924,12 @@ tools/can_sim.py                         Bench CAN tool (v0.1.154): drives a CAN
                                          MS3Pro Simplified-Dash broadcaster — coolant / AFR / IAT waveforms, a
                                          static-value mode and a passive bus decoder — or sends raw frames
                                          (`probe` / `listen` / `ms3` / `coolant` / `afr` / `iat` / `send`)
+src/aemnet.h                             AEMnet decoder (AEM's 29-bit CAN protocol), header-only, host-tested by
+                                         tests/test_aemnet.py; layout + sources + bench workflow: tools/AEMNET.md
+tools/can_sim.py validate               v0.1.177: send KNOWN values (--protocol rc35|megasquirt|aemnet) and prove
+                                         the Teensy's USB ECU/AEMNET line matches EXACTLY (exit 1 on any mismatch);
+                                         `bench --protocol` picks the framing; can_gui.py has the same dropdowns,
+                                         a live "teensy" row under each value and a VALIDATE button
 tools/can_bench_test.py                  One-shot "does the logger see the CAN bus?" bench test: passive listen,
                                          then inject while reading the Teensy's 1 Hz CANDIAG line, then a verdict
                                          (`--wave sweep|coolant|afr|iat|both|all`)

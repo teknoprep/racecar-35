@@ -121,6 +121,10 @@ the "Creating esp32s3 image" step (compile itself is fine — it dies in the ima
 cd <repo root>
 export PYTHONPATH=/home/chris/racecar-tools/pylibs          # <-- required (1e)
 CLI="/home/chris/racecar-tools/bin/arduino-cli --config-file /home/chris/racecar-tools/arduino-cli.yaml"
+# NOTE (2026-10-21): on the current build host racecar-tools/bin and racecar-tools/pylibs do NOT
+# exist - the CLI is ~/.local/bin/arduino-cli with its default config (~/.arduino15/arduino-cli.yaml,
+# esp32:esp32 2.0.14 installed) and compiles fine without the PYTHONPATH:
+#   CLI=/home/chris/.local/bin/arduino-cli
 base="esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=default,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,PartitionScheme=default,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none"
 # NimBLE size trim (v0.1.109): we are BLE central+observer only — compiling out the
 # peripheral/broadcaster roles + single connection saves ~15.5 KB of the 1.31 MB OTA slot.

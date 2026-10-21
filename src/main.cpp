@@ -74,6 +74,7 @@ extern "C" {
 #include <SdFat.h>
 #include "zdeflate_teensy.h"   // compress session blocks BEFORE the UART bottleneck
 #include "../crowpanel-arduino/RaceDash/aem_afr.h"
+#include "aemnet.h"        // AEMnet (AEM's 29-bit CAN protocol) decoder - host-tested
 #include <stdarg.h>
 #include <TimeLib.h>
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
@@ -1429,6 +1430,13 @@ static struct CanEcu {
     uint32_t bench_ms   = 0;   // millis() of the most recent RC35 bench frame
 } can_ecu;
 
+// AEMnet (v0.1.177): AEM's CAN protocol, decoded by src/aemnet.h from 29-bit frames on the SAME
+// bus as the MS3 / bench frames. Kept in its own struct - never merged into can_ecu - so the dash
+// can pick MegaSquirt or AEMnet PER INPUT (an MS3Pro and an AEM X-Series wideband gauge commonly
+// share one bus: RPM/coolant from the MS3, AFR from the gauge). Each frame group expires on its
+// own clock (CAN_STALE_MS) so a device that stops broadcasting reads as no data.
+static aemnet::State can_aem;
+
 // CAN RX diagnostics — independent of whether any frame ID matched our parser.
 // can_rx_total counts EVERY frame seen on the bus since boot; the seen-ID ring
 // records the distinct IDs observed in the last report window. This is what
@@ -1445,6 +1453,7 @@ static struct CanDiag {
     uint8_t  ids_count     = 0;
     uint32_t base_hits     = 0;    // frames matching CAN_BASE_ID+0..3 this window
     uint32_t bench_hits    = 0;    // RC35 bench frames (0x700/0x701) this window
+    uint32_t aem_hits      = 0;    // AEMnet frames (29-bit, src/aemnet.h) this window (v0.1.177)
     // v0.1.170: these were uint8_t and WRAPPED at 256 - a 3800 fps storm printed as
     // "BENCH frames/s=225", which looked like a healthy 200 fps bench.
     uint32_t last_report_ms = 0;
@@ -1796,6 +1805,19 @@ static void canDiagReport() {
     usbTele("BENCH frames/s=%lu oil=%d rpm=%u (RC35 0x%03lX/0x%03lX)\n",
                   (unsigned long)can_diag.bench_hits, can_ecu.oil_x10, can_ecu.rpm,
                   (unsigned long)CAN_BENCH_CORE_ID, (unsigned long)CAN_BENCH_AUX_ID);
+    // AEMnet visibility (v0.1.177) - USB ONLY, same reason. Which AEMnet devices are live and
+    // what they decoded to, so tools/can_sim.py validate / can_gui.py can prove the decode.
+    usbTele("AEMNET frames/s=%lu ecu=%c%c%c uego=%c(id %u, %s) rpm=%ld clt_f=%d iat_f=%d tps=%d "
+            "map=%d oil=%d bat=%d lambda=%ld afr=%d adv=%d\n",
+            (unsigned long)can_diag.aem_hits,
+            can_aem.engine_ms ? 'E' : '-', can_aem.lambda_ms ? 'L' : '-', can_aem.pressure_ms ? 'P' : '-',
+            can_aem.uego_ms ? 'U' : '-', (unsigned)can_aem.uego_index,
+            aemnet::uegoStatus(can_aem) == aemnet::UEGO_OK ? "valid"
+              : aemnet::uegoStatus(can_aem) == aemnet::UEGO_NOT_READY ? "not-ready"
+              : aemnet::uegoStatus(can_aem) == aemnet::UEGO_FAULTED ? "FAULT" : "none",
+            (long)can_aem.rpm, can_aem.clt_f_x10, can_aem.iat_f_x10, can_aem.tps_x10,
+            can_aem.map_x10, can_aem.oil_x10, aemnet::batteryX10(can_aem),
+            (long)aemnet::lambdaX10000(can_aem), aemnet::afrX10(can_aem), can_aem.adv_x10);
     // Also surface it on the dash link so it can be shown without a USB cable.
     // CANDIAG,<frames/s>,<total>,<base_hits>,<dup%>,<ACK_ERR>,<TXerr>,<RXerr>,<txtest>
     DASH_SERIAL.printf("CANDIAG,%lu,%lu,%u,%lu,%d,%u,%u,%u\n",
@@ -1811,6 +1833,7 @@ static void canDiagReport() {
     can_diag.ids_count = 0;
     can_diag.base_hits = 0;
     can_diag.bench_hits = 0;
+    can_diag.aem_hits = 0;
 }
 
 // CAN sniffer: when cansniff_active (declared near the top), EVERY frame on
@@ -1829,12 +1852,19 @@ static void pumpCAN() {
         // storm. Skipping the count made frames/s alternate 3800 <-> 0 on successive reports.
         if (!can_diag.storm_mode) canDiagNote(msg.id, msg.len, msg.buf);
         else { can_diag.rx_total++; can_diag.rx_window++; }
-        if (msg.id >= CAN_BASE_ID && msg.id <= CAN_BASE_ID + 3) can_diag.base_hits++;
-        if (msg.id == CAN_BENCH_CORE_ID || msg.id == CAN_BENCH_AUX_ID) can_diag.bench_hits++;
         // Sniffer: capture the raw frame (any ID) before our targeted parse.
         if (cansniff_active) {
             cansniffLog(msg.id, msg.flags.extended, msg.len, msg.buf);
         }
+        // v0.1.177: an 11-bit and a 29-bit frame with the same NUMBER are different frames.
+        // AEMnet is all 29-bit; the MS3 Simplified Dash and our RC35 bench frames are 11-bit.
+        // Before this, the switch below matched the number alone.
+        if (msg.flags.extended) {
+            if (aemnet::decode(msg.id, true, msg.buf, msg.len, can_aem, now)) can_diag.aem_hits++;
+            continue;
+        }
+        if (msg.id >= CAN_BASE_ID && msg.id <= CAN_BASE_ID + 3) can_diag.base_hits++;
+        if (msg.id == CAN_BENCH_CORE_ID || msg.id == CAN_BENCH_AUX_ID) can_diag.bench_hits++;
         switch (msg.id) {
             case CAN_BASE_ID + 0:   // 0x5E8: map, rpm, clt, tps
                 can_ecu.map_x10    = (int16_t)(((uint16_t)msg.buf[0] << 8) | msg.buf[1]);
@@ -1879,6 +1909,7 @@ static void pumpCAN() {
                 break;
         }
     }
+    aemnet::expire(can_aem, now, CAN_STALE_MS);   // each AEMnet group on its own clock
     // Staleness guard — if the MS3Pro goes silent, reset all fields to -1
     // so the dash shows '---' instead of frozen last-known values.
     if (can_ecu.last_ms != 0 && now - can_ecu.last_ms > CAN_STALE_MS) {
@@ -2921,6 +2952,47 @@ static void writeSessionSample(uint8_t fix, uint8_t sats,
         // folded into batt_v (that one is the ECU's / dongle's measurement).
         if (g_cfg.vin_direct && vin_x10 >= 0)
             append("\"vin_v\":%.1f,", vin_x10 * 0.1f);
+    }
+
+    // AEMnet channels (v0.1.177) - their OWN keys, never folded into the MS3 ones, so a session
+    // shows exactly which bus each value came from. Each group appears only while it is live:
+    //   aem_lambda aem_afr aem_uego                      the lambda the logger reports (UEGO gauge
+    //                                                     while it broadcasts, else ECU lambda #1)
+    //                                                     + gauge status 1 valid/2 not ready/3 fault
+    //   aem_rpm aem_tps_pct aem_iat_f aem_coolant_f      0x01F0A000 (AEM ECU)
+    //   aem_map_kpa aem_oil_psi                           0x01F0A004
+    //   aem_lambda1 aem_spark_deg aem_batt_v              0x01F0A003
+    // LINE BUDGET: SESSION_LINE_CAP cannot grow (the upload window's static_assert sits at 31488 of
+    // 31744 B), and with EVERY source live at once the line would reach ~700 B - append() would then
+    // drop the WHOLE sample. So each group is added only if it still leaves room for the fixed
+    // ax..gz tail, in priority order: in that extreme case a low-priority AEM group is left out of
+    // the sample, never the sample itself. (MS3 + a UEGO gauge, the realistic case, is ~520 B.)
+    {
+        constexpr size_t TAIL_RESERVE = 96;   // worst-case ax..gz tail is 77 B + newline
+        const aemnet::State& a = can_aem;
+        auto addIfRoom = [&](const char* fmt, ...) {
+            if (n < 0) return;
+            char tmp[96];
+            va_list ap; va_start(ap, fmt);
+            const int used = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+            va_end(ap);
+            if (used <= 0 || used >= (int)sizeof(tmp)) return;
+            if ((size_t)n + (size_t)used + TAIL_RESERVE >= sizeof(buf)) return;   // leave it out
+            memcpy(buf + n, tmp, (size_t)used + 1);
+            n += used;
+        };
+        const int32_t lam = aemnet::lambdaX10000(a);
+        if (lam >= 0)
+            addIfRoom("\"aem_lambda\":%.4f,\"aem_afr\":%.1f,", lam * 0.0001f, aemnet::afrX10(a) * 0.1f);
+        if (a.uego_ms) addIfRoom("\"aem_uego\":%u,", (unsigned)aemnet::uegoStatus(a));
+        if (a.engine_ms)
+            addIfRoom("\"aem_rpm\":%ld,\"aem_tps_pct\":%.1f,\"aem_iat_f\":%.1f,\"aem_coolant_f\":%.1f,",
+                      (long)a.rpm, a.tps_x10 * 0.1f, a.iat_f_x10 * 0.1f, a.clt_f_x10 * 0.1f);
+        if (a.pressure_ms)
+            addIfRoom("\"aem_map_kpa\":%.1f,\"aem_oil_psi\":%.1f,", a.map_x10 * 0.1f, a.oil_x10 * 0.1f);
+        if (a.lambda_ms)
+            addIfRoom("\"aem_lambda1\":%.4f,\"aem_spark_deg\":%.1f,\"aem_batt_v\":%.1f,",
+                      a.lambda1_x10000 * 0.0001f, a.adv_x10 * 0.1f, a.bat_x10 * 0.1f);
     }
 
     append(
@@ -4507,6 +4579,26 @@ static void emitToDash() {
                   ecuRpm, can_ecu.clt_f_x10, can_ecu.map_x10,
                   can_ecu.tps_x10, can_ecu.afr_x10,
                   can_ecu.iat_f_x10, can_ecu.bat_x10, can_ecu.oil_x10);
+    // AEMNET line (v0.1.177): the AEMnet-decoded values, in the ECU line's field order so the
+    // dash parses both with one routine, plus the lambda it reports and the UEGO gauge status:
+    //   AEMNET,<rpm>,<clt_f_x10>,<map_x10>,<tps_x10>,<afr_x10>,<iat_f_x10>,<bat_x10>,<oil_x10>,
+    //          <lambda_x10000>,<uego_status 0 none/1 valid/2 not ready/3 fault>
+    // -1 = not received. Sent ONLY while an AEMnet device is broadcasting (a bus without AEM
+    // costs the dash link nothing); the dash expires its copy after 2 s, so when the device
+    // stops, the values read as no data.
+    if (aemnet::anyLive(can_aem)) {
+        const int aemRpm = test_mode_active ? (int)rpm : (int)can_aem.rpm;
+        dashTele("AEMNET,%d,%d,%d,%d,%d,%d,%d,%d,%ld,%u\n",
+                 aemRpm, can_aem.clt_f_x10, can_aem.map_x10, can_aem.tps_x10,
+                 aemnet::afrX10(can_aem), can_aem.iat_f_x10, aemnet::batteryX10(can_aem),
+                 can_aem.oil_x10, (long)aemnet::lambdaX10000(can_aem),
+                 (unsigned)aemnet::uegoStatus(can_aem));
+        usbTele("AEMNET,%d,%d,%d,%d,%d,%d,%d,%d,%ld,%u\n",
+                aemRpm, can_aem.clt_f_x10, can_aem.map_x10, can_aem.tps_x10,
+                aemnet::afrX10(can_aem), can_aem.iat_f_x10, aemnet::batteryX10(can_aem),
+                can_aem.oil_x10, (long)aemnet::lambdaX10000(can_aem),
+                (unsigned)aemnet::uegoStatus(can_aem));
+    }
     dashTele("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
                        ax, ay, az, gx, gy, gz);
     usbTele("IMU,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f\n",
