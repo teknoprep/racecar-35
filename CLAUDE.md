@@ -125,6 +125,17 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   `hardware/` (`Quotation for …T-6C2W1148674A…(2026-10-21).xls`) is a DIFFERENT board
   (PCA9955BTW / CREE CLW6A / 2×20 Pi-HAT socket, 9 lines) — not Rev F; don't answer it with
   Rev F data.
+  **2026-10-22 — BOM agreed, Gerber re-uploaded.** PCBWay corrected the mix-up and sent a
+  **1-unit** Rev F quotation (`hardware/Quotation for T-2SJ3W1113248A-1unit-…(2026-10-22).xls`);
+  their attachment matches our BOM on all 77 lines except **U1 qty = 2**, which is the correct
+  socket pair. `pcbway/update_quotation_reply.py` verifies the sheet line-by-line against
+  `Racecar-RevF-BOM-pcbway-assembly.csv` (aborts on any MPN/maker/designator/qty difference,
+  accepts U1=2 explicitly), fills `Actual Purchase Mfg Part #` on all 77 lines and
+  `Customer Reply` on the 8 decision lines, and writes `…-REPLIED.xls/.xlsx` (it picks the
+  quotation by **mtime** — filename sorting grabs the old 5-unit sheet). Reply text:
+  `pcbway/PCBWAY-REPLY-2026-10-22.md`. Outstanding with PCBWay: PCB price (5-piece minimum)
+  added to the 1-unit component+assembly total, longest lead time, and a 5-unit assembly
+  reference.
   Re-export with `fabrication/export.py --engineering-prototype`. **No automotive
   transient qualification, and no built, measured or independently reviewed board.**
   Rev F also ships a **shareable 3D model**: `Racecar-RevF-3D.html` (one self-contained
