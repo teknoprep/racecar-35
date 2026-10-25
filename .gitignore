@@ -41,3 +41,7 @@ desktop.ini
 logs/
 __pycache__/
 *.pyc
+
+# Generated PCBWay production folder (reproducible: pcbway/make_production_folder.py)
+hardware/teensy-integrated-revf/pcbway/PRODUCTION-READY-*/
+hardware/teensy-integrated-revf/pcbway/PRODUCTION-READY-*.zip

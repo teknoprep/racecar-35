@@ -92,7 +92,22 @@ and CPL are 1:1 (182 designators), and the engineering package travels with the 
 
 ---
 
-## 4. Rebuild / re-check
+## 4. One-folder bundle for the order
+
+`make_production_folder.py` assembles **`pcbway/PRODUCTION-READY-<date>/`** (and a
+`.zip` of it) with everything above plus the unpacked `gerbers/`, the engineering
+package, `docs/ASSEMBLY.md` / `ASSEMBLY-EXTRAS.csv` / `BRINGUP.md`, a
+`README-PRODUCTION.md` index and `SHA256SUMS.txt`. It hard-fails unless the gerber
+ZIP is the complete 16-file set **and** carries the verified 2026-10-19 silk.
+
+```bash
+python3 pcbway/make_production_folder.py            # -> PRODUCTION-READY-<today>/
+(cd pcbway/PRODUCTION-READY-<today> && zip -qr ../PRODUCTION-READY-<today>.zip .)
+```
+
+---
+
+## 5. Rebuild / re-check
 
 ```bash
 cd hardware/teensy-integrated-revf

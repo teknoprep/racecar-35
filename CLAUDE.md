@@ -136,6 +136,14 @@ The screen's own WiFi/BLE arbiter remains mandatory; the separate module is inde
   `pcbway/PCBWAY-REPLY-2026-10-22.md`. Outstanding with PCBWay: PCB price (5-piece minimum)
   added to the 1-unit component+assembly total, longest lead time, and a 5-unit assembly
   reference.
+  **Production folder.** `pcbway/make_production_folder.py` assembles
+  `pcbway/PRODUCTION-READY-<date>/` (+ a `.zip`) in one step: complete 16-file
+  `gerbers/`, the gerber ZIP, BOM, CPL, `ACTUAL-PURCHASE-MPN.csv`, the REPLIED
+  quotation, order guide, changes doc, reply text, engineering package,
+  `docs/ASSEMBLY.md`/`ASSEMBLY-EXTRAS.csv`/`BRINGUP.md`, `README-PRODUCTION.md`
+  and `SHA256SUMS.txt`. It HARD-FAILS unless the gerber ZIP is the complete
+  16-file set and carries the verified 2026-10-19 silk. The folder is generated
+  (gitignored) — rebuild it rather than editing it.
   Re-export with `fabrication/export.py --engineering-prototype`. **No automotive
   transient qualification, and no built, measured or independently reviewed board.**
   Rev F also ships a **shareable 3D model**: `Racecar-RevF-3D.html` (one self-contained
