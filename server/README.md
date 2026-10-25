@@ -28,7 +28,8 @@ LAN IP of the host running the container.
 | POST   | `/account/apikey/refresh`   | Regenerate the signed-in user's API key. Old key stops working immediately. |
 | GET    | `/admin`                    | Admin portal (admins only): add authorized Gmail accounts, grant/revoke admin. |
 | GET    | `/admin/sessions/targets`   | Emails an admin may reassign a session to (all known accounts). Admins only. |
-| POST   | `/admin/sessions/move`      | **Reassign a session to another user.** Body `{user, filename, target}` (target = destination email). Moves the `.ndjson` **and its AI history** into the target's dir; refuses if the target already has a same-named session. Admins only. |
+| POST   | `/admin/sessions/move`      | **Reassign a session to another user.** Body `{user, filename, target}` (target = destination email or an existing user dir). Moves the `.ndjson` **and every sidecar** (AI history, lap exclusions, video link, lap cache, debug log, share tokens, coach items) into the target's dir; refuses if the target already has a same-named session. Admins, **or the firmware key** (scriptable re-filing). |
+| POST   | `/admin/sessions/attribute` | **Claim every session in one directory for an account.** Body `{from, target, execute}` — `from:"anon"` + `target:<email>` re-files uploads that arrived with no identity; dry run unless `execute:1`, never overwrites (skips + reports). Admins, **or the firmware key**. |
 | POST   | `/admin/users`              | Add an account or change its admin flag (JSON `{email, is_admin}`). Admins only. |
 | POST   | `/admin/users/delete`       | Remove a managed account (JSON `{email}`). Admins only. |
 | GET    | `/admin/user/<email>`       | Per-user screen: ALL USERS toggle + manage who this account can see. Admins only. |
@@ -93,10 +94,16 @@ login (or when an admin adds the account) and persisted in `/data/users.json`.
 A user views/refreshes their own key from the **account** link in the header
 (`/account`). Refreshing replaces the old key immediately.
 
-Send the key as `X-API-Key` on uploads. When no `X-User-Email` header is
-supplied, the upload is filed under the key owner's email automatically. This
-is independent of the global `RACECAR_API_KEY` env var (which, when set, gates
-all ingestion with a single shared secret).
+Send the key as `X-API-Key` on uploads. **On a device upload the key decides
+who owns the file**: only its owner can be holding it, so a screen that has the
+key but a blank (or stale) *cloud user email* field still files its sessions
+under the right account instead of `sessions/anon/`. A disagreement is recorded
+as an `owner_override` event in `/data/upload_log.jsonl` (`/admin/upload/log`).
+A **signed-in web user** is the exception — the index page's upload box sends
+the account to file under as `X-User-Email`, so there the header wins (that is
+how an admin imports a file for a driver). This is independent of the global
+`RACECAR_API_KEY` env var (which, when set, gates all ingestion with a single
+shared secret and is never an identity).
 
 ## Request headers honored
 
@@ -105,7 +112,8 @@ These match the dash and Teensy firmware exactly:
 ```
 Content-Type:  application/x-ndjson
 X-API-Key:     <secret>           (optional; required if RACECAR_API_KEY is set)
-X-User-Email:  user@example.com   (used to namespace files on disk)
+X-User-Email:  user@example.com   (namespace for the saved file — a per-user API
+                                   key wins over it on a device upload)
 X-Session-Id:  1714942567         (used in the saved filename; usually unix epoch)
 X-Track-Name:  Lime_Rock_Park     (used in the saved filename)
 ```
@@ -184,7 +192,8 @@ Settings → cloud rows on the dash, when **Internet mode = WiFi**:
 Cloud host:   <LAN IP of the docker host>   e.g. 192.168.1.50
 Cloud port:   8089
 Protocol:     HTTP                          (HTTPS is the default; switch to HTTP for LAN test)
-User email:   anything you want (used to namespace files)
+User email:   anything you want (namespaces the file — a per-user API key or a
+              logged-in web session overrides it)
 API key:      match RACECAR_API_KEY, or any value if RACECAR_API_KEY is empty
 Record cloud: ON
 ```
@@ -196,6 +205,10 @@ If everything is wired up correctly, you'll see (in `docker compose logs -f`):
 ```
 INFO racecar.cloud: received 192.168.1.123 mode=w email=anon session=1714... track=TEST bytes=14352 lines=58 -> sessions/anon/1714..._TEST.ndjson
 ```
+
+(`anon` = the test unit sent no API key and no user email. With a per-user API
+key configured on the dash, the file is filed under that key's account even when
+the email field is blank.)
 
 And opening `http://<host>:8089/` in a browser shows the new session in the table.
 

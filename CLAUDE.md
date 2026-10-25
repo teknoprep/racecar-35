@@ -631,6 +631,45 @@ button (`#trk-sel`/`#trk-save`). The per-session coach checklist row (`#sess-coa
   `__TOKEN__` in `_REVIEW_HTML` is replaced by the route** (a forgotten one is a silent JS
   syntax error that kills the editor).
 
+### Upload attribution: the API KEY names the owner, not `X-User-Email`
+The dash sends both headers unconditionally — `X-API-Key` (Settings → cloud auth key) and
+`X-User-Email` (the account box) — and the account box is commonly **blank or stale**, which is
+why sessions uploaded *with a perfectly good account key* sat in `sessions/anon/`
+(4 of them, 2026-10-25: the upload log shows `has_key=false user=""` for that panel).
+`_upload_owner_email()` (`server/app/main.py`) now decides the owner:
+- **Device upload (no signed-in web user): a per-user API key WINS.** Only its owner can be
+  holding it, so `email_for_api_key()` decides the directory; the header is only a *claim* and a
+  disagreement is logged as an `owner_override` event in `/data/upload_log.jsonl` (plus `owner`
+  + `attr` on every `ok` event, and `user`/`attribution` in the `/upload` JSON response). The
+  firmware/server key is NOT an identity (it belongs to the server, not a person) so it still
+  falls back to the header.
+- **Signed-in web user: the header still wins** (then the session account, then the key). The
+  index page's upload box puts the account to file under in `X-User-Email`, and an admin
+  importing a file for a driver means it — making the key win there would file the import under
+  the admin.
+- No identity at all (no key, no header) still lands in `anon` — a key-less bench upload must
+  keep working — and `ANON`/`UNKNOWN`/`none`/`n/a` in the header are treated as *no* identity
+  (they used to create a separate `sessions/ANON/`).
+- Emails are **lower-cased when they look like one** (`_norm_owner_email`; `users.json` keys are
+  lowercase) so a typed `CM.Rawlings@Gmail.com` cannot open a second directory for the same
+  account — `safe_name()` deliberately does NOT lowercase, so this has to happen in the resolver.
+- `_resolve_upload_target()` also RETURNS `owner_src` (`key`/`web`/`header`/`anon`), and it is
+  still the ONE derivation shared by `/upload`, `/stream`, partial salvage, `/upload/progress`
+  (resume) and `/upload/aim`, so a resumed upload looks in the same directory it started in.
+
+**Re-filing what already landed in `anon/`.** `POST /admin/sessions/attribute`
+body `{from:"anon", target:"cm.rawlings@gmail.com", execute:0|1}` claims a whole directory
+(dry run by default, reports the plan, skips — never overwrites — files the target already has,
+and every sidecar follows). `POST /admin/sessions/move`
+`{user, filename, target}` does one file. **Both now accept EITHER an admin web login OR the
+firmware key** (`X-API-Key`), so tooling on the build host can fix attribution with curl — the
+same key already gates `/admin/sessions/{list,get}` and `/admin/upload/log`. Neither moves a
+file onto an existing one (409 / `skipped`), and `move` now carries **every** sidecar (AI
+history, lap exclusions, video link, lap cache, debug log, share tokens, coach items) instead of
+only the AI history. Tests: `tests/test_upload_owner.py` (key-vs-header vs web-vs-header
+precedence, placeholder headers, case folding, debug companion following the same owner, dry
+run → execute, collision skip, firmware-key-or-admin gate).
+
 ### Admin: impersonate a user + login audit + activity report
 
 **Impersonation.** From the `/admin` user list, each non-self row has an **impersonate** button

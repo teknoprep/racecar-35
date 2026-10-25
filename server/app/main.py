@@ -18,8 +18,12 @@ DELETE /sessions/<user>/<file> Delete one session file (API key checked if set).
 GET  /health   Returns {"ok": true}; used by nginx / Docker healthcheck.
 
 Headers honored (must match the dash firmware):
-    X-API-Key       optional; if RACECAR_API_KEY is set in env, must match
-    X-User-Email    used to namespace saved files
+    X-API-Key       optional; if RACECAR_API_KEY is set in env, must match.
+                    A PER-USER key also names the account that owns the upload.
+    X-User-Email    used to namespace saved files — but a per-user API key wins
+                    on a device upload (the key is the credential, the header is
+                    only a claim; blank/stale headers used to file sessions in
+                    sessions/anon/). A signed-in web user's header still wins.
     X-Session-Id    used in filename (the recording's start unix epoch)
     X-Track-Name    used in filename (best-effort sanitized)
     Content-Type    expected: application/x-ndjson
@@ -4300,12 +4304,62 @@ def _upload_event(d: dict) -> None:
 
 
 
+# Values a DEVICE can put in X-User-Email when its cloud account field was
+# never filled in (the dash sends the header unconditionally, even blank).
+_ANON_OWNERS = {"", "anon", "unknown", "unnamed", "none", "null", "n/a", "na"}
+
+
+def _norm_owner_email(s: str) -> str:
+    """Emails are case-insensitive (users.json keys are lowercase), so a typed
+    `CM.Rawlings@Gmail.com` must not open a second session directory for the
+    same account. Anything that is not email-shaped is left exactly as sent."""
+    s = (s or "").strip()
+    return s.lower() if "@" in s else s
+
+
+def _upload_owner_email(x_user_email, web_user, x_api_key) -> tuple:
+    """(owner email or "", how it was decided) for an inbound upload.
+
+    A per-user API key IS an identity — its owner is the only person who can be
+    holding it — so on a DEVICE upload (the screen in the car) it decides who
+    owns the session. The dash sends X-User-Email unconditionally, blank or
+    stale, which is exactly how uploads from a panel whose account field was
+    never filled in ended up in sessions/anon/ while their API key named a real
+    account. The key therefore wins; the header is recorded so a disagreement is
+    visible in the upload log instead of being silently obeyed.
+
+    A SIGNED-IN web user is different: the index page's upload box sends the
+    account to file under as X-User-Email, and an admin importing a file for a
+    driver means it. There the header wins, then the session account, then the
+    key. With no identity at all the session lands in the anon bucket (the
+    pre-existing behaviour, kept so a key-less bench upload still works).
+    """
+    key_email = email_for_api_key(x_api_key) if x_api_key else None
+    header = _norm_owner_email(x_user_email)
+    if web_user:
+        header = header or _norm_owner_email(str(web_user.get("email") or ""))
+        if header:
+            return header, "web"
+        if key_email:
+            return key_email, "key"
+        return "", "anon"
+    if key_email:
+        return key_email, "key"
+    if header.lower() in _ANON_OWNERS:
+        return "", "anon"
+    return header, "header"
+
+
 def _resolve_upload_target(x_user_email, x_session_id, x_track_name,
                            x_api_key, web_user, kind: str):
     """Filename derivation shared by /upload, /stream, partial-salvage and
-    /upload/progress — MUST stay byte-identical across them or resume breaks."""
-    key_email = email_for_api_key(x_api_key) if x_api_key else None
-    email = safe_name(x_user_email or (web_user or {}).get("email") or key_email)
+    /upload/progress — MUST stay byte-identical across them or resume breaks.
+
+    Returns (email, sid, sid_int, sid_overridden, track, filename, out_path,
+    owner_src) where owner_src says how the owning account was decided
+    (key / web / header / anon) — logged with every upload."""
+    owner_email, owner_src = _upload_owner_email(x_user_email, web_user, x_api_key)
+    email = safe_name(owner_email)
     sid_raw = (x_session_id or "").strip()
     sid_overridden = False
     try:
@@ -4332,7 +4386,8 @@ def _resolve_upload_target(x_user_email, x_session_id, x_track_name,
     else:
         filename = f"{sid}_{track}.ndjson"
         out_path = session_dir_for(email) / filename
-    return email, sid, sid_int, sid_overridden, track, filename, out_path
+    return (email, sid, sid_int, sid_overridden, track, filename, out_path,
+            owner_src)
 
 
 def _zb_decode_partial(data: bytes) -> bytes:
@@ -4392,9 +4447,17 @@ async def _save_body(
 
     # Resolve the target BEFORE reading the body so an interrupted read can
     # still salvage what arrived (resume support, v: resume).
-    email, sid, sid_int, sid_overridden, track, filename, out_path = \
-        _resolve_upload_target(x_user_email, x_session_id, x_track_name,
-                               x_api_key, web_user, kind)
+    (email, sid, sid_int, sid_overridden, track, filename, out_path,
+     owner_src) = _resolve_upload_target(
+        x_user_email, x_session_id, x_track_name, x_api_key, web_user, kind)
+    if owner_src == "key" and (x_user_email or "").strip() and \
+            safe_name(_norm_owner_email(x_user_email)) != email:
+        # The panel's account field disagreed with its API key. The KEY is the
+        # credential (only its owner can hold it), so it won — but say so: this
+        # is how a session used to be filed under a stale/blank email.
+        _upload_event({"ev": "owner_override", "ip": _client_host,
+                       "kind": kind or "session", "header_user": x_user_email,
+                       "owner": email})
     _zb_hdr = (request.headers.get("x-body-format") or "").strip().lower() == "zblocks"
     _rx = 0
     try:
@@ -4476,6 +4539,7 @@ async def _save_body(
     _upload_event({"ev": "ok", "ip": _client_host, "kind": kind or "session",
                    "session": sid, "track": track, "bytes": len(body), "lines": nl,
                    "wire": wire_len,   # < bytes when the body came in compressed
+                   "owner": email, "attr": owner_src,
                    "path": str(out_path.relative_to(DATA_DIR))})
     # Auto-coach: review this session in the BACKGROUND (never delays the dash's
     # upload response) and file 1-3 de-duplicated checklist items.
@@ -4506,6 +4570,10 @@ async def _save_body(
             "ts": int(time.time()),
             "session_id": sid_int,
             "session_id_overridden": sid_overridden,
+            # Who actually owns the file — the API key's account when the key
+            # names one, never just whatever the panel had typed in.
+            "user": email,
+            "attribution": owner_src,
         }
     )
 
@@ -4530,7 +4598,7 @@ async def upload_progress(
             raise HTTPException(status_code=401, detail="invalid api key")
     elif oauth_enabled():
         web_user = current_user(request)
-    _, _, _, _, _, filename, out_path = _resolve_upload_target(
+    _, _, _, _, _, filename, out_path, _ = _resolve_upload_target(
         x_user_email, session, track, x_api_key, web_user,
         "debug" if kind == "debug" else "")
     if not out_path.exists():
@@ -4697,12 +4765,12 @@ async def upload_aim(
     validation = validate_ndjson_body(conv.ndjson)
 
     # Caller headers win; otherwise the file's own metadata names the session.
-    email, sid, sid_int, sid_overridden, track, filename_out, out_path = \
-        _resolve_upload_target(
-            x_user_email,
-            x_session_id or str(conv.session_id),
-            x_track_name or conv.track,
-            x_api_key, web_user, "")
+    (email, sid, sid_int, sid_overridden, track, filename_out, out_path,
+     owner_src) = _resolve_upload_target(
+        x_user_email,
+        x_session_id or str(conv.session_id),
+        x_track_name or conv.track,
+        x_api_key, web_user, "")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
@@ -4719,7 +4787,7 @@ async def upload_aim(
     _upload_event({"ev": "ok", "ip": _client_host, "kind": "aim", "file": name,
                    "source": conv.source, "session": sid, "track": track,
                    "bytes": len(conv.ndjson), "lines": conv.samples,
-                   "laps": conv.laps,
+                   "laps": conv.laps, "owner": email, "attr": owner_src,
                    "path": str(out_path.relative_to(DATA_DIR)),
                    "archive": str(archive.relative_to(DATA_DIR))})
     if coach:
@@ -5766,16 +5834,25 @@ def people_for_picker(tokens) -> list:
 
 
 @app.post("/admin/sessions/move")
-async def admin_move_session(request: Request) -> JSONResponse:
-    """Reassign a session (and its AI history) to another user. Admin only.
+async def admin_move_session(request: Request,
+                            x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    """Reassign a session to another user. Admin web login OR firmware key.
 
     Body JSON: {user, filename, target}  where `user`/`filename` identify the
     source session (same as the URL params) and `target` is the destination
-    account EMAIL. Moves the .ndjson into the target's sessions dir and moves
-    the matching ai_history file alongside it. Refuses if the target already
-    has a session with the same name (so nothing is silently overwritten).
+    account EMAIL. Moves the .ndjson into the target's sessions dir and every
+    per-session sidecar (AI history, lap exclusions, video link, lap cache,
+    debug log, share tokens, coach items) alongside it, exactly like the review
+    page's "edit session" mover. Refuses if the target already has a session
+    with the same name (so nothing is silently overwritten).
+
+    The firmware key is accepted as well as an admin login so tooling/agents can
+    re-file sessions that were uploaded before a panel's API key attribution
+    existed (they landed in sessions/anon/) — the same key already gates
+    /admin/sessions/{list,get} for remote forensics.
     """
-    require_admin(request)
+    if not (FIRMWARE_KEY and x_api_key == FIRMWARE_KEY):
+        require_admin(request)
     try:
         body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
     except Exception:
@@ -5783,8 +5860,12 @@ async def admin_move_session(request: Request) -> JSONResponse:
     user = str(body.get("user", ""))
     filename = str(body.get("filename", ""))
     target = str(body.get("target", "")).strip().lower()
-    if not target:
-        raise HTTPException(status_code=400, detail="target (email) required")
+    # An EMAIL (a new or existing account) or the slug of a directory that
+    # already holds sessions — same rule as the review page's reassign.
+    if not target or ("@" not in target
+                      and not (DATA_DIR / "sessions" / safe_name(target)).is_dir()):
+        raise HTTPException(status_code=400,
+                            detail="target must be an account email or an existing user")
 
     src = _resolve_session(user, filename)     # 404 if it doesn't exist
     dst_dir = session_dir_for(target)          # creates the target dir; slug = safe_name(target)
@@ -5795,27 +5876,88 @@ async def admin_move_session(request: Request) -> JSONResponse:
         raise HTTPException(status_code=409,
                             detail=f"target already has a session named {src.name}")
 
-    shutil.move(str(src), str(dst))
-    # Move the AI Q&A history alongside the session (best-effort).
-    src_hist = _ai_history_path(user, src.name)
-    dst_hist = _ai_history_path(target, src.name)
-    if src_hist.exists():
-        dst_hist.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src_hist), str(dst_hist))
-    # Tidy now-empty source dirs.
-    for d in (src.parent, src_hist.parent):
-        try:
-            d.rmdir()
-        except OSError:
-            pass
+    old_user = safe_name(user)
     new_user = safe_name(target)
-    log.info("admin moved session %s: %s -> %s", src.name, safe_name(user), new_user)
+    shutil.move(str(src), str(dst))
+    session_sidecars_follow(old_user, src.name, new_user, src.name)
+    # Tidy a now-empty source dir (an "anon" bucket can stop existing entirely).
+    try:
+        src.parent.rmdir()
+    except OSError:
+        pass
+    log.info("admin moved session %s: %s -> %s", src.name, old_user, new_user)
     return JSONResponse({
         "ok": True,
         "user": new_user,
         "filename": src.name,
         "review": f"/review/{new_user}/{src.name}",
     })
+
+
+@app.post("/admin/sessions/attribute")
+async def admin_attribute_sessions(request: Request,
+                                  x_api_key: Optional[str] = Header(None)) -> JSONResponse:
+    """Give every session sitting in a directory to one account. Admin OR
+    firmware key (same reasoning as /admin/sessions/move).
+
+    Body JSON: {from, target, execute?}
+        from     the directory slug/email whose sessions are being claimed
+                 ("anon" is the bucket an upload lands in with no identity)
+        target   the account email that owns them
+        execute  0 = dry run (default): report what WOULD move and why each
+                 file was skipped; 1 = do it
+
+    Behind the fix in `_upload_owner_email`, this is how sessions uploaded
+    before it (a panel with an API key but a blank account field) get re-filed
+    in one command. Files already present in the target are skipped, never
+    overwritten; every sidecar follows.
+    """
+    if not (FIRMWARE_KEY and x_api_key == FIRMWARE_KEY):
+        require_admin(request)
+    try:
+        body = json.loads((await request.body()).decode("utf-8", "replace") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    src_slug = safe_name(str(body.get("from", "")).strip().lower())
+    target = str(body.get("target", "")).strip().lower()
+    try:
+        execute = bool(int(body.get("execute", 0) or 0))
+    except (TypeError, ValueError):
+        execute = str(body.get("execute", "")).strip().lower() in ("1", "true", "yes")
+    if not target or "@" not in target:
+        raise HTTPException(status_code=400, detail="target (account email) required")
+    new_user = safe_name(target)
+    if not src_slug or src_slug == new_user:
+        raise HTTPException(status_code=400, detail="from must be a different directory")
+    src_dir = DATA_DIR / "sessions" / src_slug
+    if not src_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"no such session directory: {src_slug}")
+
+    moved, skipped = [], []
+    for f in sorted(src_dir.iterdir()):
+        if not f.is_file() or f.suffix != ".ndjson":
+            continue
+        dst = DATA_DIR / "sessions" / new_user / f.name
+        if dst.exists():
+            skipped.append({"file": f.name, "why": f"{new_user} already has it"})
+            continue
+        if not execute:
+            moved.append({"file": f.name, "size": f.stat().st_size})
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(f), str(dst))
+        session_sidecars_follow(src_slug, f.name, new_user, f.name)
+        moved.append({"file": f.name})
+    if execute and not skipped:
+        try:
+            src_dir.rmdir()          # only when nothing is left in it
+        except OSError:
+            pass
+    log.info("admin attribute %s -> %s: %s %d file(s), %d skipped",
+             src_slug, new_user, "moved" if execute else "would move",
+             len(moved), len(skipped))
+    return JSONResponse({"ok": True, "executed": execute, "from": src_slug,
+                         "user": new_user, "moved": moved, "skipped": skipped})
 
 
 @app.get("/sessions/{user}/{filename}/data")
