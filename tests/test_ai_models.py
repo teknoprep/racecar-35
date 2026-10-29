@@ -33,7 +33,8 @@ _WANTED_FUNCS = ("ai_resolve_model", "_ai_haiku_id")
 _WANTED_VARS = (
     "_ai_temp_raw",                       # helper for AI_TEMPERATURE
     "AI_MODELS", "AI_HAIKU_MODEL", "AI_ANALYSIS_MODEL", "AI_COACH_MODEL",
-    "AI_DEFAULT_MODEL", "AI_FEATURE_MODELS", "AI_API_KEY", "AI_BASE_URL",
+    "AI_TRACK_MODEL", "AI_DEFAULT_MODEL", "AI_FEATURE_MODELS", "AI_API_KEY",
+    "AI_BASE_URL",
     "AI_MODEL", "AI_TIMEOUT", "AI_TEMPERATURE",
 )
 

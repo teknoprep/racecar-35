@@ -55,6 +55,7 @@ def _page_html() -> str:
     # session's track name as the DASH spells it (JSON literal, injected).
     return (html.replace("__USER__", "test-user")
                 .replace("__FILE__", "1700000000_Summit_Point_Main.ndjson")
+                .replace("__ADMIN__", "false")
                 .replace("__TRACK__", json.dumps("Summit Point Main")))
 
 
@@ -300,6 +301,52 @@ R.alt = (function () {
   var p = RC3D.buildPath(s, { smooth: 5 });
   var mn = Math.min.apply(null, p.y), mx = Math.max.apply(null, p.y);
   return { min: mn, max: mx, yRef: p.yRef };
+})();
+
+// ---- the road's VERTICAL profile (v18: no more bucking road) ---------------
+R.profile = (function () {
+  // a real hill (40 m relief) sampled every 2 m around a closed loop, with
+  // what a 3 m DEM actually gives: a slope break per cell + noise
+  var n = 1500, truth = [], noisy = [], i;
+  for (i = 0; i < n; i++) {
+    var s = i * 2, h = 40 * Math.sin(2 * Math.PI * i / n);   // piecewise periodic
+    truth.push(h);
+    noisy.push(h + 1.6 * (((i % 3) / 3) - 0.5) + ((i % 2) ? 0.9 : -0.9));
+  }
+  var sm = RC3D.smoothProfile(noisy, 2, 24, true);
+  var grade = function (a) {
+    var m = 0;
+    for (var k = 1; k < a.length; k++) m = Math.max(m, Math.abs(a[k] - a[k - 1]) / 2);
+    return m;
+  };
+  var err = 0;
+  for (i = 0; i < n; i++) err += Math.abs(sm[i] - truth[i]);
+  // the terrain grid blur: a plane must stay a plane, the raster noise must go
+  var cols = 60, rows = 60, plane = new Float32Array(cols * rows), j, rr, cc;
+  for (j = 0; j < cols * rows; j++) {
+    rr = Math.floor(j / cols); cc = j % cols;
+    plane[j] = 0.06 * cc + 0.03 * rr + ((j % 2) ? 0.5 : -0.5);
+  }
+  var grid = { cols: cols, rows: rows, bounds: [0, 0, 1, 1], values: plane, cell_m: 3 };
+  var blur = RC3D.smoothGrid(grid, 2);
+  var dev = 0, slope = 0, slope0 = 0;
+  for (j = 0; j < cols * rows; j++) {
+    rr = Math.floor(j / cols); cc = j % cols;
+    dev = Math.max(dev, Math.abs(blur.values[j] - (0.06 * cc + 0.03 * rr)));
+    if (cc > 10 && cc < cols - 10) {
+      slope = Math.max(slope, Math.abs(blur.values[j] - blur.values[j - 1]) / 3);
+      slope0 = Math.max(slope0, Math.abs(plane[j] - plane[j - 1]) / 3);
+    }
+  }
+  return { gradeNoisy: grade(noisy), gradeSmoothed: grade(sm),
+           // curvature ACROSS the seam (the wrap joins n-1 to 0 to 1): a real
+           // step there is a big second difference, not a normal hill slope
+           seamStep: Math.abs(sm[0] - 2 * sm[n - 1] + sm[n - 2]) +
+                     Math.abs(sm[1] - 2 * sm[0] + sm[n - 1]),
+           seamNoisy: Math.abs(noisy[0] - 2 * noisy[n - 1] + noisy[n - 2]) +
+                      Math.abs(noisy[1] - 2 * noisy[0] + noisy[n - 1]),
+           err: err / n,
+           sameLength: sm.length === n, dev: dev, slope: slope, slope0: slope0 };
 })();
 
 // ---- the REAL Shenandoah asset (imagery-measured width + DEM grid) ---------
@@ -1386,6 +1433,25 @@ class Track3DMathTests(unittest.TestCase):
         self.assertAlmostEqual(f["clampStart"], 4.0, places=3)   # clamped into the lap
         self.assertAlmostEqual(f["clampEnd"], 20.0, places=3)
         self.assertAlmostEqual(f["eye"], 1.15, places=3)
+
+        # 10b. the road's VERTICAL profile: a raster DEM read must be smoothed
+        #      into a road before it is drawn. The synthetic input has a 40 m
+        #      hill plus a 3 m cell sawtooth; the output must kill the sawtooth
+        #      (grade), stay on the hill, and wrap at the start/finish seam.
+        pr = res["profile"]
+        self.assertTrue(pr["sameLength"])
+        self.assertGreater(pr["gradeNoisy"], 0.4, "test input is not raster-noisy")
+        self.assertLess(pr["gradeSmoothed"], pr["gradeNoisy"] * 0.35,
+                        "the road profile is still bucking")
+        self.assertLess(pr["gradeSmoothed"], 0.15, "a 40 m hill cannot be 15 %+ grade")
+        self.assertLess(pr["err"], 1.0, "smoothing moved the road off the hill")
+        self.assertGreater(pr["seamNoisy"], 0.5)
+        self.assertLess(pr["seamStep"], 0.05, "closed lap has a step at start/finish")
+        # the terrain grid blur keeps a plane a plane and removes the per-cell
+        # zig-zag (that is the ground the shadowed mesh is built from)
+        self.assertLess(pr["dev"], 0.25, "DEM blur distorted a plane")
+        self.assertGreater(pr["slope"], 0.015, "DEM blur flattened the hills")
+        self.assertLess(pr["slope"], pr["slope0"] * 0.5, "DEM blur left the raster noise")
 
         # 10c. the REAL prepared track (fixture = the asset actually baked from
         #      Esri imagery + AWS DEM for Summit Point Shenandoah): the viewer

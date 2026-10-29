@@ -232,12 +232,17 @@ AI_HAIKU_MODEL = (os.environ.get("RACECAR_AI_HAIKU_MODEL", "").strip()
                   or "anthropic.anthropic/claude-haiku-5.5")
 AI_ANALYSIS_MODEL = os.environ.get("RACECAR_AI_ANALYSIS_MODEL", "").strip() or AI_HAIKU_MODEL
 AI_COACH_MODEL = os.environ.get("RACECAR_AI_COACH_MODEL", "").strip() or AI_HAIKU_MODEL
+# The track-render review (admin "re-render" / "AI review" on the 3D view) is an
+# occasional diagnostic over a small numeric sheet - Haiku is plenty, and it is
+# its own knob so the analysis/coach surfaces can be retargeted independently.
+AI_TRACK_MODEL = os.environ.get("RACECAR_AI_TRACK_MODEL", "").strip() or AI_ANALYSIS_MODEL
 # The default/preselected model the UI shows (and the one used when a request
 # names none): the analysis model, else the first allowlist entry.
 AI_DEFAULT_MODEL = AI_ANALYSIS_MODEL or (AI_MODELS[0] if AI_MODELS else "")
 # feature name -> configured model id, for the server-side surfaces that pick
 # their own model instead of inheriting the user's dropdown choice.
-AI_FEATURE_MODELS = {"analysis": AI_ANALYSIS_MODEL, "coach": AI_COACH_MODEL}
+AI_FEATURE_MODELS = {"analysis": AI_ANALYSIS_MODEL, "coach": AI_COACH_MODEL,
+                     "track": AI_TRACK_MODEL}
 
 
 # ---------------------------------------------------------------------------
@@ -3395,7 +3400,13 @@ def _prep_log(slug: str, msg: str) -> None:
 
 
 def _prep_run(slug: str, track: str, params: dict) -> None:
-    """Background worker: build one track asset. Never raises out."""
+    """Background worker: build one track asset. Never raises out.
+
+    params[enrich]  also fetch OSM features / lidar terrain / the facility
+                    network right here (the admin re-render), so the result
+                    the button reports as "done" is the finished render.
+    params[review]  audit the result and ask the AI what is wrong with it.
+    """
     with _PREP_LOCK:
         _PREP.setdefault(slug, {})["state"] = "running"
     try:
@@ -3416,6 +3427,20 @@ def _prep_run(slug: str, track: str, params: dict) -> None:
              "prep_version": PREP_VERSION},
             log=lambda m: _prep_log(slug, m),
         )
+        if params.get("enrich"):
+            try:
+                _prep_log(slug, "enriching: OSM network + lidar terrain + facility imagery")
+                got = tp.enrich_asset(_track_asset_path(slug), DATA_DIR / "tilecache",
+                                      log=lambda m: _prep_log(slug, m))
+                if got:
+                    asset = got
+            except Exception as e:
+                _prep_log(slug, "enrichment failed: %s" % e)
+        if params.get("review", True):
+            try:
+                _track_render_review(slug, ai=True, log=lambda m: _prep_log(slug, m))
+            except Exception as e:
+                _prep_log(slug, "render review failed: %s" % e)
         with _PREP_LOCK:
             _PREP[slug].update(state="done", finished=int(time.time()),
                                summary={"track": asset["track"], "stations": len(asset["line"]),
@@ -3426,6 +3451,106 @@ def _prep_run(slug: str, track: str, params: dict) -> None:
         with _PREP_LOCK:
             _PREP[slug].update(state="failed", error=str(e)[:300],
                                finished=int(time.time()))
+
+
+def _json_from_model(text: str) -> Optional[dict]:
+    """The first JSON object in a model reply (a fence or a preamble is fine).
+
+    Tolerates a trailing comma, which is the one syntax slip models actually
+    make; anything else means "no usable answer" rather than a crash."""
+    if not text:
+        return None
+    i, j = text.find("{"), text.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    blob = text[i:j + 1]
+    for cand in (blob, re.sub(r",\s*([}\]])", r"\1", blob)):
+        try:
+            obj = json.loads(cand)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            continue
+    return None
+
+
+def _track_render_review(slug: str, ai: bool = True, log=print) -> dict:
+    """Audit a prepared track and (when AI is configured) have the model read it.
+
+    The deterministic audit is the ground truth: numbers already compared with
+    what a GOOD render needs. The AI is only allowed to interpret those facts -
+    it cannot invent a measurement, and a failed call never fails a render.
+    Returns the review that was stored on the asset (also served to the UI)."""
+    tp = _trackprep()
+    path = _track_asset_path(slug)
+    try:
+        asset = json.loads(path.read_text("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"no prepared asset: {e}")
+    audit = tp.audit_asset(asset)
+    review = {"at": int(time.time()), "audit": audit,
+              "ai": {"enabled": bool(AI_API_KEY)}}
+    issues = list(audit.get("issues") or [])
+    if ai and AI_API_KEY:
+        facts = {k: audit.get(k) for k in
+                 ("track", "stations", "length_m", "step_m", "closed", "width",
+                  "imagery", "elevation", "dem", "network", "features")}
+        facts["detected_issues"] = issues
+        prompt = (
+            "You are reviewing the automated PRE-RENDER of a race track for a "
+            "3D telemetry view. The pipeline measures the track's width from "
+            "satellite imagery, traces its centreline, bakes terrain from a DEM "
+            "and drapes imagery, and draws the road from a smoothed elevation "
+            "profile. Typical failures: the road drawn on the grass, a width "
+            "that is run-off instead of asphalt, the car floating or sunk, a "
+            "road that bucks up and down (raster elevation not smoothed), "
+            "wallpaper-like ground imagery, or the wrong place entirely.\n\n"
+            "FACTS (JSON, measured - do not invent numbers):\n" +
+            json.dumps(facts, separators=(",", ":"))[:7000] +
+            "\n\nReply with ONE JSON object and nothing else:\n"
+            '{"verdict":"one sentence on whether this render is usable",'
+            '"confidence":0.0,"issues":[{"severity":"high|medium|low",'
+            '"area":"elevation|width|imagery|line|network|other",'
+            '"issue":"what is wrong in <=25 words",'
+            '"fix":"the concrete action in <=25 words"}],'
+            '"checked":["short phrases of what looks right"]}\n'
+            "Max 6 issues, most severe first. If it is healthy, say so and "
+            "leave issues empty. Never repeat a fact without judging it."
+        )
+        try:
+            answer, model, usage = _ai_chat(
+                [{"role": "system", "content": "You are a track-render engineer. "
+                                               "Answer with JSON only."},
+                 {"role": "user", "content": prompt}],
+                feature="track")
+            parsed = _json_from_model(answer)
+            ai_out = {"model": model, "usage": usage, "raw": (answer or "")[:4000]}
+            if parsed:
+                cleaned = []
+                for it in (parsed.get("issues") or [])[:8]:
+                    if not isinstance(it, dict):
+                        continue
+                    sev = str(it.get("severity") or "low").lower()
+                    cleaned.append({"severity": sev if sev in ("high", "medium", "low") else "low",
+                                    "area": str(it.get("area") or "other")[:20],
+                                    "issue": str(it.get("issue") or "")[:300],
+                                    "fix": str(it.get("fix") or "")[:300]})
+                ai_out.update({"verdict": str(parsed.get("verdict") or "")[:400],
+                               "confidence": parsed.get("confidence"),
+                               "issues": cleaned,
+                               "checked": [str(c)[:80] for c in (parsed.get("checked") or [])][:8]})
+            else:
+                ai_out["error"] = "the model did not return JSON"
+            review["ai"] = ai_out
+        except Exception as e:
+            review["ai"] = {"enabled": True, "error": str(e)[:300]}
+            log("ai review skipped: %s" % e)
+    try:
+        tp.save_review(path, review)
+    except Exception as e:
+        log("could not store the review: %s" % e)
+    log("review: %d deterministic issue(s), ai=%s" %
+        (len(issues), "issues" if review["ai"].get("issues") else review["ai"].get("error", "n/a")))
+    return review
 
 
 @app.get("/trackassets")
@@ -3600,11 +3725,27 @@ def session_track_prep(request: Request, user: str, filename: str,
             if lat is None:
                 raise ValueError("session has no GPS fixes")
             bbox = (lat - 0.06, lon - 0.08, lat + 0.06, lon + 0.08)
-            way = tp.osm_best(track, bbox)
-            if not way:
-                raise ValueError("no OSM raceway found near this session")
-            points, source, osm_id, osm_w = way["points"], f"osm:{way['id']}", \
-                way["id"], way.get("width_m")
+            # STITCH the circuit first: a real lap is many short OSM ways
+            # (Watkins Glen is 23), and picking the longest single way gave a
+            # 2.0 km fragment for Road Atlanta's 4.1 km circuit. osm_best is
+            # the last resort for a venue mapped as one unnamed fragment.
+            circ = None
+            try:
+                circ = tp.osm_circuit(bbox)
+            except Exception as e:
+                _prep_log(slug, "stitched circuit lookup failed: %s" % e)
+            if circ and len(circ.get("points") or []) >= 20:
+                points, source, osm_id, osm_w = circ["points"], \
+                    "osm-circuit:%dways" % len(circ.get("ways") or []), None, None
+                _prep_log(slug, "OSM circuit: %d ways stitched, %.0f m, %d gaps"
+                          % (len(circ.get("ways") or []), circ.get("len") or 0,
+                             circ.get("gaps") or 0))
+            else:
+                way = tp.osm_best(track, bbox)
+                if not way:
+                    raise ValueError("no OSM raceway found near this session")
+                points, source, osm_id, osm_w = way["points"], f"osm:{way['id']}", \
+                    way["id"], way.get("width_m")
         except Exception as e2:
             with _PREP_LOCK:
                 _PREP[slug].update(state="failed", error=str(e2)[:300])
@@ -3628,6 +3769,105 @@ async def session_track_prep_status(request: Request, user: str, filename: str) 
     if not st and await asyncio.to_thread(_track_asset_for, _track_key(p.name)):
         st = {"state": "done", "already": True}
     return JSONResponse({"ok": True, "slug": slug, "prep": st})
+
+
+# ---------------------------------------------------------------------------
+# Prepared-track QA: audit + AI review + an ADMIN re-render
+#
+# A baked track can be wrong in ways nobody notices until they are watching it
+# at 100 mph: the width measured off run-off, a line on the grass, a road that
+# bucks because the elevation was a raster read, no lidar at all. The audit is
+# deterministic (numbers compared with what a GOOD render needs); the AI only
+# interprets that sheet. Re-rendering is admin-only and re-bakes from the
+# asset's OWN centreline, so it fixes a track nobody has a session for.
+# ---------------------------------------------------------------------------
+def _gate_track_admin(request: Request) -> None:
+    """Admin gate for the 3D view's track QA buttons.
+
+    Deliberately the SAME rule the page uses to SHOW them (_req_is_admin): in
+    dev mode (OAuth off) the whole app is open, so a bench can re-render a
+    track; with OAuth on it takes an admin account. (require_admin() is
+    stricter - it refuses outright when OAuth is not configured - which is right
+    for the admin portal, not for a local bench.)"""
+    if not _req_is_admin(request):
+        raise HTTPException(status_code=403, detail="admin access required")
+
+
+@app.get("/trackassets/{slug}/prep")
+async def trackasset_prep(request: Request, slug: str) -> JSONResponse:
+    """Everything the 3D page's admin panel shows: render state, audit, AI review."""
+    require_web_user(request)
+    p = _track_asset_path(slug)
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="no prepared asset for this track")
+    with _PREP_LOCK:
+        st = dict(_PREP.get(slug) or {})
+    try:
+        asset = json.loads(p.read_text("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"unreadable asset: {e}")
+    audit = await asyncio.to_thread(_trackprep().audit_asset, asset)
+    return JSONResponse({"ok": True, "slug": slug, "prep": st,
+                         "audit": audit,
+                         "review": asset.get("render_review") or {},
+                         "ai_enabled": bool(AI_API_KEY)})
+
+
+@app.post("/trackassets/{slug}/review")
+def trackasset_review(request: Request, slug: str,
+                      ai: int = Query(1)) -> JSONResponse:
+    """Audit the asset and ask the AI to read the numbers (admin only).
+
+    A plain `def`: both the audit (numpy over the DEM) and the AI call block, so
+    they belong on the thread pool - never on the event loop (that is what froze
+    the whole server once, with track-prep).
+    """
+    _gate_track_admin(request)
+    if not _track_asset_path(slug).is_file():
+        raise HTTPException(status_code=404, detail="no prepared asset for this track")
+    try:
+        review = _track_render_review(slug, ai=bool(ai), log=lambda m: log.info("review %s", m))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"review failed: {e}")
+    return JSONResponse({"ok": True, "slug": slug, "review": review})
+
+
+@app.post("/trackassets/{slug}/rerender")
+def trackasset_rerender(request: Request, slug: str) -> JSONResponse:
+    """Re-bake a prepared track from its own centreline (admin only).
+
+    Runs the whole pipeline in the background - bake, then the enrichment
+    (OSM network, lidar terrain, facility imagery), then the audit + AI review
+    - and reports through /trackassets/{slug}/prep.
+    """
+    _gate_track_admin(request)
+    p = _track_asset_path(slug)
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="no prepared asset for this track")
+    try:
+        asset = json.loads(p.read_text("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"unreadable asset: {e}")
+    points = [[float(q[0]), float(q[1])] for q in (asset.get("line") or [])]
+    if len(points) < 20:
+        raise HTTPException(status_code=422,
+                            detail="this asset has no usable centreline to re-render from")
+    with _PREP_LOCK:
+        cur = (_PREP.get(slug) or {}).get("state")
+        if cur in ("queued", "running"):
+            return JSONResponse({"ok": True, "slug": slug, "state": cur, "already": True})
+        _PREP[slug] = {"state": "queued", "track": asset.get("track") or slug,
+                       "started": int(time.time()), "log": ["re-render requested"]}
+    threading.Thread(
+        target=_prep_run,
+        args=(slug, asset.get("track") or slug,
+              {"points": points, "source": "asset",
+               "osm_id": (asset.get("source") or {}).get("osm_id"),
+               "enrich": True, "review": True}),
+        daemon=True).start()
+    return JSONResponse({"ok": True, "slug": slug, "state": "queued"})
 
 
 # ---------------------------------------------------------------------------
@@ -3965,7 +4205,7 @@ load();
 # Bumps whenever the 3D drive view changes materially (documented at length in
 # the /caps docstring below). Kept as a constant because /caps and /version both
 # report it — two literals would drift.
-TRACK3D_V = 16
+TRACK3D_V = 17
 
 
 @app.get("/caps")
@@ -7212,6 +7452,7 @@ async def track3d(request: Request, user: str, filename: str) -> Response:
     p = _resolve_session(user, filename)
     return _TRACK3D_HTML.replace("__USER__", safe_name(user)) \
                         .replace("__FILE__", p.name) \
+                        .replace("__ADMIN__", "true" if _req_is_admin(request) else "false") \
                         .replace("__TRACK__", json.dumps(_display_track_name(p.name))
                                  .replace("<", "\\u003c"))
 
@@ -9672,6 +9913,27 @@ _TRACK3D_HTML = (
     border-radius:4px; padding:8px 10px; font:600 12px Inter,sans-serif; white-space:nowrap; }
   #bar a:hover { color:var(--text); }
   #bar .sep { width:1px; height:26px; background:var(--line); flex:0 0 auto; }
+  /* admin: track render QA + re-render (see the qa block below). Above the bar
+     on the right, under the legend; scrolls when it gets long. */
+  #qa { position:fixed; right:14px; bottom:64px; z-index:25; width:340px;
+    max-height:54vh; overflow:auto; display:none;
+    background:rgba(14,16,20,0.94); border:1px solid var(--line);
+    border-radius:8px; padding:10px 12px;
+    font:500 12px/1.45 Inter,sans-serif; color:var(--text); }
+  #qa h4 { margin:0 0 6px; font:700 11px Inter,sans-serif; letter-spacing:0.5px;
+    text-transform:uppercase; color:var(--muted); }
+  #qa .qbtn { background:#20242E; color:var(--text); border:1px solid var(--line);
+    border-radius:4px; padding:6px 9px; cursor:pointer; font:600 11px Inter,sans-serif;
+    margin:6px 6px 0 0; }
+  #qa .qbtn:disabled { opacity:0.45; cursor:default; }
+  #qa .qissue { margin:5px 0; padding-left:8px; border-left:3px solid #6B7280; }
+  #qa .qissue.high { border-color:#FF4D4D; }
+  #qa .qissue.medium { border-color:#FBC72E; }
+  #qa .qissue.low { border-color:#6B7280; }
+  #qa .qsev { color:var(--muted); font:600 10px ui-monospace, Menlo, monospace;
+    text-transform:uppercase; }
+  #qa .qlog { color:var(--muted); font:500 11px ui-monospace, Menlo, monospace;
+    white-space:pre-wrap; margin-top:6px; }
 </style></head><body>
 <canvas id="view"></canvas>
 <div id="notice">loading session…</div>
@@ -9701,6 +9963,14 @@ _TRACK3D_HTML = (
 </div>
 <canvas id="mini" width="200" height="200"></canvas>
 <div id="scalebar"><i></i><span id="scale-txt">—</span></div>
+<div id="qa">
+  <h4>track render QA · admin</h4>
+  <div id="qa-body">loading…</div>
+  <div id="qa-ai"></div>
+  <button class="qbtn" id="qa-rerender" title="re-bake this track from its own centreline: imagery width, lidar terrain, smoothed road profile, then the AI review">re-render track</button>
+  <button class="qbtn" id="qa-review" title="audit the render and ask the AI to read the numbers">AI review</button>
+  <div class="qlog" id="qa-log"></div>
+</div>
 <div id="bar">
   <button id="b-play">▶ drive</button>
   <input id="b-scrub" type="range" min="0" max="1000" value="0" step="1" style="flex:1 1 150px;min-width:100px">
@@ -9774,6 +10044,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // this never runs, the page shows a way out instead of a stuck "loading".
   window.__track3dReady = true;
   var USER = "__USER__", FILE = "__FILE__", MYTRACK = __TRACK__;
+  var ADMIN = __ADMIN__;
   var q = new URLSearchParams(location.search);
   var pts = (q.get("pts") || "").split("|").map(function (s) {
     return s.split(",").map(Number);
@@ -9835,6 +10106,39 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       s = 0; n = 0;
       for (j = a; j <= b; j++) { s += arr[j]; n++; }
       out[i] = s / n;
+    }
+    return out;
+  };
+
+  // Gaussian smoother in ARC LENGTH for one value per station - the ROAD's own
+  // vertical profile. A DEM read along a centreline has a slope break at every
+  // cell edge plus pixel noise; at chase-camera height that reads as the tarmac
+  // bucking up and down (measured: 55 % grade between two 2 m stations at
+  // Watkins Glen, on a track whose real grades are ~10 %). Smoothing over ~25 m
+  // OF TRACK - not over N samples - is what a road's vertical alignment is, and
+  // a closed lap WRAPS, so there is no step at the start/finish line.
+  RC3D.smoothProfile = function (a, stepM, sigmaM, closed) {
+    var n = a.length, i, k, j;
+    if (n < 3) return Array.prototype.slice.call(a);
+    var step = (stepM > 0.05) ? stepM : 2;
+    var sig  = Math.max(step, sigmaM || 24);
+    var rad  = Math.max(1, Math.round(3 * sig / step));
+    var w = new Float64Array(2 * rad + 1), sum = 0;
+    for (k = -rad; k <= rad; k++) {
+      var d = k * step;
+      w[k + rad] = Math.exp(-(d * d) / (2 * sig * sig));
+      sum += w[k + rad];
+    }
+    var out = new Array(n), acc;
+    for (i = 0; i < n; i++) {
+      acc = 0;
+      for (k = -rad; k <= rad; k++) {
+        j = i + k;
+        if (closed) j = ((j % n) + n) % n;
+        else j = (j < 0) ? 0 : (j >= n ? n - 1 : j);
+        acc += a[j] * w[k + rad];
+      }
+      out[i] = acc / sum;
     }
     return out;
   };
@@ -10757,6 +11061,44 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
            v10 * tr * (1 - tc) + v11 * tr * tc;
   };
 
+  // Separable Gaussian over a DEM grid, sigma in CELLS. The terrain the ground
+  // mesh is built from is a raster too: at 3 m spacing its bilinear read has a
+  // crease at every cell, which the shadowed ground shows as corrugation. A
+  // light blur (~2 cells = 6 m) removes the raster and keeps the hillside.
+  // The ROAD does not rely on this - it gets the much stronger along-track
+  // smoothProfile() above - so a blurred grid can never flatten a gradient.
+  RC3D.smoothGrid = function (g, sigmaCells) {
+    if (!g || !g.values) return g;
+    var cols = g.cols | 0, rows = g.rows | 0, sig = sigmaCells || 2;
+    var rad = Math.max(1, Math.round(3 * sig)), k = [], sum = 0, i, r, c;
+    for (i = -rad; i <= rad; i++) { k.push(Math.exp(-(i * i) / (2 * sig * sig))); sum += k[i + rad]; }
+    for (i = 0; i < k.length; i++) k[i] /= sum;
+    var src = g.values, tmp = new Float32Array(src.length), out = new Float32Array(src.length);
+    for (r = 0; r < rows; r++) {
+      for (c = 0; c < cols; c++) {
+        var acc = 0;
+        for (i = -rad; i <= rad; i++) {
+          var cc = c + i; if (cc < 0) cc = 0; else if (cc >= cols) cc = cols - 1;
+          acc += src[r * cols + cc] * k[i + rad];
+        }
+        tmp[r * cols + c] = acc;
+      }
+    }
+    for (c = 0; c < cols; c++) {
+      for (r = 0; r < rows; r++) {
+        var acc2 = 0;
+        for (i = -rad; i <= rad; i++) {
+          var rr = r + i; if (rr < 0) rr = 0; else if (rr >= rows) rr = rows - 1;
+          acc2 += tmp[rr * cols + c] * k[i + rad];
+        }
+        out[r * cols + c] = acc2;
+      }
+    }
+    var o = Object.assign({}, g, { values: out });
+    o.smooth_m = Math.round(sig * (Number(g.cell_m) || 0) * 10) / 10;
+    return o;
+  };
+
   // Re-seat the path on the prepared terrain. Road AND ground mesh then share
   // one reference, so the road can never float. The HUD still shows the alt_m
   // the car logged — a different measurement, and it stays honest.
@@ -11252,7 +11594,12 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     var drop = opt.drop == null ? 0.06 : opt.drop;
     var shoulder = opt.shoulder == null ? 3 : opt.shoulder;
     var blend = opt.blend == null ? 30 : opt.blend;
-    var reach = (opt.maxHalf || 15) + shoulder + blend;
+    // The blend distance GROWS with the height difference: a real cutting or
+    // embankment has a slope (~1 in 6), not a vertical wall. A fixed 30 m blend
+    // turned Road Atlanta's ~20 m cuts into green cliffs right beside the
+    // tarmac (the camera sits 1.15 m up, so they filled the screen).
+    var BLEND_MAX_DH = 6;
+    var reach = (opt.maxHalf || 15) + shoulder + Math.max(blend, 320);
     return function (x, z) {
       var t = terrain(x, z);
       if (field.approx(x, z) > reach + field.cell) return t;
@@ -11260,7 +11607,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       if (!q) return t;
       var ry = dense.y[q.i] - drop, edge = hw(q.i) + shoulder;
       if (q.d <= edge) return ry;
-      var u = (q.d - edge) / blend;
+      var bl = Math.max(blend, Math.abs(t - ry) * BLEND_MAX_DH);
+      var u = (q.d - edge) / bl;
       if (u >= 1) return t;
       u = u * u * (3 - 2 * u);
       return ry + (t - ry) * u;
@@ -12327,6 +12675,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   var CORNERS = [];                                       // detected corners
   var TRACK_SEED = "track";                               // stable per-track scatter
   var opts = { smooth: 5, eye: 1.15, road: 12, speedColour: true, markers: true,
+               // profileSigma: metres of along-track smoothing for the road's
+               // vertical profile (see RC3D.smoothProfile). 24 m keeps a real
+               // circuit's hills and removes the DEM's 3 m raster noise.
+               profileSigma: 24,
                ghost: false, ground: "sim", brakes: true, dressing: true, network: true };
 
   function tryRenderer() {
@@ -13787,7 +14139,12 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         .catch(function () { return null; });
     };
     return Promise.all([get("hr", asset.dem_hr), get("far", asset.dem_far)])
-      .then(function (g) { DEM_HR = g[0]; DEM_FAR = g[1]; });
+      .then(function (g) {
+        // the fine grid is blurred by ~2 cells (6 m): raster creases out, hills
+        // kept. The road's own profile is smoothed far harder, along the track.
+        DEM_HR = g[0] ? RC3D.smoothGrid(g[0], 2) : null;
+        DEM_FAR = g[1];
+      });
   }
 
   // per-station [left, right] half widths of a track path: the prepared
@@ -13980,7 +14337,23 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         if (ys[i] < YREF) YREF = ys[i];
       }
       for (i = 0; i < ys.length; i++) ys[i] -= YREF;
-      ys = RC3D.smooth(ys, 5);
+      // The road's VERTICAL ALIGNMENT: smooth in METRES along the track, not
+      // over N samples, and wrap a closed lap. This is the difference between
+      // a road and a DEM read (see RC3D.smoothProfile): ~25 m is right for a
+      // real circuit - it keeps every hill while removing the raster's noise.
+      var stepM = 2;
+      if (line.x.length > 1) {
+        var totM = 0;
+        for (i = 1; i < line.x.length; i++) {
+          totM += Math.sqrt((line.x[i] - line.x[i - 1]) * (line.x[i] - line.x[i - 1]) +
+                            (line.z[i] - line.z[i - 1]) * (line.z[i] - line.z[i - 1]));
+        }
+        stepM = totM / Math.max(1, line.x.length - 1);
+      }
+      ys = RC3D.smoothProfile(ys, stepM, opts.profileSigma || 24, closed);
+      YREF = Infinity;
+      for (i = 0; i < ys.length; i++) if (ys[i] < YREF) YREF = ys[i];
+      for (i = 0; i < ys.length; i++) ys[i] -= YREF;
     } else {
       // the logged altitude, carried over from the nearest driven station
       var pidx = RC3D.lineIndex(P0.dense.x, P0.dense.z, 40);
@@ -15749,6 +16122,130 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     return null;
   }
 
+  // ---- admin: track render QA, re-render, AI review ----------------------
+  // A baked track can be wrong in ways only a driver at 100 mph notices: width
+  // measured off run-off, a line on the grass, a road that bucks because the
+  // elevation was a raster read. The server's audit is DETERMINISTIC (numbers
+  // compared with what a good render needs); the AI only interprets that sheet.
+  // Admin-only: the panel never renders for anyone else.
+  var QA = { slug: null, poll: null, loaded: false };
+  function qaEsc(v) {
+    var m = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
+    return String(v == null ? "" : v).replace(/[&<>"]/g, function (c) { return m[c]; });
+  }
+  function qaIssues(list) {
+    var h = "";
+    (list || []).forEach(function (it) {
+      h += "<div class='qissue " + qaEsc(it.severity) + "'>" +
+           "<span class='qsev'>" + qaEsc(it.severity) + " · " + qaEsc(it.area) +
+           "</span><br>" + qaEsc(it.issue) +
+           (it.fix ? "<br><span style='color:#9CA3AF'>" + qaEsc(it.fix) + "</span>" : "") +
+           "</div>";
+    });
+    return h;
+  }
+  function qaRender(d) {
+    if (!ADMIN || !QA.slug || !el("qa")) return;
+    el("qa").style.display = "block";
+    var a = (d && d.audit) || null, r = (d && d.review) || {}, ai = r.ai || {};
+    var h = "";
+    if (a) {
+      var ev = a.elevation || {}, w = a.width || {};
+      h += "<div>" + qaEsc(a.track || QA.slug) +
+           (a.length_m ? " · " + (a.length_m / 1000).toFixed(2) + " km" : "") +
+           " · " + (w.median_m != null ? w.median_m + " m wide (" + qaEsc(w.source || "?") + ")"
+                                     : "width ?") + "</div>";
+      h += "<div style='color:#9CA3AF'>grade p95 " + Math.round(100 * (ev.grade_p95 || 0)) +
+           "% · max " + Math.round(100 * (ev.grade_max || 0)) + "% · relief " +
+           (ev.relief_m != null ? ev.relief_m + " m" : "?") + " · " +
+           qaEsc(ev.source || "no dem") + "</div>";
+    }
+    var det = (a && a.issues) || [];
+    h += det.length ? qaIssues(det)
+                    : "<div style='margin-top:6px;color:#5CE07F'>no deterministic problems found</div>";
+    el("qa-body").innerHTML = h;
+    var ah = "";
+    if (ai && (ai.verdict || ai.error || (ai.issues && ai.issues.length))) {
+      ah += "<div style='margin-top:8px;border-top:1px solid var(--line);padding-top:6px'>" +
+            "<span class='qsev'>ai" + (ai.model ? " · " + qaEsc(ai.model) : "") + "</span>";
+      if (ai.verdict) ah += "<div>" + qaEsc(ai.verdict) + "</div>";
+      if (ai.error) ah += "<div style='color:#FBC72E'>" + qaEsc(ai.error) + "</div>";
+      ah += qaIssues(ai.issues) + "</div>";
+    } else if (d && d.ai_enabled === false) {
+      ah = "<div style='margin-top:8px;color:#9CA3AF'>AI review is off (RACECAR_AI_API_KEY not set)</div>";
+    }
+    el("qa-ai").innerHTML = ah;
+  }
+  function qaLog(d) {
+    var st = (d.prep && d.prep.state) || "";
+    var lg = (d.prep && d.prep.log) || [];
+    if (!st || st === "done") { el("qa-log").textContent = ""; return; }
+    el("qa-log").textContent = "re-render: " + st + " " + (lg.length ? lg[lg.length - 1] : "");
+  }
+  function qaLoad() {
+    if (!ADMIN || !QA.slug) return;
+    fetch("/trackassets/" + encodeURIComponent(QA.slug) + "/prep")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) return;
+        QA.loaded = true;
+        qaRender(d);
+        var st = (d.prep && d.prep.state) || "";
+        if (st === "queued" || st === "running") { qaLog(d); qaPoll(); }
+      })
+      .catch(function () {});
+  }
+  function qaPoll() {
+    if (QA.poll) return;
+    QA.poll = setInterval(function () {
+      fetch("/trackassets/" + encodeURIComponent(QA.slug) + "/prep")
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d) return;
+          qaLog(d);
+          var st = (d.prep && d.prep.state) || "";
+          if (st && st !== "queued" && st !== "running") {
+            clearInterval(QA.poll); QA.poll = null;
+            if (st === "done") location.reload();
+          }
+        })
+        .catch(function () {});
+    }, 2000);
+  }
+  function qaSeedAsset(asset) {
+    if (!ADMIN || !asset || !asset.slug || QA.slug === asset.slug) return;
+    QA.slug = asset.slug;
+    qaLoad();
+  }
+  function qaInit() {
+    if (!ADMIN || !el("qa")) return;
+    el("qa-rerender").addEventListener("click", function () {
+      if (!QA.slug) return;
+      el("qa-rerender").disabled = true;
+      el("qa-log").textContent = "re-render requested…";
+      fetch("/trackassets/" + encodeURIComponent(QA.slug) + "/rerender", { method: "POST" })
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (x) {
+          if (!x.ok) throw new Error((x.d && x.d.detail) || "request failed");
+          qaPoll();
+        })
+        .catch(function (e) {
+          el("qa-log").textContent = String((e && e.message) || e);
+          el("qa-rerender").disabled = false;
+        });
+    });
+    el("qa-review").addEventListener("click", function () {
+      if (!QA.slug) return;
+      el("qa-review").disabled = true;
+      el("qa-log").textContent = "auditing + asking the AI…";
+      fetch("/trackassets/" + encodeURIComponent(QA.slug) + "/review", { method: "POST" })
+        .then(function (r) { return r.json(); })
+        .then(function () { el("qa-log").textContent = ""; qaLoad(); })
+        .catch(function (e) { el("qa-log").textContent = String((e && e.message) || e); })
+        .then(function () { el("qa-review").disabled = false; });
+    });
+  }
+
   function applyAsset(asset) {
     var problem = asset ? assetProblem(asset) : null;
     if (problem) {
@@ -15766,6 +16263,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     }
     RAW_ASSET = asset;
     ASSET = asset;
+    qaSeedAsset(asset);
     if (!asset || !PATH) return;
     // The session's track as the DASH names it (injected) — "Summit Point Main"
     // — not the prepared asset's facility name ("Summit Point"). The asset is
@@ -15938,6 +16436,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
 
   function start() {
     if (!tryRenderer()) return;
+    qaInit();
     buildScene();
     // supersample by default: 1.5x on a standard display, 2x on a hi-dpi one.
     // The scene is a few thousand triangles, so this is cheap and it is the

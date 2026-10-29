@@ -29,7 +29,7 @@
 // a new build (eventually automated by scripts/release.sh + GitHub Action).
 // Settings page displays it; "Check for updates" compares to manifest.json
 // from https://raw.githubusercontent.com/teknoprep/racecar-35/main/firmware/.
-#define FIRMWARE_VERSION "0.1.177"
+#define FIRMWARE_VERSION "0.1.178"
 
 #include <Preferences.h>
 #include <time.h>
@@ -74,6 +74,7 @@ enum SettingId : uint8_t {
     // either fires the same colour.
     ST_SENSOR_TYPE,   // legacy GLOBAL source - now hidden; per-item Source is the control
     ST_BT_PAIR,       // ACTION: Bluetooth OBD-II pairing/status page (was ST_SENSOR_TYPE's page)
+    ST_BT_PIN,        // 4-digit BLE pairing PIN (NVS btpin, default "0000") — v0.1.178
     ST_AEM_AFR, ST_AEM_STATUS,  // independent AEM 30-0300 analog input (opt-in)
     ST_SHOW_AFR, ST_AFR_WARN_LO, ST_AFR_WARN_HI, ST_AFR_WARN_COL,
     ST_REC_SD, ST_REC_CLOUD,
@@ -865,6 +866,9 @@ struct Settings {
     uint8_t  bt_atype           = 0;       // BLE address type (public/random)
     char     bt_name[24]        = {0};     // friendly name for the UI
     uint8_t  bt_pid_clt         = 0x05;    // Mode-01 PID mapped to COOLANT (default 05 = std ECT)
+    // 4-digit BLE pairing PIN (passkey). A passkey is a NUMBER, so "0000" is 0;
+    // the Settings row renders it zero-padded (v0.1.178).
+    uint16_t bt_pin             = 0;
 
     // GPS UART baud (Teensy<->u-blox). Default 38400 = the KNOWN-GOOD rate the
     // module ships at (do not auto-raise at boot). Higher rates are an explicit,
@@ -1845,8 +1849,10 @@ static void loadSettings() {
     prefs.getString      ("bt_addr",  s.bt_addr, sizeof(s.bt_addr));
     s.bt_atype           = prefs.getUChar ("bt_atype", s.bt_atype);
     s.bt_pid_clt         = prefs.getUChar ("btpid",    s.bt_pid_clt);
+    s.bt_pin             = prefs.getUShort("btpin",    s.bt_pin);
     if (!s.bt_pid_clt) s.bt_pid_clt = 0x05;
     obd::setCoolantPid(s.bt_pid_clt);
+    obd::setPin(s.bt_pin);
     prefs.getString      ("bt_name",  s.bt_name, sizeof(s.bt_name));
     s.rpm_ppr_x10        = prefs.getUShort("rpmppr",   s.rpm_ppr_x10);
     s.gps_baud           = prefs.getULong ("gpsbaud",  s.gps_baud);
@@ -1960,6 +1966,7 @@ static void saveSettings() {
     prefs.putString("bt_addr",  s.bt_addr);
     prefs.putUChar ("bt_atype", s.bt_atype);
     prefs.putUChar ("btpid",    s.bt_pid_clt);
+    prefs.putUShort("btpin",    s.bt_pin);
     prefs.putString("bt_name",  s.bt_name);
     prefs.putUShort("rpmppr",   s.rpm_ppr_x10);
     prefs.putULong ("gpsbaud",  s.gps_baud);
@@ -6972,6 +6979,7 @@ static const SettingRow ROWS[ST_COUNT] = {
     { ST_VOLT_WARN_COL,"Voltage warn color",       SettingRow::COLOR   },
     { ST_SENSOR_TYPE,  "Sensor data source",    SettingRow::ENUM    },  // hidden (v0.1.170)
     { ST_BT_PAIR,      "Bluetooth OBD-II",      SettingRow::ACTION  },
+    { ST_BT_PIN,       "Bluetooth PIN",         SettingRow::TEXT    },
     { ST_AEM_AFR,      "AEM 30-0300 AFR input", SettingRow::TOGGLE  },
     { ST_AEM_STATUS,   "AEM voltage / lambda", SettingRow::INFO    },
     { ST_SHOW_AFR,     "Show AFR",              SettingRow::TOGGLE  },
@@ -7043,6 +7051,10 @@ static NumBounds numBounds(SettingId id) {
         case ST_AUTO_START_SEC: return { 1,  30, 1 };  // seconds it must be HELD
         case ST_AUTO_STOP_SEC:  return { 5, 600, 5 };  // seconds at 0 speed before stopping
         case ST_LAP_OVERLAY:    return { 0,   9, 1 };  // lap popup seconds (0 = off)
+        // BLE pairing passkey, typed as 4 digits. Stored as a NUMBER because a
+        // BLE passkey IS a number: "0000" and "0" are the same key, so the
+        // leading zeros need no special storage (the row renders %04u).
+        case ST_BT_PIN:         return { 0, 9999, 1 };
         default:         return {    0,     0,   0 };
     }
 }
@@ -7065,6 +7077,7 @@ static uint16_t getNum(SettingId id) {
         case ST_AUTO_START_SEC: return s.auto_start_sec;
         case ST_AUTO_STOP_SEC:  return s.auto_stop_sec;
         case ST_LAP_OVERLAY:    return s.lap_overlay_s;
+        case ST_BT_PIN:         return (uint16_t)s.bt_pin;
         default:         return 0;
     }
 }
@@ -7086,6 +7099,8 @@ static void setNum(SettingId id, uint16_t v) {
         case ST_AUTO_START_SEC: s.auto_start_sec = (uint16_t)(v < 1 ? 1 : (v > 30 ? 30 : v)); break;
         case ST_AUTO_STOP_SEC:  s.auto_stop_sec  = (uint16_t)(v < 5 ? 5 : (v > 600 ? 600 : v)); break;
         case ST_LAP_OVERLAY:    s.lap_overlay_s  = (uint8_t)(v > 9 ? 9 : v); break;
+        case ST_BT_PIN:         s.bt_pin = (uint16_t)(v > 9999 ? 9999 : v);
+                                obd::setPin(s.bt_pin); break;
         default: break;
     }
 }
@@ -7940,8 +7955,9 @@ static void drawSensorPage() {
     {
         char buf[128];
         tft.setTextColor(TFT_WHITE, BG);
-        snprintf(buf, sizeof(buf), "Device: %s",
-                 s.bt_name[0] ? s.bt_name : (s.bt_addr[0] ? s.bt_addr : "(none selected)"));
+        snprintf(buf, sizeof(buf), "Device: %s   PIN %04u",
+                 s.bt_name[0] ? s.bt_name : (s.bt_addr[0] ? s.bt_addr : "(none selected)"),
+                 (unsigned)(s.bt_pin % 10000u));
         tft.drawString(buf, 30, by);
 
         const bool conn = obd::connected();
@@ -8408,6 +8424,7 @@ static int rowGroup(SettingId id) {
         case ST_AM_RPM: case ST_AM_COL: case ST_AM_HZ: return SG_RPM;
         case ST_SENSOR_TYPE:
         case ST_BT_PAIR:
+        case ST_BT_PIN:
         case ST_SHOW_TEMP: case ST_TEMP_WARN_F: case ST_TEMP_WARN_COL:
         case ST_SHOW_PSI:  case ST_PSI_WARN_PSI: case ST_PSI_WARN_COL:
         case ST_AEM_AFR: case ST_AEM_STATUS:
@@ -8693,6 +8710,7 @@ static void drawSettingsPage() {
             tft.fillRect(TEXT_X, y, TEXT_W, SETTINGS_ROW_HEIGHT, TFT_BLACK);
             tft.drawRect(TEXT_X, y, TEXT_W, SETTINGS_ROW_HEIGHT, TFT_DARKGREY);
             char portBuf[8];
+            char pinBuf[8];
             char passMask[24];
             const char* shown = "?";
             if (r.id == ST_CL_HOST) {
@@ -8715,6 +8733,10 @@ static void drawSettingsPage() {
                 }
             } else if (r.id == ST_WIFI_SSID) {
                 shown = (s.wifi_ssid[0] == '\0') ? "<tap to set>" : s.wifi_ssid;
+            } else if (r.id == ST_BT_PIN) {
+                // Zero-padded so the default reads "0000", not "0".
+                snprintf(pinBuf, sizeof(pinBuf), "%04u", (unsigned)(s.bt_pin % 10000u));
+                shown = pinBuf;
             } else if (r.id == ST_WIFI_PASS) {
                 if (s.wifi_pass[0] == '\0') {
                     shown = "<tap to set>";
@@ -8919,6 +8941,7 @@ static void handleSettingsTap(int x, int y) {
             constexpr int TEXT_X = 410, TEXT_W = 360;
             if (inRect(x, y, TEXT_X, ry, TEXT_W, SETTINGS_ROW_HEIGHT)) {
                 if (r.id == ST_CL_PORT)              openNumericKeyboard(r.id);
+                else if (r.id == ST_BT_PIN)          openNumericKeyboard(r.id);
                 else if (r.id == ST_WIFI_SSID)       openWifiScanner();
                 else if (r.id == ST_WIFI_PASS)       openTextKeyboard(r.id);
                 else if (r.id == ST_CL_HOST    ||
@@ -9228,6 +9251,7 @@ static const char* kbTitleFor(SettingId id) {
         case ST_CL_AUTH_PASS: return "Edit API key (sent as X-API-Key)";
         case ST_WIFI_SSID:    return "Edit WiFi network name";
         case ST_WIFI_PASS:    return "Edit WiFi password";
+        case ST_BT_PIN:       return "Bluetooth pairing PIN (4 digits)";
         default:              return "Edit value";
     }
 }

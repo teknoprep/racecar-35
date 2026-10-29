@@ -786,6 +786,62 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
+### 3D view v17 — the road is a PROFILE, the terrain is cross-checked, admins can re-render (`track3d_v` 17, `ENRICH_VERSION` 4)
+The complaint: **Road Atlanta looks like shit, and the track bucks up and down.** Two separate
+causes, both measured before anything was changed:
+- **The road was a raster read.** `ys[i] = DEM(x,z)` at every station, smoothed over 5 samples.
+  On the real USGS 3DEP grid that is 55 % grade between two 2 m stations at Watkins Glen (a
+  circuit's real grades are ~10 %). The car and camera ride that line, so it is visible as the
+  tarmac bucking. Now `trackprep.road_profile()` (PROFILE_V 2) makes a ROAD's vertical alignment:
+  samples the DEM at the station and ±2 m either side and takes the median (a lone tree/bridge
+  pixel cannot move the road), rejects samples > 1.25 m off the local median, applies a Gaussian
+  in **ARC LENGTH** (25 m, sigma not a sample count) that **WRAPS on a closed lap**, then clamps
+  any surviving grade at 22 % (a guard, not the fix). Stored as `asset.line[][2]` + `asset.elevation`
+  {relief_m, grade_p95, grade_max, roughness_m, source, cell_m, sigma_m, rejected}. Enrichment step
+  (d) redoes it from the 3 m lidar grid; `ENRICH_VERSION` 4 makes every older asset redo it, and
+  `_enrich_missing()` requires `elevation.v == PROFILE_V`. The shipped seeds were rebuilt.
+- **3DEP fills a void with a plausible CONSTANT.** Road Atlanta's skidpad area came back as
+  **257.4 m for ~5,900 cells** while the hillside around it is 290 m (AWS terrarium says 272 m).
+  `_clean_dem()` used to fill NoData with the GLOBAL MEDIAN, and this plateau is not even NoData.
+  The road dived 33 m into it and the ground beside it stood up as vertical green walls. Now
+  `_dem3dep()` cross-checks the 3DEP grid against AWS terrarium z15: NoData cells are filled from
+  terrarium, and a large exact-constant region (`DEM_FLAT_MIN_SHARE` 1 %) that terrarium disagrees
+  with by >10 m is replaced with terrarium. `_clean_dem()` fills remaining holes from their
+  NEIGHBOURS (`_fill_from_neighbours`, normalized 3x3 growth), never one flat median.
+  The written grid metadata carries **`DEM_V`** (1): an older grid counts as MISSING in
+  `_enrich_missing()`/`need()`, so every existing asset re-fetches its terrain once in the
+  background and heals itself (no file deletion needed). A re-render rebuilds it anyway:
+  `build_asset()` writes a fresh JSON without `dem_hr`/`dem_far`/`network`/`ground`/`features`.
+- **Viewer:** the fine DEM grid is blurred 2 cells (`RC3D.smoothGrid`, ~6 m: raster creases out,
+  hills kept) and the track's vertical profile is smoothed again in metres along the lap
+  (`RC3D.smoothProfile`, 24 m, wraps), with `YREF` recomputed after smoothing. The ground
+  blend distance now GROWS with the height difference (1 in 6, `groundField`): a 20 m cutting
+  eases over ~120 m instead of forming a wall 10 m off the tarmac. Numbers: Watkins Glen
+  grade max 55 % → 18 %, p95 15 % → 9 %; Road Atlanta relief 58 → 44 m after the DEM fix.
+- **Admin re-render + AI review (the QA panel).** `/track3d` shows a bottom-right **track render
+  QA** panel to admins only (`__ADMIN__` injected with `_req_is_admin`), listing the audit's
+  issues and two buttons: **re-render track** (`POST /trackassets/<slug>/rerender`, background:
+  bake from the asset's OWN centreline → `enrich_asset()` → audit → AI review, polled through
+  `GET /trackassets/<slug>/prep`) and **AI review** (`POST /trackassets/<slug>/review`).
+  `trackprep.audit_asset()` is DETERMINISTIC — width (median/p10/p90, source, clamp, confidence,
+  OSM agreement), imagery (texture/ground px + m/px, validator, landcover line_paved), elevation
+  (relief, grades, roughness, source, cell), DEM, network, features, enrichment version — and every
+  miss becomes an issue with an actionable `fix`. The AI (`RACECAR_AI_TRACK_MODEL`, default = the
+  analysis/Haiku model, feature `"track"`) may ONLY interpret that sheet: it gets the facts as JSON
+  and must return `{verdict, confidence, issues[{severity,area,issue,fix}], checked}`; a failed or
+  non-JSON answer is stored as an error, never fails the render. Stored on the asset as
+  `render_review` via `trackprep.save_review()` (slug-locked read-modify-write). `_gate_track_admin()`
+  is the route gate — the SAME `_req_is_admin` rule the page uses to show the buttons, so a dev
+  bench (OAuth off) can re-render too.
+- **OSM-only preps stitch the circuit.** When a session has no usable line the fallback now calls
+  `osm_circuit()` (many ways → one ring) before `osm_best()` (longest single way): Road Atlanta
+  was being baked as a 2.0 km fragment instead of its 4.09 km circuit.
+- Tests: `tests/test_trackprep.py::RoadProfileTests` (a synthetic hill + per-node raster noise:
+  grade 40 %+ → under 12 %, the hill kept, the closed lap has no seam step; audit flags a 55 %
+  "grade", a clamped width, a rejected imagery and an old enrichment; save_review round-trip),
+  `tests/test_track3d.py` 10b (`smoothProfile` + `smoothGrid`), `tests/test_track_review.py`
+  (AI JSON parsing, the same gate on both endpoints, the panel markup + `__ADMIN__` injection).
+
 ### 3D view v14 — the compare GHOST, and a wide comparison search (`track3d_v` 14)
 The user: when a lap or session is picked for comparison on the review page, the 3D view should show where
 that driver is.
@@ -1317,7 +1373,9 @@ exit speed, brake zones, best line, consistency). Server side (`server/app/main.
 - **Model selection (2026-10-09): both AI surfaces default to Haiku 5.5**, each with its own
   env knob — `RACECAR_AI_ANALYSIS_MODEL` (corner analysis + ideal-line + the dropdown default)
   and `RACECAR_AI_COACH_MODEL` (the checklist) — plus `RACECAR_AI_HAIKU_MODEL` for the built-in
-  id. **`RACECAR_AI_MODEL` no longer selects either** (it only seeds `RACECAR_AI_MODELS`, so a
+  id. A third knob, **`RACECAR_AI_TRACK_MODEL`** (feature `"track"`), drives the prepared-track
+  AI review on the 3D view and defaults to the analysis model — one occasional diagnostic, so
+  Haiku is the right default there too. **`RACECAR_AI_MODEL` no longer selects either** (it only seeds `RACECAR_AI_MODELS`, so a
   stale Sonnet pin in a deployed `.env` cannot silently override the switch).
   The configured id is matched against the gateway's LIVE catalogue (`_ai_catalogue_ids`, cached
   10 min): Open WebUI aggregates providers, so the same model is
@@ -1899,6 +1957,7 @@ Namespace `"dash"`. Keys are short to fit NVS limits. Saved on every dash entry 
 | `s_volt` / `v_warn` / `v_col` | bool/uint16/uint8 | **Voltage show / low-warn (V×10, default 128=12.8 V) / warn-colour (v0.1.110).** Source: BT ATRV (srctyp==2) or MS3 CAN bat (==1). Display AND warning are gated on `eng.rpm >= ENGINE_RUNNING_RPM` (500) — parked ignition-on reads ~12.4 V, which is normal, not a dying alternator. The VOLT line shares the AFR dash row (renders only when the AFR line doesn't). |
 | `srctyp` | uint8 | **Legacy global sensor source: 0=Direct, 1=MegaSquirt, 2=Bluetooth.** **Hidden from the Settings menu since v0.1.170** (each monitor item carries its own Source). Still loaded/saved and sent to the Teensy (`CFG,srctyp`) as the *acquisition/logging* choice and the `monDefaults()` seed. Never repurpose. |
 | `bt_addr` / `bt_atype` / `bt_name` | string/uint8/string | **Paired BLE OBD-II (ELM327) dongle**: address `"aa:bb:.."`, BLE address type, friendly name. Used when `srctyp==2` to auto-reconnect on boot. Set from PAGE_BT_SCAN. |
+| `btpin` | uint16 | **BLE pairing PIN** (v0.1.178, default 0 = `0000`). A BLE passkey is a NUMBER, so `0000` and `0` are the same key — the Settings row (`Bluetooth PIN`, 0–9999, numeric keypad) renders it zero-padded `%04u`. Sent to `obd::setPin()` on load and on every edit; NimBLE legacy pairing (bonding + MITM, Secure Connections OFF — the ELM327 clones don't implement SC) uses it when a dongle asks for a passkey. The PAGE_SENSOR header shows the current PIN (`Device: <name>   PIN 0000`) so it can be read while pairing. |
 | `btpid` | uint8 | **Mode-01 PID mapped to the COOLANT function** (default 0x05 = standard ECT). Set from PAGE_PID_SCAN (Sensor page → COOLANT PID button); decoded as A−40 °C. |
 | `rpmppr` | uint16 | **Tach pulses/rev ×10** (Direct-mode RPM divider). 20=2.0. Sent to Teensy as `CFG,rpmppr,<x10>`; Teensy divides the opto-tach frequency by `rpmppr/10`. Ignored in MegaSquirt mode (RPM is straight from CAN). |
 | `rpmspk` | uint8 | **RPM spike filter** 0=Off 1=Mild 2=Normal 3=Strong (default 2). Sent as `CFG,rpmspk,<v>`; Teensy slew-gates tach pulses (see "RPM spike filter" note above). |
@@ -2260,6 +2319,17 @@ work — only COOLANT is mappable today. ⚠️ Car-side
 prerequisite: something must ANSWER OBD2 on the port — an MS3Pro needs
 "OBD-II over CAN (ISO 15765)" enabled in TunerStudio; a 90–95 NA Miata has no
 OBD2 at all.
+
+**Bluetooth pairing PIN (v0.1.178).** Some BLE ELM327 dongles refuse every command until the
+link is paired and ask for the classic 4-digit PIN (0000 / 1234 / 1111). Settings →
+**Bluetooth PIN** (NVS `btpin`, 0–9999, numeric keypad, rendered `%04u`, default `0000`) is
+handed to `obd::setPin()` on load and on every edit. The NimBLE client is configured
+**bonding + MITM, Secure Connections OFF** (the clone firmware does not implement SC) and
+answers `BLE_SM_IOACT_INPUT` from `ClientCB::onPassKeyRequest()` with that number; if the first
+`ATZ` fails the task starts security once (bounded 3 s, abortable), re-subscribes and retries —
+so a dongle that gates GATT access behind encryption recovers instead of timing out forever.
+A failed pairing lands in `obd::lastErr()` ("pairing failed (PIN 1234)"), which PAGE_SENSOR shows.
+**A BLE passkey is a number**, so leading zeros need no special storage: `0000` = 0.
 
 **⚠️ WiFi + BLE may NEVER run at the same time (v0.1.101).** On this core
 (arduino-esp32 2.0.14 / IDF 4.4, ESP32-S3) enabling the BT controller with

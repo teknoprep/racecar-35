@@ -306,8 +306,15 @@ def dem_grid(bbox, cols: int, rows: int, cache_dir: pathlib.Path, z: int = 14,
 DEM3DEP = ("https://elevation.nationalmap.gov/arcgis/rest/services/"
            "3DEPElevation/ImageServer/exportImage?")
 DEM_MAX_TILE_PX = 2000
+# Bump when the FILLING of such cells changes: a grid written by an older
+# version is treated as missing and re-fetched (this is how the Road Atlanta
+# "257.4 m for 5,900 cells" plateau heals without anyone deleting files).
+DEM_V = 1
 DEM_BAD_MAX_FRAC = 0.02           # more invalid cells than this = the source failed
 DEM_MIN_OK_M, DEM_MAX_OK_M = -500.0, 9000.0
+# a CONSTANT region this large is a filled void, not terrain (see _dem3dep)
+DEM_FLAT_MIN_SHARE = 0.01
+DEM_FLAT_DISAGREE_M = 10.0
 
 
 def _grid_dims(bbox, max_cells: int, min_cell_m: float):
@@ -322,17 +329,53 @@ def _grid_dims(bbox, max_cells: int, min_cell_m: float):
     return cols, rows, math.sqrt((w_m / (cols - 1)) * (h_m / (rows - 1)))
 
 
+def _fill_from_neighbours(v, bad):
+    """Grow the valid neighbourhood into the invalid cells (normalized 3x3 blur).
+
+    A global median fill (what this used to do) turned every void into ONE FLAT
+    PLATEAU at the grid's median elevation. Road Atlanta's Turn 10 skirts a lake,
+    which 3DEP returns as NoData: the plateau sat 33 m BELOW the surrounding
+    hillside, so the road dived into a trench and the ground beside it stood up
+    as vertical walls. A void must take the elevation of what SURROUNDS it.
+    """
+    v = np.asarray(v, dtype=np.float64).copy()
+    bad = np.asarray(bad, dtype=bool).copy()
+    if not bad.any():
+        return v.astype(np.float32)
+    good = (~bad).astype(np.float64)
+    v[bad] = 0.0
+    for _ in range(200):
+        if not bad.any():
+            break
+        vp = np.pad(v, 1, mode="edge")
+        gp = np.pad(good, 1, mode="edge")
+        num = np.zeros_like(v)
+        den = np.zeros_like(v)
+        for dy in (0, 1, 2):
+            for dx in (0, 1, 2):
+                num += vp[dy:dy + v.shape[0], dx:dx + v.shape[1]]
+                den += gp[dy:dy + v.shape[0], dx:dx + v.shape[1]]
+        grow = bad & (den > 0)
+        if not grow.any():
+            break
+        v[grow] = num[grow] / den[grow]
+        good[grow] = 1.0
+        bad[grow] = False
+    if bad.any():                     # a void bigger than the whole grid
+        v[bad] = float(np.median(v[~bad])) if (~bad).any() else float(np.median(v))
+    return v.astype(np.float32)
+
+
 def _clean_dem(v, what: str):
-    """Fill the few invalid cells (NaN, nodata ~ -3.4e38, absurd values) with the
-    median; refuse the whole grid when more than DEM_BAD_MAX_FRAC are bad."""
+    """Fill invalid cells (NaN, nodata ~ -3.4e38, absurd values) from their
+    neighbours; refuse the whole grid when more than DEM_BAD_MAX_FRAC are bad."""
     v = np.asarray(v, dtype=np.float32)
     bad = ~np.isfinite(v) | (v < DEM_MIN_OK_M) | (v > DEM_MAX_OK_M)
     frac = float(bad.mean()) if v.size else 1.0
     if frac >= DEM_BAD_MAX_FRAC or bad.all():
         raise RuntimeError("%s: %.1f%% of the cells are invalid" % (what, 100 * frac))
     if bad.any():
-        v = v.copy()
-        v[bad] = float(np.median(v[~bad]))
+        v = _fill_from_neighbours(v, bad)
     return v
 
 
@@ -390,6 +433,46 @@ def _dem3dep(bbox, cols: int, rows: int, cache_dir: pathlib.Path, log=print,
             if fresh:
                 _cache_put(cpath, blob)
             out[r0:r1, c0:c1] = arr[::-1]          # TIFF row 0 is NORTH
+    # 3DEP returns WATER and unsurveyed ground as NoData. Fill those from AWS
+    # terrarium (a real, continuous surface) rather than inventing an elevation:
+    # a lake becomes the lake shore's level, not a flat plateau 33 m below it.
+    bad = ~np.isfinite(out) | (out < DEM_MIN_OK_M) | (out > DEM_MAX_OK_M)
+    frac = float(bad.mean())
+    t = None
+    # AWS terrarium has no voids: it is the reference for anything strange.
+    try:
+        t = _terrarium_grid(tuple(bbox), cols, rows, 15, cache_dir, log=log)
+    except Exception as e:
+        log(f"[dem3dep] terrarium cross-check unavailable: {type(e).__name__}: {e}")
+    if bad.any() and frac < DEM_BAD_MAX_FRAC and t is not None:
+        use = bad & np.isfinite(t)
+        if use.any():
+            out = np.where(use, t, out)
+            log(f"[dem3dep] {100 * frac:.1f}% of the grid was NoData "
+                f"(water/void); {int(use.sum())} cells filled from AWS terrarium z15")
+    # A 3DEP void can also come back as a PLAUSIBLE CONSTANT instead of NoData:
+    # Road Atlanta's skidpad area is 257.4 m for ~6,000 cells while the hillside
+    # around it is 290 m. That is not terrain - it is a filled hole, and a road
+    # driven through it dives into a trench with vertical green walls beside it.
+    # A large exact-constant region that terrarium disagrees with IS the artifact.
+    if t is not None:
+        try:
+            q = np.round(out * 2.0) / 2.0
+            vals, counts = np.unique(q, return_counts=True)
+            for k in np.argsort(counts)[::-1][:8]:
+                share = float(counts[k]) / out.size
+                if share < DEM_FLAT_MIN_SHARE:
+                    break
+                mode = float(vals[k])
+                flat = np.abs(out - mode) < 0.2
+                theirs = float(np.median(t[flat]))
+                if abs(theirs - mode) > DEM_FLAT_DISAGREE_M:
+                    out = np.where(flat, t, out)
+                    log(f"[dem3dep] {100 * share:.1f}% of the grid was a constant "
+                        f"{mode:.1f} m while terrarium says {theirs:.1f} m there "
+                        f"-> fill artefact; replaced with terrarium")
+        except Exception as e:
+            log(f"[dem3dep] flat-region check failed: {type(e).__name__}: {e}")
     return _clean_dem(out, "3DEP")
 
 
@@ -518,6 +601,177 @@ def dem_sample(grid: dict, lats, lons):
     return out
 
 
+# ---------------------------------------------------------------------------
+# the road's VERTICAL profile
+#
+# A DEM is a raster. Read bilinearly along a centreline it has a slope break at
+# every cell edge plus pixel noise, which at driving height (the 3D view draws
+# the road under the camera) reads as the tarmac bucking up and down. Measured
+# on the USGS 3DEP grid, two 2 m stations at Watkins Glen differed by 87 % grade
+# (a real circuit is under ~15 %), and the raw profile was the source of the
+# "whoops" in the render. This is not fixed by a coarser DEM - it is fixed by
+# smoothing ALONG THE TRACK, which is what a road's vertical alignment is:
+#   * sample the DEM at the station AND +-2 m either side, take the median
+#     (a lone bridge/tree/embankment pixel cannot move the road),
+#   * replace single samples > PROFILE_MAX_JUMP_M off the local median,
+#   * Gaussian in ARC LENGTH (25 m default), WRAPPING on a closed lap so there
+#     is no step at start/finish,
+#   * a final grade clamp so nothing physically impossible survives.
+# The result is metres ASL per station; the caller re-references to its datum.
+# ---------------------------------------------------------------------------
+PROFILE_V = 2                 # 1 = the old _movavg(z, 5); 2 = this profile
+PROFILE_SIGMA_M = 25.0        # along-track Gaussian, metres
+PROFILE_LAT_M = 2.0           # lateral DEM samples either side of the centreline
+PROFILE_MAX_JUMP_M = 1.25     # a sample this far off the local median is raster noise
+PROFILE_MAX_GRADE = 0.22      # no circuit is steeper; only DEM artefacts are
+
+
+def _fill_nan(z, closed: bool):
+    """Linear fill of NaN gaps; across the seam too when the lap is closed."""
+    z = np.asarray(z, dtype=float)
+    good = np.isfinite(z)
+    if good.all():
+        return z.copy()
+    if not good.any():
+        return np.zeros_like(z)
+    idx = np.arange(len(z))
+    if closed:
+        good = np.concatenate([good, good])
+        ze = np.concatenate([z, z])
+        ie = np.concatenate([idx, idx + len(z)])
+        return np.interp(ie, ie[good], ze[good])[:len(z)]
+    return np.interp(idx, idx[good], z[good])
+
+
+def _gauss_profile(z, s, sigma_m: float, closed: bool):
+    """Gaussian smoothing of z(s) with sigma in METRES, wrapping when closed."""
+    z = np.asarray(z, dtype=float)
+    n = len(z)
+    if n < 3 or sigma_m <= 0:
+        return z.copy()
+    step = float(s[-1] - s[0]) / max(1, n - 1) if len(s) == n else 2.0
+    step = step if step > 0.05 else 2.0
+    rad = max(1, int(round(3.0 * sigma_m / step)))
+    k = np.arange(-rad, rad + 1) * step
+    w = np.exp(-(k * k) / (2.0 * sigma_m * sigma_m))
+    w = w / w.sum()
+    if closed and n > 2 * rad:
+        pad = np.concatenate([z[-rad:], z, z[:rad]])
+    else:
+        pad = np.pad(z, (rad, rad), mode="edge")
+    return np.convolve(pad, w, mode="valid")[:n]
+
+
+def _clamp_grade(z, s, max_grade: float, closed: bool):
+    """Limit |dz/ds| by a forward/backward pass (a box limit, twice, both ways).
+
+    Only pathological DEM steps are affected: 25 m of Gaussian smoothing already
+    keeps a real circuit under ~15 %, so this is a guard, not the fix."""
+    z = np.asarray(z, dtype=float)
+    n = len(z)
+    if n < 3 or max_grade <= 0:
+        return z.copy()
+    ds = np.diff(np.asarray(s, dtype=float))
+    ds = np.where(ds > 0.05, ds, 0.05)
+    out = z.copy()
+    for _ in range(2):
+        for i in range(1, n):
+            lim = max_grade * ds[i - 1]
+            if out[i] > out[i - 1] + lim:
+                out[i] = out[i - 1] + lim
+            elif out[i] < out[i - 1] - lim:
+                out[i] = out[i - 1] - lim
+        for i in range(n - 2, -1, -1):
+            lim = max_grade * ds[i]
+            if out[i] > out[i + 1] + lim:
+                out[i] = out[i + 1] + lim
+            elif out[i] < out[i + 1] - lim:
+                out[i] = out[i + 1] - lim
+    return out
+
+
+def road_profile(grid: dict, lats, lons, closed: Optional[bool] = None,
+                 sigma_m: float = PROFILE_SIGMA_M,
+                 lateral_m: float = PROFILE_LAT_M, log=print):
+    """Metres-ASL per station: the DEM, made into a road's vertical alignment.
+
+    Returns (z, stats). `stats` is what the render audit and the admin UI show
+    (relief, grades, how many raster spikes were rejected) - a smoothness claim
+    nobody can check is worth nothing.
+    """
+    _require_deps()
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    n = len(lats)
+    if n < 3:
+        z = dem_sample(grid, lats, lons)
+        return [float(0.0 if not np.isfinite(v) else v) for v in z], {
+            "v": PROFILE_V, "n": int(n), "closed": False}
+
+    lat0 = float(np.mean(lats))
+    mx = M_PER_DEG_LAT * math.cos(math.radians(lat0))
+    mx = mx if abs(mx) > 1.0 else M_PER_DEG_LAT
+    x = (lons - lons[0]) * mx
+    y = (lats - lats[0]) * M_PER_DEG_LAT
+    ds = np.hypot(np.diff(x), np.diff(y))
+    s = np.concatenate([[0.0], np.cumsum(ds)])
+    step = float(s[-1]) / max(1, n - 1)
+    step = step if step > 0.05 else 2.0
+    if closed is None:
+        closed = bool(math.hypot(x[-1] - x[0], y[-1] - y[0]) < max(40.0, 10.0 * step))
+
+    # tangent + normal per station (metres); lateral samples +-lateral_m
+    tx = np.gradient(x)
+    ty = np.gradient(y)
+    tl = np.hypot(tx, ty)
+    tl[tl == 0] = 1.0
+    nx = -ty / tl
+    ny = tx / tl
+    cols = [dem_sample(grid, lats, lons)]
+    if lateral_m and lateral_m > 0:
+        dlat = ny * lateral_m / M_PER_DEG_LAT
+        dlon = nx * lateral_m / mx
+        cols.append(dem_sample(grid, lats + dlat, lons + dlon))
+        cols.append(dem_sample(grid, lats - dlat, lons - dlon))
+    M = np.vstack(cols)
+    import warnings as _warnings
+    with np.errstate(invalid="ignore"), _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN column = outside the grid
+        z = np.nanmedian(M, axis=0)
+    z = _fill_nan(z, bool(closed))
+
+    # single-sample raster spikes (bridges, tree canopy, a tile seam)
+    h = max(1, int(round(7.5 / step)))          # ~15 m window
+    med = _roll_median(z, h, bool(closed))
+    bad = np.abs(z - med) > PROFILE_MAX_JUMP_M
+    rejected = int(bad.sum())
+    if rejected:
+        z = np.where(bad, med, z)
+
+    z = _gauss_profile(z, s, sigma_m, bool(closed))
+    z = _clamp_grade(z, s, PROFILE_MAX_GRADE, bool(closed))
+    # the clamp can leave a hairline crease; a short second pass removes it
+    z = _gauss_profile(z, s, max(3.0, sigma_m / 5.0), bool(closed))
+
+    grade = np.diff(z) / step
+    dd = np.diff(z, 2)
+    stats = {
+        "v": PROFILE_V, "n": int(n), "closed": bool(closed),
+        "sigma_m": float(sigma_m), "lateral_m": float(lateral_m),
+        "step_m": round(step, 2), "rejected": rejected,
+        "relief_m": round(float(np.max(z) - np.min(z)), 1),
+        "grade_p95": round(float(np.percentile(np.abs(grade), 95)), 3) if len(grade) else 0.0,
+        "grade_max": round(float(np.max(np.abs(grade))), 3) if len(grade) else 0.0,
+        "roughness_m": round(float(np.sqrt(np.mean(dd * dd))), 2) if len(dd) else 0.0,
+        "cell_m": grid.get("cell_m"), "source": grid.get("source"),
+    }
+    log(f"[profile] {n} stations @ {step:.1f} m, {stats['relief_m']} m relief, "
+        f"grade p95 {stats['grade_p95']*100:.0f}% max {stats['grade_max']*100:.0f}%, "
+        f"sigma {sigma_m:.0f} m, {rejected} spikes rejected, "
+        f"{grid.get('source')} {grid.get('cell_m')} m")
+    return z, stats
+
+
 def write_dem_bin(grid: dict, path) -> dict:
     """Quantise a grid to uint16 little-endian: q = round((v - base) / scale),
     base = min (floored to 1 mm), scale 0.05 m (0.1 / 0.25 if the range needs it).
@@ -548,7 +802,7 @@ def write_dem_bin(grid: dict, path) -> dict:
         except OSError:
             pass
         raise
-    return {"file": path.name, "cols": int(grid["cols"]), "rows": int(grid["rows"]),
+    return {"v": DEM_V, "file": path.name, "cols": int(grid["cols"]), "rows": int(grid["rows"]),
             "bounds": [float(x) for x in grid["bounds"]], "base": base, "scale": scale,
             "cell_m": grid.get("cell_m"), "source": grid.get("source"),
             "format": "u16le"}
@@ -2124,8 +2378,10 @@ def add_landcover(asset: dict, img, bounds: dict, log=print) -> dict:
 # ---------------------------------------------------------------------------
 # enrichment: real-world features, hi-res terrain, a centred line
 # ---------------------------------------------------------------------------
-ENRICH_VERSION = 3                  # 2: + the facility track network + ground image
+ENRICH_VERSION = 4                  # 2: + the facility track network + ground image
                                     # 3: network v2 (2-D traced edges) replaces v1
+                                    # 4: the road PROFILE (smoothed along the track) replaces
+                                    #    the raw raster station elevations
 ENRICH_RETRY_S = 6 * 3600           # a failed network step is not retried sooner
 _ENRICH_ACTIVE = set()
 _ENRICH_ACTIVE_LOCK = threading.Lock()
@@ -2548,12 +2804,17 @@ def _enrich_missing(asset: dict, adir: pathlib.Path) -> bool:
         m = asset.get(k)
         if not m or not (adir / str(m.get("file") or "?")).is_file():
             return True
+        if int(m.get("v") or 0) < DEM_V:
+            return True
     if not (asset.get("network") or {}).get("chains"):
         return True
     if _network_stale(asset):
         return True
     g = asset.get("ground")
     if not g or not (adir / str(g.get("file") or "?")).is_file():
+        return True
+    # the station elevations must be a ROAD PROFILE (v2), not the old raw raster
+    if int((asset.get("elevation") or {}).get("v") or 0) < PROFILE_V:
         return True
     return False
 
@@ -2617,7 +2878,8 @@ def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
 
     def need(key):
         m = asset.get(key)
-        return not m or not (adir / str(m.get("file") or "?")).is_file()
+        return (not m or not (adir / str(m.get("file") or "?")).is_file()
+                or int(m.get("v") or 0) < DEM_V)
 
     if network and dem_ok_to_try and len(line) >= 2:
         if need("dem_hr"):
@@ -2645,25 +2907,23 @@ def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
             asset.pop("dem_tried", None)
 
     # d. station elevations from the hi-res grid --------------------------------
+    #    A road profile, not a raster read: smoothed along the track, wrapped on
+    #    a closed lap (see road_profile). `elevation.v` records which method made
+    #    these numbers, so an asset from the old moving-average pass is redone.
     hr = asset.get("dem_hr")
-    if hr and len(line) >= 2 and (hr_new or refined_now
+    want_profile = int((asset.get("elevation") or {}).get("v") or 0) < PROFILE_V
+    if hr and len(line) >= 2 and (hr_new or refined_now or want_profile
                                   or asset.get("line_elev_source") != hr.get("source")):
         try:
             grid = hr_grid
             if grid is None:
                 grid = dict(hr)
                 grid["values"] = read_dem_bin(hr, adir / hr["file"])
-            z = dem_sample(grid, lats, lons)
-            old = np.array([np.nan if p[2] is None else p[2] for p in asset["line"]],
-                           dtype=float)
-            z = np.where(np.isfinite(z), z, old)
-            good = np.isfinite(z)
-            if good.sum() >= 2:
-                idx = np.arange(len(z))
-                z = np.interp(idx, idx[good], z[good])
-                z = _movavg(z, 5)
+            z, estats = road_profile(grid, lats, lons, log=log)
+            if len(z) == len(asset["line"]):
                 asset["line"] = [[p[0], p[1], round(float(v), 1)]
                                  for p, v in zip(asset["line"], z)]
+                asset["elevation"] = estats
                 asset["line_elev_source"] = hr.get("source")
         except Exception as e:
             log(f"[{slug}] station elevations failed: {type(e).__name__}: {e}")
@@ -2728,6 +2988,7 @@ def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
            "features": bool(asset.get("features")),
            "dem_hr": (asset.get("dem_hr") or {}).get("source"),
            "dem_far": (asset.get("dem_far") or {}).get("source"),
+           "elev": int((asset.get("elevation") or {}).get("v") or 0),
            "refined": bool((asset.get("centreline_refine") or {}).get("applied")),
            "network": len((asset.get("network") or {}).get("chains") or []),
            "ground": (asset.get("ground") or {}).get("z")}
@@ -2884,13 +3145,14 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
         + ("" if agreement is None else f", agreement={agreement}"))
 
     dz = int(opts.get("dem_zoom") or 14)
-    elev = dem_elevations(zip(lats, lons), cache_dir, z=dz, log=log)
-    if all(e is None for e in elev):
-        elev = [0.0] * len(lats)
     grid = dem_grid(bbox, int(opts.get("dem_cols") or 40), int(opts.get("dem_rows") or 40),
                     cache_dir, z=dz, log=log)
     log(f"[{slug}] dem grid {grid['cols']}x{grid['rows']} "
         f"{min(grid['values']):.1f}-{max(grid['values']):.1f} m")
+    # The line's elevation is a ROAD PROFILE, not a raster read: smoothed along
+    # the track (see road_profile). The enrichment step re-does this from the
+    # 3 m lidar grid; this keeps the first render from bucking while it waits.
+    elev, elev_stats = road_profile(grid, lats, lons, log=log)
 
     # ground texture: the mosaic itself, cropped to the bbox and downscaled
     tex_w = int(opts.get("texture_px") or 2048)
@@ -2931,6 +3193,7 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
         "width_background_rgb": w.get("background_rgb"),
         "lateral_reference": "centreline from the driven line",
         "dem": grid,
+        "elevation": elev_stats,
         "step_m": step,
         "texture": None if not tex_name else {
             "file": tex_name,
@@ -3008,6 +3271,184 @@ def validate_asset(asset: dict, line: dict) -> list:
                    "of the line is on paved pixels) - wrong place, tiled or placeholder "
                    "imagery" % (100.0 * lc.get("line_paved", 0.0)))
     return bad
+
+
+def _elev_stats_from_line(asset: dict) -> dict:
+    """Grade/roughness of the STORED station elevations (see road_profile)."""
+    z = np.array([p[2] if len(p) > 2 and p[2] is not None else np.nan
+                  for p in (asset.get("line") or [])], dtype=float)
+    z = z[np.isfinite(z)]
+    if len(z) < 4:
+        return {}
+    n = len(asset.get("line") or [])
+    step = (float(asset.get("length_m") or 0) / max(1, n - 1)) or 2.0
+    grade = np.diff(z) / step
+    dd = np.diff(z, 2)
+    return {"relief_m": round(float(z.max() - z.min()), 1),
+            "grade_p95": round(float(np.percentile(np.abs(grade), 95)), 3),
+            "grade_max": round(float(np.max(np.abs(grade))), 3),
+            "roughness_m": round(float(np.sqrt(np.mean(dd * dd))), 2)}
+
+
+def audit_asset(asset: dict) -> dict:
+    """Deterministic quality report for a prepared track (offline).
+
+    Every number is compared against the value a GOOD render needs, and each
+    miss becomes a concrete issue in plain words. This is the sheet the admin
+    UI shows and what the AI review is grounded on - "the track looks wrong"
+    is answerable (width clamped, no lidar, imagery rejected, road bucking)
+    without opening a browser, and guessing is not required.
+    """
+    _require_deps()
+    line = asset.get("line") or []
+    n = len(line)
+    lat = np.array([p[0] for p in line], dtype=float)
+    lon = np.array([p[1] for p in line], dtype=float)
+    length = float(asset.get("length_m") or 0)
+    step = (length / max(1, n - 1)) if length and n > 1 else None
+    closed = None
+    if n > 2:
+        seam = math.hypot((lon[0] - lon[-1]) * M_PER_DEG_LAT * math.cos(math.radians(float(lat.mean()))),
+                          (lat[0] - lat[-1]) * M_PER_DEG_LAT)
+        closed = bool(seam < max(40.0, 10.0 * (step or 2.0)))
+
+    w = np.array([float(v) for v in (asset.get("width_m") or [])
+                  if isinstance(v, (int, float)) and 0 < float(v) < 80], dtype=float)
+    widths = {"n": int(len(w))}
+    if len(w):
+        widths.update({"median_m": round(float(np.median(w)), 2),
+                       "p10_m": round(float(np.percentile(w, 10)), 2),
+                       "p90_m": round(float(np.percentile(w, 90)), 2)})
+    widths.update({
+        "source": asset.get("width_source"),
+        "imagery_m": asset.get("width_imagery_m"),
+        "imagery_raw_m": asset.get("width_imagery_raw_m"),
+        "clamped": bool(asset.get("width_clamped")),
+        "confidence": asset.get("width_confidence"),
+        "osm_m": asset.get("width_osm_m"),
+        "agreement": asset.get("width_agreement"),
+        "classifier": asset.get("width_classifier"),
+    })
+
+    tex = asset.get("texture") or {}
+    ground = asset.get("ground") or {}
+    imagery = {"texture_px": tex.get("px"), "ground_px": ground.get("px"),
+               "ground_cover": ground.get("cover")}
+    if tex.get("bounds"):
+        b = tex["bounds"]
+        imagery["span_m"] = [round((b["east"] - b["west"]) * M_PER_DEG_LAT
+                                   * math.cos(math.radians(float(lat.mean()))) if n else 0),
+                             round((b["north"] - b["south"]) * M_PER_DEG_LAT)]
+        if tex.get("px"):
+            sw, sh = imagery["span_m"]
+            imagery["m_per_px"] = round(max(sw / tex["px"][0], sh / tex["px"][1]), 2)
+    lc = asset.get("landcover") or {}
+    imagery["line_on_paved"] = lc.get("line_paved")
+    try:
+        imagery["validator"] = validate_asset(asset, {"lat": lat, "lon": lon})
+    except Exception as e:
+        imagery["validator"] = [f"validator failed: {type(e).__name__}: {e}"]
+
+    elev = dict(asset.get("elevation") or {})
+    if not elev:
+        elev = _elev_stats_from_line(asset)
+    elif "relief_m" not in elev:
+        elev.update(_elev_stats_from_line(asset))
+    elev["source"] = asset.get("line_elev_source") or (asset.get("dem_hr") or {}).get("source")
+    elev["cell_m"] = (asset.get("dem_hr") or {}).get("cell_m") or (elev.get("cell_m"))
+
+    net = asset.get("network") or {}
+    chains = net.get("chains") or []
+    network = {"chains": len(chains), "v": net.get("v"),
+               "layouts": sorted({str(c.get("kind") or "circuit") for c in chains}),
+               "names": sorted({nm for c in chains for nm in (c.get("names") or [])})[:12]}
+    feat = asset.get("features") or {}
+    features = {k: len(v) for k, v in feat.items() if isinstance(v, list)}
+
+    issues = []
+
+    def add(sev, area, msg, fix):
+        issues.append({"severity": sev, "area": area, "issue": msg, "fix": fix})
+
+    if n < 20:
+        add("high", "line", f"only {n} centreline stations",
+            "re-render from a session with a complete lap")
+    if length and length > 25000:
+        add("high", "line", f"traced line is {length / 1000:.1f} km - laps, not a circuit",
+            "re-render: the bake must use ONE fastest lap")
+    if asset.get("width_clamped"):
+        add("medium", "width",
+            f"imagery width {asset.get('width_imagery_raw_m')} m was clamped to "
+            f"{asset.get('width_imagery_m')} m",
+            "check the imagery for run-off at this track; an OSM width tag overrides it")
+    if asset.get("width_confidence") is not None and asset.get("width_confidence") < 0.6:
+        add("medium", "width",
+            f"edge detection confidence only {100 * asset['width_confidence']:.0f}%",
+            "imagery may be too dark/shaded; compare with the OSM width tag")
+    if asset.get("width_source") == "imagery" and not asset.get("width_osm_m"):
+        add("low", "width", "width comes from imagery alone (no surveyed OSM width)",
+            "fine when confidence is high; add an OSM width tag for this circuit if it reads wrong")
+    if not (asset.get("dem_hr")):
+        add("high", "elevation", "no high-resolution terrain (only the coarse DEM)",
+            "re-render: it fetches USGS 3DEP lidar / terrarium z15 and keeps it with the track")
+    gmax = float(elev.get("grade_max") or 0)
+    if gmax > 0.30:
+        add("high", "elevation",
+            f"road grade reaches {100 * gmax:.0f}% between stations - that is DEM noise, "
+            "not a road (it is what the camera bucks over)",
+            "re-render: the profile is smoothed 25 m along the track (trackprep road_profile)")
+    elif gmax > 0.20:
+        add("low", "elevation", f"peak grade {100 * gmax:.0f}% - check against the real track",
+            "re-render smooths the profile; ignore if this circuit really is that steep")
+    if not elev.get("v"):
+        add("medium", "elevation", "station elevations are raw raster samples (old profile)",
+            "re-render to bake the smoothed road profile")
+    bad = imagery.get("validator") or []
+    for m in bad:
+        add("high", "imagery", m, "re-render; if it persists the imagery source is wrong for this place")
+    lp = imagery.get("line_on_paved")
+    if lp is not None and lp < 0.85:
+        add("medium", "imagery", f"only {100 * lp:.0f}% of the centreline is on paved pixels",
+            "the baked line may be off the imagery (registration); re-render or re-centre the line")
+    if not imagery.get("ground_px"):
+        add("medium", "imagery", "no facility ground image (other layouts and run-off will be flat)",
+            "re-render fetches one z18 image of the whole facility")
+    if not chains:
+        add("medium", "network", "no OSM raceway network - no other layouts, pit lane or kart track",
+            "re-render when OpenStreetMap is reachable (it is cached for 45 days)")
+    if not features:
+        add("low", "features", "no OSM features (buildings, fences, woods)",
+            "re-render to add the scenery OSM knows about")
+    iv = int((asset.get("enrich") or {}).get("v") or 0)
+    if iv < ENRICH_VERSION:
+        add("medium", "enrichment", f"enrichment is version {iv}, current is {ENRICH_VERSION}",
+            "open the track in 3D (it enriches in the background) or press re-render")
+
+    return {"track": asset.get("track"), "slug": asset.get("slug"),
+            "generated": asset.get("generated"), "enrich": asset.get("enrich"),
+            "stations": n, "length_m": length, "step_m": None if step is None else round(step, 2),
+            "closed": closed, "width": widths, "imagery": imagery,
+            "elevation": elev, "dem": {"hr": asset.get("dem_hr"),
+                                          "far": asset.get("dem_far")},
+            "network": network, "features": features,
+            "prep_version": asset.get("prep_version"),
+            "issues": issues}
+
+
+def save_review(asset_path, review: dict, log=print) -> bool:
+    """Attach a render review to an asset file (read-modify-write, slug lock).
+
+    Never clobbers a concurrent enrichment: it re-reads under the lock and only
+    adds the one key. False when the asset vanished (a forced re-prepare)."""
+    asset_path = pathlib.Path(asset_path)
+    with _slug_lock(asset_path):
+        try:
+            asset = json.loads(asset_path.read_text("utf-8"))
+        except Exception:
+            return False
+        asset["render_review"] = review
+        _write_json_atomic(asset_path, asset)
+        return True
 
 
 def session_centreline(path: pathlib.Path, target: int = 6000):

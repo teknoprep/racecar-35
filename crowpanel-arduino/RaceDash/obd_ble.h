@@ -19,6 +19,15 @@
 //
 // ELM327 flow: ATZ, ATE0, ATL0, ATS0, ATH0, ATSP0 then poll PIDs round-robin.
 //
+// PAIRING PIN: some BLE ELM327 dongles require the classic 4-digit Bluetooth
+// PIN (0000 / 1234 / 1111 ...) before they accept a single command. The dash
+// supplies it from Settings -> "Bluetooth PIN" (NVS btpin, default "0000",
+// i.e. passkey 0). The pairing itself is BLE legacy pairing (Secure Connections
+// OFF) because the clone firmware in these dongles does not implement SC; the
+// peripheral either asks for a passkey (BLE_SM_IOACT_INPUT -> onPassKeyRequest)
+// or refuses the GATT access until the link is encrypted, which we recover
+// from by starting security once and retrying the ELM init.
+//
 // NimBLE version: **1.4.x** (NOT 2.x). 2.x targets the arduino-esp32 3.x core
 // (IDF 5); on this board's 2.0.14 core (IDF 4.4) it compiles but crash-reboots
 // on BLE init. 1.4.3 is the battle-tested match for 2.0.14. API differs from 2.x
@@ -73,6 +82,12 @@ static void blePhase(uint8_t ph) {
   Preferences p;
   if (p.begin("blediag", false)) { p.putUChar("ph", ph); p.end(); }
 }
+
+// Pairing PIN (default 0 == "0000"). Written from the UI core (plain uint32
+// store), read by the NimBLE host task when the peer asks for a passkey.
+static volatile uint32_t g_pin = 0;
+static volatile bool     g_secure_done = false;   // pairing attempt finished (host task)
+static volatile bool     g_secure_ok   = false;   // ...and the link ended up encrypted
 
 // last human-readable BLE error (shown on the Sensor page)
 static char g_last_err[48] = {0};
@@ -198,6 +213,16 @@ class ClientCB : public NimBLEClientCallbacks {
     g_link_up = false;
     // only auto-reconnect if the user still wants BT (not a deliberate stop)
     if (g_state != OFF && !g_req_stop && !g_req_shutdown) g_state = RECONNECT;
+  }
+  // The dongle asks US to enter its PIN (BLE_SM_IOACT_INPUT). Runs on the NimBLE
+  // host task: read the plain uint32 only, never log/print here.
+  uint32_t onPassKeyRequest() override { return g_pin; }
+  // Numeric comparison (only used by Secure Connections, which we leave off for
+  // clone compatibility) - accept when the peer echoes our own passkey.
+  bool onConfirmPIN(uint32_t pin) override { return pin == g_pin; }
+  void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+    g_secure_ok   = desc && desc->sec_state.encrypted;
+    g_secure_done = true;
   }
 };
 static ClientCB g_clientCB;
@@ -339,7 +364,28 @@ static bool connectAndInit() {
   }
 
   g_state = INIT;
-  elmCmd("ATZ", 2000); vTaskDelay(pdMS_TO_TICKS(200));   // reset
+  bool elm_ok = elmCmd("ATZ", 2000); vTaskDelay(pdMS_TO_TICKS(200));   // reset
+  if (!elm_ok && g_client && g_client->isConnected()) {
+    // A dongle that requires pairing usually lets the GATT connect through and
+    // then ignores writes (or answers ATT 0x05) until the link is encrypted.
+    // Ask for security ONCE with OUR pin and retry; bounded (3 s) and abortable,
+    // so a dongle that simply does not answer cannot wedge the task here.
+    g_secure_done = false; g_secure_ok = false;
+    if (NimBLEDevice::startSecurity(g_client->getConnId()) == 0) {
+      for (int i = 0; i < 60 && !g_secure_done; ++i) {
+        if (abortReq()) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+      }
+    }
+    if (g_secure_done && !g_secure_ok) {
+      snprintf(g_last_err, sizeof(g_last_err), "pairing failed (PIN %04u)",
+               (unsigned)g_pin);
+    }
+    // Some clones drop the CCCD when the link keys change: re-subscribe, then
+    // retry the reset once. Still non-fatal (a clone that ignores ATZ works).
+    if (g_rx) g_rx->subscribe(g_rx->canNotify(), notifyCB);
+    elmCmd("ATZ", 2000); vTaskDelay(pdMS_TO_TICKS(200));
+  }
   elmCmd("ATE0", 1000);   // echo off
   elmCmd("ATL0", 1000);   // linefeeds off
   elmCmd("ATS0", 1000);   // spaces off
@@ -517,6 +563,11 @@ static void obdTask(void*) {
   }
   // Heavy BLE stack init on the task's own stack (never the UI stack).
   NimBLEDevice::init("racedash");
+  // Pairing: bonding + MITM (a passkey is requested), Secure Connections OFF -
+  // the ELM327 clones do not implement SC and a SC-only attempt just fails.
+  // The passkey is the Settings value (default 0 == "0000").
+  NimBLEDevice::setSecurityAuth(true /*bonding*/, true /*mitm*/, false /*sc*/);
+  NimBLEDevice::setSecurityPasskey(g_pin);
   // LOW TX power EVERYWHERE (default/conn + adv + scan-req): the radio going
   // to full +9dBm draws a current spike that can brown out a marginal supply
   // (suspected BT crash cause). N0 = 0 dBm is plenty for an OBD dongle a few
@@ -631,6 +682,14 @@ static void begin() {
     g_inited = false;
   }
 }
+
+// Pairing PIN for the next/current connection. A BLE passkey is a NUMBER, so
+// "0000" and "0" are the same key - the UI shows it zero-padded to 4 digits.
+static void setPin(uint32_t pin) {
+  g_pin = pin % 1000000u;
+  NimBLEDevice::setSecurityPasskey(g_pin);   // plain static store; safe before init
+}
+static uint32_t pin() { return g_pin; }
 
 static void setBlocked(bool b) { g_blocked = b; }
 static bool blocked()          { return g_blocked; }

@@ -880,10 +880,68 @@ class DemTests(unittest.TestCase):
             g = tp.dem_hires(bbox, self.cache, max_cells=10_000_000, min_cell_m=1.0,
                              log=lambda *_: None)
         self.assertGreater(g["cols"], 2000)
-        self.assertEqual(len(reqs), -(-g["cols"] // 2000))
+        # count the 3DEP tiles only: the grid is also cross-checked against AWS
+        # terrarium (a 3DEP void can come back as a plausible CONSTANT), which
+        # fetches its own tiles
+        det = sum(1 for u in reqs if "3DEPElevation" in u)
+        self.assertEqual(det, -(-g["cols"] // 2000))
         V = g["values"].reshape(g["rows"], g["cols"])
         want = (np.linspace(W0, W0 + 0.05, g["cols"]) - W0) * 1e5
         self.assertLess(float(np.abs(V[0] - want).max()), 0.5)  # seamless across the tiles
+
+    def test_a_void_takes_its_neighbours_elevation_not_the_grid_median(self):
+        """A NoData cell must be filled from what SURROUNDS it.
+
+        Filling from the grid median turned Road Atlanta's lake/void into a flat
+        plateau 33 m below the hillside, so the road dived into a trench with
+        vertical walls beside it. Half this grid is at 500 m, so the median
+        (300) is nowhere near the 20 m plateau the hole sits in.
+        """
+        tp = self.tp
+        v = np.full((20, 20), 100.0, dtype=np.float32)
+        v[:10, :] = 500.0
+        v[15, 15] = np.nan
+        out = tp._clean_dem(v, "unit")
+        self.assertAlmostEqual(float(out[15, 15]), 100.0, delta=0.01)
+        self.assertFalse(np.isnan(out).any())
+
+    def test_a_plausible_constant_3dep_plateau_is_detected_and_replaced(self):
+        """3DEP can return a void as a CONSTANT that looks like a real elevation.
+
+        Road Atlanta's skidpad came back as 257.4 m for ~5,900 cells while the
+        hillside around it is 290 m. Nothing about 257.4 is invalid - only the
+        fact that it is a huge exact constant where terrarium sees a hillside.
+        """
+        tp = self.tp
+        bbox = self.BBOX
+
+        def fake_get(url, timeout=45.0, data=None):
+            if "3DEPElevation" in url:
+                q = urllib.parse.parse_qs(url.split("?", 1)[1])
+                tw, th = [int(x) for x in q["size"][0].split(",")]
+                # a continuous hillside (no repeated value) ...
+                a = (288.0 + 0.06 * np.arange(tw)[None, :] +
+                     0.004 * np.arange(th)[:, None]).astype(np.float32)
+                a[: th // 2, : tw // 2] = 257.4          # ... plus the filled hole
+                return self._tiff(a)
+            if "/terrarium/" in url:
+                # terrarium: the whole area is the hillside at 290 m
+                val = 290.0 + 32768.0
+                px = np.zeros((256, 256, 3), dtype=np.uint8)
+                px[:, :, 0] = int(val) // 256
+                px[:, :, 1] = int(val) % 256
+                buf = io.BytesIO()
+                Image.fromarray(px, "RGB").save(buf, "PNG")
+                return buf.getvalue()
+            raise AssertionError("unexpected URL " + url)
+
+        logs = []
+        with mock.patch.object(tp, "_get", fake_get):
+            g = tp.dem_hires(bbox, self.cache, log=lambda m: logs.append(m))
+        V = g["values"].reshape(g["rows"], g["cols"])
+        self.assertFalse(np.any(np.abs(V - 257.4) < 0.2), "the plateau survived")
+        self.assertGreater(float(V.min()), 280.0, (float(V.min()), float(V.max())))
+        self.assertTrue(any("fill artefact" in m for m in logs), logs)
 
     def test_3dep_failure_falls_back_to_bilinear_terrarium(self):
         tp = self.tp
@@ -1457,7 +1515,7 @@ class EnrichTests(unittest.TestCase):
         self.assertIn("USGS 3DEP", res["source"]["dem"])
         e = res["enrich"]
         self.assertEqual(e["v"], tp.ENRICH_VERSION)
-        self.assertEqual(tp.ENRICH_VERSION, 3)
+        self.assertEqual(tp.ENRICH_VERSION, 4)
         self.assertTrue(e["features"] and e["refined"])
         self.assertEqual(e["network"], 3)
         # the network: schema
@@ -1669,3 +1727,134 @@ class EnrichTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
+class RoadProfileTests(unittest.TestCase):
+    """The road's vertical profile (trackprep.road_profile) and the render audit.
+
+    The 3D view draws the road UNDER the camera, so an elevation that is a raw
+    raster read is visible as the tarmac bucking. Measured on the real USGS
+    fixture: 55 % grade between two 2 m stations at Watkins Glen, where the
+    circuit's real grades are ~10 %. These tests pin the fix on a grid whose
+    truth is known: a hill plus the per-cell noise a DEM actually has.
+    """
+
+    LAT0, LON0 = 39.0, -77.0
+    M = 111320.0
+
+    def _grid(self, half_m=380.0, cell_m=3.0):
+        tp = _tp()
+        cols = rows = int(2 * half_m / cell_m) + 1
+        half = (cols - 1) * cell_m / 2.0
+        dlat = half / self.M
+        dlon = half / (self.M * math.cos(math.radians(self.LAT0)))
+        bounds = [self.LAT0 - dlat, self.LON0 - dlon, self.LAT0 + dlat, self.LON0 + dlon]
+        vals = []
+        for r in range(rows):                     # SOUTH row first
+            y = r * cell_m - half
+            for c in range(cols):
+                x = c * cell_m - half
+                hill = 40.0 * math.sin(2 * math.pi * y / 2500.0) + 0.02 * x
+                # deterministic quasi-random per-node raster noise (an
+                # alternating pattern would alias away on a 3 m grid sampled every 2 m)
+                noise = 1.5 * (((r * 2654435761 + c * 40503) % 1000) / 500.0 - 1.0)
+                vals.append(hill + noise)
+        return {"cols": cols, "rows": rows, "bounds": bounds, "cell_m": cell_m,
+                "source": "synthetic", "values": vals}
+
+    def _line_north(self, n=240, step_m=2.0):
+        return [self.LAT0 + (i * step_m) / self.M for i in range(n)], [self.LON0] * n
+
+    def test_profile_smooths_a_raster_into_a_road(self):
+        tp = _tp()
+        g = self._grid()
+        lats, lons = self._line_north()
+        raw = tp.dem_sample(g, lats, lons)
+        z, stats = tp.road_profile(g, lats, lons, closed=False, log=lambda *_: None)
+        self.assertEqual(len(z), len(lats))
+        self.assertEqual(stats["v"], tp.PROFILE_V)
+        self.assertGreater(stats["rejected"] + 1, 0)
+        # raw raster: a slope break + noise every 3 m. This is the "whoops".
+        raw_grade = max(abs(raw[i + 1] - raw[i]) / 2.0 for i in range(len(raw) - 1))
+        self.assertGreater(raw_grade, 0.3)
+        # the smoothed road: every hill kept, the raster gone
+        self.assertLess(stats["grade_p95"], 0.12, stats)
+        self.assertLess(stats["grade_max"], 0.15, stats)
+        self.assertGreater(stats["relief_m"], 30.0)            # ~40 m hill survives
+        truth = [40.0 * math.sin(2 * math.pi * (i * 2.0) / 2500.0)
+                 for i in range(len(lats))]
+        # interior only: a Gaussian smoother edge-clamps at the ends of an OPEN
+        # line (the viewer's lap is closed and wraps), but it must not wander
+        # off the hill in the middle
+        lo, hi = len(z) // 5, 4 * len(z) // 5
+        err = sum(abs(z[i] - truth[i]) for i in range(lo, hi)) / (hi - lo)
+        self.assertLess(err, 0.6, "the profile left the hill")
+
+    def test_profile_wraps_a_closed_lap(self):
+        tp = _tp()
+        g = self._grid()
+        n, radius = 420, 80.0
+        lats, lons = [], []
+        for i in range(n):
+            a = 2 * math.pi * i / n
+            lats.append(self.LAT0 + radius * math.cos(a) / self.M)
+            lons.append(self.LON0 + radius * math.sin(a) /
+                        (self.M * math.cos(math.radians(self.LAT0))))
+        z, stats = tp.road_profile(g, lats, lons, closed=True, log=lambda *_: None)
+        self.assertTrue(stats["closed"])
+        # curvature across the seam must match everywhere else: a step at
+        # start/finish is exactly what a non-wrapping smoother leaves behind
+        seam = abs(z[0] - 2 * z[-1] + z[-2]) + abs(z[1] - 2 * z[0] + z[-1])
+        typical = sorted(abs(z[i + 1] - 2 * z[i] + z[i - 1])
+                         for i in range(1, n - 1))[int(0.95 * (n - 2))]
+        self.assertLess(seam, max(0.05, typical * 6), (seam, typical))
+
+    def test_audit_flags_an_unsmoothed_road_and_a_clamped_width(self):
+        tp = _tp()
+        n = 400
+        line = []
+        for i in range(n):
+            a = 2 * math.pi * i / n
+            lat = self.LAT0 + 100 * math.cos(a) / self.M
+            lon = self.LON0 + 100 * math.sin(a) / (self.M * math.cos(math.radians(self.LAT0)))
+            # 55 % grade between adjacent stations: the real Watkins Glen artefact
+            z = 20.0 + (4.4 if i % 2 else 0.0)
+            line.append([lat, lon, round(z, 1)])
+        asset = {"track": "Test Circuit", "slug": "test-circuit", "line": line,
+                 "length_m": 628.0, "prep_version": 2, "enrich": {"v": 3},
+                 "width_m": [10.0] * n, "width_source": "imagery",
+                 "width_imagery_m": 15.0, "width_imagery_raw_m": 23.0,
+                 "width_clamped": True, "width_confidence": 0.4,
+                 "width_osm_m": None, "width_agreement": None,
+                 "texture": {"bounds": {"south": self.LAT0 - 0.01, "west": self.LON0 - 0.01,
+                                        "north": self.LAT0 + 0.01, "east": self.LON0 + 0.01},
+                             "px": [2048, 2048]},
+                 "landcover": {"line_paved": 0.5}}
+        aud = tp.audit_asset(asset)
+        areas = {(i["severity"], i["area"]) for i in aud["issues"]}
+        self.assertIn(("high", "elevation"), areas)      # 55 % "grade"
+        self.assertIn(("high", "elevation"), areas)
+        self.assertTrue(any(i["area"] == "width" for i in aud["issues"]))
+        self.assertTrue(any(i["area"] == "imagery" for i in aud["issues"]))
+        self.assertTrue(any(i["area"] == "enrichment" for i in aud["issues"]))
+        self.assertEqual(aud["stations"], n)
+        self.assertTrue(aud["closed"])
+        # every issue carries an actionable fix, never just a complaint
+        for it in aud["issues"]:
+            self.assertTrue(it["fix"].strip())
+            self.assertIn(it["severity"], ("high", "medium", "low"))
+
+    def test_save_review_attaches_without_disturbing_the_asset(self):
+        import tempfile
+        tp = _tp()
+        with tempfile.TemporaryDirectory() as td:
+            p = pathlib.Path(td) / "t.json"
+            base = {"slug": "t", "track": "T", "line": [[1, 2, 3]]}
+            p.write_text(json.dumps(base))
+            self.assertTrue(tp.save_review(p, {"verdict": "ok"}))
+            got = json.loads(p.read_text())
+            self.assertEqual(got["render_review"], {"verdict": "ok"})
+            self.assertEqual(got["line"], base["line"])
+            p.unlink()
+            self.assertFalse(tp.save_review(p, {"verdict": "gone"}))
