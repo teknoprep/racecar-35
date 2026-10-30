@@ -905,12 +905,12 @@ class DemTests(unittest.TestCase):
         self.assertAlmostEqual(float(out[15, 15]), 100.0, delta=0.01)
         self.assertFalse(np.isnan(out).any())
 
-    def test_a_plausible_constant_3dep_plateau_is_detected_and_replaced(self):
-        """3DEP can return a void as a CONSTANT that looks like a real elevation.
+    def test_a_hydro_flattened_lake_is_kept_not_replaced(self):
+        """3DEP flattens WATER to one level, and that level is real.
 
-        Road Atlanta's skidpad came back as 257.4 m for ~5,900 cells while the
-        hillside around it is 290 m. Nothing about 257.4 is invalid - only the
-        fact that it is a huge exact constant where terrarium sees a hillside.
+        A first attempt at the Road Atlanta "trench" replaced any large exact
+        constant with terrarium; that raised the lake 30 m and built a 34 m
+        cliff at its shoreline. A constant must survive the cross-check.
         """
         tp = self.tp
         bbox = self.BBOX
@@ -919,13 +919,11 @@ class DemTests(unittest.TestCase):
             if "3DEPElevation" in url:
                 q = urllib.parse.parse_qs(url.split("?", 1)[1])
                 tw, th = [int(x) for x in q["size"][0].split(",")]
-                # a continuous hillside (no repeated value) ...
                 a = (288.0 + 0.06 * np.arange(tw)[None, :] +
                      0.004 * np.arange(th)[:, None]).astype(np.float32)
-                a[: th // 2, : tw // 2] = 257.4          # ... plus the filled hole
+                a[: th // 2, : tw // 2] = 257.4          # the lake surface
                 return self._tiff(a)
             if "/terrarium/" in url:
-                # terrarium: the whole area is the hillside at 290 m
                 val = 290.0 + 32768.0
                 px = np.zeros((256, 256, 3), dtype=np.uint8)
                 px[:, :, 0] = int(val) // 256
@@ -935,13 +933,11 @@ class DemTests(unittest.TestCase):
                 return buf.getvalue()
             raise AssertionError("unexpected URL " + url)
 
-        logs = []
         with mock.patch.object(tp, "_get", fake_get):
-            g = tp.dem_hires(bbox, self.cache, log=lambda m: logs.append(m))
+            g = tp.dem_hires(bbox, self.cache, log=lambda m: None)
         V = g["values"].reshape(g["rows"], g["cols"])
-        self.assertFalse(np.any(np.abs(V - 257.4) < 0.2), "the plateau survived")
-        self.assertGreater(float(V.min()), 280.0, (float(V.min()), float(V.max())))
-        self.assertTrue(any("fill artefact" in m for m in logs), logs)
+        self.assertGreater(int((np.abs(V - 257.4) < 0.2).sum()), V.size // 5,
+                           "the lake surface was replaced")
 
     def test_3dep_failure_falls_back_to_bilinear_terrarium(self):
         tp = self.tp

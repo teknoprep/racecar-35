@@ -309,12 +309,9 @@ DEM_MAX_TILE_PX = 2000
 # Bump when the FILLING of such cells changes: a grid written by an older
 # version is treated as missing and re-fetched (this is how the Road Atlanta
 # "257.4 m for 5,900 cells" plateau heals without anyone deleting files).
-DEM_V = 1
+DEM_V = 2      # 2: v1 grids may carry the reverted "constant plateau" replacement
 DEM_BAD_MAX_FRAC = 0.02           # more invalid cells than this = the source failed
 DEM_MIN_OK_M, DEM_MAX_OK_M = -500.0, 9000.0
-# a CONSTANT region this large is a filled void, not terrain (see _dem3dep)
-DEM_FLAT_MIN_SHARE = 0.01
-DEM_FLAT_DISAGREE_M = 10.0
 
 
 def _grid_dims(bbox, max_cells: int, min_cell_m: float):
@@ -450,29 +447,11 @@ def _dem3dep(bbox, cols: int, rows: int, cache_dir: pathlib.Path, log=print,
             out = np.where(use, t, out)
             log(f"[dem3dep] {100 * frac:.1f}% of the grid was NoData "
                 f"(water/void); {int(use.sum())} cells filled from AWS terrarium z15")
-    # A 3DEP void can also come back as a PLAUSIBLE CONSTANT instead of NoData:
-    # Road Atlanta's skidpad area is 257.4 m for ~6,000 cells while the hillside
-    # around it is 290 m. That is not terrain - it is a filled hole, and a road
-    # driven through it dives into a trench with vertical green walls beside it.
-    # A large exact-constant region that terrarium disagrees with IS the artifact.
-    if t is not None:
-        try:
-            q = np.round(out * 2.0) / 2.0
-            vals, counts = np.unique(q, return_counts=True)
-            for k in np.argsort(counts)[::-1][:8]:
-                share = float(counts[k]) / out.size
-                if share < DEM_FLAT_MIN_SHARE:
-                    break
-                mode = float(vals[k])
-                flat = np.abs(out - mode) < 0.2
-                theirs = float(np.median(t[flat]))
-                if abs(theirs - mode) > DEM_FLAT_DISAGREE_M:
-                    out = np.where(flat, t, out)
-                    log(f"[dem3dep] {100 * share:.1f}% of the grid was a constant "
-                        f"{mode:.1f} m while terrarium says {theirs:.1f} m there "
-                        f"-> fill artefact; replaced with terrarium")
-        except Exception as e:
-            log(f"[dem3dep] flat-region check failed: {type(e).__name__}: {e}")
+    # NOTE: a large exact-CONSTANT region is deliberately left alone. 3DEP
+    # hydro-flattens WATER to one level (Road Atlanta's lake: 257.4 m for ~5,900
+    # cells), and that IS the surface. Replacing it with terrarium (which smooths
+    # the ravine to ~290 m) raised the lake 30 m and built a 34 m cliff at its
+    # shoreline - tried in v0.1.178 development and reverted.
     return _clean_dem(out, "3DEP")
 
 

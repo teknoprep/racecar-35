@@ -9894,9 +9894,20 @@ _TRACK3D_HTML = (
     background:rgba(14,16,20,0.94); border:1px solid var(--line); border-radius:6px;
     padding:9px 15px; font:600 12px Inter,sans-serif; max-width:78vw; }
   #notice.err { border-color:var(--bad); color:#FFB0B0; }
-  #bar { position:absolute; left:0; right:0; bottom:0; height:52px; z-index:15;
-    display:flex; align-items:center; gap:9px; padding:0 12px; overflow-x:auto;
+  /* ONE row of driving controls; everything else lives in the "options" pop-up.
+     It used to be ~25 controls in one overflow-x:auto row, so the page scrolled
+     sideways. On a narrow screen the row WRAPS instead of scrolling. */
+  #bar { position:absolute; left:0; right:0; bottom:0; min-height:52px; z-index:26;
+    display:flex; flex-wrap:wrap; align-items:center; gap:9px; padding:6px 12px;
+    overflow:visible; box-sizing:border-box;
     background:var(--surface); border-top:1px solid var(--line); }
+  /* #bar (z 26) is a stacking context: keep it above the admin QA panel (25) */
+  #b-more { position:absolute; right:12px; bottom:calc(100% + 6px); z-index:30;
+    display:none; flex-direction:column; align-items:flex-start; gap:9px;
+    background:rgba(14,16,20,0.97); border:1px solid var(--line); border-radius:8px;
+    padding:12px 14px; max-height:70vh; overflow-y:auto; min-width:240px; }
+  #b-more.open { display:flex; }
+  #b-more label { justify-content:space-between; width:100%; }
   #bar button { background:#20242E; color:var(--text); border:1px solid var(--line);
     border-radius:4px; padding:8px 13px; cursor:pointer; font:600 12px Inter,sans-serif;
     white-space:nowrap; }
@@ -9913,10 +9924,11 @@ _TRACK3D_HTML = (
     border-radius:4px; padding:8px 10px; font:600 12px Inter,sans-serif; white-space:nowrap; }
   #bar a:hover { color:var(--text); }
   #bar .sep { width:1px; height:26px; background:var(--line); flex:0 0 auto; }
-  /* admin: track render QA + re-render (see the qa block below). Above the bar
-     on the right, under the legend; scrolls when it gets long. */
-  #qa { position:fixed; right:14px; bottom:64px; z-index:25; width:340px;
-    max-height:54vh; overflow:auto; display:none;
+  /* admin: track render QA + re-render (see the qa block below). Top-LEFT - the
+     one free corner (HUD bottom-left, legend top-right, mini-map bottom-right);
+     scrolls when it gets long. */
+  #qa { position:fixed; left:14px; top:14px; z-index:25; width:340px;
+    max-height:44vh; overflow:auto; display:none;
     background:rgba(14,16,20,0.94); border:1px solid var(--line);
     border-radius:8px; padding:10px 12px;
     font:500 12px/1.45 Inter,sans-serif; color:var(--text); }
@@ -9982,16 +9994,6 @@ _TRACK3D_HTML = (
   <select id="b-lap" title="which lap to drive"></select>
   <select id="b-cmp" title="GHOST: another lap driven on the same clock as yours - a see-through car, its line on the road and the live gap. Pick a comparison lap on the pit wall to bring another driver's lap here"><option value="">no ghost</option></select>
   <span class="sep"></span>
-  <label title="smoothing window over the 25 Hz GPS — higher is smoother but rounds off real detail">
-    <span class="meta">smooth</span>
-    <input id="b-smooth" type="range" min="1" max="15" step="2" value="5" style="width:74px"></label>
-  <label title="eye height above the track surface (scroll wheel too)">
-    <span class="meta">eye</span>
-    <input id="b-eye" type="range" min="0.5" max="4" step="0.05" value="1.15" style="width:74px"></label>
-  <label title="width of the ribbon drawn around your line">
-    <span class="meta">road</span>
-    <input id="b-road" type="range" min="6" max="24" step="1" value="12" style="width:74px"></label>
-  <span class="sep"></span>
   <select id="b-view" title="chase = driving view; plan = whole circuit from above, over the real imagery">
     <option value="chase">chase</option>
     <option value="plan">plan</option>
@@ -9999,15 +10001,27 @@ _TRACK3D_HTML = (
   <label id="b-ground-lab" title="ground surface: simulated asphalt/grass/kerbs drawn procedurally, the prepared satellite imagery, or nothing"><span class="meta">ground</span>
     <select id="b-groundsel"><option value="sim">simulated</option><option value="satellite">satellite</option><option value="none">none</option></select></label>
   <button id="b-prep" style="display:none" type="button" title="pre-render this track from satellite imagery + OpenStreetMap on the server (once per track)">prepare track</button>
-  <label title="road colour = your inputs, not your speed: green accelerating, grey neither, red braking (deeper with the g)"><input type="checkbox" id="b-speedcol" checked>accel / brake</label>
-  <label title="render scale: higher supersamples the view, which is what removes jagged/crawling edges. Pick 1x if the GPU struggles"><span class="meta">sharp</span>
-    <select id="b-scale"><option value="1">1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
-  <label><input type="checkbox" id="b-markers" checked>markers</label>
-  <label title="numbered brake boards (5 4 3 2 1 = hundreds of metres) before the corners that need them — tight corners get the full ladder, gentle bends get none"><input type="checkbox" id="b-brakes" checked>brake boards</label>
-  <label title="every other layout of the facility (other circuits, links, pit lanes, kart track) from OpenStreetMap + the imagery - shown, never driven on"><input type="checkbox" id="b-net" checked>all layouts</label>
-  <label><input type="checkbox" id="b-ghost">other laps</label>
-  <label><input type="checkbox" id="b-loop" checked>loop</label>
-  <label title="lean the camera into corners (computed from the path curvature)"><input type="checkbox" id="b-bank" checked>bank</label>
+  <button id="b-more-btn" type="button" title="display options">options ▾</button>
+  <div id="b-more" role="dialog" aria-label="display options">
+    <label title="smoothing window over the 25 Hz GPS — higher is smoother but rounds off real detail">
+      <span class="meta">smooth</span>
+      <input id="b-smooth" type="range" min="1" max="15" step="2" value="5" style="width:74px"></label>
+    <label title="eye height above the track surface (scroll wheel too)">
+      <span class="meta">eye</span>
+      <input id="b-eye" type="range" min="0.5" max="4" step="0.05" value="1.15" style="width:74px"></label>
+    <label title="width of the ribbon drawn around your line">
+      <span class="meta">road</span>
+      <input id="b-road" type="range" min="6" max="24" step="1" value="12" style="width:74px"></label>
+    <label title="road colour = your inputs, not your speed: green accelerating, grey neither, red braking (deeper with the g)"><input type="checkbox" id="b-speedcol" checked>accel / brake</label>
+    <label title="render scale: higher supersamples the view, which is what removes jagged/crawling edges. Pick 1x if the GPU struggles"><span class="meta">sharp</span>
+      <select id="b-scale"><option value="1">1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+    <label><input type="checkbox" id="b-markers" checked>markers</label>
+    <label title="numbered brake boards (5 4 3 2 1 = hundreds of metres) before the corners that need them — tight corners get the full ladder, gentle bends get none"><input type="checkbox" id="b-brakes" checked>brake boards</label>
+    <label title="every other layout of the facility (other circuits, links, pit lanes, kart track) from OpenStreetMap + the imagery - shown, never driven on"><input type="checkbox" id="b-net" checked>all layouts</label>
+    <label><input type="checkbox" id="b-ghost">other laps</label>
+    <label><input type="checkbox" id="b-loop" checked>loop</label>
+    <label title="lean the camera into corners (computed from the path curvature)"><input type="checkbox" id="b-bank" checked>bank</label>
+  </div>
   <span class="sep"></span>
   <a href="/review/__USER__/__FILE__">← pit wall</a>
   <a href="/map3d/__USER__/__FILE__" title="the same session on satellite imagery with 3D terrain">satellite map</a>
@@ -11598,8 +11612,11 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     // embankment has a slope (~1 in 6), not a vertical wall. A fixed 30 m blend
     // turned Road Atlanta's ~20 m cuts into green cliffs right beside the
     // tarmac (the camera sits 1.15 m up, so they filled the screen).
-    var BLEND_MAX_DH = 6;
-    var reach = (opt.maxHalf || 15) + shoulder + Math.max(blend, 320);
+    // The blend must FINISH inside the search radius: beyond `reach` the ground is
+    // raw terrain, so a blend still running there would end in a step - a cliff
+    // ~300 m off the road (seen on the horizon at Road Atlanta, then fixed).
+    var BLEND_MAX_DH = 6, BLEND_MAX_M = 300;
+    var reach = (opt.maxHalf || 15) + shoulder + Math.max(blend, BLEND_MAX_M);
     return function (x, z) {
       var t = terrain(x, z);
       if (field.approx(x, z) > reach + field.cell) return t;
@@ -11607,7 +11624,8 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       if (!q) return t;
       var ry = dense.y[q.i] - drop, edge = hw(q.i) + shoulder;
       if (q.d <= edge) return ry;
-      var bl = Math.max(blend, Math.abs(t - ry) * BLEND_MAX_DH);
+      var bl = Math.min(Math.max(blend, Math.abs(t - ry) * BLEND_MAX_DH),
+                        Math.max(blend, reach - edge));
       var u = (q.d - edge) / bl;
       if (u >= 1) return t;
       u = u * u * (3 - 2 * u);
@@ -14330,13 +14348,14 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     TRACK_INFO.dem = covers ? ((demHr && demHr.source) || (demFar && demFar.source) || "coarse grid") : null;
     var ys = new Array(line.x.length);
     if (covers) {
-      YREF = Infinity;
+      // ABSOLUTE metres first; the datum (YREF) is taken AFTER smoothing, once.
+      // (Taking it before, then again from the already-relative profile, left
+      // YREF ~0 while the terrain is DEM - YREF: the ground stood ~290 m above
+      // the road at Road Atlanta and rose as green walls beside it.)
       for (i = 0; i < line.x.length; i++) {
         var l2 = RC3D.localToLatLon(line.x[i], line.z[i], o);
         ys[i] = DEMFN(l2[0], l2[1]);
-        if (ys[i] < YREF) YREF = ys[i];
       }
-      for (i = 0; i < ys.length; i++) ys[i] -= YREF;
       // The road's VERTICAL ALIGNMENT: smooth in METRES along the track, not
       // over N samples, and wrap a closed lap. This is the difference between
       // a road and a DEM read (see RC3D.smoothProfile): ~25 m is right for a
@@ -14354,6 +14373,19 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       YREF = Infinity;
       for (i = 0; i < ys.length; i++) if (ys[i] < YREF) YREF = ys[i];
       for (i = 0; i < ys.length; i++) ys[i] -= YREF;
+      // Self-check: the smoothed road must stay on the terrain it was read from
+      // (metres; a datum bug shows up here as hundreds). Reported in
+      // window.__rc3dInfo.track.roadVsDem and warned about on the console.
+      var devs = [];
+      for (i = 0; i < ys.length; i += 7) {
+        var l4 = RC3D.localToLatLon(line.x[i], line.z[i], o);
+        devs.push(Math.abs(ys[i] + YREF - DEMFN(l4[0], l4[1])));
+      }
+      devs.sort(function (a, b) { return a - b; });
+      TRACK_INFO.roadVsDem = devs.length ? Math.round(devs[devs.length >> 1] * 100) / 100 : null;
+      if (TRACK_INFO.roadVsDem > 3) {
+        console.warn("[track3d] road sits " + TRACK_INFO.roadVsDem + " m off the terrain (median)");
+      }
     } else {
       // the logged altitude, carried over from the nearest driven station
       var pidx = RC3D.lineIndex(P0.dense.x, P0.dense.z, 40);
@@ -16434,9 +16466,26 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     }).catch(function () { prepPoll = setTimeout(pollPrep, 5000); });
   }
 
+  function moreInit() {
+    var btn = el("b-more-btn"), pane = el("b-more");
+    if (!btn || !pane) return;
+    var set = function (open) {
+      pane.classList.toggle("open", open);
+      btn.classList.toggle("on", open);
+    };
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      set(!pane.classList.contains("open"));
+    });
+    pane.addEventListener("click", function (e) { e.stopPropagation(); });
+    document.addEventListener("click", function () { set(false); });
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") set(false); });
+  }
+
   function start() {
     if (!tryRenderer()) return;
     qaInit();
+    moreInit();
     buildScene();
     // supersample by default: 1.5x on a standard display, 2x on a hi-dpi one.
     // The scene is a few thousand triangles, so this is cheap and it is the

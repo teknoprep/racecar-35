@@ -800,24 +800,37 @@ causes, both measured before anything was changed:
   {relief_m, grade_p95, grade_max, roughness_m, source, cell_m, sigma_m, rejected}. Enrichment step
   (d) redoes it from the 3 m lidar grid; `ENRICH_VERSION` 4 makes every older asset redo it, and
   `_enrich_missing()` requires `elevation.v == PROFILE_V`. The shipped seeds were rebuilt.
-- **3DEP fills a void with a plausible CONSTANT.** Road Atlanta's skidpad area came back as
-  **257.4 m for ~5,900 cells** while the hillside around it is 290 m (AWS terrarium says 272 m).
-  `_clean_dem()` used to fill NoData with the GLOBAL MEDIAN, and this plateau is not even NoData.
-  The road dived 33 m into it and the ground beside it stood up as vertical green walls. Now
-  `_dem3dep()` cross-checks the 3DEP grid against AWS terrarium z15: NoData cells are filled from
-  terrarium, and a large exact-constant region (`DEM_FLAT_MIN_SHARE` 1 %) that terrarium disagrees
-  with by >10 m is replaced with terrarium. `_clean_dem()` fills remaining holes from their
-  NEIGHBOURS (`_fill_from_neighbours`, normalized 3x3 growth), never one flat median.
-  The written grid metadata carries **`DEM_V`** (1): an older grid counts as MISSING in
-  `_enrich_missing()`/`need()`, so every existing asset re-fetches its terrain once in the
-  background and heals itself (no file deletion needed). A re-render rebuilds it anyway:
-  `build_asset()` writes a fresh JSON without `dem_hr`/`dem_far`/`network`/`ground`/`features`.
+- **DEM fills.** `_dem3dep()` now fills NoData cells from AWS terrarium z15, and `_clean_dem()`
+  fills any remaining hole from its NEIGHBOURS (`_fill_from_neighbours`, normalized 3x3 growth),
+  never the old single global median (which turned every void into one flat plateau).
+  ⚠️ **A large exact-CONSTANT region is LEFT ALONE — it is water.** 3DEP hydro-flattens lakes to
+  one level (Road Atlanta's lake: 257.4 m over ~5,900 cells). An attempt to "fix" it by swapping in
+  terrarium (which smooths the ravine to ~290 m) raised the lake 30 m and built a **34 m cliff** at
+  the shoreline; it was reverted and `tests/test_trackprep.py` pins the lake staying put. The
+  Road Atlanta "trench" was the OSM-only TEST line clipping the lake edge, not bad terrain.
+  The written grid metadata carries **`DEM_V`** (2): an older grid counts as MISSING in
+  `_enrich_missing()`/`need()`, so it is re-fetched once in the background (v1 grids may carry the
+  reverted replacement). A re-render rebuilds it anyway: `build_asset()` writes a fresh JSON
+  without `dem_hr`/`dem_far`/`network`/`ground`/`features`.
 - **Viewer:** the fine DEM grid is blurred 2 cells (`RC3D.smoothGrid`, ~6 m: raster creases out,
   hills kept) and the track's vertical profile is smoothed again in metres along the lap
-  (`RC3D.smoothProfile`, 24 m, wraps), with `YREF` recomputed after smoothing. The ground
-  blend distance now GROWS with the height difference (1 in 6, `groundField`): a 20 m cutting
-  eases over ~120 m instead of forming a wall 10 m off the tarmac. Numbers: Watkins Glen
-  grade max 55 % → 18 %, p95 15 % → 9 %; Road Atlanta relief 58 → 44 m after the DEM fix.
+  (`RC3D.smoothProfile`, 24 m, wraps). ⚠️ **Datum rule:** the profile is smoothed in ABSOLUTE
+  metres and `YREF` (the datum the terrain uses as `DEM − YREF`) is taken ONCE, after smoothing.
+  A version that took it again from the already-relative profile left `YREF ≈ 0`, so the terrain
+  stood ~290 m above the road and rose as green walls/hills beside it. `__rc3dInfo.track.roadVsDem`
+  (median |road − DEM|, metres) now reports it on every load and the console warns above 3 m —
+  healthy is ~0.2 m. The ground blend distance GROWS with the height difference (1 in 6,
+  `groundField`) but is capped (`BLEND_MAX_M` 300) so it always FINISHES inside the search
+  radius; an uncapped blend snapped to raw terrain mid-ramp = a cliff ~300 m out (host test:
+  a 60 m cutting must ease out with < 1 m per 1 m step). Numbers: Watkins Glen grade max
+  55 % → 18 %, p95 15 % → 9 %.
+- **The 3D bar never scrolls sideways.** It was ~25 controls in one `overflow-x:auto` row. The
+  driving controls stay in the bar (drive, scrub, clock, rate, lap, ghost, chase/plan, ground,
+  prepare, links); smooth/eye/road/accel-brake/sharp/markers/brake boards/all layouts/other
+  laps/loop/bank live in an **options ▾** pop-up (`#b-more`, same element ids, so the wiring is
+  untouched; closes on an outside click / Esc). The bar wraps on a narrow screen instead of
+  scrolling. It is z-index 26 (a stacking context) so the pop-up opens over the QA panel, which
+  sits TOP-LEFT — the bottom-right corner belongs to the mini-map.
 - **Admin re-render + AI review (the QA panel).** `/track3d` shows a bottom-right **track render
   QA** panel to admins only (`__ADMIN__` injected with `_req_is_admin`), listing the audit's
   issues and two buttons: **re-render track** (`POST /trackassets/<slug>/rerender`, background:

@@ -727,8 +727,25 @@ R.world = (function () {
     if (prevY !== null) worstStep = Math.max(worstStep, Math.abs(ty2 - prevY));
     prevY = ty2;
   }
+  // a deep CUTTING: terrain 60 m above the road everywhere. The blend grows with
+  // the height difference (1 in 6) and must FINISH inside groundField's search
+  // radius - when it did not, the ground snapped to raw terrain mid-blend and a
+  // ~30 m cliff stood ~300 m off the road (the Road Atlanta horizon wall).
+  var cut = RC3D.groundField(d, field, { halfWidth: hw, terrain: function () { return 60; },
+                                         drop: 0.06, maxHalf: hwM });
+  var worstCut = 0, cutFar = null;
+  for (var ci = 0; ci < d.x.length; ci += 97) {
+    var ctx = d.tan[ci][0], ctz = d.tan[ci][1], prevC = null;
+    for (var co = hwM; co <= hwM + 600; co += 1) {
+      var cy = cut(d.x[ci] + ctz * co, d.z[ci] - ctx * co);
+      if (prevC !== null) worstCut = Math.max(worstCut, Math.abs(cy - prevC));
+      prevC = cy;
+    }
+    cutFar = prevC;
+  }
   var farX = box.maxX - 5, farZ = box.maxZ - 5;
-  return { worstNear: worstNear, worstApprox: worstApprox, probes: probes,
+  return { cutStep: worstCut, cutFar: cutFar,
+           worstNear: worstNear, worstApprox: worstApprox, probes: probes,
            proc: proc.length, procClear: clearance(proc),
            lc: lcSpots.length, lcClear: clearance(lcSpots), none: none.length,
            terrainStep: worstStep, aboveRoad: worstAbove, underRoad: worstUnder,
@@ -1571,6 +1588,8 @@ class Track3DMathTests(unittest.TestCase):
         #     they were generated from - so on a circuit that folds back they
         #     stood on the other straight.
         w = res["world"]
+        # a 60 m cutting eases out as a slope, never a cliff (1 m probe steps)
+        self.assertLess(w["cutStep"], 1.0, "the ground has a cliff beside a deep cutting")
         self.assertGreater(w["probes"], 100)
         self.assertLess(w["worstNear"], 0.01, "road field must be exact near the road")
         self.assertLess(w["worstApprox"], 4.0, "raster distance is off by more than a cell")
