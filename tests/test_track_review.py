@@ -93,3 +93,100 @@ class EndpointGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _t3d():
+    i = SRC.index("_TRACK3D_HTML = (")
+    return SRC[i:SRC.index("_CAN_REVIEW_HTML = (")]
+
+
+def _review():
+    i = SRC.index("_REVIEW_HTML = (")
+    return SRC[i:SRC.index("_ROSTER_HTML = (")]
+
+
+class ProblemHereTests(unittest.TestCase):
+    """The admin "problem here" tool: point, say what is wrong, get ONE bounded
+    fix (the AI only picks from trackprep.CORRECTION_OPS), preview, accept."""
+
+    def test_every_fix_endpoint_uses_the_admin_rule(self):
+        for name in ("trackasset_profile", "trackasset_fix_propose",
+                     "trackasset_fix_apply", "trackasset_fix_remove"):
+            i = SRC.index("def %s(" % name)
+            self.assertIn("_gate_track_admin(request)", SRC[i:i + 900], name)
+            # blocking work (AI call, numpy, file locks) -> plain def, thread pool
+            self.assertNotIn("async def %s(" % name, SRC)
+
+    def test_the_ai_choice_is_always_validated_by_trackprep(self):
+        i = SRC.index("def trackasset_fix_propose(")
+        block = SRC[i:SRC.index("def trackasset_fix_apply(")]
+        self.assertIn("tp.validate_correction(", block)
+        j = SRC.index("def trackasset_fix_apply(")
+        self.assertIn("tp.validate_correction(", SRC[j:j + 1500])   # never trust the client copy
+        self.assertIn("_slug_lock(path)", SRC[j:j + 1500])
+
+    def test_corrections_survive_rerender_reprep_and_seed_refresh(self):
+        i = SRC.index("def trackasset_rerender(")
+        self.assertIn('"corrections": asset.get("corrections")', SRC[i:i + 2400])
+        j = SRC.index("def session_track_prep(")
+        self.assertIn('"corrections": keep_corr', SRC[j:j + 9000])
+        k = SRC.index("def _prep_run(")
+        self.assertIn('"corrections": params.get("corrections")', SRC[k:k + 2600])
+        m = SRC.index("def _seed_tracks(")
+        self.assertIn("reapply_corrections", SRC[m:m + 4000])
+
+    def test_heuristic_without_ai(self):
+        tree = ast.parse(SRC)
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_fix_heuristic")
+        ns = {}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(MAIN), "exec"), ns)
+        f = ns["_fix_heuristic"]
+        self.assertEqual(f("make it flat", [1, 2], [1, 1])["op"], "flatten")
+        self.assertEqual(f("way too steep here", [1], [1])["op"], "max_grade")
+        self.assertEqual(f("it bucks and is bumpy", [1], [1])["op"], "smooth")
+        self.assertEqual(f("impossibly high hill", [1], [1])["op"], "scale_relief")
+
+    def test_panel_has_the_tool_and_a_collapse_button(self):
+        h = _t3d()
+        for idv in ("qa-toggle", "qa-prof", "qa-here", "qa-note", "qa-ask", "qa-op",
+                    "qa-accept", "qa-discard", "qa-corr"):
+            self.assertIn('id="%s"' % idv, h, idv)
+        self.assertIn("rc3.qa.collapsed", h)              # the collapse is remembered
+        self.assertIn("#qa.collapsed #qa-main { display:none; }", h)
+        self.assertIn("/fix/propose", h)
+        self.assertIn("/fix/apply", h)
+        self.assertIn("/fix/remove", h)
+
+    def test_the_viewer_draws_the_prepared_profile_not_its_own_dem_read(self):
+        h = _t3d()
+        self.assertIn('TRACK_INFO.profile = "asset"', h)
+        self.assertIn("ASSET.elevation.v || 0) >= 2", h)
+
+
+class EmbeddedThreeDTests(unittest.TestCase):
+    """The 3D view opens IN the pit wall's map card on the data the page has,
+    and only grows when its full-screen button is pressed."""
+
+    def test_review_page_embeds_and_shares_its_data(self):
+        r = _review()
+        self.assertIn('id="map3dwrap"', r)
+        self.assertIn('id="map3dframe"', r)
+        self.assertIn('id="rc3dfull"', r)
+        self.assertIn("window.__rcReview.data = data;", r)
+        self.assertIn("window.__rcReview.laps = lr;", r)
+        self.assertIn("q.push('embed=1');", r)
+        self.assertIn("window.__rc3dFull = function", r)
+        self.assertIn("window.__rc3dExitFull = function", r)
+        self.assertNotIn("'track3d');", r)                # no more pop-up window
+
+    def test_track3d_reads_the_parent_in_embed_mode_and_has_the_buttons(self):
+        h = _t3d()
+        self.assertIn('q.get("embed") === "1"', h)
+        self.assertIn("window.parent.__rcReview", h)
+        self.assertIn('id="b-full"', h)
+        self.assertIn('id="b-exitfs"', h)
+        self.assertIn("window.__rc3dNow = function", h)
+        # compact embed hides the admin panel, legend and options
+        self.assertIn(".embed #legend, .embed #qa", h)
+        # the full view fetches its OWN full-resolution data
+        self.assertIn('"/data?target=30000&fixes=1"', h)

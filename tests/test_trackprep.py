@@ -824,6 +824,16 @@ class DemTests(unittest.TestCase):
         b2 = tp.read_dem_bin(m2, p)
         self.assertLessEqual(float(np.abs(b2 - grid2["values"]).max()), m2["scale"] / 2 + 1e-3)
 
+    def test_server_extent_matches_the_live_3dep_answer(self):
+        """Measured on the live service (exportImage f=json): bbox
+        -83.82,34.134,-83.809,34.152 with size 337x667 (metre-square pixels)
+        came back as ymin 34.13211424, ymax 34.15388576 - x1.21 the latitude."""
+        x0, y0, x1, y1, px = self.tp._server_extent((-83.82, 34.134, -83.809, 34.152), 337, 667)
+        self.assertAlmostEqual(x0, -83.82, places=7)
+        self.assertAlmostEqual(x1, -83.809, places=7)
+        self.assertAlmostEqual(y0, 34.13211424332344, places=7)
+        self.assertAlmostEqual(y1, 34.15388575667655, places=7)
+
     def test_3dep_is_used_flipped_and_node_aligned(self):
         tp = self.tp
         reqs = []
@@ -836,6 +846,13 @@ class DemTests(unittest.TestCase):
             w, s, e, n = [float(x) for x in q["bbox"][0].split(",")]
             tw, th = [int(x) for x in q["size"][0].split(",")]
             self.assertEqual(q["pixelType"], ["F32"])
+            # what the REAL ImageServer does: square pixels in the output SR,
+            # centred on the bbox - it grows one axis. Assuming the bbox comes
+            # back exactly is the bug that squashed every grid 21 % N-S.
+            px = max((e - w) / tw, (n - s) / th)
+            cx, cy = (w + e) / 2, (s + n) / 2
+            w, e = cx - tw * px / 2, cx + tw * px / 2
+            s, n = cy - th * px / 2, cy + th * px / 2
             lon_c = w + (np.arange(tw) + 0.5) * (e - w) / tw
             lat_c = n - (np.arange(th) + 0.5) * (n - s) / th      # row 0 = NORTH
             a = ((lon_c[None, :] - W0) * 1e5 + (lat_c[:, None] - 39.2) * 1e5).astype(np.float32)
@@ -873,6 +890,9 @@ class DemTests(unittest.TestCase):
             w, s, e, n = [float(x) for x in q["bbox"][0].split(",")]
             tw, th = [int(x) for x in q["size"][0].split(",")]
             self.assertLessEqual(max(tw, th), 2000)
+            px = max((e - w) / tw, (n - s) / th)               # the real server's extent
+            cx = (w + e) / 2
+            w, e = cx - tw * px / 2, cx + tw * px / 2
             lon_c = w + (np.arange(tw) + 0.5) * (e - w) / tw
             return self._tiff(np.tile(((lon_c - W0) * 1e5)[None, :], (th, 1)))
         bbox = (39.2, W0, 39.2004, W0 + 0.05)                  # ~4.3 km x 44 m
@@ -1854,3 +1874,134 @@ class RoadProfileTests(unittest.TestCase):
             self.assertEqual(got["line"], base["line"])
             p.unlink()
             self.assertFalse(tp.save_review(p, {"verdict": "gone"}))
+
+
+@unittest.skipUnless(HAVE_DEPS, "Pillow/numpy not installed")
+class WaterAndCorrectionTests(unittest.TestCase):
+    """Water bridging in the profile, the admin's profile CORRECTIONS and the
+    audit rules that would have caught the 3DEP squash (v0.1.178 follow-up).
+
+    Real failure: 3DEP returned a degree-square raster 21 % taller than asked
+    for; the lake's hydro-flattened level (257.4 m) landed across Road
+    Atlanta's Turn 7 hairpin, the road dived 33 m into it and climbed out at
+    the 22 % cap - the "impossibly high hill before the back straight".
+    """
+    LAT0, LON0 = 34.14, -83.81
+
+    def _grid(self, lake=True, half_m=400.0, cell_m=3.0):
+        cols = rows = int(2 * half_m / cell_m) + 1
+        half = (cols - 1) * cell_m / 2.0
+        dlat, dlon = half / M, half / (M * math.cos(math.radians(self.LAT0)))
+        b = [self.LAT0 - dlat, self.LON0 - dlon, self.LAT0 + dlat, self.LON0 + dlon]
+        y = (np.arange(rows) * cell_m - half)[:, None]
+        x = (np.arange(cols) * cell_m - half)[None, :]
+        V = 280.0 + 0.01 * y + 0.0 * x + 0.003 * ((np.arange(rows)[:, None] * 7 + np.arange(cols)[None, :] * 13) % 11)
+        V = np.broadcast_to(V, (rows, cols)).copy()
+        if lake:                                   # a flattened band 25 m down, across the line
+            V[(np.abs(y) < 60).repeat(cols, 1)] = 255.0
+        return {"cols": cols, "rows": rows, "bounds": b, "cell_m": cell_m,
+                "source": "synthetic", "values": V.reshape(-1).astype(np.float32)}
+
+    def _line(self, n=300, step=2.0, east_m=0.0):
+        lats = [self.LAT0 - 300.0 / M + i * step / M for i in range(n)]
+        lons = [self.LON0 + east_m / (M * math.cos(math.radians(self.LAT0)))] * n
+        return lats, lons
+
+    def test_a_hydro_flattened_level_is_found(self):
+        tp = _tp()
+        self.assertEqual(tp.flat_levels(self._grid(lake=True)), [255.0])
+        self.assertEqual(tp.flat_levels(self._grid(lake=False)), [])
+
+    def test_the_road_bridges_water_instead_of_diving_into_it(self):
+        tp = _tp()
+        lats, lons = self._line()
+        z, st = tp.road_profile(self._grid(lake=True), lats, lons, closed=False, log=lambda m: None)
+        self.assertGreater(st["water_m"], 80)                 # the band was seen...
+        self.assertGreater(float(np.min(z)), 276.0)           # ...and bridged, not dived into
+        self.assertLess(st["grade_max"], 0.05)
+
+    def _asset(self):
+        tp = _tp()
+        lats, lons = self._line(n=600)
+        # a 12 m hill in the middle of an otherwise gentle line
+        s = np.arange(600) * 2.0
+        z = 280 + 0.01 * s + 12.0 * np.exp(-((s - 600.0) / 60.0) ** 2)
+        return {"line": [[a, b, float(c)] for a, b, c in zip(lats, lons, z)],
+                "elevation": {"v": 3}}
+
+    def test_validate_bounds_and_cleans_a_correction(self):
+        tp = _tp()
+        a = self._asset()
+        with self.assertRaises(ValueError):
+            tp.validate_correction({"op": "delete_track", "s0": 0, "s1": 100}, a["line"])
+        with self.assertRaises(ValueError):
+            tp.validate_correction({"op": "flatten", "s0": 100, "s1": 105}, a["line"])
+        c = tp.validate_correction({"op": "scale_relief", "s0": 700, "s1": 500,
+                                    "params": {"factor": 9, "evil": 1}}, a["line"])
+        self.assertEqual((c["s0"], c["s1"]), (500.0, 700.0))  # swapped
+        self.assertEqual(c["params"], {"factor": 1.5})        # clamped, unknown dropped
+        self.assertEqual(len(c["p0"]), 2)                      # lat/lon ends kept
+        c2 = tp.validate_correction({"op": "shift", "s0": 0, "s1": 100}, a["line"])
+        self.assertEqual(c2["params"], {"dz_m": 0.0})          # default filled in
+
+    def test_each_op_does_what_it_says_without_steps(self):
+        tp = _tp()
+        a = self._asset()
+        s, closed = tp.line_arclength(a["line"])
+        z = np.array([p[2] for p in a["line"]])
+        i0, i1 = int(np.searchsorted(s, 450)), int(np.searchsorted(s, 750))
+        mk = lambda op, **p: tp.validate_correction({"op": op, "s0": 450, "s1": 750, "params": p}, a["line"])
+        flat = tp.apply_correction(z, s, mk("flatten"), closed)
+        self.assertLess(float(np.max(np.abs(np.diff(flat[i0:i1 + 1], 2)))), 1e-6)   # a straight ramp
+        same = tp.apply_correction(z, s, mk("scale_relief", factor=1.0), closed)
+        self.assertLess(float(np.max(np.abs(same - z))), 1e-9)
+        half = tp.apply_correction(z, s, mk("scale_relief", factor=0.5), closed)
+        k = int(np.searchsorted(s, 600))             # the hill's peak
+        self.assertAlmostEqual(float(half[k] - flat[k]), float(z[k] - flat[k]) / 2, delta=0.05)
+        up = tp.apply_correction(z, s, mk("shift", dz_m=5), closed)
+        self.assertAlmostEqual(float(up[(i0 + i1) // 2] - z[(i0 + i1) // 2]), 5.0, delta=0.01)
+        lim = tp.apply_correction(z, s, mk("max_grade", grade_pct=4), closed)
+        g = np.abs(np.diff(lim[i0:i1 + 1])) / np.diff(s[i0:i1 + 1])
+        self.assertLess(float(g.max()), 0.06)
+        for zz in (flat, half, up, lim):                # outside the stretch: untouched
+            self.assertTrue(np.allclose(zz[:i0], z[:i0]) and np.allclose(zz[i1 + 1:], z[i1 + 1:]))
+            self.assertLess(float(np.max(np.abs(np.diff(zz)))), 0.6)   # no step anywhere
+
+    def test_corrections_reapply_remove_and_follow_a_rerender(self):
+        tp = _tp()
+        a = self._asset()
+        base = [p[2] for p in a["line"]]
+        c = tp.validate_correction({"op": "flatten", "s0": 450, "s1": 750}, a["line"])
+        a["corrections"] = [c]
+        tp.reapply_corrections(a, log=lambda m: None)
+        self.assertEqual(a["elevation"]["corrections"], 1)
+        self.assertLess(a["elevation"]["relief_m"], a["elevation"]["base"]["relief_m"])
+        self.assertEqual(a["profile_base"], [round(v, 2) for v in base])
+        # a re-render: the same road, resampled 1 m sideways - the fix follows by lat/lon
+        b2 = {"line": [[p[0], p[1] + 1.0 / (M * math.cos(math.radians(self.LAT0))), p[2]]
+                       for p in a["line"][3:]], "corrections": [c]}
+        b2["profile_base"] = [q[2] for q in b2["line"]]
+        tp.reapply_corrections(b2, log=lambda m: None)
+        self.assertEqual(b2["elevation"]["corrections"], 1)
+        self.assertNotIn("corrections_lost", b2["elevation"])
+        # moved somewhere else entirely: reported, never applied to the wrong place
+        far = {"line": [[p[0] + 0.01, p[1], p[2]] for p in a["line"]], "corrections": [c]}
+        tp.reapply_corrections(far, log=lambda m: None)
+        self.assertEqual(far["elevation"]["corrections_lost"], 1)
+        # removing it restores the base exactly
+        a["corrections"] = []
+        tp.reapply_corrections(a, log=lambda m: None)
+        self.assertEqual([p[2] for p in a["line"]], a["profile_base"])
+
+    def test_audit_flags_the_squash_signatures(self):
+        tp = _tp()
+        a = self._asset()
+        a["elevation"] = {"v": 3, "grade_p95": 0.21, "grade_max": 0.22, "relief_m": 58}
+        a["dem_hr"] = {"v": 2, "source": "USGS 3DEP", "cell_m": 3.0,
+                       "ref_check": {"p95_abs_m": 14.8, "over12_pct": 9.4}}
+        txt = " ".join(i["issue"] for i in tp.audit_asset(a)["issues"] if i["severity"] == "high")
+        self.assertIn("safety cap", txt)
+        self.assertIn("squashed", txt)
+        self.assertIn("disagrees with the reference", txt)
+        a["elevation"]["water_m"] = 120
+        self.assertTrue(any("hydro-flattened" in i["issue"] for i in tp.audit_asset(a)["issues"]))

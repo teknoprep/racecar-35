@@ -62,7 +62,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 # ---------------------------------------------------------------------------
@@ -3239,8 +3239,11 @@ def _seed_tracks() -> int:
                     continue
                 log.info("replacing stale seeded track %s (prep_version %s, enrich %s)",
                          dst.name, have.get("prep_version"), h_en)
+                keep = have.get("corrections") or []
             except Exception:
                 continue
+        else:
+            keep = []
         try:
             # side files first, the JSON that points at them last
             tex = src.with_suffix(".jpg")
@@ -3251,6 +3254,15 @@ def _seed_tracks() -> int:
                 if extra.is_file():
                     shutil.copy2(extra, TRACKS_DIR / extra.name)
             shutil.copy2(src, dst)
+            if keep:                     # an admin's profile fixes outlive a seed refresh
+                try:
+                    tpm = _trackprep()
+                    a2 = json.loads(dst.read_text("utf-8"))
+                    a2["corrections"] = keep
+                    tpm.reapply_corrections(a2, log=lambda m: log.info("seed %s", m))
+                    tpm._write_json_atomic(dst, a2)
+                except Exception as e:
+                    log.warning("could not carry corrections onto seed %s: %s", src.name, e)
             n += 1
         except OSError as e:
             log.warning("seed track %s failed: %s", src.name, e)
@@ -3424,7 +3436,8 @@ def _prep_run(slug: str, track: str, params: dict) -> None:
             track, points, DATA_DIR,
             {"zoom": params.get("zoom", 18), "line_source": source,
              "osm_id": osm_id, "osm_width_m": osm_w,
-             "prep_version": PREP_VERSION},
+             "prep_version": PREP_VERSION,
+             "corrections": params.get("corrections") or []},
             log=lambda m: _prep_log(slug, m),
         )
         if params.get("enrich"):
@@ -3674,6 +3687,11 @@ def session_track_prep(request: Request, user: str, filename: str,
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"trackprep unavailable: {e}")
     slug = _track_slug(track)
+    keep_corr = []                       # admin profile fixes survive a re-bake
+    try:
+        keep_corr = json.loads(_track_asset_path(slug).read_text("utf-8")).get("corrections") or []
+    except Exception:
+        keep_corr = []
     if force:                            # re-bake even though an asset exists
         try:
             _track_asset_path(slug).unlink()
@@ -3752,7 +3770,8 @@ def session_track_prep(request: Request, user: str, filename: str,
             raise HTTPException(status_code=422, detail=str(e2))
     threading.Thread(target=_prep_run, args=(slug, track,
                                              {"points": points, "source": source,
-                                              "osm_id": osm_id, "osm_width_m": osm_w}),
+                                              "osm_id": osm_id, "osm_width_m": osm_w,
+                                              "corrections": keep_corr}),
                      daemon=True).start()
     return JSONResponse({"ok": True, "slug": slug, "state": "queued",
                          "line_source": source})
@@ -3865,9 +3884,284 @@ def trackasset_rerender(request: Request, slug: str) -> JSONResponse:
         args=(slug, asset.get("track") or slug,
               {"points": points, "source": "asset",
                "osm_id": (asset.get("source") or {}).get("osm_id"),
+               "corrections": asset.get("corrections") or [],
                "enrich": True, "review": True}),
         daemon=True).start()
     return JSONResponse({"ok": True, "slug": slug, "state": "queued"})
+
+
+# ---------------------------------------------------------------------------
+# "Problem here": an admin points at a stretch of the 3D track, says what is
+# wrong, and gets a BOUNDED fix - one op from trackprep.CORRECTION_OPS with
+# clamped parameters, previewed before/after, applied only on accept. The AI
+# (when configured) only chooses from that menu; without it the admin picks
+# the op by hand or a keyword heuristic proposes one. Corrections are stored
+# on the asset (lat/lon ends), survive re-render / re-bake / seed refresh, and
+# are removable.
+# ---------------------------------------------------------------------------
+_FIX_WINDOW_M = 600.0       # profile context either side of the pointed station
+
+
+def _load_track_asset(slug: str):
+    path = _track_asset_path(slug)
+    try:
+        return path, json.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="no prepared asset for this track")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"unreadable asset: {e}")
+
+
+def _asset_profile(asset: dict):
+    """(s, z, base, closed) numpy arrays for the asset line."""
+    import numpy as _np
+    tp = _trackprep()
+    line = asset.get("line") or []
+    if len(line) < 10:
+        raise HTTPException(status_code=422, detail="this asset has no usable centreline")
+    s, closed = tp.line_arclength(line)
+    z = _np.array([float(q[2]) if len(q) > 2 and q[2] is not None else 0.0 for q in line])
+    base = asset.get("profile_base")
+    base = _np.array(base, dtype=float) if base and len(base) == len(line) else z.copy()
+    return s, z, base, closed
+
+
+def _decimate_profile(s, *cols, step_m: float = 4.0, lo: float = None, hi: float = None):
+    import numpy as _np
+    lo = float(s[0]) if lo is None else lo
+    hi = float(s[-1]) if hi is None else hi
+    keep = _np.where((s >= lo) & (s <= hi))[0]
+    if not len(keep):
+        return []
+    k = max(1, int(round(step_m / max(0.1, float(s[-1]) / max(1, len(s) - 1)))))
+    idx = keep[::k]
+    if idx[-1] != keep[-1]:
+        idx = _np.append(idx, keep[-1])
+    return [[round(float(s[i]), 1)] + [round(float(c[i]), 2) for c in cols] for i in idx]
+
+
+@app.get("/trackassets/{slug}/profile")
+def trackasset_profile(request: Request, slug: str) -> JSONResponse:
+    """The road profile for the admin panel's plot: [s, z, base] every ~4 m."""
+    _gate_track_admin(request)
+    _path, asset = _load_track_asset(slug)
+    s, z, base, closed = _asset_profile(asset)
+    tp = _trackprep()
+    return JSONResponse({"ok": True, "slug": slug, "length_m": round(float(s[-1]), 1),
+                         "closed": bool(closed),
+                         "points": _decimate_profile(s, z, base, step_m=4.0),
+                         "corrections": asset.get("corrections") or [],
+                         "ops": {k: {"desc": v[0], "params": {pk: list(pv) for pk, pv in v[1].items()}}
+                                 for k, v in tp.CORRECTION_OPS.items()},
+                         "elevation": asset.get("elevation") or {}})
+
+
+def _fix_heuristic(note: str, seg_z, trend) -> dict:
+    """No AI: read the admin's words for the op, the profile for its sign."""
+    t = (note or "").lower()
+    if any(w in t for w in ("flat", "level")):
+        return {"op": "flatten", "params": {}, "explanation": "flattened (the note asks for level)"}
+    if any(w in t for w in ("steep", "grade", "cliff", "wall")):
+        return {"op": "max_grade", "params": {"grade_pct": 8.0},
+                "explanation": "slope limited to 8 % (the note says it is too steep)"}
+    if any(w in t for w in ("bump", "rough", "jag", "wobbl", "buck", "noisy", "smooth")):
+        return {"op": "smooth", "params": {"sigma_m": 50.0},
+                "explanation": "smoothed 50 m along the track (the note says it is rough)"}
+    if any(w in t for w in ("raise", "higher", "too low", "sunk", "under")):
+        dz = max(2.0, float(max(trend - seg_z)) if len(seg_z) else 5.0)
+        return {"op": "shift", "params": {"dz_m": round(min(40.0, dz), 1)},
+                "explanation": "raised the stretch"}
+    # "hill / hump / too high / dip / hole": keep the shape, cut the excursion
+    return {"op": "scale_relief", "params": {"factor": 0.35},
+            "explanation": "the rise/dip relative to the straight line between the ends cut to 35 %"}
+
+
+def _fix_ai(asset: dict, s, z, s_at: float, s0: float, s1: float, note: str, tp) -> dict:
+    """Ask the model to pick ONE op from the menu. Returns the raw choice."""
+    import numpy as _np
+    lo, hi = max(0.0, s_at - _FIX_WINDOW_M), min(float(s[-1]), s_at + _FIX_WINDOW_M)
+    pts = _decimate_profile(s, z, step_m=10.0, lo=lo, hi=hi)
+    rows = []
+    for k, r in enumerate(pts):
+        g = 0.0
+        if 0 < k < len(pts) - 1:
+            g = (pts[k + 1][1] - pts[k - 1][1]) / max(0.1, pts[k + 1][0] - pts[k - 1][0])
+        rows.append([r[0], r[1], round(100 * g, 1)])
+    elev = asset.get("elevation") or {}
+    facts = {
+        "track": asset.get("track"), "lap_length_m": round(float(s[-1]), 1),
+        "pointed_at_m": round(s_at, 1), "default_stretch_m": [round(s0, 1), round(s1, 1)],
+        "lap_relief_m": elev.get("relief_m"), "lap_grade_p95": elev.get("grade_p95"),
+        "terrain": (asset.get("dem_hr") or {}).get("source"),
+        "existing_corrections": [{k: c.get(k) for k in ("op", "s0", "s1", "params")}
+                                 for c in (asset.get("corrections") or [])],
+        "profile_m_z_gradepct": rows,
+    }
+    menu = {k: {"what": v[0], "params": {pk: {"min": pv[0], "max": pv[1], "default": pv[2]}
+                                         for pk, pv in v[1].items()}}
+            for k, v in tp.CORRECTION_OPS.items()}
+    prompt = (
+        "A race-track 3D render draws the road on an elevation profile (metres "
+        "along the lap -> metres above sea level). An admin watching it pointed at "
+        "a spot and wrote what is wrong. Choose the ONE correction that fixes what "
+        "they describe, from this menu only:\n" + json.dumps(menu, separators=(",", ":")) +
+        "\n\nFACTS (measured; do not invent numbers):\n" +
+        json.dumps(facts, separators=(",", ":"))[:9000] +
+        "\n\nADMIN SAYS: " + json.dumps((note or "")[:600]) +
+        "\n\nPick s0/s1 (metres along the lap) to cover exactly the stretch they mean - "
+        "use the profile to find where the bad feature starts and ends (e.g. a hill: "
+        "from the foot before it to the foot after it), within 20..2500 m. Prefer "
+        "scale_relief/flatten for a hill or dip that should not be there, max_grade "
+        "for one that is too steep, smooth for bumps, shift only when the level is "
+        "wrong. Reply with ONE JSON object and nothing else:\n"
+        '{"op":"<menu key or none>","s0":0,"s1":0,"params":{},'
+        '"explanation":"<=30 words: what you change and why","confidence":0.0}'
+    )
+    answer, model, usage = _ai_chat(
+        [{"role": "system", "content": "You are a track-render engineer. Answer with JSON only."},
+         {"role": "user", "content": prompt}], feature="track")
+    parsed = _json_from_model(answer) or {}
+    parsed["_model"] = model
+    parsed["_usage"] = usage
+    return parsed
+
+
+@app.post("/trackassets/{slug}/fix/propose")
+def trackasset_fix_propose(request: Request, slug: str, body: dict = Body(...)) -> JSONResponse:
+    """Propose ONE bounded profile correction around a pointed station.
+
+    body: {s (metres along the asset line) | lat+lon, span_m?, s0?, s1?, note?,
+           op?, params?}. With `op` the admin chose by hand (no AI). Nothing is
+    stored: the reply carries the validated correction and a before/after
+    preview; POST .../fix/apply stores it. A plain `def` (AI + numpy block)."""
+    _gate_track_admin(request)
+    import numpy as _np
+    tp = _trackprep()
+    _path, asset = _load_track_asset(slug)
+    s, z, base, closed = _asset_profile(asset)
+    line = asset["line"]
+    total = float(s[-1])
+    try:
+        if body.get("s") is not None:
+            s_at = float(body["s"])
+        elif body.get("lat") is not None and body.get("lon") is not None:
+            i, _d = tp.nearest_station(line, float(body["lat"]), float(body["lon"]))
+            s_at = float(s[i])
+        elif body.get("s0") is not None and body.get("s1") is not None:
+            s_at = (float(body["s0"]) + float(body["s1"])) / 2
+        else:
+            raise ValueError("say where: s, lat/lon or s0/s1")
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    s_at = max(0.0, min(total, s_at))
+    span = max(40.0, min(2000.0, float(body.get("span_m") or 300.0)))
+    s0 = float(body["s0"]) if body.get("s0") is not None else s_at - span / 2
+    s1 = float(body["s1"]) if body.get("s1") is not None else s_at + span / 2
+    s0, s1 = max(0.0, s0), min(total, s1)
+    note = str(body.get("note") or "")[:600]
+    who = (current_user(request) or {}).get("email") if oauth_enabled() else "dev"
+    choice, source, ai_meta = None, "manual", None
+    if body.get("op"):
+        choice = {"op": body.get("op"), "params": body.get("params") or {},
+                  "explanation": "chosen by hand"}
+    elif AI_API_KEY:
+        try:
+            raw = _fix_ai(asset, s, z, s_at, s0, s1, note, tp)
+            ai_meta = {"model": raw.get("_model"), "confidence": raw.get("confidence"),
+                       "explanation": str(raw.get("explanation") or "")[:400]}
+            if str(raw.get("op") or "").lower() == "none":
+                return JSONResponse({"ok": True, "slug": slug, "proposal": None,
+                                     "source": "ai", "ai": ai_meta,
+                                     "message": ai_meta["explanation"] or "the AI sees nothing to change"})
+            choice = {"op": raw.get("op"), "params": raw.get("params") or {},
+                      "explanation": ai_meta["explanation"]}
+            try:                         # the AI's own stretch, if it is a sane one
+                a0, a1 = float(raw.get("s0")), float(raw.get("s1"))
+                if 20 <= abs(a1 - a0) <= 2500 and min(a0, a1) <= s_at + 400 and max(a0, a1) >= s_at - 400:
+                    s0, s1 = min(a0, a1), max(a0, a1)
+            except (TypeError, ValueError):
+                pass
+            source = "ai"
+        except Exception as e:
+            ai_meta = {"error": str(e)[:300]}
+            log.info("fix propose: AI unavailable (%s) - heuristic", e)
+    if choice is None:
+        i0, i1 = int(_np.searchsorted(s, s0)), int(min(len(s) - 1, _np.searchsorted(s, s1)))
+        seg = z[i0:i1 + 1]
+        tr = _np.linspace(seg[0], seg[-1], len(seg)) if len(seg) else seg
+        choice = _fix_heuristic(note, seg, tr)
+        source = "heuristic" if not body.get("op") else "manual"
+    try:
+        corr = tp.validate_correction(
+            {"op": choice.get("op"), "s0": s0, "s1": s1, "params": choice.get("params"),
+             "note": note, "by": who or "", "ai": ai_meta if source == "ai" else None},
+            line)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"not a usable correction: {e}")
+    after = tp.apply_correction(z, s, corr, closed)
+    lo, hi = max(0.0, corr["s0"] - 250), min(total, corr["s1"] + 250)
+    seg_before = z[(s >= corr["s0"]) & (s <= corr["s1"])]
+    seg_after = after[(s >= corr["s0"]) & (s <= corr["s1"])]
+    step = total / max(1, len(s) - 1)
+    return JSONResponse({
+        "ok": True, "slug": slug, "source": source, "ai": ai_meta,
+        "explanation": choice.get("explanation") or "",
+        "proposal": corr,
+        "preview": _decimate_profile(s, z, after, step_m=4.0, lo=lo, hi=hi),
+        "change": {"max_dz_m": round(float(_np.max(_np.abs(after - z))), 2),
+                   "before": tp.profile_stats(seg_before, step) if len(seg_before) > 3 else None,
+                   "after": tp.profile_stats(seg_after, step) if len(seg_after) > 3 else None}})
+
+
+@app.post("/trackassets/{slug}/fix/apply")
+def trackasset_fix_apply(request: Request, slug: str, body: dict = Body(...)) -> JSONResponse:
+    """Store a proposed correction on the asset and re-apply all of them."""
+    _gate_track_admin(request)
+    tp = _trackprep()
+    path, _a = _load_track_asset(slug)
+    prop = body.get("proposal") if isinstance(body.get("proposal"), dict) else body
+    with tp._slug_lock(path):
+        try:
+            asset = json.loads(path.read_text("utf-8"))
+        except Exception as e:
+            raise HTTPException(status_code=409, detail=f"asset changed under us: {e}")
+        try:
+            corr = tp.validate_correction(prop, asset.get("line") or [])
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        lst = [c for c in (asset.get("corrections") or []) if c.get("id") != corr["id"]]
+        lst.append(corr)
+        asset["corrections"] = lst
+        tp.reapply_corrections(asset, log=lambda m: log.info("fix %s %s", slug, m))
+        tp._write_json_atomic(path, asset)
+    log.info("track %s: correction %s %s %.0f-%.0f m applied", slug, corr["id"], corr["op"],
+             corr["s0"], corr["s1"])
+    return JSONResponse({"ok": True, "slug": slug, "correction": corr,
+                         "corrections": asset["corrections"],
+                         "elevation": asset.get("elevation") or {}})
+
+
+@app.post("/trackassets/{slug}/fix/remove")
+def trackasset_fix_remove(request: Request, slug: str, body: dict = Body(...)) -> JSONResponse:
+    """Remove one correction (by id) - or all with {"all": true} - and re-apply."""
+    _gate_track_admin(request)
+    tp = _trackprep()
+    path, _a = _load_track_asset(slug)
+    with tp._slug_lock(path):
+        asset = json.loads(path.read_text("utf-8"))
+        before = asset.get("corrections") or []
+        if body.get("all"):
+            lst = []
+        else:
+            cid = str(body.get("id") or "")
+            lst = [c for c in before if c.get("id") != cid]
+            if len(lst) == len(before):
+                raise HTTPException(status_code=404, detail="no such correction")
+        asset["corrections"] = lst
+        tp.reapply_corrections(asset, log=lambda m: log.info("fix %s %s", slug, m))
+        tp._write_json_atomic(path, asset)
+    return JSONResponse({"ok": True, "slug": slug, "corrections": lst,
+                         "elevation": asset.get("elevation") or {}})
 
 
 # ---------------------------------------------------------------------------
@@ -4205,7 +4499,7 @@ load();
 # Bumps whenever the 3D drive view changes materially (documented at length in
 # the /caps docstring below). Kept as a constant because /caps and /version both
 # report it — two literals would drift.
-TRACK3D_V = 17
+TRACK3D_V = 18
 
 
 @app.get("/caps")
@@ -9853,6 +10147,15 @@ _TRACK3D_HTML = (
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>3D drive · __FILE__</title>
+<script>
+  // embed=1: a compact view inside the pit wall's map card; fs=1: the full view
+  // inside the pit wall's full-screen overlay (set before first paint)
+  (function () {
+    var q = location.search, c = document.documentElement.classList;
+    if (/[?&]embed=1(&|$)/.test(q)) c.add("embed");
+    if (/[?&]fs=1(&|$)/.test(q)) c.add("fs");
+  })();
+</script>
 <style>
   :root { --bg:#0E1014; --surface:#181B22; --line:#2A2F3A; --text:#E6E8EE;
           --muted:#8A92A3; --good:#6CD07A; --warn:#FFB020; --bad:#FF4D4D; }
@@ -9928,7 +10231,7 @@ _TRACK3D_HTML = (
      one free corner (HUD bottom-left, legend top-right, mini-map bottom-right);
      scrolls when it gets long. */
   #qa { position:fixed; left:14px; top:14px; z-index:25; width:340px;
-    max-height:44vh; overflow:auto; display:none;
+    max-height:calc(100vh - 320px); overflow:auto; display:none;
     background:rgba(14,16,20,0.94); border:1px solid var(--line);
     border-radius:8px; padding:10px 12px;
     font:500 12px/1.45 Inter,sans-serif; color:var(--text); }
@@ -9946,6 +10249,44 @@ _TRACK3D_HTML = (
     text-transform:uppercase; }
   #qa .qlog { color:var(--muted); font:500 11px ui-monospace, Menlo, monospace;
     white-space:pre-wrap; margin-top:6px; }
+  #qa .qhead { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  #qa .qhead h4 { margin:0; }
+  #qa .qx { background:#20242E; color:var(--text); border:1px solid var(--line); border-radius:4px;
+    width:24px; height:22px; padding:0; cursor:pointer; font:700 12px Inter,sans-serif; }
+  #qa.collapsed { width:auto; max-height:none; overflow:visible; }
+  #qa.collapsed #qa-main { display:none; }
+  #qa-main { margin-top:6px; }
+  #qa .qsec { margin-top:8px; border-top:1px solid var(--line); padding-top:6px; }
+  #qa .qsub { color:var(--muted); font:600 10px ui-monospace, Menlo, monospace; text-transform:uppercase; }
+  #qa .qsub span { text-transform:none; color:#AEB6C2; }
+  #qa canvas#qa-prof { width:100%; height:100px; display:block; margin-top:4px; cursor:crosshair;
+    background:#0B0D11; border:1px solid var(--line); border-radius:4px; }
+  #qa .qrow { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:6px; }
+  #qa .qrow .qbtn { margin:0; }
+  #qa .qlab { color:var(--muted); font:600 11px Inter,sans-serif; display:flex; align-items:center; gap:4px; }
+  #qa select, #qa input[type=number], #qa textarea { background:#20242E; color:var(--text);
+    border:1px solid var(--line); border-radius:4px; font:500 11px Inter,sans-serif; padding:4px 5px; }
+  #qa input[type=number] { width:64px; }
+  #qa select#qa-op { flex:1 1 120px; min-width:0; max-width:100%; }
+  #qa textarea { width:100%; margin-top:5px; resize:vertical; box-sizing:border-box; }
+  #qa .qmeta { color:#AEB6C2; font:500 11px ui-monospace, Menlo, monospace; margin-top:4px; }
+  #qa .qbtn.ok { background:#1F6F3A; border-color:#2E9B53; }
+  #qa .qprop { margin-top:6px; padding:6px 8px; border-left:3px solid #3FD8FF; background:#11161C; }
+  #qa .qcorr { display:flex; justify-content:space-between; align-items:center; gap:6px; margin-top:4px;
+    font:500 11px ui-monospace, Menlo, monospace; color:#AEB6C2; }
+  /* compact embed (the pit wall's map card): driving + full screen only */
+  .embed #legend, .embed #qa, .embed #b-cmp, .embed #b-ground-lab, .embed #b-prep,
+  .embed #b-more-btn, .embed #b-more, .embed #bar a, .embed #bar .sep, .embed #scalebar,
+  .embed #b-rate { display:none !important; }
+  .embed #hud { transform:scale(0.7); transform-origin:left bottom; left:8px; bottom:56px; }
+  .embed #mini { transform:scale(0.62); transform-origin:right bottom; right:8px; bottom:56px; }
+  .embed #bar { gap:6px; padding:5px 8px; }
+  .embed #bar button, .embed #bar select { padding:6px 9px; }
+  #b-full, #b-exitfs { display:none; }
+  .embed #b-full, .fs #b-exitfs { display:inline-block; }
+  .fs #b-pitwall, .fs #b-satmap { display:none; }
+  #qa .qcorr button { background:none; border:1px solid var(--line); color:var(--muted); border-radius:3px;
+    font:600 10px Inter,sans-serif; cursor:pointer; padding:2px 6px; }
 </style></head><body>
 <canvas id="view"></canvas>
 <div id="notice">loading session…</div>
@@ -9976,12 +10317,39 @@ _TRACK3D_HTML = (
 <canvas id="mini" width="200" height="200"></canvas>
 <div id="scalebar"><i></i><span id="scale-txt">—</span></div>
 <div id="qa">
-  <h4>track render QA · admin</h4>
-  <div id="qa-body">loading…</div>
-  <div id="qa-ai"></div>
-  <button class="qbtn" id="qa-rerender" title="re-bake this track from its own centreline: imagery width, lidar terrain, smoothed road profile, then the AI review">re-render track</button>
-  <button class="qbtn" id="qa-review" title="audit the render and ask the AI to read the numbers">AI review</button>
-  <div class="qlog" id="qa-log"></div>
+  <div class="qhead"><h4>track render QA · admin</h4>
+    <button class="qx" id="qa-toggle" type="button" title="collapse / expand this panel">▾</button></div>
+  <div id="qa-main">
+    <div id="qa-body">loading…</div>
+    <div class="qsec">
+      <div class="qsub">road profile <span id="qa-pinfo"></span></div>
+      <canvas id="qa-prof" width="632" height="200" title="the lap's elevation: click a spot to fix it. amber = where the car is"></canvas>
+      <div class="qrow">
+        <button class="qbtn" id="qa-here" type="button" title="mark the stretch where the car is now (or click the plot)">⌖ problem here</button>
+        <label class="qlab">stretch <select id="qa-span"><option value="150">150</option><option value="300" selected>300</option><option value="600">600</option><option value="1000">1000</option></select> m</label>
+      </div>
+      <div id="qa-fix" style="display:none">
+        <div class="qmeta" id="qa-at"></div>
+        <textarea id="qa-note" rows="2" placeholder="what is wrong here? e.g. this hill is far too high, it should be nearly flat"></textarea>
+        <div class="qrow">
+          <button class="qbtn" id="qa-ask" type="button">ask AI</button>
+          <select id="qa-op" title="or choose the fix yourself"><option value="">or pick a fix…</option></select>
+          <input id="qa-param" type="number" step="any" style="display:none">
+          <button class="qbtn" id="qa-manual" type="button" style="display:none">preview</button>
+        </div>
+        <div id="qa-prop"></div>
+        <div class="qrow" id="qa-propbtns" style="display:none">
+          <button class="qbtn ok" id="qa-accept" type="button">accept</button>
+          <button class="qbtn" id="qa-discard" type="button">discard</button>
+        </div>
+      </div>
+      <div id="qa-corr"></div>
+    </div>
+    <div id="qa-ai"></div>
+    <button class="qbtn" id="qa-rerender" title="re-bake this track from its own centreline: imagery width, lidar terrain, smoothed road profile, then the AI review (profile corrections are kept)">re-render track</button>
+    <button class="qbtn" id="qa-review" title="audit the render and ask the AI to read the numbers">AI review</button>
+    <div class="qlog" id="qa-log"></div>
+  </div>
 </div>
 <div id="bar">
   <button id="b-play">▶ drive</button>
@@ -10002,6 +10370,7 @@ _TRACK3D_HTML = (
     <select id="b-groundsel"><option value="sim">simulated</option><option value="satellite">satellite</option><option value="none">none</option></select></label>
   <button id="b-prep" style="display:none" type="button" title="pre-render this track from satellite imagery + OpenStreetMap on the server (once per track)">prepare track</button>
   <button id="b-more-btn" type="button" title="display options">options ▾</button>
+  <button id="b-full" type="button" title="open the full 3D view (full-resolution data, all the controls) over the whole screen">⛶ full screen</button>
   <div id="b-more" role="dialog" aria-label="display options">
     <label title="smoothing window over the 25 Hz GPS — higher is smoother but rounds off real detail">
       <span class="meta">smooth</span>
@@ -10023,8 +10392,9 @@ _TRACK3D_HTML = (
     <label title="lean the camera into corners (computed from the path curvature)"><input type="checkbox" id="b-bank" checked>bank</label>
   </div>
   <span class="sep"></span>
-  <a href="/review/__USER__/__FILE__">← pit wall</a>
-  <a href="/map3d/__USER__/__FILE__" title="the same session on satellite imagery with 3D terrain">satellite map</a>
+  <a id="b-pitwall" href="/review/__USER__/__FILE__">← pit wall</a>
+  <a id="b-satmap" href="/map3d/__USER__/__FILE__" title="the same session on satellite imagery with 3D terrain">satellite map</a>
+  <button id="b-exitfs" type="button" title="back to the pit wall (the 3D view stays in the map card)">✕ exit full screen</button>
 </div>
 <script type="module">
 import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
@@ -10066,6 +10436,20 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   // ?lap=<n> = the lap to drive; ?ghost=<user>/<file>&glap=<n>[&glabel=...] =
   // the comparison lap picked on the pit wall, driven alongside as a GHOST
   var LAP_REQ = Number(q.get("lap")) || 0;
+  // embed=1: inside the pit wall's map card - draw from the data that page
+  // already holds; fs=1: the full view inside its full-screen overlay;
+  // at=<epoch>: start at that moment of the session (the pit wall's playhead)
+  var EMBED = q.get("embed") === "1", FS = q.get("fs") === "1";
+  var AT_REQ = Number(q.get("at")) || 0;
+  var T0ABS = null;                    // absolute time of PATH.t == 0 (the first fix)
+  function parentReview() {
+    if (!EMBED) return null;
+    try {
+      var pr = (window.parent && window.parent !== window) ? window.parent.__rcReview : null;
+      if (pr && pr.data && pr.data.samples && pr.data.samples.length > 20) return pr;
+    } catch (e) {}
+    return null;
+  }
   var GHOST_REQ = (function () {
     var g = q.get("ghost") || "", k = g.indexOf("/"), lap = Number(q.get("glap"));
     if (k <= 0 || k >= g.length - 1 || !(lap > 0)) return null;
@@ -14356,6 +14740,36 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         var l2 = RC3D.localToLatLon(line.x[i], line.z[i], o);
         ys[i] = DEMFN(l2[0], l2[1]);
       }
+      // The PREPARED profile wins where the track runs on the asset's line: it
+      // is the server's road profile (water bridged, raster spikes rejected)
+      // WITH the admin's corrections - re-reading the DEM here would silently
+      // drop both. Faded to the DEM read over 6..12 m off that line (a link the
+      // asset does not have keeps the terrain).
+      TRACK_INFO.profile = "dem";
+      if (ASSET && ASSET.line && ASSET.elevation && (ASSET.elevation.v || 0) >= 2) {
+        var apx = [], apz = [], apy = [], k2;
+        for (k2 = 0; k2 < ASSET.line.length; k2++) {
+          var ap = ASSET.line[k2];
+          if (ap.length > 2 && typeof ap[2] === "number" && isFinite(ap[2])) {
+            var aq = RC3D.project(ap[0], ap[1], o);
+            apx.push(aq.x); apz.push(aq.z); apy.push(ap[2]);
+          }
+        }
+        if (apx.length > 20) {
+          var aix = RC3D.lineIndex(apx, apz, 20), used = 0;
+          for (i = 0; i < line.x.length; i++) {
+            var ah = aix.nearest(line.x[i], line.z[i], 12);
+            if (!ah) continue;
+            var wa = ah.d <= 6 ? 1 : Math.max(0, 1 - (ah.d - 6) / 6);
+            var za = apy[ah.seg] + (apy[Math.min(apy.length - 1, ah.seg + 1)] - apy[ah.seg]) * ah.f;
+            if (wa > 0) { ys[i] = wa * za + (1 - wa) * ys[i]; used++; }
+          }
+          if (used > line.x.length * 0.5) {
+            TRACK_INFO.profile = "asset";
+            TRACK_INFO.corrections = (ASSET.corrections || []).length;
+          }
+        }
+      }
       // The road's VERTICAL ALIGNMENT: smooth in METRES along the track, not
       // over N samples, and wrap a closed lap. This is the difference between
       // a road and a DEM read (see RC3D.smoothProfile): ~25 m is right for a
@@ -15440,6 +15854,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     el("b-clock").textContent = fmtClock(NOW - TA) + " / " + fmtClock(TB - TA);
     el("b-scrub").value = String(TB > TA ? Math.round(1000 * (NOW - TA) / (TB - TA)) : 0);
     drawMini(st.s);
+    qaTick();
   }
 
   /* ---- mini-map: an unambiguous "you are HERE" ---------------------------
@@ -16207,6 +16622,10 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       ah = "<div style='margin-top:8px;color:#9CA3AF'>AI review is off (RACECAR_AI_API_KEY not set)</div>";
     }
     el("qa-ai").innerHTML = ah;
+    QAP.ai = !!(d && d.ai_enabled);
+    el("qa-ask").textContent = QAP.ai ? "ask AI" : "suggest fix";
+    el("qa-ask").title = QAP.ai ? "the AI reads your note + the profile and picks ONE fix from the menu"
+                                : "AI is off: a fix is proposed from the words in your note";
   }
   function qaLog(d) {
     var st = (d.prep && d.prep.state) || "";
@@ -16222,6 +16641,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
         if (!d) return;
         QA.loaded = true;
         qaRender(d);
+        qaProfile();
         var st = (d.prep && d.prep.state) || "";
         if (st === "queued" || st === "running") { qaLog(d); qaPoll(); }
       })
@@ -16238,7 +16658,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
           var st = (d.prep && d.prep.state) || "";
           if (st && st !== "queued" && st !== "running") {
             clearInterval(QA.poll); QA.poll = null;
-            if (st === "done") location.reload();
+            if (st === "done") qaResumeReload();
           }
         })
         .catch(function () {});
@@ -16249,8 +16669,278 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     QA.slug = asset.slug;
     qaLoad();
   }
+  // ---- admin: "problem here" - fix one stretch of the road profile ----------
+  // Point at a stretch (the car's position, or a click on the plot), say what is
+  // wrong, and the server proposes ONE bounded fix from a fixed menu (the AI
+  // only ever chooses from it). Nothing changes until you accept the preview;
+  // accepted fixes live on the track asset and survive a re-render.
+  var QAP = { prof: null, sel: null, prop: null, ai: false, line: null, drawnAt: 0 };
+  var QA_OP_NAMES = { flatten: "flatten", scale_relief: "scale hill/dip", max_grade: "limit grade",
+                      smooth: "smooth", shift: "raise / lower" };
+  function qaKm(m) { return (m / 1000).toFixed(2) + " km"; }
+  function qaLine() {
+    if (!ASSET || !ASSET.line || !PATH) return null;
+    if (QAP.line && QAP.line.asset === ASSET) return QAP.line;
+    var x = [], z = [], sv = [0], i;
+    for (i = 0; i < ASSET.line.length; i++) {
+      var q = RC3D.project(ASSET.line[i][0], ASSET.line[i][1], PATH.o);
+      x.push(q.x); z.push(q.z);
+      if (i) sv.push(sv[i - 1] + Math.sqrt((x[i] - x[i - 1]) * (x[i] - x[i - 1]) +
+                                           (z[i] - z[i - 1]) * (z[i] - z[i - 1])));
+    }
+    QAP.line = { asset: ASSET, x: x, z: z, s: sv, idx: RC3D.lineIndex(x, z, 20) };
+    return QAP.line;
+  }
+  // where the car is, in the SERVER's metres along the prepared line
+  function qaCarS() {
+    var L = qaLine();
+    if (!L || !PATH) return null;
+    var c = RC3D.pointAtS(PATH, RC3D.sAtTime(PATH, NOW));
+    var h = L.idx.nearest(c.x, c.z, 40);
+    if (!h) return null;
+    var a = L.s[h.seg], b = L.s[Math.min(L.s.length - 1, h.seg + 1)];
+    var k = QAP.prof ? QAP.prof.length_m / (L.s[L.s.length - 1] || 1) : 1;
+    return (a + (b - a) * h.f) * k;
+  }
+  function qaZAt(sv, col) {
+    var P = QAP.prof && QAP.prof.points;
+    if (!P || !P.length) return null;
+    var lo = 0, hi = P.length - 1;
+    while (hi - lo > 1) { var m = (lo + hi) >> 1; if (P[m][0] <= sv) lo = m; else hi = m; }
+    var f = P[hi][0] > P[lo][0] ? (sv - P[lo][0]) / (P[hi][0] - P[lo][0]) : 0;
+    f = Math.max(0, Math.min(1, f));
+    return P[lo][col || 1] + (P[hi][col || 1] - P[lo][col || 1]) * f;
+  }
+  function qaDraw() {
+    var cv = el("qa-prof");
+    if (!cv || !QAP.prof || !QAP.prof.points.length) return;
+    var c = cv.getContext("2d"), W = cv.width, H = cv.height, P = QAP.prof.points;
+    var Lm = QAP.prof.length_m || 1, zmin = Infinity, zmax = -Infinity, i;
+    var corr = QAP.prof.corrections || [];
+    var pv = QAP.prop && QAP.prop.preview ? QAP.prop.preview : [];
+    P.forEach(function (q) { zmin = Math.min(zmin, q[1], q[2]); zmax = Math.max(zmax, q[1], q[2]); });
+    pv.forEach(function (q) { zmin = Math.min(zmin, q[2]); zmax = Math.max(zmax, q[2]); });
+    if (!(zmax > zmin)) zmax = zmin + 1;
+    var X = function (sv) { return sv / Lm * W; };
+    var Y = function (zv) { return H - 14 - (zv - zmin) / (zmax - zmin) * (H - 28); };
+    c.clearRect(0, 0, W, H);
+    c.fillStyle = "#6B7280"; c.font = "18px ui-monospace, monospace";
+    c.fillText(Math.round(zmax) + " m", 6, 18); c.fillText(Math.round(zmin) + " m", 6, H - 4);
+    corr.forEach(function (k) {                 // applied fixes: a green band underneath
+      c.fillStyle = "rgba(52,208,88,0.55)";
+      c.fillRect(X(k.s0), H - 6, Math.max(2, X(k.s1) - X(k.s0)), 6);
+    });
+    if (QAP.sel) {                               // the stretch being fixed
+      var a = QAP.prop ? QAP.prop.proposal.s0 : QAP.sel.s - QAP.sel.span / 2;
+      var b = QAP.prop ? QAP.prop.proposal.s1 : QAP.sel.s + QAP.sel.span / 2;
+      c.fillStyle = "rgba(255,176,32,0.16)";
+      c.fillRect(X(a), 0, Math.max(2, X(b) - X(a)), H);
+    }
+    var line = function (col, idx, dash, width) {
+      c.strokeStyle = col; c.lineWidth = width; c.setLineDash(dash);
+      c.beginPath();
+      for (i = 0; i < P.length; i++) {
+        if (i) c.lineTo(X(P[i][0]), Y(P[i][idx])); else c.moveTo(X(P[i][0]), Y(P[i][idx]));
+      }
+      c.stroke(); c.setLineDash([]);
+    };
+    if (corr.length) line("#6B7280", 2, [6, 5], 2);       // the profile before any fix
+    line("#E6E8EE", 1, [], 2.5);
+    if (pv.length) {                                       // the proposal
+      c.strokeStyle = "#3FD8FF"; c.lineWidth = 3; c.beginPath();
+      for (i = 0; i < pv.length; i++) {
+        if (i) c.lineTo(X(pv[i][0]), Y(pv[i][2])); else c.moveTo(X(pv[i][0]), Y(pv[i][2]));
+      }
+      c.stroke();
+    }
+    var cs = qaCarS();
+    if (cs !== null) {
+      c.strokeStyle = "#FFB020"; c.lineWidth = 2;
+      c.beginPath(); c.moveTo(X(cs), 0); c.lineTo(X(cs), H); c.stroke();
+      c.fillStyle = "#FFB020"; c.beginPath(); c.arc(X(cs), Y(qaZAt(cs) || zmin), 6, 0, Math.PI * 2); c.fill();
+    }
+  }
+  function qaTick() {
+    if (!ADMIN || !QAP.prof) return;
+    var box = el("qa");
+    if (!box || box.style.display === "none" || box.classList.contains("collapsed")) return;
+    var t = Date.now();
+    if (t - QAP.drawnAt < 200) return;
+    QAP.drawnAt = t;
+    qaDraw();
+  }
+  function qaProfile() {
+    if (!ADMIN || !QA.slug) return;
+    fetch("/trackassets/" + encodeURIComponent(QA.slug) + "/profile")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d || !d.points) return;
+        QAP.prof = d;
+        var ev = d.elevation || {};
+        el("qa-pinfo").textContent = qaKm(d.length_m) + " · relief " + (ev.relief_m != null ? ev.relief_m : "?") +
+          " m · p95 " + Math.round(100 * (ev.grade_p95 || 0)) + "%" +
+          (TRACK_INFO && TRACK_INFO.profile === "asset" ? "" : " · (3D using its own DEM read)");
+        var sel = el("qa-op");
+        if (sel.options.length <= 1) {
+          Object.keys(d.ops || {}).forEach(function (k) {
+            var o = document.createElement("option");
+            o.value = k; o.textContent = QA_OP_NAMES[k] || k.replace("_", " ");
+            o.title = d.ops[k].desc;
+            sel.appendChild(o);
+          });
+        }
+        qaCorrList();
+        qaDraw();
+      })
+      .catch(function () {});
+  }
+  function qaCorrList() {
+    var corr = (QAP.prof && QAP.prof.corrections) || [], h = "";
+    if (corr.length) {
+      h = "<div class='qsub' style='margin-top:6px'>applied fixes</div>";
+      corr.forEach(function (k) {
+        var pr = Object.keys(k.params || {}).map(function (n) { return n + " " + k.params[n]; }).join(", ");
+        h += "<div class='qcorr'><span title='" + qaEsc(k.note || "") + "'>" + qaEsc(k.op.replace("_", " ")) +
+             " " + qaKm(k.s0) + "–" + qaKm(k.s1) + (pr ? " (" + qaEsc(pr) + ")" : "") +
+             (k.ai ? " · ai" : "") + "</span><button data-id='" + qaEsc(k.id) + "'>remove</button></div>";
+      });
+    }
+    el("qa-corr").innerHTML = h;
+    Array.prototype.forEach.call(el("qa-corr").querySelectorAll("button[data-id]"), function (b) {
+      b.addEventListener("click", function () {
+        b.disabled = true;
+        qaPost("/fix/remove", { id: b.getAttribute("data-id") })
+          .then(qaResumeReload)
+          .catch(function (e) { el("qa-log").textContent = String(e.message || e); b.disabled = false; });
+      });
+    });
+  }
+  function qaPost(path, body) {
+    return fetch("/trackassets/" + encodeURIComponent(QA.slug) + path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        if (!r.ok) throw new Error((d && d.detail) || ("HTTP " + r.status));
+        return d;
+      });
+    });
+  }
+  function qaSelect(sv) {
+    if (!QAP.prof) return;
+    var span = Number(el("qa-span").value) || 300;
+    sv = Math.max(0, Math.min(QAP.prof.length_m, sv));
+    QAP.sel = { s: sv, span: span };
+    QAP.prop = null;
+    el("qa-fix").style.display = "block";
+    el("qa-prop").innerHTML = "";
+    el("qa-propbtns").style.display = "none";
+    var z0 = qaZAt(sv), za = qaZAt(Math.max(0, sv - 10)), zb = qaZAt(Math.min(QAP.prof.length_m, sv + 10));
+    el("qa-at").textContent = "at " + qaKm(sv) + " · " + (z0 != null ? Math.round(z0) + " m" : "?") +
+      " · slope " + (za != null && zb != null ? ((zb - za) / 20 * 100).toFixed(1) + " %" : "?") +
+      " · fixing " + qaKm(Math.max(0, sv - span / 2)) + "–" + qaKm(Math.min(QAP.prof.length_m, sv + span / 2));
+    qaDraw();
+  }
+  function qaShowProp(d) {
+    if (!d.proposal) {
+      el("qa-prop").innerHTML = "<div class='qprop'>" + qaEsc(d.message || "nothing to change") + "</div>";
+      return;
+    }
+    QAP.prop = d;
+    var k = d.proposal, ch = d.change || {};
+    var pr = Object.keys(k.params || {}).map(function (n) { return n + " " + k.params[n]; }).join(", ");
+    var src = d.source === "ai" ? "AI" + (d.ai && d.ai.model ? " · " + d.ai.model : "")
+            : d.source === "heuristic" ? "from your words (AI off" + (d.ai && d.ai.error ? ": " + d.ai.error : "") + ")"
+            : "chosen by hand";
+    el("qa-prop").innerHTML = "<div class='qprop'><b>" + qaEsc(k.op.replace("_", " ")) + "</b> " +
+      qaKm(k.s0) + "–" + qaKm(k.s1) + (pr ? " (" + qaEsc(pr) + ")" : "") +
+      "<div>" + qaEsc(d.explanation || "") + "</div>" +
+      "<div class='qmeta'>moves the road up to " + (ch.max_dz_m != null ? ch.max_dz_m : "?") + " m" +
+      (ch.before && ch.after ? " · relief " + ch.before.relief_m + " → " + ch.after.relief_m +
+        " m · steepest " + Math.round(100 * ch.before.grade_max) + " → " +
+        Math.round(100 * ch.after.grade_max) + " %" : "") + "</div>" +
+      "<div class='qmeta'>" + qaEsc(src) + " · cyan = after</div></div>";
+    el("qa-propbtns").style.display = "flex";
+    qaDraw();
+  }
+  function qaPropose(extra) {
+    if (!QAP.sel) return;
+    var body = { s: QAP.sel.s, span_m: QAP.sel.span, note: el("qa-note").value || "" }, k;
+    for (k in (extra || {})) body[k] = extra[k];
+    el("qa-prop").innerHTML = "<div class='qmeta'>" + (body.op ? "previewing…" : "thinking…") + "</div>";
+    el("qa-propbtns").style.display = "none";
+    QAP.prop = null;
+    qaPost("/fix/propose", body).then(qaShowProp).catch(function (e) {
+      el("qa-prop").innerHTML = "<div class='qprop' style='border-color:#FBC72E'>" + qaEsc(e.message || e) + "</div>";
+    });
+  }
+  function qaResumeReload() {
+    try {
+      sessionStorage.setItem("rc3.resume", JSON.stringify({ file: FILE, t: Date.now(), lap: LAPNO,
+                                                            now: NOW, view: view, qa: true }));
+    } catch (e) {}
+    location.reload();
+  }
+  function qaFixInit() {
+    var box = el("qa");
+    var setC = function (on) {
+      box.classList.toggle("collapsed", on);
+      el("qa-toggle").textContent = on ? "▸" : "▾";
+      el("qa-toggle").title = on ? "expand the QA panel" : "collapse the QA panel";
+      try { localStorage.setItem("rc3.qa.collapsed", on ? "1" : "0"); } catch (e) {}
+      if (!on) qaDraw();
+    };
+    var stored = null;
+    try { stored = localStorage.getItem("rc3.qa.collapsed"); } catch (e) {}
+    setC(stored === "1");
+    el("qa-toggle").addEventListener("click", function () { setC(!box.classList.contains("collapsed")); });
+    el("qa-prof").addEventListener("click", function (e) {
+      if (!QAP.prof) return;
+      var r = el("qa-prof").getBoundingClientRect();
+      qaSelect((e.clientX - r.left) / Math.max(1, r.width) * QAP.prof.length_m);
+    });
+    el("qa-here").addEventListener("click", function () {
+      var cs = qaCarS();
+      if (cs === null) { el("qa-log").textContent = "the car is not on the prepared line here"; return; }
+      qaSelect(cs);
+      el("qa-note").focus();
+    });
+    el("qa-span").addEventListener("change", function () { if (QAP.sel) qaSelect(QAP.sel.s); });
+    el("qa-ask").addEventListener("click", function () { qaPropose({}); });
+    el("qa-op").addEventListener("change", function () {
+      var op = el("qa-op").value, spec = op && QAP.prof && QAP.prof.ops[op];
+      var names = spec ? Object.keys(spec.params || {}) : [];
+      el("qa-param").style.display = names.length ? "" : "none";
+      el("qa-manual").style.display = op ? "" : "none";
+      if (names.length) {
+        var pr = spec.params[names[0]];
+        el("qa-param").min = pr[0]; el("qa-param").max = pr[1]; el("qa-param").value = pr[2];
+        el("qa-param").title = names[0] + " (" + pr[0] + "–" + pr[1] + ")";
+        el("qa-param").dataset.name = names[0];
+      }
+    });
+    el("qa-manual").addEventListener("click", function () {
+      var op = el("qa-op").value;
+      if (!op) return;
+      var params = {};
+      if (el("qa-param").style.display !== "none") params[el("qa-param").dataset.name] = Number(el("qa-param").value);
+      qaPropose({ op: op, params: params });
+    });
+    el("qa-discard").addEventListener("click", function () {
+      QAP.prop = null; el("qa-prop").innerHTML = ""; el("qa-propbtns").style.display = "none"; qaDraw();
+    });
+    el("qa-accept").addEventListener("click", function () {
+      if (!QAP.prop || !QAP.prop.proposal) return;
+      el("qa-accept").disabled = true;
+      el("qa-log").textContent = "applying…";
+      qaPost("/fix/apply", { proposal: QAP.prop.proposal })
+        .then(qaResumeReload)
+        .catch(function (e) { el("qa-log").textContent = String(e.message || e); el("qa-accept").disabled = false; });
+    });
+  }
+
   function qaInit() {
     if (!ADMIN || !el("qa")) return;
+    qaFixInit();
     el("qa-rerender").addEventListener("click", function () {
       if (!QA.slug) return;
       el("qa-rerender").disabled = true;
@@ -16482,8 +17172,73 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") set(false); });
   }
 
+  // where to start: a reload after an admin fix (sessionStorage), else the pit
+  // wall's playhead (?at=<epoch>). Paused there - you came to LOOK at it.
+  function resumeAt() {
+    var rs = null;
+    try {
+      rs = JSON.parse(sessionStorage.getItem("rc3.resume") || "null");
+      sessionStorage.removeItem("rc3.resume");
+    } catch (e) { rs = null; }
+    var tt = null, lapWant = null;
+    if (rs && rs.file === FILE && Date.now() - (rs.t || 0) < 120000) {
+      lapWant = rs.lap; tt = rs.now;
+      if (rs.view && el("b-view") && el("b-view").value !== rs.view) {
+        el("b-view").value = rs.view;
+        el("b-view").dispatchEvent(new Event("change"));
+      }
+      if (rs.qa && el("qa")) {
+        el("qa").classList.remove("collapsed");
+        try { localStorage.setItem("rc3.qa.collapsed", "0"); } catch (e) {}
+      }
+    } else if (AT_REQ && T0ABS !== null) {
+      tt = AT_REQ - T0ABS;
+      // the playhead wins over ?lap= when it is in another lap: it is what
+      // the pit wall was looking at
+      var inReq = LAP_REQ && lapObj(LAP_REQ) &&
+                  tt >= lapObj(LAP_REQ).t_start && tt <= lapObj(LAP_REQ).t_end;
+      if (!inReq) {
+        LAPS.forEach(function (L) { if (tt >= L.t_start && tt <= L.t_end) lapWant = L.lap; });
+      }
+    }
+    if (tt === null || !isFinite(tt)) return;
+    if (lapWant !== null && lapWant !== LAPNO && (lapWant === 0 || lapObj(lapWant))) {
+      el("b-lap").value = String(lapWant);
+      setLap(lapWant);
+    }
+    NOW = Math.max(TA, Math.min(TB, tt));
+    cur = (PATH.samples || S)[RC3D.indexOfTime(PATH.t, NOW)] || null;
+    playing = false;
+    syncPlay();
+  }
+  // read-only: where the view is (the pit wall asks when leaving full screen)
+  window.__rc3dNow = function () {
+    return { at: T0ABS !== null ? T0ABS + NOW : null, lap: LAPNO || 0 };
+  };
+  function fsInit() {
+    if (el("b-full")) el("b-full").addEventListener("click", function () {
+      var o = window.__rc3dNow();
+      var par = null;
+      try { par = (window.parent && window.parent !== window) ? window.parent : null; } catch (e) { par = null; }
+      if (par && par.__rc3dFull) { par.__rc3dFull(o); return; }
+      // not inside the pit wall: the full view in a new tab, same moment
+      var qq = new URLSearchParams(location.search);
+      qq.delete("embed");
+      if (o.at) qq.set("at", o.at.toFixed(3));
+      if (o.lap) qq.set("lap", String(o.lap));
+      window.open(location.pathname + "?" + qq.toString(), "_blank");
+    });
+    if (el("b-exitfs")) el("b-exitfs").addEventListener("click", function () {
+      try {
+        if (window.parent && window.parent.__rc3dExitFull) { window.parent.__rc3dExitFull(window.__rc3dNow()); return; }
+      } catch (e) {}
+      location.href = "/review/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE);
+    });
+  }
+
   function start() {
     if (!tryRenderer()) return;
+    fsInit();
     qaInit();
     moreInit();
     buildScene();
@@ -16495,15 +17250,26 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
     if (mini) { try { miniCtx = mini.getContext("2d"); } catch (e) { miniCtx = null; } }
     resize();
     wire();
-    fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) +
-          "/data?target=30000&fixes=1")
-      .then(function (r) { return r.json(); })
+    var PR = parentReview();
+    (PR ? Promise.resolve(PR.data)
+        : fetch("/sessions/" + encodeURIComponent(USER) + "/" + encodeURIComponent(FILE) +
+                "/data?target=30000&fixes=1").then(function (r) { return r.json(); }))
       .then(function (d) {
         var all = d.samples || [];
         S = all.filter(function (s) {
           return typeof s.lat === "number" && typeof s.lon === "number" &&
                  (s.lat || s.lon) && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180;
         });
+        if (PR) {
+          // the pit wall's copy is not de-duplicated (?fixes=1 does that on the
+          // server): the logger repeats each fix, keep one row per real fix
+          var kept = [], lastK = null;
+          S.forEach(function (r0) {
+            var kk = r0.lat + "," + r0.lon + "," + r0.speed_mph;
+            if (kk !== lastK) { kept.push(r0); lastK = kk; }
+          });
+          S = kept;
+        }
         if (S.length < 20) { notice("no GPS fixes in this session", true); return; }
         // the server times laps from the FILE's first row; our clock starts at
         // the first row with a fix (a session that starts before GPS lock)
@@ -16516,10 +17282,12 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
           return null;
         };
         var tFile = firstT(all), tFix = firstT(S);
+        T0ABS = tFix;
         var lapShift = (tFile !== null && tFix !== null && tFix > tFile) ? tFix - tFile : 0;
-        return fetch("/sessions/" + encodeURIComponent(USER) + "/" +
-                     encodeURIComponent(FILE) + "/laps")
-          .then(function (r) { return r.json(); })
+        return (PR && PR.laps ? Promise.resolve(PR.laps)
+                : fetch("/sessions/" + encodeURIComponent(USER) + "/" +
+                        encodeURIComponent(FILE) + "/laps")
+                    .then(function (r) { return r.json(); }))
           .catch(function () { return {}; })
           .then(function (lj) {
             LAPS = ((lj && lj.laps) || []).map(function (L) {
@@ -16542,6 +17310,7 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
               BOOTED = true;
               setLap(Number(el("b-lap").value) || 0);
               initGhost();
+              resumeAt();
             };
             loadAsset().then(first, first);
             setTimeout(first, 6000);            // a slow asset must not hold the view
@@ -16789,6 +17558,13 @@ _REVIEW_HTML = (
   .card-body { padding: var(--sp-md); }
   #map { height: 560px; width: 100%; background: var(--bg); }
   .mapcard #map { height: auto; min-height: 560px; flex: 1 1 auto; }
+  /* 3D drive view IN the map card (the data this page already has); its own
+     full-screen button opens the full 3D view in #rc3dfull */
+  #map3dwrap { position: relative; min-height: 560px; flex: 1 1 auto; background: #000; }
+  #map3dwrap iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  #rc3dfull { position: fixed; inset: 0; z-index: 9000; background: #000; display: none; }
+  #rc3dfull.open { display: block; }
+  #rc3dfull iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
   .leaflet-container { background: var(--bg); }
   /* Basemap switch: checkbox strip directly UNDER the map. Off = no tiles at
      all, just a black surface — what you want when the imagery fights the
@@ -17124,6 +17900,7 @@ _REVIEW_HTML = (
   <a id="yt-view" class="btn" target="_blank" style="display:none">&#9654; overlay</a>
   <button id="yt-share" class="btn" style="display:none">share</button>
 </header>
+<div id="rc3dfull"><iframe id="rc3dfullframe" title="3D drive view (full screen)" allow="fullscreen"></iframe></div>
 <main>
   <div id="loading" class="loading">loading session\u2026</div>
   <div id="app" style="display:none">
@@ -17138,6 +17915,9 @@ _REVIEW_HTML = (
             <div class="dl-row dl-note" id="dl-note"></div>
           </div>
         </div>
+        <div id="map3dwrap" style="display:none">
+          <iframe id="map3dframe" title="3D drive view" allow="fullscreen"></iframe>
+        </div>
         <div id="mapopts" class="mapopts">
           <label class="mapchk" for="opt-sat">
             <input type="checkbox" id="opt-sat">
@@ -17145,7 +17925,7 @@ _REVIEW_HTML = (
           </label>
           <span class="sep"></span>
           <a id="map3d" class="mapbtn" target="_blank" href="/track3d/__USER__/__FILE__"
-             title="first-person driving view built from the data alone: your line as a road ribbon on the logged elevation, speed-coloured, with brake/apex/throttle markers">\u25b6 3D drive view</a>
+             title="show the 3D drive view right here, in place of the map (it uses the data this page already loaded); its full-screen button opens the full 3D view">\u25b6 3D drive view</a>
           <button id="map-circle" class="mapbtn ghost" type="button"
                   title="drag on the map to mark a corner or section — it feeds the 3D view and the ideal line">\u25cb circle a section</button>
           <span class="sep"></span>
@@ -17418,6 +18198,10 @@ _REVIEW_HTML = (
     return;
   }
   const S = data.samples || [];
+  // the embedded 3D view reads THIS (same origin): no second download of the
+  // session while it sits in the map card
+  window.__rcReview = window.__rcReview || {};
+  window.__rcReview.data = data;
   if (!S.length) {
     el('loading').textContent = 'session file is empty.';
     return;
@@ -18370,6 +19154,8 @@ _REVIEW_HTML = (
       const r=await fetch('/sessions/'+enc(USER)+'/'+enc(FILE)+'/laps');
       if (!r.ok) return; lr=await r.json();
     } catch(e){ return; }
+    window.__rcReview = window.__rcReview || {};
+    window.__rcReview.laps = lr;
     const laps=lr.laps||[];
     if (!laps.length) return;
     selfLaps=laps;
@@ -18704,7 +19490,7 @@ _REVIEW_HTML = (
     // ...and the LAPS card's selection: the lap you clicked is the one you
     // drive, and the comparison lap (another lap, session or driver) rides
     // alongside as a GHOST car on the same clock.
-    el('map3d').addEventListener('click', (ev)=>{
+    function map3dQuery(){
       const q = [];
       if (pts.length>=3){
         const step = Math.max(1, Math.ceil(pts.length/50));
@@ -18721,10 +19507,63 @@ _REVIEW_HTML = (
         q.push('glap='+ref.lap.lap);
         if (ref.label) q.push('glabel='+encodeURIComponent(ref.label));
       }
-      if (!q.length) return;                 // the plain link is fine
+      return q;
+    }
+    const base3d = '/track3d/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE);
+    // where the pit wall's playback is, as an absolute epoch (both views share it)
+    function nowAbs(){
+      const i = Math.max(0, Math.min(S.length-1, Number(slider.value)||0));
+      const r = S[i] || {};
+      return typeof r.t === 'number' ? r.t : (typeof r.t_ms === 'number' ? r.t_ms/1000 : null);
+    }
+    let in3d = false;
+    function show3d(on, opt){
+      in3d = on;
+      const wrap = el('map3dwrap'), fr = el('map3dframe');
+      el('map').style.display = on ? 'none' : '';
+      wrap.style.display = on ? 'block' : 'none';
+      el('map3d').textContent = on ? '\u25c0 2D map' : '\u25b6 3D drive view';
+      if (on) {
+        const q = map3dQuery().filter(x=>!(opt && opt.lap && x.indexOf('lap=')===0));
+        q.push('embed=1');
+        const at = (opt && opt.at) || nowAbs();
+        if (at) q.push('at='+at.toFixed(3));
+        if (opt && opt.lap) q.push('lap='+opt.lap);
+        fr.src = base3d+'?'+q.join('&');
+      } else {
+        fr.src = 'about:blank';               // stop the GPU work
+        setTimeout(()=>{ try{ map.invalidateSize(); }catch(e){} }, 50);   // it was hidden
+      }
+    }
+    el('map3d').addEventListener('click', (ev)=>{
       ev.preventDefault();
-      window.open('/track3d/'+encodeURIComponent(USER)+'/'+encodeURIComponent(FILE)+
-                  '?'+q.join('&'), 'track3d');
+      show3d(!in3d);
+    });
+    // the embedded view's FULL SCREEN button: the full 3D view (its own, full-
+    // resolution data) over the whole window, at the same moment of the lap
+    window.__rc3dFull = function(o){
+      const q = map3dQuery().filter(x=>x.indexOf('lap=')!==0);
+      q.push('fs=1');
+      if (o && o.lap) q.push('lap='+o.lap);
+      if (o && o.at) q.push('at='+Number(o.at).toFixed(3));
+      const box = el('rc3dfull');
+      el('rc3dfullframe').src = base3d+'?'+q.join('&');
+      el('map3dframe').src = 'about:blank';
+      box.classList.add('open');
+      try { if (box.requestFullscreen) box.requestFullscreen().catch(()=>{}); } catch(e) {}
+    };
+    window.__rc3dExitFull = function(o){
+      const box = el('rc3dfull');
+      if (!box.classList.contains('open')) return;
+      if (!o) { try { o = el('rc3dfullframe').contentWindow.__rc3dNow(); } catch(e) { o = null; } }
+      box.classList.remove('open');
+      el('rc3dfullframe').src = 'about:blank';
+      try { if (document.fullscreenElement) document.exitFullscreen().catch(()=>{}); } catch(e) {}
+      show3d(true, o || {});
+    };
+    document.addEventListener('fullscreenchange', ()=>{
+      // Esc left the browser's full screen: leave the full 3D view with it
+      if (!document.fullscreenElement && el('rc3dfull').classList.contains('open')) window.__rc3dExitFull();
     });
     document.querySelectorAll('.ai-preset').forEach(b=>{
       b.addEventListener('click', ()=>{ el('ai-prompt').value=b.dataset.q; ask(); });

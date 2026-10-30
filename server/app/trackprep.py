@@ -309,7 +309,8 @@ DEM_MAX_TILE_PX = 2000
 # Bump when the FILLING of such cells changes: a grid written by an older
 # version is treated as missing and re-fetched (this is how the Road Atlanta
 # "257.4 m for 5,900 cells" plateau heals without anyone deleting files).
-DEM_V = 2      # 2: v1 grids may carry the reverted "constant plateau" replacement
+DEM_V = 3      # 2: v1 grids may carry the reverted "constant plateau" replacement
+               # 3: 3DEP grids were squashed N-S by cos(lat) (see _dem3dep) - refetch
 DEM_BAD_MAX_FRAC = 0.02           # more invalid cells than this = the source failed
 DEM_MIN_OK_M, DEM_MAX_OK_M = -500.0, 9000.0
 
@@ -376,6 +377,47 @@ def _clean_dem(v, what: str):
     return v
 
 
+_LAST_REF_CHECK = None     # set by _dem3dep, read straight after by _dem_fetch
+
+
+def _server_extent(bb, w_px: int, h_px: int):
+    """The extent an ArcGIS ImageServer ACTUALLY returns for bbox + size: it keeps
+    the centre and makes pixels square, px = max(width/w_px, height/h_px).
+    (Verified against exportImage f=json: asked 0.018 deg of latitude at 34 N
+    with metre-square pixels, got 0.02177 = x1.21 back.) -> (w, s, e, n, px)."""
+    bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+    px = max(bw / float(w_px), bh / float(h_px))
+    cx, cy = (bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0
+    return (cx - w_px * px / 2.0, cy - h_px * px / 2.0,
+            cx + w_px * px / 2.0, cy + h_px * px / 2.0, px)
+
+
+def _resample_nodes(arr, ext, lats, lons):
+    """Bilinear read of a NORTH-first raster with pixel-AREA extent `ext` at the
+    node lat/lons -> (len(lats), len(lons)) SOUTH row first. NaN propagates (a
+    NoData pixel stays NoData for the fill below)."""
+    a = np.asarray(arr, dtype=np.float64)
+    h, w = a.shape
+    x0, y0, x1, y1, px = ext
+    fx = (np.asarray(lons, dtype=float) - x0) / px - 0.5        # pixel-centre coords
+    fy = (y1 - np.asarray(lats, dtype=float)) / px - 0.5        # row 0 is NORTH
+    # nodes within half a pixel of the edge lie OUTSIDE the pixel centres
+    # (degree-square pixels are taller than our metre-square rows): extrapolate
+    # linearly there - clamping would offset the edge rows by ~half a pixel
+    fx = np.clip(fx, -0.5, w - 0.5)
+    fy = np.clip(fy, -0.5, h - 0.5)
+    i0 = np.clip(np.floor(fx).astype(int), 0, max(0, w - 2))
+    j0 = np.clip(np.floor(fy).astype(int), 0, max(0, h - 2))
+    i1 = np.minimum(i0 + 1, w - 1)
+    j1 = np.minimum(j0 + 1, h - 1)
+    ax = (fx - i0)[None, :]
+    ay = (fy - j0)[:, None]
+    J0, J1 = j0[:, None], j1[:, None]
+    top = a[J0, i0[None, :]] * (1 - ax) + a[J0, i1[None, :]] * ax
+    bot = a[J1, i0[None, :]] * (1 - ax) + a[J1, i1[None, :]] * ax
+    return (top * (1 - ay) + bot * ay).astype(np.float32)
+
+
 def _dem3dep(bbox, cols: int, rows: int, cache_dir: pathlib.Path, log=print,
              timeout: float = 90.0):
     """(rows, cols) float32, SOUTH row first, node-aligned (see _grid_dims)."""
@@ -393,9 +435,24 @@ def _dem3dep(bbox, cols: int, rows: int, cache_dir: pathlib.Path, log=print,
             # a pixel AREA is requested, so pad half a cell to centre pixels on nodes
             bb = (w + c0 * dx - dx / 2, s + r0 * dy - dy / 2,
                   w + (c1 - 1) * dx + dx / 2, s + (r1 - 1) * dy + dy / 2)
+            # ⚠️ The ImageServer makes pixels SQUARE IN THE OUTPUT SR (degrees here):
+            # it keeps the bbox centre, takes px = max(width/w_px, height/h_px) and
+            # grows the other axis to fit. Our grid is square in METRES, so a
+            # degree-square request at 34 N came back covering 1/cos(lat) = 1.21x
+            # the latitude we asked for - every grid was squashed 21 % N-S toward
+            # its centre (Road Atlanta's lake sat ~150 m north, across the Turn 7
+            # hairpin; the road climbed hills that are somewhere else). Ask for
+            # degree-square pixels, compute the extent the server really used, and
+            # resample onto our node grid.
+            bw, bh = bb[2] - bb[0], bb[3] - bb[1]
+            rw = tw
+            rh = max(2, int(round(tw * bh / bw)))
+            if rh > DEM_MAX_TILE_PX:
+                rh = DEM_MAX_TILE_PX
+                rw = max(2, int(round(rh * bw / bh)))
             url = DEM3DEP + urllib.parse.urlencode({
                 "bbox": "%.8f,%.8f,%.8f,%.8f" % bb, "bboxSR": 4326, "imageSR": 4326,
-                "size": f"{tw},{th}", "format": "tiff", "pixelType": "F32",
+                "size": f"{rw},{rh}", "format": "tiff", "pixelType": "F32",
                 "noDataInterpretation": "esriNoDataMatchAny",
                 "interpolation": "RSP_BilinearInterpolation", "f": "image"})
             cpath = cache_dir / "dem3dep" / (hashlib.sha1(url.encode()).hexdigest() + ".tif")
@@ -414,8 +471,8 @@ def _dem3dep(bbox, cols: int, rows: int, cache_dir: pathlib.Path, log=print,
                         continue
                 try:
                     a = np.array(Image.open(io.BytesIO(blob)), dtype=np.float32)
-                    if a.shape != (th, tw):
-                        raise ValueError("got %s, wanted %s" % (a.shape, (th, tw)))
+                    if a.shape != (rh, rw):
+                        raise ValueError("got %s, wanted %s" % (a.shape, (rh, rw)))
                     arr = a
                     break
                 except Exception as ex:
@@ -429,7 +486,9 @@ def _dem3dep(bbox, cols: int, rows: int, cache_dir: pathlib.Path, log=print,
                 raise RuntimeError("3DEP gave no usable tile")
             if fresh:
                 _cache_put(cpath, blob)
-            out[r0:r1, c0:c1] = arr[::-1]          # TIFF row 0 is NORTH
+            ext = _server_extent(bb, rw, rh)
+            out[r0:r1, c0:c1] = _resample_nodes(
+                arr, ext, s + np.arange(r0, r1) * dy, w + np.arange(c0, c1) * dx)
     # 3DEP returns WATER and unsurveyed ground as NoData. Fill those from AWS
     # terrarium (a real, continuous surface) rather than inventing an elevation:
     # a lake becomes the lake shore's level, not a flat plateau 33 m below it.
@@ -447,6 +506,19 @@ def _dem3dep(bbox, cols: int, rows: int, cache_dir: pathlib.Path, log=print,
             out = np.where(use, t, out)
             log(f"[dem3dep] {100 * frac:.1f}% of the grid was NoData "
                 f"(water/void); {int(use.sum())} cells filled from AWS terrarium z15")
+    # Registration/scale check against the reference surface: the cos(lat)
+    # squash above showed up as 9 % of cells > 12 m off terrarium in diagonal
+    # bands. A healthy 3DEP grid agrees to ~0.2 m (p95); the audit reads this.
+    global _LAST_REF_CHECK
+    _LAST_REF_CHECK = None
+    if t is not None:
+        ok = np.isfinite(out) & np.isfinite(t) & ~bad
+        if ok.sum() > 100:
+            dd = np.abs(out[ok] - t[ok])
+            _LAST_REF_CHECK = {"ref": "AWS terrarium z15",
+                               "med_abs_m": round(float(np.median(dd)), 2),
+                               "p95_abs_m": round(float(np.percentile(dd, 95)), 2),
+                               "over12_pct": round(float(100.0 * np.mean(dd > 12.0)), 2)}
     # NOTE: a large exact-CONSTANT region is deliberately left alone. 3DEP
     # hydro-flattens WATER to one level (Road Atlanta's lake: 257.4 m for ~5,900
     # cells), and that IS the surface. Replacing it with terrarium (which smooths
@@ -512,9 +584,13 @@ def _terrarium_grid(bbox, cols: int, rows: int, z: int, cache_dir: pathlib.Path,
     return _clean_dem(top * (1 - ay) + bot * ay, f"terrarium z{z}")
 
 
-def _dem_fetch(bbox, cols, rows, cache_dir, terrarium_z: int, log):
+def _dem_fetch(bbox, cols, rows, cache_dir, terrarium_z: int, log, check: Optional[dict] = None):
+    """(values, source). `check` (a dict) receives the 3DEP-vs-reference stats."""
     try:
-        return _dem3dep(bbox, cols, rows, cache_dir, log=log), "USGS 3DEP"
+        v = _dem3dep(bbox, cols, rows, cache_dir, log=log)
+        if check is not None and _LAST_REF_CHECK:
+            check.update(_LAST_REF_CHECK)
+        return v, "USGS 3DEP"
     except Exception as e:
         log(f"[dem] 3DEP unavailable ({type(e).__name__}: {e}); using AWS terrarium z{terrarium_z}")
     return (_terrarium_grid(bbox, cols, rows, terrarium_z, cache_dir, log=log),
@@ -533,12 +609,17 @@ def dem_hires(bbox, cache_dir: pathlib.Path, max_cells: int = 250_000,
     _require_deps()
     cache_dir = pathlib.Path(cache_dir)
     cols, rows, cell = _grid_dims(bbox, max_cells, min_cell_m)
-    v, src = _dem_fetch(bbox, cols, rows, cache_dir, 15, log)
+    chk: dict = {}
+    v, src = _dem_fetch(bbox, cols, rows, cache_dir, 15, log, check=chk)
     log(f"[dem] hi-res {cols}x{rows} @ {cell:.1f} m from {src}: "
-        f"{float(v.min()):.1f}..{float(v.max()):.1f} m")
-    return {"cols": cols, "rows": rows, "bounds": [float(x) for x in bbox],
-            "cell_m": round(cell, 2), "source": src,
-            "values": v.reshape(-1).astype(np.float32)}
+        f"{float(v.min()):.1f}..{float(v.max()):.1f} m"
+        + (f" (vs reference: p95 {chk['p95_abs_m']} m)" if chk else ""))
+    out = {"cols": cols, "rows": rows, "bounds": [float(x) for x in bbox],
+           "cell_m": round(cell, 2), "source": src,
+           "values": v.reshape(-1).astype(np.float32)}
+    if chk:
+        out["ref_check"] = chk
+    return out
 
 
 def dem_far(centre_lat: float, centre_lon: float, half_m: float = 3500.0,
@@ -552,11 +633,15 @@ def dem_far(centre_lat: float, centre_lon: float, half_m: float = 3500.0,
     dlat = half_m / M_PER_DEG_LAT
     dlon = half_m / (M_PER_DEG_LAT * math.cos(math.radians(centre_lat)))
     bbox = (centre_lat - dlat, centre_lon - dlon, centre_lat + dlat, centre_lon + dlon)
-    v, src = _dem_fetch(bbox, int(cells), int(cells), cache_dir, 12, log)
+    chk: dict = {}
+    v, src = _dem_fetch(bbox, int(cells), int(cells), cache_dir, 12, log, check=chk)
     log(f"[dem] far {cells}x{cells} from {src}: {float(v.min()):.1f}..{float(v.max()):.1f} m")
-    return {"cols": int(cells), "rows": int(cells), "bounds": [float(x) for x in bbox],
-            "cell_m": round(2.0 * half_m / (cells - 1), 2), "source": src,
-            "values": v.reshape(-1).astype(np.float32)}
+    out = {"cols": int(cells), "rows": int(cells), "bounds": [float(x) for x in bbox],
+           "cell_m": round(2.0 * half_m / (cells - 1), 2), "source": src,
+           "values": v.reshape(-1).astype(np.float32)}
+    if chk:
+        out["ref_check"] = chk
+    return out
 
 
 def dem_sample(grid: dict, lats, lons):
@@ -598,11 +683,36 @@ def dem_sample(grid: dict, lats, lons):
 #   * a final grade clamp so nothing physically impossible survives.
 # The result is metres ASL per station; the caller re-references to its datum.
 # ---------------------------------------------------------------------------
-PROFILE_V = 2                 # 1 = the old _movavg(z, 5); 2 = this profile
+PROFILE_V = 3                 # 1 = the old _movavg(z, 5); 2 = this profile;
+                              # 3 = + hydro-flattened water masked (bridge = interpolated)
 PROFILE_SIGMA_M = 25.0        # along-track Gaussian, metres
 PROFILE_LAT_M = 2.0           # lateral DEM samples either side of the centreline
 PROFILE_MAX_JUMP_M = 1.25     # a sample this far off the local median is raster noise
 PROFILE_MAX_GRADE = 0.22      # no circuit is steeper; only DEM artefacts are
+# 3DEP hydro-flattens water to ONE exact level. A road cannot sit on a lake
+# surface: a station reading such a level is a bridge/causeway (or a wrong
+# line), so it is masked and interpolated from the banks.
+FLAT_MIN_SHARE = 0.01         # a level covering >= 1 % of the grid...
+FLAT_MIN_CELLS = 400          # ...and at least this many cells...
+FLAT_RATIO = 8.0              # ...and 8x the typical 5 cm elevation bin
+FLAT_TOL_M = 0.06
+
+
+def flat_levels(grid: dict) -> list:
+    """Exact-constant elevations in a grid that are far too common to be terrain
+    (3DEP's hydro-flattened water). Quantised to 5 cm so it works on both the
+    float grid and a read-back u16 bin."""
+    _require_deps()
+    v = np.asarray(grid.get("values"), dtype=np.float64).reshape(-1)
+    v = v[np.isfinite(v)]
+    if v.size < 1000:
+        return []
+    q = np.rint(v / 0.05).astype(np.int64)
+    vals, cnt = np.unique(q, return_counts=True)
+    thr = max(FLAT_MIN_CELLS, FLAT_MIN_SHARE * v.size, FLAT_RATIO * max(1.0, float(np.median(cnt))))
+    keep = np.argsort(-cnt)
+    out = [round(float(vals[k]) * 0.05, 2) for k in keep[:6] if cnt[k] >= thr]
+    return out
 
 
 def _fill_nan(z, closed: bool):
@@ -713,6 +823,17 @@ def road_profile(grid: dict, lats, lons, closed: Optional[bool] = None,
         cols.append(dem_sample(grid, lats + dlat, lons + dlon))
         cols.append(dem_sample(grid, lats - dlat, lons - dlon))
     M = np.vstack(cols)
+    levels = flat_levels(grid)
+    water = np.zeros(n, dtype=bool)
+    if levels:
+        # a sample is water when ANY of its 4 bilinear nodes is: a read beside
+        # the shore blends water and bank and would otherwise leak the dip in
+        pts = [(lats, lons)]
+        if lateral_m and lateral_m > 0:
+            pts += [(lats + dlat, lons + dlon), (lats - dlat, lons - dlon)]
+        wm = np.vstack([_water_nodes(grid, levels, la, lo) for la, lo in pts])
+        water = wm.all(axis=0)                  # every sample at this station is water
+        M = np.where(wm, np.nan, M)
     import warnings as _warnings
     with np.errstate(invalid="ignore"), _warnings.catch_warnings():
         _warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN column = outside the grid
@@ -732,23 +853,284 @@ def road_profile(grid: dict, lats, lons, closed: Optional[bool] = None,
     # the clamp can leave a hairline crease; a short second pass removes it
     z = _gauss_profile(z, s, max(3.0, sigma_m / 5.0), bool(closed))
 
-    grade = np.diff(z) / step
-    dd = np.diff(z, 2)
     stats = {
         "v": PROFILE_V, "n": int(n), "closed": bool(closed),
         "sigma_m": float(sigma_m), "lateral_m": float(lateral_m),
         "step_m": round(step, 2), "rejected": rejected,
-        "relief_m": round(float(np.max(z) - np.min(z)), 1),
-        "grade_p95": round(float(np.percentile(np.abs(grade), 95)), 3) if len(grade) else 0.0,
-        "grade_max": round(float(np.max(np.abs(grade))), 3) if len(grade) else 0.0,
-        "roughness_m": round(float(np.sqrt(np.mean(dd * dd))), 2) if len(dd) else 0.0,
+        "water_m": round(float(water.sum()) * step, 1),
+        "water_levels": levels if water.any() else [],
         "cell_m": grid.get("cell_m"), "source": grid.get("source"),
     }
+    stats.update(profile_stats(z, step))
+    if water.any():
+        log(f"[profile] {stats['water_m']} m of the line reads hydro-flattened water "
+            f"({levels}) - bridged from the banks")
     log(f"[profile] {n} stations @ {step:.1f} m, {stats['relief_m']} m relief, "
         f"grade p95 {stats['grade_p95']*100:.0f}% max {stats['grade_max']*100:.0f}%, "
         f"sigma {sigma_m:.0f} m, {rejected} spikes rejected, "
         f"{grid.get('source')} {grid.get('cell_m')} m")
     return z, stats
+
+
+def _water_nodes(grid: dict, levels, lats, lons):
+    """True where any of the 4 grid nodes around a point sits at a flat level."""
+    s_, w_, n_, e_ = grid["bounds"]
+    cols, rows = int(grid["cols"]), int(grid["rows"])
+    V = np.asarray(grid["values"], dtype=np.float64).reshape(rows, cols)
+    fx = (np.asarray(lons, dtype=float) - w_) / (e_ - w_) * (cols - 1)
+    fy = (np.asarray(lats, dtype=float) - s_) / (n_ - s_) * (rows - 1)
+    i0 = np.clip(np.floor(fx).astype(int), 0, cols - 2)
+    j0 = np.clip(np.floor(fy).astype(int), 0, rows - 2)
+    out = np.zeros(len(fx), dtype=bool)
+    for dj in (0, 1):
+        for di in (0, 1):
+            v = V[j0 + dj, i0 + di]
+            for lv in levels:
+                out |= np.abs(v - lv) < FLAT_TOL_M
+    inside = (fx >= 0) & (fx <= cols - 1) & (fy >= 0) & (fy <= rows - 1)
+    return out & inside
+
+
+def profile_stats(z, step: float) -> dict:
+    """relief / grade p95 / grade max / roughness of a profile at `step` metres."""
+    z = np.asarray(z, dtype=float)
+    if len(z) < 3:
+        return {"relief_m": 0.0, "grade_p95": 0.0, "grade_max": 0.0, "roughness_m": 0.0}
+    grade = np.diff(z) / max(0.05, float(step))
+    dd = np.diff(z, 2)
+    return {"relief_m": round(float(np.max(z) - np.min(z)), 1),
+            "grade_p95": round(float(np.percentile(np.abs(grade), 95)), 3),
+            "grade_max": round(float(np.max(np.abs(grade))), 3),
+            "roughness_m": round(float(np.sqrt(np.mean(dd * dd))), 2)}
+
+
+# ---------------------------------------------------------------------------
+# Manual profile CORRECTIONS (the admin "problem here" tool)
+#
+# A fixed menu of operations on a stretch of the lap - the AI may only ever pick
+# one of these and its parameters (validated and clamped here); it never edits
+# geometry itself. Each correction stores its ends as lat/lon so it re-locates
+# onto a re-rendered centreline, and the uncorrected profile is kept as
+# `profile_base`, so corrections can be removed and re-applied in any order.
+# ---------------------------------------------------------------------------
+CORRECTION_OPS = {
+    # op: (description, {param: (min, max, default)})
+    "flatten": ("straight, even slope between the two ends of the stretch", {}),
+    "scale_relief": ("keep the shape, scale the rise/dip relative to the straight "
+                     "line between the ends (0 = flat, 0.5 = half as high, 1 = unchanged)",
+                     {"factor": (0.0, 1.5, 0.5)}),
+    "max_grade": ("limit the slope to grade_pct", {"grade_pct": (1.0, 20.0, 8.0)}),
+    "smooth": ("Gaussian smoothing along the track, sigma_m metres",
+               {"sigma_m": (8.0, 150.0, 50.0)}),
+    "shift": ("raise (+) or lower (-) the stretch by dz_m, eased in and out",
+              {"dz_m": (-40.0, 40.0, 0.0)}),
+}
+CORR_MIN_SPAN_M = 20.0
+CORR_MAX_SPAN_M = 2500.0
+
+
+def _line_xy(line):
+    lat = np.array([p[0] for p in line], dtype=float)
+    lon = np.array([p[1] for p in line], dtype=float)
+    mx = M_PER_DEG_LAT * math.cos(math.radians(float(lat.mean()) if len(lat) else 0.0))
+    x = (lon - (lon[0] if len(lon) else 0.0)) * mx
+    y = (lat - (lat[0] if len(lat) else 0.0)) * M_PER_DEG_LAT
+    return lat, lon, x, y, mx
+
+
+def line_arclength(line):
+    """(s metres per station, closed?) for an asset line."""
+    _require_deps()
+    lat, lon, x, y, _ = _line_xy(line)
+    if len(x) < 2:
+        return np.zeros(len(x)), False
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))])
+    step = float(s[-1]) / max(1, len(s) - 1)
+    closed = bool(math.hypot(x[-1] - x[0], y[-1] - y[0]) < max(40.0, 10.0 * step))
+    return s, closed
+
+
+def nearest_station(line, lat: float, lon: float):
+    """(index, distance m) of the station nearest a lat/lon."""
+    la, lo, x, y, mx = _line_xy(line)
+    px = (lon - lo[0]) * mx
+    py = (lat - la[0]) * M_PER_DEG_LAT
+    d = np.hypot(x - px, y - py)
+    i = int(np.argmin(d))
+    return i, float(d[i])
+
+
+def validate_correction(c: dict, line) -> dict:
+    """A clean, bounded correction (raises ValueError on anything unusable).
+
+    Accepts {op, s0, s1, params?, p0?, p1?, note?, by?, ai?}; s0/s1 are metres
+    along THIS line. Adds p0/p1 (lat/lon of the ends) for re-location."""
+    if not isinstance(c, dict):
+        raise ValueError("correction must be an object")
+    op = str(c.get("op") or "")
+    if op not in CORRECTION_OPS:
+        raise ValueError(f"unknown op {op!r} (allowed: {', '.join(CORRECTION_OPS)})")
+    s, _closed = line_arclength(line)
+    if len(s) < 10:
+        raise ValueError("track line too short")
+    total = float(s[-1])
+    try:
+        s0, s1 = float(c.get("s0")), float(c.get("s1"))
+    except (TypeError, ValueError):
+        raise ValueError("s0/s1 must be numbers (metres along the lap)")
+    if not (math.isfinite(s0) and math.isfinite(s1)):
+        raise ValueError("s0/s1 must be finite")
+    s0, s1 = max(0.0, min(total, s0)), max(0.0, min(total, s1))
+    if s1 < s0:
+        s0, s1 = s1, s0
+    if s1 - s0 < CORR_MIN_SPAN_M:
+        raise ValueError(f"stretch must be at least {CORR_MIN_SPAN_M:.0f} m")
+    if s1 - s0 > CORR_MAX_SPAN_M:
+        raise ValueError(f"stretch must be under {CORR_MAX_SPAN_M:.0f} m")
+    spec = CORRECTION_OPS[op][1]
+    params = {}
+    raw = c.get("params") if isinstance(c.get("params"), dict) else {}
+    for k, (lo, hi, dflt) in spec.items():
+        v = raw.get(k, dflt)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            v = dflt
+        if not math.isfinite(v):
+            v = dflt
+        params[k] = round(max(lo, min(hi, v)), 3)
+    i0 = int(np.searchsorted(s, s0))
+    i1 = int(min(len(s) - 1, np.searchsorted(s, s1)))
+    out = {"id": str(c.get("id") or "") or hashlib_hex(f"{op}{s0}{s1}{time.time()}")[:10],
+           "op": op, "s0": round(s0, 1), "s1": round(s1, 1), "params": params,
+           "p0": [round(float(line[i0][0]), 7), round(float(line[i0][1]), 7)],
+           "p1": [round(float(line[i1][0]), 7), round(float(line[i1][1]), 7)],
+           "note": str(c.get("note") or "")[:400], "by": str(c.get("by") or "")[:120],
+           "at": int(c.get("at") or time.time())}
+    if isinstance(c.get("ai"), dict):
+        out["ai"] = {k: c["ai"][k] for k in ("model", "explanation", "confidence")
+                     if k in c["ai"]}
+    return out
+
+
+def hashlib_hex(text: str) -> str:
+    import hashlib
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _cos_ramp(n: int):
+    if n <= 0:
+        return np.zeros(0)
+    return 0.5 - 0.5 * np.cos(np.linspace(0.0, math.pi, n + 2)[1:-1])
+
+
+def apply_correction(z, s, c: dict, closed: bool = False):
+    """New profile with ONE correction applied to stations s0..s1 (indices from
+    s). Anchored ops (flatten, scale_relief) keep both ends; the others are
+    blended in/out over a cosine taper inside the stretch so nothing steps."""
+    z = np.asarray(z, dtype=float).copy()
+    s = np.asarray(s, dtype=float)
+    i0 = int(np.searchsorted(s, float(c["s0"])))
+    i1 = int(min(len(s) - 1, np.searchsorted(s, float(c["s1"]))))
+    if i1 - i0 < 3:
+        return z
+    seg = z[i0:i1 + 1].copy()
+    ss = s[i0:i1 + 1] - s[i0]
+    L = float(ss[-1]) or 1.0
+    trend = seg[0] + (seg[-1] - seg[0]) * ss / L
+    op, prm = c["op"], c.get("params") or {}
+    if op == "flatten":
+        z[i0:i1 + 1] = trend
+        return z
+    if op == "scale_relief":
+        z[i0:i1 + 1] = trend + float(prm.get("factor", 0.5)) * (seg - trend)
+        return z
+    if op == "max_grade":
+        # clamp, then pin BOTH ends back onto the road with a straight-line
+        # correction (adds at most |end mismatch| / L of grade) - a taper back
+        # to the original would itself be steep
+        g = float(prm.get("grade_pct", 8.0)) / 100.0
+        tgt = _gauss_profile(_clamp_grade(seg, ss, g, False), ss, 5.0, False)
+        tgt = _clamp_grade(tgt, ss, g, False)
+        w = ss / L
+        z[i0:i1 + 1] = tgt + (seg[0] - tgt[0]) * (1 - w) + (seg[-1] - tgt[-1]) * w
+        return z
+    step = L / max(1, len(ss) - 1)
+    if op == "smooth":
+        tgt = _gauss_profile(z, s, float(prm.get("sigma_m", 50.0)), closed)[i0:i1 + 1]
+    elif op == "shift":
+        tgt = seg + float(prm.get("dz_m", 0.0))
+    else:
+        return z
+    taper = max(2, min(len(ss) // 3, int(round(30.0 / max(0.1, step)))))
+    w = np.ones(len(ss))
+    r = _cos_ramp(taper)
+    w[:taper] = r
+    w[-taper:] = np.minimum(w[-taper:], r[::-1])
+    w[0] = w[-1] = 0.0
+    z[i0:i1 + 1] = seg * (1 - w) + tgt * w
+    return z
+
+
+def relocate_correction(c: dict, line, s) -> Optional[dict]:
+    """The correction re-expressed on (a possibly re-rendered) line: its ends
+    snap to the stations nearest p0/p1. None when the ends are > 25 m away
+    (that stretch no longer exists)."""
+    c = dict(c)
+    if c.get("p0") and c.get("p1"):
+        i0, d0 = nearest_station(line, c["p0"][0], c["p0"][1])
+        i1, d1 = nearest_station(line, c["p1"][0], c["p1"][1])
+        if d0 > 25.0 or d1 > 25.0:
+            return None
+        a, b = float(s[i0]), float(s[i1])
+        if b < a:
+            a, b = b, a
+        c["s0"], c["s1"] = a, b
+    return c
+
+
+def corrected_profile(line, base_z, corrections, closed: Optional[bool] = None):
+    """(z, applied list) - base profile with every correction applied in order."""
+    s, cl = line_arclength(line)
+    if closed is None:
+        closed = cl
+    z = np.asarray(base_z, dtype=float).copy()
+    applied = []
+    for c in corrections or []:
+        rc = relocate_correction(c, line, s)
+        if rc is None:
+            continue
+        z = apply_correction(z, s, rc, closed)
+        applied.append(rc)
+    return z, applied
+
+
+def reapply_corrections(asset: dict, log=print) -> dict:
+    """Line z = profile_base + corrections; elevation stats follow. In place."""
+    line = asset.get("line") or []
+    if len(line) < 10:
+        return asset
+    base = asset.get("profile_base")
+    if not base or len(base) != len(line):
+        base = [float(p[2]) if len(p) > 2 and p[2] is not None else 0.0 for p in line]
+        asset["profile_base"] = [round(float(v), 2) for v in base]
+    corr = asset.get("corrections") or []
+    z, applied = corrected_profile(line, base, corr)
+    asset["line"] = [[p[0], p[1], round(float(v), 2)] for p, v in zip(line, z)]
+    s, _ = line_arclength(line)
+    step = float(s[-1]) / max(1, len(s) - 1) if len(s) > 1 else 2.0
+    elev = dict(asset.get("elevation") or {})
+    elev.update(profile_stats(z, step))
+    elev["corrections"] = len(applied)
+    if corr and len(applied) < len(corr):
+        elev["corrections_lost"] = len(corr) - len(applied)
+        log(f"[profile] {len(corr) - len(applied)} correction(s) no longer match the line")
+    else:
+        elev.pop("corrections_lost", None)
+    base_stats = profile_stats(np.asarray(base, dtype=float), step)
+    elev["base"] = base_stats
+    asset["elevation"] = elev
+    return asset
 
 
 def write_dem_bin(grid: dict, path) -> dict:
@@ -784,7 +1166,7 @@ def write_dem_bin(grid: dict, path) -> dict:
     return {"v": DEM_V, "file": path.name, "cols": int(grid["cols"]), "rows": int(grid["rows"]),
             "bounds": [float(x) for x in grid["bounds"]], "base": base, "scale": scale,
             "cell_m": grid.get("cell_m"), "source": grid.get("source"),
-            "format": "u16le"}
+            "format": "u16le", **({"ref_check": grid["ref_check"]} if grid.get("ref_check") else {})}
 
 
 def read_dem_bin(meta: dict, path):
@@ -2900,10 +3282,13 @@ def _enrich_steps(asset: dict, adir: pathlib.Path, cache_dir: pathlib.Path, log,
                 grid["values"] = read_dem_bin(hr, adir / hr["file"])
             z, estats = road_profile(grid, lats, lons, log=log)
             if len(z) == len(asset["line"]):
-                asset["line"] = [[p[0], p[1], round(float(v), 1)]
+                asset["line"] = [[p[0], p[1], round(float(v), 2)]
                                  for p, v in zip(asset["line"], z)]
+                asset["profile_base"] = [round(float(v), 2) for v in z]
                 asset["elevation"] = estats
                 asset["line_elev_source"] = hr.get("source")
+                if asset.get("corrections"):
+                    reapply_corrections(asset, log=log)
         except Exception as e:
             log(f"[{slug}] station elevations failed: {type(e).__name__}: {e}")
 
@@ -3184,6 +3569,10 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
     }
     if refine_report is not None:
         asset["centreline_refine"] = refine_report
+    # manual profile corrections carried over from the asset this re-render
+    # replaces (they re-locate by lat/lon onto the new line)
+    if opts.get("corrections"):
+        asset["corrections"] = [dict(c) for c in opts["corrections"] if isinstance(c, dict)]
     if tex_name:
         add_landcover(asset, img, bounds, log=log)
     problems = validate_asset(asset, line)
@@ -3199,6 +3588,8 @@ def build_asset(track: str, line_points, data_dir: pathlib.Path, opts=None,
                 _enrich_steps(asset, out_dir, cache_dir, log, network=True, refine=False)
             except Exception as e:
                 log(f"[{slug}] enrichment failed: {type(e).__name__}: {e}")
+        if asset.get("corrections") or not asset.get("profile_base"):
+            reapply_corrections(asset, log=log)
         with _LANDCOVER_LOCK:
             _write_json_atomic(asset_path, asset)
     log(f"[{slug}] asset written ({asset_path})")
@@ -3370,6 +3761,39 @@ def audit_asset(asset: dict) -> dict:
     if not (asset.get("dem_hr")):
         add("high", "elevation", "no high-resolution terrain (only the coarse DEM)",
             "re-render: it fetches USGS 3DEP lidar / terrarium z15 and keeps it with the track")
+    hrm = asset.get("dem_hr") or {}
+    if hrm and int(hrm.get("v") or 0) < DEM_V:
+        add("high", "elevation",
+            f"terrain grid is version {hrm.get('v') or 0}, current is {DEM_V} - grids before v3 "
+            "were squashed north-south by the 3DEP service (hills in the wrong place)",
+            "re-render (or open the track in 3D: it re-fetches the terrain in the background)")
+    rc = hrm.get("ref_check") or {}
+    if rc.get("p95_abs_m") is not None and float(rc["p95_abs_m"]) > 6.0:
+        add("high", "elevation",
+            f"lidar terrain disagrees with the reference surface: p95 {rc['p95_abs_m']} m, "
+            f"{rc.get('over12_pct')}% of cells > 12 m off - misregistered or a broken tile",
+            "re-render; if it persists the 3DEP answer is wrong for this place")
+    gp95 = float(elev.get("grade_p95") or 0)
+    if gp95 >= 0.9 * PROFILE_MAX_GRADE:
+        add("high", "elevation",
+            f"the road sits on the {100 * PROFILE_MAX_GRADE:.0f}% safety cap for much of the lap "
+            f"(grade p95 {100 * gp95:.0f}%) - the terrain under the line is wrong, "
+            "not the track (misregistered terrain, water-flattened lidar or a line off the road)",
+            "re-render; then use 'problem here' on any stretch that still looks wrong")
+    wm = float(elev.get("water_m") or 0)
+    if wm > 0:
+        add("medium", "elevation",
+            f"{wm:.0f} m of the line reads hydro-flattened water {elev.get('water_levels') or ''} "
+            "- treated as a bridge/causeway and interpolated from the banks",
+            "check it is a real bridge; otherwise the line is off the road there")
+    nc = len(asset.get("corrections") or [])
+    if nc:
+        add("low", "elevation", f"{nc} manual profile correction(s) applied",
+            "listed under 'corrections'; remove one if a re-render made it unnecessary")
+    if elev.get("corrections_lost"):
+        add("medium", "elevation",
+            f"{elev['corrections_lost']} correction(s) no longer match the line (it moved > 25 m)",
+            "remove them and re-apply on the new line")
     gmax = float(elev.get("grade_max") or 0)
     if gmax > 0.30:
         add("high", "elevation",
@@ -3411,6 +3835,8 @@ def audit_asset(asset: dict) -> dict:
                                           "far": asset.get("dem_far")},
             "network": network, "features": features,
             "prep_version": asset.get("prep_version"),
+            "corrections": [{k: c.get(k) for k in ("id", "op", "s0", "s1", "params", "note")}
+                            for c in (asset.get("corrections") or [])],
             "issues": issues}
 
 

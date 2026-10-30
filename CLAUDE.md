@@ -786,7 +786,7 @@ absent) so the payoff is visible without clicking anything: Summit Point, Jeffer
 CLI: `python3 -m app.trackprep --track "Summit Point" --osm-id 572443699 --near 39.2415,-77.9779`
 (or `--session <ndjson>`, which also borrows OSM's surveyed width by shape). `--list-tracks` shows what exists.
 
-### 3D view v17 — the road is a PROFILE, the terrain is cross-checked, admins can re-render (`track3d_v` 17, `ENRICH_VERSION` 4)
+### 3D view v17/v18 — the road is a PROFILE, the terrain is cross-checked + unsquashed, admins can re-render and fix it (`track3d_v` 18, `ENRICH_VERSION` 4, `DEM_V` 3, `PROFILE_V` 3)
 The complaint: **Road Atlanta looks like shit, and the track bucks up and down.** Two separate
 causes, both measured before anything was changed:
 - **The road was a raster read.** `ys[i] = DEM(x,z)` at every station, smoothed over 5 samples.
@@ -800,18 +800,30 @@ causes, both measured before anything was changed:
   {relief_m, grade_p95, grade_max, roughness_m, source, cell_m, sigma_m, rejected}. Enrichment step
   (d) redoes it from the 3 m lidar grid; `ENRICH_VERSION` 4 makes every older asset redo it, and
   `_enrich_missing()` requires `elevation.v == PROFILE_V`. The shipped seeds were rebuilt.
-- **DEM fills.** `_dem3dep()` now fills NoData cells from AWS terrarium z15, and `_clean_dem()`
-  fills any remaining hole from its NEIGHBOURS (`_fill_from_neighbours`, normalized 3x3 growth),
-  never the old single global median (which turned every void into one flat plateau).
-  ⚠️ **A large exact-CONSTANT region is LEFT ALONE — it is water.** 3DEP hydro-flattens lakes to
-  one level (Road Atlanta's lake: 257.4 m over ~5,900 cells). An attempt to "fix" it by swapping in
-  terrarium (which smooths the ravine to ~290 m) raised the lake 30 m and built a **34 m cliff** at
-  the shoreline; it was reverted and `tests/test_trackprep.py` pins the lake staying put. The
-  Road Atlanta "trench" was the OSM-only TEST line clipping the lake edge, not bad terrain.
-  The written grid metadata carries **`DEM_V`** (2): an older grid counts as MISSING in
-  `_enrich_missing()`/`need()`, so it is re-fetched once in the background (v1 grids may carry the
-  reverted replacement). A re-render rebuilds it anyway: `build_asset()` writes a fresh JSON
-  without `dem_hr`/`dem_far`/`network`/`ground`/`features`.
+- **⚠️ THE 3DEP SQUASH (the real Road Atlanta root cause, fixed after v0.1.178, `DEM_V` 3).** The
+  3DEP `exportImage` service makes pixels **square in the OUTPUT SR** (degrees): it keeps the bbox
+  centre, takes `px = max(width/w_px, height/h_px)` and GROWS the other axis. We asked for
+  metre-square pixels, so at 34 N the answer covered **1/cos(lat) = 1.21×** the latitude we asked
+  for, and every lidar grid since the v11 3D view was squashed ~21 % north-south toward its centre
+  (verified with `f=json`: asked 0.018° of latitude, got 0.02177°). Terrain was read from up to
+  ~200 m away: the lake's hydro-flattened level (257.4 m) landed ACROSS the Turn 7 hairpin, the
+  road dived 33 m into it and climbed out at the 22 % cap — the "impossibly high hill before the
+  back straight". It was never water and never a smoothing problem. `_dem3dep()` now requests
+  degree-square pixels, computes the extent the server really used (`_server_extent`, pinned to the
+  live numbers in `test_server_extent_matches_the_live_3dep_answer`) and bilinear-resamples onto our
+  node grid (`_resample_nodes`, extrapolating the half pixel at the edges). The test fakes now
+  behave like the real server. Result: 3DEP vs terrarium p95 **0.2 m** (was 15 m, 9 % of cells
+  > 12 m off); Road Atlanta 36 m relief / grade p95 10 % / max 16 % (was 58 m / 22 % on the cap);
+  Watkins Glen max 10 %. Every grid now carries `ref_check` {med_abs_m, p95_abs_m, over12_pct} vs
+  terrarium, and the audit raises HIGH when p95 > 6 m, when `dem_hr.v < DEM_V`, or when the profile
+  sits on the grade cap (p95 ≥ 90 % of 22 %) — the three signatures of this bug. Seeds re-enriched.
+- **DEM fills.** NoData cells are filled from AWS terrarium z15 and `_clean_dem()` fills what is left
+  from its NEIGHBOURS (`_fill_from_neighbours`), never one global median. A large exact-CONSTANT
+  region is LEFT ALONE: it is 3DEP's hydro-flattened water. (Yesterday's "plateau" replacement
+  was reverted: it was treating the squash's symptom.) **`PROFILE_V` 3**: `road_profile()` masks
+  any sample whose four bilinear nodes include a flattened level (`flat_levels()`: ≥ 1 % of the grid,
+  ≥ 400 cells, ≥ 8× the typical 5 cm bin) and interpolates from the banks — a road on a lake surface
+  is a bridge; stats carry `water_m` / `water_levels`, the audit says MEDIUM.
 - **Viewer:** the fine DEM grid is blurred 2 cells (`RC3D.smoothGrid`, ~6 m: raster creases out,
   hills kept) and the track's vertical profile is smoothed again in metres along the lap
   (`RC3D.smoothProfile`, 24 m, wraps). ⚠️ **Datum rule:** the profile is smoothed in ABSOLUTE
@@ -831,7 +843,36 @@ causes, both measured before anything was changed:
   untouched; closes on an outside click / Esc). The bar wraps on a narrow screen instead of
   scrolling. It is z-index 26 (a stacking context) so the pop-up opens over the QA panel, which
   sits TOP-LEFT — the bottom-right corner belongs to the mini-map.
-- **Admin re-render + AI review (the QA panel).** `/track3d` shows a bottom-right **track render
+- **The viewer draws the PREPARED profile.** It used to re-read the DEM itself, which would
+  silently drop the server's water bridging and every admin correction. Now the track's heights
+  come from `ASSET.line[][2]` wherever the track runs within 6 m of the asset's line (fading to the
+  DEM read by 12 m, so a link the asset lacks keeps the terrain); `__rc3dInfo.track.profile` =
+  `asset` | `dem`, `.corrections` = count. `roadVsDem` stays ~0.2 m on a healthy track.
+- **"Problem here" — fix a stretch of the road yourself (admin, in the QA panel).** A profile plot
+  of the lap (white = now, dashed grey = before any fix, amber = the car, green bands = applied
+  fixes). Press **⌖ problem here** (the car's position) or click the plot, pick the stretch length,
+  type what is wrong, then **ask AI** (or **suggest fix** when AI is off) or pick an op by hand.
+  The server answers with ONE bounded correction plus a cyan before/after preview and the numbers
+  (max change, relief, steepest grade); nothing changes until **accept**. Menu =
+  `trackprep.CORRECTION_OPS`: `flatten`, `scale_relief` (factor 0..1.5 of the rise/dip vs the
+  straight line between the ends), `max_grade` (1..20 %, anchored at both ends), `smooth`
+  (sigma 8..150 m), `shift` (±40 m, eased). `validate_correction()` clamps every parameter, rejects
+  unknown ops / stretches outside 20..2500 m, and stores the ends as lat/lon (`p0`/`p1`).
+  The AI (`_fix_ai`, feature `track`) gets the profile around the spot at 10 m (m, z, grade %), the
+  lap stats and the menu, and may only return `{op, s0, s1, params, explanation, confidence}` or
+  `op: none`; its answer is re-validated; with no AI key `_fix_heuristic` reads the note's words.
+  Storage: `asset.corrections[]` + `asset.profile_base` (the uncorrected profile);
+  `reapply_corrections()` rebuilds `line[][2]` from base + every fix (removal = re-apply without
+  it); they **re-locate by lat/lon onto a re-rendered line** (a fix whose ends moved > 25 m is
+  reported as `corrections_lost`, never applied elsewhere) and are carried through admin
+  re-render, a session re-prep (`keep_corr`) and a seed refresh. Endpoints (all `_gate_track_admin`,
+  plain `def`): `GET /trackassets/<slug>/profile`, `POST …/fix/propose`
+  `{s|lat+lon, span_m, note, op?, params?}`, `POST …/fix/apply {proposal}` (slug-locked, re-validated),
+  `POST …/fix/remove {id | all}`. After accept/remove the page reloads and **resumes** at the same
+  lap + moment with the panel open (`sessionStorage rc3.resume`, 2 min). The panel has a **collapse
+  ▾/▸ button** (remembered in `localStorage rc3.qa.collapsed`) and sits top-left, `max-height:
+  calc(100vh - 320px)`.
+- **Admin re-render + AI review (the QA panel).** `/track3d` shows a **track render
   QA** panel to admins only (`__ADMIN__` injected with `_req_is_admin`), listing the audit's
   issues and two buttons: **re-render track** (`POST /trackassets/<slug>/rerender`, background:
   bake from the asset's OWN centreline → `enrich_asset()` → audit → AI review, polled through
@@ -854,6 +895,21 @@ causes, both measured before anything was changed:
   "grade", a clamped width, a rejected imagery and an old enrichment; save_review round-trip),
   `tests/test_track3d.py` 10b (`smoothProfile` + `smoothGrid`), `tests/test_track_review.py`
   (AI JSON parsing, the same gate on both endpoints, the panel markup + `__ADMIN__` injection).
+
+### The 3D view lives IN the pit wall's map card; full screen is a button
+The review page's **▶ 3D drive view** no longer opens a window: it swaps the Track Map card's
+Leaflet map for `#map3dframe` (`/track3d/...?embed=1&at=<epoch>` + the usual `lap/ghost/pts`), and
+the button becomes **◀ 2D map**. Small = the data already on the screen: the review page publishes
+`window.__rcReview = {data, laps}` (same origin) and the embedded view draws from it (de-duplicating
+repeated fixes itself, as `?fixes=1` would) — **no second download** (verified: zero `/data` or
+`/laps` requests on opening it). `embed=1` is a compact layout (driving bar + **⛶ full screen**; no
+legend, QA panel, options or links). **⛶ full screen** calls the parent's `__rc3dFull({at, lap})`:
+a fixed `#rc3dfull` overlay (+ the browser's Fullscreen API when allowed) loads the FULL view
+(`fs=1`), which fetches its own `/data?target=30000&fixes=1`; its bar shows **✕ exit full screen**
+instead of the pit-wall links, and leaving (button or Esc) returns to the card at the same moment
+(`window.__rc3dNow()` reports `{at, lap}`). `?at=<epoch>` starts paused at the pit wall's
+playhead, and wins over `?lap=` when the playhead is in another lap. Outside the pit wall the full
+screen button opens a new tab. Tests: `tests/test_track_review.py` `EmbeddedThreeDTests`.
 
 ### 3D view v14 — the compare GHOST, and a wide comparison search (`track3d_v` 14)
 The user: when a lap or session is picked for comparison on the review page, the 3D view should show where
