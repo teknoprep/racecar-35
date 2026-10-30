@@ -190,3 +190,16 @@ class EmbeddedThreeDTests(unittest.TestCase):
         self.assertIn(".embed #legend, .embed #qa", h)
         # the full view fetches its OWN full-resolution data
         self.assertIn('"/data?target=30000&fixes=1"', h)
+
+
+class KeyboardShortcutTests(unittest.TestCase):
+    def test_space_and_arrows_never_steal_keys_from_a_text_box(self):
+        """Typing a note to the AI in the QA panel: space must be a space, not
+        play/pause (and the arrows must move the cursor, not scrub)."""
+        h = _t3d()
+        i = h.index('document.addEventListener("keydown", function (e) {\n      // typing')
+        self.assertIn("if (isTypingTarget(e.target)) return;", h[i:i + 400])
+        j = h.index("function isTypingTarget(t)")
+        body = h[j:j + 400]
+        for tag in ("TEXTAREA", "SELECT", "isContentEditable", '"INPUT"'):
+            self.assertIn(tag, body)

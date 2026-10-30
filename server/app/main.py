@@ -10100,6 +10100,9 @@ _TRACK3DMAP_HTML = (
   map.on("pitchend", function () { PITCH = map.getPitch(); });
   map.on("zoomend", function () { zoom = map.getZoom(); el("b-zoom").value = String(zoom); });
   document.addEventListener("keydown", function (ev) {
+    var tg = ev.target, tn = tg && tg.tagName;
+    if (tg && (tg.isContentEditable || tn === "TEXTAREA" || tn === "SELECT" ||
+               (tn === "INPUT" && !/^(range|checkbox|radio|button|submit)$/i.test(tg.type || "")))) return;
     if (ev.key === " ") { ev.preventDefault(); el("b-play").click(); }
     else if (ev.key === "ArrowRight") seek(curTime + 2);
     else if (ev.key === "ArrowLeft") seek(curTime - 2);
@@ -10458,6 +10461,13 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
   })();
 
   function el(id) { return document.getElementById(id); }
+  // a text box / dropdown / number field has the keyboard: shortcuts stay out
+  function isTypingTarget(t) {
+    if (!t) return false;
+    var tn = t.tagName;
+    if (t.isContentEditable || tn === "TEXTAREA" || tn === "SELECT") return true;
+    return tn === "INPUT" && !/^(range|checkbox|radio|button|submit)$/i.test(t.type || "");
+  }
   function notice(msg, err) {
     var n = el("notice");
     n.style.display = "block";
@@ -16135,6 +16145,9 @@ import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
       el("b-eye").value = String(opts.eye);
     }, { passive: false });
     document.addEventListener("keydown", function (e) {
+      // typing in a box (the QA note, a fix parameter, a dropdown) is TYPING:
+      // space must be a space and the arrows must move the cursor
+      if (isTypingTarget(e.target)) return;
       if (e.key === " ") { e.preventDefault(); el("b-play").click(); }
       else if (e.key === "ArrowRight") { playing = false; syncPlay(); NOW = Math.min(TB, NOW + 1); advance(0); }
       else if (e.key === "ArrowLeft") { playing = false; syncPlay(); NOW = Math.max(TA, NOW - 1); advance(0); }
